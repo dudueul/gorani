@@ -12,7 +12,7 @@
 //! arrives with the restore commit.
 
 use gorani_formats::backup::{self, BackupWriter, FileKey};
-use worker::{Request, Response, Result};
+use worker::{Env, Headers, Request, RequestInit, Response, Result};
 
 #[derive(serde::Deserialize)]
 struct KvRow {
@@ -20,6 +20,7 @@ struct KvRow {
 }
 
 use crate::family::json_error;
+use crate::files_store::bind;
 use crate::member::GoraniMemberDO;
 
 const STAMP_LEN: usize = 16;
@@ -240,3 +241,111 @@ fn base64_of(b: &[u8]) -> String {
 #[allow(unused)]
 fn void<F>(_: &F) {}
 use rand_core::RngCore as _RngCore;
+// ── Restore (12c): replay decrypted rows + assign fresh object keys ──
+//
+// The CLIENT decrypts the .gbak with its key file and sends the rows; the
+// server upserts them (ids preserved; triggers journal the changes so other
+// devices converge) and assigns a FRESH object key per version — the client
+// then re-puts the sealed object bytes to that key (zero-trust: the server
+// stores what it cannot read, exactly like any upload).
+
+impl GoraniMemberDO {
+	pub(crate) async fn backup_restore(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let member = actor_to_member_prefix(&self.env, actor).await?;
+		let mut objects: Vec<(String, String)> = Vec::new(); // (versionRef, objectKey)
+		if let Some(folders) = body.get("folders").and_then(|v| v.as_array()) {
+			for f in folders {
+				let get = |k: &str| f.get(k).and_then(|v| v.as_str()).map(str::to_string);
+				let Some(id) = get("id") else { continue };
+				let Some(name) = get("name") else { continue };
+				if !gorani_formats::formats::is_sealed_text(&name) {
+					return json_error(400, "restored folder names must be sealed text");
+				}
+				self.sql
+					.exec(
+						"INSERT INTO file_folders (id, parent_id, name_sealed, created_at, updated_at) VALUES (?1, ?2, ?3, COALESCE(?4, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(id) DO UPDATE SET name_sealed = ?3, deleted_at = NULL, trashed_with = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+						Some(vec![id.clone().into(), bind(get("parent")), name.into(), bind(get("createdAt"))]),
+					)
+					.map_err(|e| worker::Error::RustError(format!("restore folder: {e}")))?;
+			}
+		}
+		if let Some(files) = body.get("files").and_then(|v| v.as_array()) {
+			for f in files {
+				let get = |k: &str| f.get(k).and_then(|v| v.as_str()).map(str::to_string);
+				let Some(id) = get("id") else { continue };
+				let Some(name) = get("name") else { continue };
+				if !gorani_formats::formats::is_sealed_text(&name) {
+					return json_error(400, "restored file names must be sealed text");
+				}
+				self.sql
+					.exec(
+						"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(id) DO UPDATE SET folder_id = ?2, name_sealed = ?3, size = ?4, deleted_at = NULL, trashed_with = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+						Some(vec![id.clone().into(), bind(get("folder")), name.into(), f.get("size").and_then(|v| v.as_i64()).unwrap_or(0).into(), f.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(), bind(get("createdAt"))]),
+					)
+					.map_err(|e| worker::Error::RustError(format!("restore file: {e}")))?;
+			}
+		}
+		if let Some(versions) = body.get("versions").and_then(|v| v.as_array()) {
+			for v in versions {
+				let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+				let Some(file) = get("file") else { continue };
+				let file_for_key = file.clone();
+				let Some(ck) = get("key") else { continue };
+				if !gorani_formats::formats::is_sealed_text(&ck) {
+					return json_error(400, "restored content keys must be sealed text");
+				}
+				let version = v.get("version").and_then(|x| x.as_i64()).unwrap_or(1);
+				let object_key = format!("files/{member}/{file_for_key}/r-{}", crate::files_store::uuid());
+				self.sql
+					.exec(
+						"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'))) ON CONFLICT(file_id, version) DO UPDATE SET content_key = ?3, object_key = ?5, type_sealed = COALESCE(?6, type_sealed), size = ?7",
+						Some(vec![
+							file.clone().into(),
+							version.into(),
+							ck.into(),
+							bind(get("vaultKeyId")),
+							object_key.clone().into(),
+							bind(get("type")),
+							v.get("size").and_then(|x| x.as_i64()).unwrap_or(0).into(),
+							v.get("chunk").and_then(|x| x.as_i64()).into(),
+							bind(get("createdAt")),
+						]),
+					)
+					.map_err(|e| worker::Error::RustError(format!("restore version: {e}")))?;
+				// The files row's pointer must move to the restored version.
+				self.sql.exec(
+					"UPDATE files SET version = MAX(version, ?1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?2",
+					Some(vec![version.into(), file_for_key.clone().into()]),
+				)?;
+				objects.push((format!("{file_for_key}:{version}"), object_key));
+			}
+		}
+		if let Some(sealed) = body.get("secrets").and_then(|v| v.as_str()).map(str::to_string) {
+			if !gorani_formats::formats::is_sealed_text(&sealed) {
+				return json_error(400, "restored secrets must be sealed text");
+			}
+			self.sql.exec("DELETE FROM files_secrets", None)?;
+			self.sql.exec("INSERT INTO files_secrets (v) VALUES (?1)", Some(vec![sealed.into()]))?;
+		}
+		self.audit(actor, "backup.restore", "restore", None, Some(&format!("objects: {}", objects.len()))).await?;
+		Ok(Response::from_json(&serde_json::json!({ "objects": objects.into_iter().map(|(r, k)| serde_json::json!({ "ref": r, "objectKey": k })).collect::<Vec<_>>() }))?)
+	}
+}
+
+/// The member id from the actor email (the restore route is member-scoped
+/// and parents may act for children; the prefix guards object keys).
+async fn actor_to_member_prefix(env: &Env, actor_email: &str) -> Result<String> {
+	let namespace = env.durable_object("FAMILY")?;
+	let stub = namespace.id_from_name("family")?.get_stub()?;
+	let mut headers = Headers::new();
+	headers.set("x-gorani-actor", actor_email)?;
+	let request = Request::new_with_init("https://do.internal/actor", &RequestInit { method: worker::Method::Get, headers, ..Default::default() })?;
+	let resp = stub.fetch_with_request(request).await?;
+	let mut resp = resp;
+	let v: serde_json::Value = resp.json().await?;
+	let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+	if id.is_empty() {
+		return Err(worker::Error::RustError("actor is not a member".into()));
+	}
+	Ok(id)
+}

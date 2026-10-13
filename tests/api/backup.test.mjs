@@ -115,7 +115,49 @@ try {
 	const keyGet2 = await api(dev.base, "GET", "/api/v1/members/jinu/backup-key", { email: "jinu@family.test" });
 	assert.ok(!JSON.stringify(keyGet2.json).includes(toBase64(backup.bundle).slice(0, 24)), "the private bundle is absent from the stored record");
 
-	console.log("ok  api:backup — key file, run, download, decrypt, round trip, tamper, zero-trust");
+	// ── 6. Restore: decrypt the backup, replay rows + sealed objects ───
+	// Trash one file first (a mini disaster), then restore everything.
+	const victim = (await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" })).json.files[0];
+	await api(dev.base, "DELETE", `/api/v1/members/jinu/files/${victim.id}`, { email: "jinu@family.test" });
+	const afterTrash = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" });
+	assert.ok(!afterTrash.json.files.some((f) => f.id === victim.id), "the victim is gone from the lists");
+
+	const folders = parsed.entries.filter((e) => e.json.kind === "folder").map((e) => e.json);
+	const restoredFiles = parsed.entries.filter((e) => e.json.kind === "file").map((e) => e.json);
+	const versions = versionEntries.map((e) => e.json);
+	const secretsEntry = parsed.entries.find((e) => e.json.kind === "files-secrets");
+	const restore = await api(dev.base, "POST", "/api/v1/members/jinu/backup/restore", {
+		email: "jinu@family.test",
+		body: { folders, files: restoredFiles, versions, secrets: secretsEntry?.json.sealed ?? null },
+	});
+	assert.equal(restore.status, 200, JSON.stringify(restore.json));
+
+	// Fill the fresh object keys with the sealed bytes from the backup.
+	for (const o of restore.json.objects) {
+		const v = versions.find((x) => `${x.file}:${x.version}` === o.ref);
+		const entry = versionEntries.find((e) => e.json.file === v.file && e.json.version === v.version);
+		const put = await fetch(`${dev.base}/api/v1/members/jinu/backup/restore/object?k=${encodeURIComponent(o.objectKey)}`, {
+			method: "PUT",
+			headers: { "x-gorani-dev-email": "jinu@family.test", "content-type": "application/octet-stream" },
+			body: entry.object,
+		});
+		assert.equal(put.status, 200, `fill ${o.objectKey}: ${await put.text()}`);
+	}
+
+	// The lists are whole again, and the victim's bytes still open.
+	const after = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" });
+	assert.ok(after.json.files.some((f) => f.id === victim.id), "the restored file is back");
+	const ckBack = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [victim.id] } });
+	const ckKey = await unwrapContentKey(storePriv, ckBack.json.keys[victim.id].key);
+	const dlBack = await fetch(`${dev.base}/api/v1/members/jinu/files/${victim.id}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
+	const got = new Uint8Array(await dlBack.arrayBuffer());
+	// The download serves the SEALED object (GV02 = magic ‖ nonce ‖ ct ‖ tag);
+	// decrypt with the restored content key and compare plaintexts.
+	const gotPlain = await openWith(ckKey, got);
+	const original = files.find((f) => Buffer.from(f.bytes).equals(Buffer.from(gotPlain)));
+	assert.ok(original, "restored bytes match one of the uploads");
+
+	console.log("ok  api:backup — key file, run, download, decrypt, round trip, tamper, zero-trust, RESTORE");
 } finally {
 	await dev.close();
 }

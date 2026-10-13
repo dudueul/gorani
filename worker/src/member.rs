@@ -355,6 +355,10 @@ impl GoraniMemberDO {
 			}
 			("GET", "backups") => self.backups_list().await,
 			("GET", id) if id.starts_with("backups/") => self.backup_object(&id["backups/".len()..]).await,
+			("POST", "backup/restore") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.backup_restore(&actor, body).await
+			}
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.files_reseal(&actor, body).await

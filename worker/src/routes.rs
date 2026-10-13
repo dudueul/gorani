@@ -175,6 +175,11 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		}
 		("GET", ["members", id, "backups"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "backups", None, actor)).await,
 		("GET", ["members", id, "backups", stamp]) => backup_download(&env, &identity, id, stamp).await,
+		("POST", ["members", id, "backup", "restore"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "backup/restore", Some(body), actor)).await
+		}
+		("PUT", ["members", id, "backup", "restore", "object"]) => backup_object_fill(req, env, &identity, id).await,
 		// ── Crypto-shredding: the destroy secret must exist and the confirm
 		// phrase must match, exactly. Without both: 403, always.
 		("DELETE", ["members", id, "vault"]) => {
@@ -859,4 +864,22 @@ async fn backup_download(env: &Env, identity: &Identity, member_id: &str, stamp:
 		}
 		Err(e) => json_error(500, &e.to_string()),
 	}
+}
+
+/// Fill a restored version's object: the client PUTs the SEALED bytes it
+/// decrypted from the backup; the key must be a member-scoped files key.
+async fn backup_object_fill(mut req: Request, env: Env, identity: &Identity, member_id: &str) -> Result<Response> {
+	match member_ctx(&env, identity, member_id).await {
+		Ok(_) => {}
+		Err(resp) => return Ok(resp),
+	}
+	let url = req.url()?;
+	let raw = crate::files_store::urlquery(url.query().unwrap_or("")).get("k").cloned().unwrap_or_default();
+	let key = raw.replace("%2F", "/").replace("%20", " "); // (the client percent-encodes the path separators)
+	if !key.starts_with(&format!("files/{member_id}/")) || key.contains("..") {
+		return json_error(400, "object key must be a member files key");
+	}
+	let bytes = req.bytes().await?;
+	crate::s3::put(&env, &key, bytes.to_vec()).await?;
+	Response::from_json(&serde_json::json!({ "ok": true }))
 }

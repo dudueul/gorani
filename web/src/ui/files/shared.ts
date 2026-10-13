@@ -43,7 +43,9 @@ export const kindLabel = (k: FileKind) => KIND_LABEL[k];
 
 // ── the platform mode (per browser, like a theme) ───────────────────
 
-export type PlatformMode = "win11" | "macos";
+export type PlatformMode = "win11" | "macos" | "music";
+// ("music" is the library view — one feed of sealed metadata blobs,
+// docs/MUSIC.md — not an explorer skin.)
 const MODE_KEY = "gorani-explorer-mode";
 
 export function loadMode(): PlatformMode {

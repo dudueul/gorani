@@ -20,6 +20,7 @@ import "./viewer/viewer.ts";
 import type { ViewerTarget } from "./viewer/viewer.ts";
 import "./files/win11.ts";
 import "./files/finder.ts";
+import "./files/music.ts";
 
 @customElement("gorani-shell")
 export class GoraniShell extends LitElement {
@@ -117,6 +118,7 @@ export class GoraniShell extends LitElement {
 						<div class="flex overflow-hidden rounded-lg border border-neutral-700">
 							<button class="px-2.5 py-1.5 ${this.mode === "win11" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="Windows 11 File Explorer" @click=${() => this.switchMode("win11")}>Windows</button>
 							<button class="px-2.5 py-1.5 ${this.mode === "macos" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="macOS Finder" @click=${() => this.switchMode("macos")}>Finder</button>
+							<button class="px-2.5 py-1.5 ${this.mode === "music" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="Music library" @click=${() => this.switchMode("music")}>Music</button>
 						</div>
 						<button class="rounded-lg border border-neutral-700 px-3 py-1.5 hover:border-accent" @click=${() => this.session.lock()}>
 							Lock
@@ -130,14 +132,18 @@ export class GoraniShell extends LitElement {
 					${this.model
 						? this.mode === "win11"
 							? html`<gorani-win11 .model=${this.model} .memberName=${this.member.name} .memberRole=${this.member.role}></gorani-win11>`
-							: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
+							: this.mode === "music"
+								? html`<gorani-music .model=${this.model} .memberName=${this.member.name}></gorani-music>`
+								: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
 						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
 				${this.viewer ? html`<gorani-viewer .model=${this.model} .target=${this.viewer} @closed=${() => (this.viewer = null)}></gorani-viewer>` : nothing}
 					${this.model
 						? this.mode === "win11"
 							? html`<gorani-win11 .model=${this.model} .memberName=${this.member.name} .memberRole=${this.member.role}></gorani-win11>`
-							: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
+							: this.mode === "music"
+								? html`<gorani-music .model=${this.model} .memberName=${this.member.name}></gorani-music>`
+								: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
 						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
 				<div class="pointer-events-none fixed bottom-4 left-1/2 z-50 -translate-x-1/2 space-y-2">

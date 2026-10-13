@@ -32,6 +32,7 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `api:backup` | Key file (private never crosses the wire) → job → download → decrypt → restore round trip | the container the server cannot open |
 | `api:housekeeping` | Retention levers with forced clocks; the growth metric | bounding the unbounded |
 | `api:cron` | The nightly pass fired like production fires it: fan-out over the registry, backup prune to 7, the `cron` actor in the audit | maintenance without an identity |
+| `unit:music` + `api:music` | Tag parsing byte by byte (ID3v2.3/2.4, FLAC) and the sealed-blob feed's contract — the server stores ciphertext with a size | metadata without surveillance |
 | `e2e:app` | The SPA in a real browser (Playwright): boot, in-browser vault setup, password + recovery unlock, a sealed upload through the file picker, the decrypted listing, the wrong-password refusal | the product surface, finally watched — non-extractable keys as shipped |
 | `api:client-live` | The REAL native binary: enrol, ls (opened names), zero-trust spot checks | two independent implementations agreeing over the wire |
 

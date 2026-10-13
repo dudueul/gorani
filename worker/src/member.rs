@@ -371,6 +371,7 @@ impl GoraniMemberDO {
 				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
 				self.cron_pass(&actor, body).await
 			}
+			("GET", "music/feed") => self.music_feed().await,
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.files_reseal(&actor, body).await

@@ -17,6 +17,7 @@
 import { store, type Store } from "../../lib/store.ts";
 import { newContentKey, importContentKey, sealText, openText, sealWith, openWith, wrapContentKey, unwrapContentKey, type VaultPrivateKey, type SealTarget } from "../../vault/vault-crypto.ts";
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
+import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { kindOf, type FileKind } from "./icons.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
@@ -370,14 +371,43 @@ export class FilesModel {
 		const nameSealed = await sealText(pub, file.name);
 		const typeSealed = await sealText(pub, file.type || "application/octet-stream");
 		const ckSealed = await wrapContentKey(pub, ck);
+		// Music metadata (docs/MUSIC.md): the tags exist only in plaintext we
+		// already hold, so parse them here and seal the summary — the library
+		// feed opens these blobs instead of ever re-reading the audio.
+		let mmeta: string | undefined;
+		if (file.type.startsWith("audio/")) {
+			const meta = parseAudioMeta(plain);
+			if (meta) mmeta = await sealText(pub, JSON.stringify(meta));
+		}
 		if (plain.length > 48 * 1024 * 1024) {
 			const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
-			await this.bridge.putMultipart(this.memberId, { ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), chunk: String(DEFAULT_CHUNK), tag, ...(folderId ? { folder_id: folderId } : {}), ...(asVersion ? {} : {}) }, chunked, DEFAULT_CHUNK);
+			await this.bridge.putMultipart(this.memberId, { ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), chunk: String(DEFAULT_CHUNK), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}), ...(asVersion ? {} : {}) }, chunked, DEFAULT_CHUNK);
 		} else {
 			const sealed = await sealWith(key, plain);
-			await this.bridge.putWhole(this.memberId, { ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), tag, ...(folderId ? { folder_id: folderId } : {}) }, sealed);
+			await this.bridge.putWhole(this.memberId, { ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}) }, sealed);
 		}
 		void asVersion;
+	}
+
+	/**
+	 * The music library (docs/MUSIC.md): one feed of sealed metadata blobs,
+	 * opened with the store key — browsing the library never decrypts the
+	 * audio itself. Blobs we can no longer open (a rotated key's leftovers)
+	 * are skipped honestly rather than failing the library.
+	 */
+	async musicLibrary(): Promise<(AudioMeta & { id: string; version: number; size: number })[]> {
+		const feed = await this.bridge.apiGet<{ tracks: { id: string; version: number; blobSealed: string; size: number }[] }>("/files/music");
+		const priv = await this.bridge.storePrivate();
+		const out: (AudioMeta & { id: string; version: number; size: number })[] = [];
+		for (const t of feed.tracks) {
+			try {
+				const meta = JSON.parse(await openText(priv, t.blobSealed)) as AudioMeta;
+				out.push({ ...meta, id: t.id, version: t.version, size: t.size });
+			} catch {
+				void 0; // a blob from a key this member no longer holds
+			}
+		}
+		return out.sort((x, y) => (x.artist ?? "").localeCompare(y.artist ?? "") || (x.album ?? "").localeCompare(y.album ?? "") || (x.title ?? "").localeCompare(y.title ?? ""));
 	}
 
 	private async fingerprint(plain: Uint8Array): Promise<string> {

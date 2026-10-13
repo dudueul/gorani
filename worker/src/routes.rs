@@ -131,6 +131,9 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		}
 		("GET", ["members", id, "files", "list"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/list", &req, actor)).await,
 		("GET", ["members", id, "files", "changes"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/changes", &req, actor)).await,
+		("GET", ["members", id, "files", "music"]) => {
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "music/feed", None, actor)).await
+		}
 		("GET", ["members", id, "files", "match"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/match", &req, actor)).await,
 		("GET", ["members", id, "files", "meta"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/meta", &req, actor)).await,
 		("GET", ["members", id, "files", "secrets"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/secrets", None, actor)).await,
@@ -339,7 +342,7 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	let form = req.form_data().await?;
 	// The known text fields; FormData has no iteration in workers-rs, so we
 	// ask for each by name (the upload contract is fixed anyway).
-	const KNOWN: [&str; 11] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id"];
+	const KNOWN: [&str; 12] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -398,6 +401,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"size": form.fields.get("size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
+		"mmeta": form.fields.get("mmeta"),
 		"objectKey": object_key,
 		"bytesSealed": true,
 		"owner": actor_id_of(&env, &identity.email).await.unwrap_or_else(|| member_id.to_string()),
@@ -432,6 +436,7 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 		"size": form.fields.get("size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
+		"mmeta": form.fields.get("mmeta"),
 		"objectKey": object_key,
 	});
 	let resp = forward_member(&env, member_id, "POST", "files/versions", Some(body), &actor).await?;
@@ -534,6 +539,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"folderId": form.fields.get("folder_id"),
 		"baseVersion": form.fields.get("base_version").and_then(|s| s.parse::<u64>().ok()),
 		"tag": form.fields.get("tag"),
+		"mmeta": form.fields.get("mmeta"),
 		"key": form.fields.get("key"),
 		// The Worker's attestation: the object added up to its declared size
 		// (size + frames × 28). GC01 frames carry no magic — their sealing is

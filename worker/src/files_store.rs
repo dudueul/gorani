@@ -63,6 +63,13 @@ struct FolderListRow {
 }
 
 #[derive(serde::Deserialize)]
+struct MusicFeedRow {
+	file_id: String,
+	version: i64,
+	blob_sealed: String,
+	size: i64,
+}
+#[derive(serde::Deserialize)]
 struct FileSqlRow {
 	id: String,
 	folder_id: Option<String>,
@@ -147,6 +154,9 @@ impl GoraniMemberDO {
 				]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("version insert: {e}")))?;
+		if let Err(resp) = self.music_meta_put(&file_id, version, get("mmeta")).await {
+			return Ok(resp);
+		}
 		self.audit(actor, "file.upload", &file_id, None, None).await?;
 		self.file_row(&file_id).await
 	}
@@ -207,8 +217,47 @@ impl GoraniMemberDO {
 			Some(vec![next.into(), size.into(), bind(name), file_id.clone().into()]),
 		)?;
 		self.contributor_add(&file_id, actor).await?;
+		if let Err(resp) = self.music_meta_put(&file_id, next, get("mmeta")).await {
+			return Ok(resp);
+		}
 		self.audit(actor, "file.version", &file_id, None, None).await?;
 		self.file_row(&file_id).await
+	}
+
+	/// The music metadata blob (docs/MUSIC.md): the client parsed the tags
+	/// from plaintext it already held, sealed them to the store key, and the
+	/// server stores the opaque blob per version. Unsealed blobs are refused
+	/// like every other sealed text — the library opens them, not reads them.
+	async fn music_meta_put(&self, file_id: &str, version: i64, blob: Option<String>) -> std::result::Result<(), Response> {
+		if let Some(b) = blob {
+			if !gorani_formats::formats::is_sealed_text(&b) {
+				return Err(json_error_raw(400, "music metadata must arrive sealed"));
+			}
+			if let Err(e) = self.sql.exec(
+					"INSERT INTO music_meta (file_id, version, blob_sealed) VALUES (?1, ?2, ?3) ON CONFLICT (file_id, version) DO UPDATE SET blob_sealed = excluded.blob_sealed",
+					Some(vec![file_id.into(), version.into(), b.into()]),
+				) {
+				return Err(json_error_raw(500, &format!("music meta insert: {e}")));
+			}
+		}
+		Ok(())
+	}
+
+	/// The music library's feed (docs/MUSIC.md): every sealed metadata blob
+	/// for living file versions in ONE response — the client opens each with
+	/// the store key and never re-reads the audio for tags.
+	pub(crate) async fn music_feed(&self) -> Result<Response> {
+		let rows: Vec<MusicFeedRow> = self
+			.sql
+			.exec(
+				"SELECT m.file_id AS file_id, m.version AS version, m.blob_sealed AS blob_sealed, f.size AS size FROM music_meta m JOIN files f ON f.id = m.file_id AND f.version = m.version WHERE f.deleted_at IS NULL ORDER BY f.created_at, f.id",
+				None,
+			)?
+			.to_array()?;
+		Ok(Response::from_json(&serde_json::json!({ "tracks": rows
+			.into_iter()
+			.map(|r| serde_json::json!({ "id": r.file_id, "version": r.version, "blobSealed": r.blob_sealed, "size": r.size }))
+			.collect::<Vec<_>>() }))?)
 	}
 
 	/// The contributors trail: one row per (file, member) — readable

@@ -37,6 +37,7 @@ use serde::Deserialize;
 use worker::{durable_object, DurableObject, Env, Error, Request, Response, Result, State};
 
 use crate::family::json_error;
+use crate::devices::EnrolBody;
 
 pub const MIGRATIONS: &[&str] = &[
 	// Vault settings: one row. The JSON carries public halves, unlock methods
@@ -197,6 +198,10 @@ pub const MIGRATIONS: &[&str] = &[
 		created_at TEXT NOT NULL
 	)",
 	"ALTER TABLE file_versions ADD COLUMN tag TEXT",
+	// Migration v3 (commit ⑧): the member audit gains a readable-details
+	// column beside the sealed one (device names and the like are structure,
+	// not content).
+	"ALTER TABLE audit ADD COLUMN details TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -223,7 +228,27 @@ impl DurableObject for GoraniMemberDO {
 		Self { sql }
 	}
 
-	async fn fetch(&self, mut req: Request) -> Result<Response> {
+	async fn fetch(&self, req: Request) -> Result<Response> {
+		// Errors become JSON with their message: an opaque 500 helps nobody,
+		// least of all the tests that must tell refusals from faults.
+		match self.dispatch(req).await {
+			Ok(r) => Ok(r),
+			Err(e) => json_error(500, &e.to_string()),
+		}
+	}
+
+}
+
+// The files operations live beside the core (worker/src/files_store.rs) —
+// same DO, another `impl` block, one module per concern.
+pub(crate) fn now_iso() -> String {
+	// The DO's SQL clock is the single source of time in this database.
+	"strftime".to_string()
+}
+
+impl GoraniMemberDO {
+
+	async fn dispatch(&self, mut req: Request) -> Result<Response> {
 		let path = req.path().trim_start_matches('/').to_string();
 		let actor = req.headers().get("x-gorani-actor")?.unwrap_or_default();
 		match (req.method().to_string().as_str(), path.as_str()) {
@@ -235,10 +260,54 @@ impl DurableObject for GoraniMemberDO {
 			("GET", "audit") => self.get_audit().await,
 			("POST", "audit") => {
 				let body = req.json::<AuditPut>().await?;
-				self.audit(&actor, &body.action, &body.target, body.details_sealed.as_deref()).await?;
+				self.audit(&actor, &body.action, &body.target, body.details_sealed.as_deref(), None).await?;
 				self.get_audit().await
 			}
 			("GET", "stats") => self.stats().await,
+			// ── Devices (worker/src/devices.rs) ──
+			("GET", "devices") => self.devices_list().await,
+			("POST", "devices") => {
+				let body = req.json::<serde_json::Value>().await?;
+				match serde_json::from_value::<EnrolBody>(body) {
+					Ok(b) => self.device_enrol(&actor, b).await,
+					Err(e) => json_error(400, &format!("bad enrolment: {e}")),
+				}
+			}
+			("POST", id) if id.starts_with("devices/") && id.ends_with("/unlock") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let token = req.headers().get("x-gorani-device-token")?;
+				self.device_unlock(&id["devices/".len()..id.len() - "/unlock".len()], token, body).await
+			}
+			("POST", id) if id.starts_with("devices/") && id.ends_with("/check") => {
+				let token = req.headers().get("x-gorani-device-token")?;
+				self.device_check(&id["devices/".len()..id.len() - "/check".len()], token).await
+			}
+			("PUT", id) if id.starts_with("devices/") && id.ends_with("/key") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let token = req.headers().get("x-gorani-device-token")?;
+				self.device_rekey(&id["devices/".len()..id.len() - "/key".len()], token, body).await
+			}
+			("POST", id) if id.starts_with("devices/") && id.ends_with("/wiped") => {
+				let token = req.headers().get("x-gorani-device-token")?;
+				self.device_wiped(&actor, &id["devices/".len()..id.len() - "/wiped".len()], token).await
+			}
+			("POST", id) if id.starts_with("devices/") && id.ends_with("/leave") => {
+				let token = req.headers().get("x-gorani-device-token")?;
+				self.device_leave(&actor, &id["devices/".len()..id.len() - "/leave".len()], token).await
+			}
+			("DELETE", id) if id.starts_with("devices/") => self.device_revoke(&actor, &id["devices/".len()..]).await,
+			// ── Vault destruction (crypto-shredding) ──
+			("DELETE", "vault") => self.vault_destroy(&actor).await,
+			// ── Trash and rotation (worker/src/files_store.rs) ──
+			("GET", "files/trash") => self.trash_list().await,
+			("POST", "files/trash/restore") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.trash_restore(&actor, body).await
+			}
+			("PUT", "files/reseal") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.files_reseal(&actor, body).await
+			}
 			("GET", id) if id.starts_with("files-object/") => {
 				let rest = &id["files-object/".len()..];
 				let (file_id, version) = match rest.split_once('?') {
@@ -301,16 +370,7 @@ impl DurableObject for GoraniMemberDO {
 			_ => Response::error("Not Found", 404),
 		}
 	}
-}
 
-// The files operations live beside the core (worker/src/files_store.rs) —
-// same DO, another `impl` block, one module per concern.
-pub(crate) fn now_iso() -> String {
-	// The DO's SQL clock is the single source of time in this database.
-	"strftime".to_string()
-}
-
-impl GoraniMemberDO {
 	async fn get_vault(&self) -> Result<Response> {
 		let row: Option<KvRow> = self.sql.exec("SELECT v FROM vault WHERE k = 'settings'", None)?.to_array::<KvRow>().ok().and_then(|mut r| r.pop());
 		Ok(match row {
@@ -338,7 +398,7 @@ impl GoraniMemberDO {
 		}
 		let v = serde_json::to_string(&body.settings).map_err(|_| Error::RustError("bad settings JSON".into()))?;
 		self.sql.exec("INSERT INTO vault (k, v) VALUES ('settings', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", Some(vec![v.into()]))?;
-		self.audit(actor, "vault.save", "settings", None).await?;
+		self.audit(actor, "vault.save", "settings", None, None).await?;
 		self.get_vault().await
 	}
 
@@ -349,14 +409,14 @@ impl GoraniMemberDO {
 			.map(|a| {
 				serde_json::json!({
 					"id": a.id, "at": a.at, "actor": a.actor, "action": a.action,
-					"target": a.target, "detailsSealed": a.details_sealed,
+					"target": a.target, "detailsSealed": a.details_sealed, "details": a.details,
 				})
 			})
 			.collect();
 		Ok(Response::from_json(&lines)?)
 	}
 
-	pub(crate) async fn audit(&self, actor: &str, action: &str, target: &str, details_sealed: Option<&str>) -> Result<()> {
+	pub(crate) async fn audit(&self, actor: &str, action: &str, target: &str, details_sealed: Option<&str>, details: Option<&str>) -> Result<()> {
 		// A sealed detail is accepted only in a sealed-text shape; the server
 		// stores what it cannot read, and never stores what it can in that
 		// column by accident.
@@ -367,12 +427,13 @@ impl GoraniMemberDO {
 		}
 		self.sql
 			.exec(
-				"INSERT INTO audit (at, actor, action, target, details_sealed) VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?1, ?2, ?3, ?4)",
+				"INSERT INTO audit (at, actor, action, target, details_sealed, details) VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?1, ?2, ?3, ?4, ?5)",
 				Some(vec![
 					actor.into(),
 					action.into(),
 					target.into(),
 					details_sealed.unwrap_or_default().into(),
+					details.unwrap_or_default().into(),
 				]),
 			)
 			.map(|_| ())
@@ -399,6 +460,7 @@ struct AuditRow {
 	action: String,
 	target: String,
 	details_sealed: Option<String>,
+	details: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct Count {

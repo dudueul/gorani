@@ -100,6 +100,9 @@ impl GoraniMemberDO {
 	/// Record a whole-file upload the Worker already put in S3. The Worker
 	/// generated the file id, version id and object key; the DO owns the rows.
 	pub(crate) async fn file_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		if let Some(msg) = self.vault_gate().await? {
+			return json_error(400, &msg);
+		}
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let name = get("name").ok_or_else(|| worker::Error::RustError("missing name".into()))?;
 		let r#type = get("type");
@@ -141,7 +144,7 @@ impl GoraniMemberDO {
 				]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("version insert: {e}")))?;
-		self.audit(actor, "file.upload", &file_id, None).await?;
+		self.audit(actor, "file.upload", &file_id, None, None).await?;
 		self.file_row(&file_id).await
 	}
 
@@ -150,6 +153,9 @@ impl GoraniMemberDO {
 	/// row lands and the file's pointer moves. Two racing uploads never
 	/// overwrite each other's bytes (each has its own object key).
 	pub(crate) async fn file_version_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		if let Some(msg) = self.vault_gate().await? {
+			return json_error(400, &msg);
+		}
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let file_id = get("fileId").ok_or_else(|| worker::Error::RustError("missing fileId".into()))?;
 		let name = get("name");
@@ -197,7 +203,7 @@ impl GoraniMemberDO {
 			"UPDATE files SET version = ?1, size = ?2, name_sealed = COALESCE(?3, name_sealed), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?4",
 			Some(vec![next.into(), size.into(), bind(name), file_id.clone().into()]),
 		)?;
-		self.audit(actor, "file.version", &file_id, None).await?;
+		self.audit(actor, "file.version", &file_id, None, None).await?;
 		self.file_row(&file_id).await
 	}
 
@@ -392,7 +398,7 @@ impl GoraniMemberDO {
 		if n == 0 {
 			return json_error(404, "no such file");
 		}
-		self.audit(actor, "file.update", id, None).await?;
+		self.audit(actor, "file.update", id, None, None).await?;
 		self.file_row(id).await
 	}
 
@@ -406,7 +412,7 @@ impl GoraniMemberDO {
 		if n == 0 {
 			return json_error(404, "no such file");
 		}
-		self.audit(actor, "file.trash", id, None).await?;
+		self.audit(actor, "file.trash", id, None, None).await?;
 		self.file_row(id).await
 	}
 
@@ -431,7 +437,7 @@ impl GoraniMemberDO {
 				Some(vec![id.clone().into(), parent.into(), name.into()]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("folder insert: {e}")))?;
-		self.audit(actor, "folder.create", &id, None).await?;
+		self.audit(actor, "folder.create", &id, None, None).await?;
 		let folders: Vec<FolderSqlRow> = self.sql.exec("SELECT id, parent_id, name_sealed, created_at, updated_at FROM file_folders WHERE id = ?1", Some(vec![id.into()]))?.to_array()?;
 		let f = folders.first().cloned().ok_or_else(|| worker::Error::RustError("insert vanished".into()))?;
 		Ok(Response::from_json(&serde_json::json!({ "id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at }))?)
@@ -486,7 +492,7 @@ impl GoraniMemberDO {
 		if n == 0 {
 			return json_error(404, "no such folder");
 		}
-		self.audit(actor, "folder.update", id, None).await?;
+		self.audit(actor, "folder.update", id, None, None).await?;
 		let folders: Vec<FolderSqlRow> = self.sql.exec("SELECT id, parent_id, name_sealed, created_at, updated_at FROM file_folders WHERE id = ?1", Some(vec![id.into()]))?.to_array()?;
 		let f = folders.first().cloned().ok_or_else(|| worker::Error::RustError("row vanished".into()))?;
 		Ok(Response::from_json(&serde_json::json!({ "id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at }))?)
@@ -513,7 +519,7 @@ impl GoraniMemberDO {
 				Some(vec![id.into()]),
 			)?
 			.rows_written();
-		self.audit(actor, "folder.trash", id, None).await?;
+		self.audit(actor, "folder.trash", id, None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "folders": n, "files": files }))?)
 	}
 
@@ -531,7 +537,7 @@ impl GoraniMemberDO {
 		}
 		self.sql.exec("DELETE FROM files_secrets", None)?;
 		self.sql.exec("INSERT INTO files_secrets (v) VALUES (?1)", Some(vec![sealed.into()]))?;
-		self.audit(actor, "files.secrets", "secrets", None).await?;
+		self.audit(actor, "files.secrets", "secrets", None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
 	}
 
@@ -547,7 +553,7 @@ impl GoraniMemberDO {
 				Some(vec![id.clone().into(), object_key.into(), file_id.into()]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("upload insert: {e}")))?;
-		self.audit(actor, "file.uploadStart", &id, None).await?;
+		self.audit(actor, "file.uploadStart", &id, None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "uploadId": id }))?)
 	}
 
@@ -590,11 +596,120 @@ impl GoraniMemberDO {
 
 	pub(crate) async fn upload_abort(&self, actor: &str, id: &str) -> Result<Response> {
 		self.sql.exec("DELETE FROM uploads WHERE id = ?1", Some(vec![id.into()]))?;
-		self.audit(actor, "file.uploadAbort", id, None).await?;
+		self.audit(actor, "file.uploadAbort", id, None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
 	}
 
+	// ── Trash and rotation ──────────────────────────────────────────────
+
+	/// The Trash: what is deleted but not purged, files and folders, with
+	/// where it was and whether a folder's deletion took it along.
+	pub(crate) async fn trash_list(&self) -> Result<Response> {
+		let files: Vec<FileSqlRow> = self
+			.sql
+			.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at FROM files WHERE deleted_at IS NOT NULL ORDER BY updated_at DESC", None)?
+			.to_array()?;
+		let folders: Vec<FolderSqlRow> = self
+			.sql
+			.exec("SELECT id, parent_id, name_sealed, created_at, updated_at FROM file_folders WHERE deleted_at IS NOT NULL ORDER BY updated_at DESC", None)?
+			.to_array()?;
+		let trashed_with: Vec<TrashedWithRow> = self.sql.exec("SELECT id, trashed_with FROM files WHERE deleted_at IS NOT NULL AND trashed_with IS NOT NULL", None)?.to_array()?;
+		Ok(Response::from_json(&serde_json::json!({
+			"files": files.into_iter().map(|f| serde_json::json!({
+				"id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size,
+				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at,
+			})).collect::<Vec<_>>(),
+			"folders": folders.into_iter().map(|f| serde_json::json!({
+				"id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at,
+			})).collect::<Vec<_>>(),
+			"trashedWith": trashed_with.into_iter().map(|t| serde_json::json!({ "id": t.id, "with": t.trashed_with })).collect::<Vec<_>>(),
+		}))?)
+	}
+
+	/// Restore files and folders from the Trash. A folder whose parent is
+	/// still in the Trash comes back at the top level; a file whose folder is
+	/// still there likewise (the tree must never dangle).
+	pub(crate) async fn trash_restore(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let files: Vec<String> = body.get("files").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+		let folders: Vec<String> = body.get("folders").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+		// Count first, then update: rows_written includes the change-feed
+		// trigger's writes (journal + counter), so it cannot be the report.
+		let mut n_files = 0;
+		let mut n_folders = 0;
+		if !folders.is_empty() {
+			let (qs, params) = in_clause(&folders);
+			n_folders = self.sql.exec(&format!("SELECT COUNT(*) AS n FROM file_folders WHERE deleted_at IS NOT NULL AND id IN ({qs})"), Some(params.clone()))?.one::<TotalCount>()?.n;
+			self.sql
+				.exec(
+					&format!("UPDATE file_folders SET deleted_at = NULL, trashed_with = NULL, parent_id = CASE WHEN EXISTS (SELECT 1 FROM file_folders p WHERE p.id = file_folders.parent_id AND p.deleted_at IS NOT NULL) THEN NULL ELSE parent_id END WHERE id IN ({qs})"),
+					Some(params),
+				)?;
+		}
+		if !files.is_empty() {
+			let (qs, params) = in_clause(&files);
+			n_files = self.sql.exec(&format!("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NOT NULL AND id IN ({qs})"), Some(params.clone()))?.one::<TotalCount>()?.n;
+			self.sql
+				.exec(
+					&format!("UPDATE files SET deleted_at = NULL, trashed_with = NULL, folder_id = CASE WHEN EXISTS (SELECT 1 FROM file_folders f2 WHERE f2.id = files.folder_id AND f2.deleted_at IS NOT NULL) THEN NULL ELSE folder_id END WHERE id IN ({qs})"),
+					Some(params),
+				)?;
+		}
+		if n_files + n_folders > 0 {
+			self.audit(actor, "files.restore", &format!("files:{n_files},folders:{n_folders}"), None, None).await?;
+		}
+		Ok(Response::from_json(&serde_json::json!({ "files": n_files, "folders": n_folders }))?)
+	}
+
+	/// Rotation, client-driven (docs/VAULT.md: rotate = re-wrap small keys,
+	/// never re-encrypt content). The client opened every content key under
+	/// the old store key and sealed it to the new one; names and types are
+	/// re-sealed the same way and sent along. This route stores the results —
+	/// and is idempotent: a row is either under the old key or the new one,
+	/// and doing it twice does no harm.
+	pub(crate) async fn files_reseal(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let Some(entries) = body.get("keys").and_then(|k| k.as_object()) else { return json_error(400, "keys required") };
+		let mut updated = 0;
+		for (id, v) in entries {
+			let ck = v.get("ck").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+			let name = v.get("name").and_then(|x| x.as_str()).map(str::to_string);
+			let r#type = v.get("type").and_then(|x| x.as_str()).map(str::to_string);
+			if !gorani_formats::formats::is_sealed_text(&ck) || name.as_ref().is_some_and(|n| !gorani_formats::formats::is_sealed_text(n)) || r#type.as_ref().is_some_and(|t| !gorani_formats::formats::is_sealed_text(t)) {
+				return json_error(400, "reseal values must be sealed text");
+			}
+			let n = self
+				.sql
+				.exec(
+					"SELECT COUNT(*) AS n FROM file_versions WHERE file_id = ?1 AND version = (SELECT version FROM files WHERE id = ?1)",
+					Some(vec![id.clone().into()]),
+				)?
+				.one::<TotalCount>()?
+				.n;
+			self.sql.exec(
+				"UPDATE file_versions SET content_key = ?1, type_sealed = COALESCE(?2, type_sealed) WHERE file_id = ?3 AND version = (SELECT version FROM files WHERE id = ?3)",
+				Some(vec![ck.into(), bind(r#type), id.clone().into()]),
+			)?;
+			if let Some(nm) = &name {
+				self.sql.exec("UPDATE files SET name_sealed = ?1 WHERE id = ?2", Some(vec![nm.clone().into(), id.clone().into()]))?;
+			}
+			updated += n;
+		}
+		self.audit(actor, "files.reseal", &format!("{updated} versions"), None, None).await?;
+		Ok(Response::from_json(&serde_json::json!({ "updated": updated }))?)
+	}
+
 	// ── small helpers ───────────────────────────────────────────────────
+
+	/// No vault (or a paused one), no uploads: the member's own keys are what
+	/// makes content sealed, so the store refuses writes that would land in
+	/// the clear (docs/VAULT.md › Pause sealing). Returns the refusal message
+	/// (a 400, an expectation) or None when the write may proceed.
+	async fn vault_gate(&self) -> Result<Option<String>> {
+		Ok(match self.vault_settings().await? {
+			None => Some("the vault is not set up".into()),
+			Some(s) if s.get("enabled").and_then(|e| e.as_bool()) == Some(true) => None,
+			Some(_) => Some("the vault is paused".into()),
+		})
+	}
 
 	async fn file_row(&self, id: &str) -> Result<Response> {
 		match self.file_sql_row(id).await? {
@@ -656,6 +771,19 @@ struct UploadRow {
 #[derive(serde::Deserialize)]
 struct KvRow {
 	v: String,
+}
+#[derive(serde::Deserialize)]
+struct TrashedWithRow {
+	id: String,
+	trashed_with: Option<String>,
+}
+
+/// `id IN (?, ?, …)` — placeholders plus the bound values, for the handful of
+/// dynamic-list queries (trash restore).
+pub(crate) fn in_clause(ids: &[String]) -> (String, Vec<worker::SqlStorageValue>) {
+	let qs = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+	let params = ids.iter().map(|s| worker::SqlStorageValue::String(s.clone())).collect();
+	(qs, params)
 }
 /// A tiny query-string reader for the few DO routes that take one (the
 /// Worker forwards the caller's query verbatim; `worker::Url` is the `url`

@@ -29,6 +29,7 @@
 use worker::*;
 
 mod auth;
+mod devices;
 mod family;
 mod files_store;
 mod member;

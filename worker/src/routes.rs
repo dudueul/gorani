@@ -124,6 +124,47 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		("GET", ["members", id, "files", "match"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/match", &req, actor)).await,
 		("GET", ["members", id, "files", "meta"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/meta", &req, actor)).await,
 		("GET", ["members", id, "files", "secrets"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/secrets", None, actor)).await,
+		("GET", ["members", id, "files", "trash"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/trash", None, actor)).await,
+		("POST", ["members", id, "files", "trash", "restore"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await
+		}
+		("PUT", ["members", id, "files", "reseal"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "files/reseal", Some(body), actor)).await
+		}
+		// ── Devices (docs/DESKTOP.md): enrolment needs the member's unlocked
+		// session or a parent; the device routes themselves authenticate with
+		// the device token INSIDE the DO (the token is not the web session).
+		("GET", ["members", id, "devices"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "devices", None, actor)).await,
+		("POST", ["members", id, "devices"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "devices", Some(body), actor)).await
+		}
+		("POST", ["members", id, "devices", device, "unlock"]) => device_call(&env, &identity, id, device, "unlock", req).await,
+		("POST", ["members", id, "devices", device, "check"]) => device_call(&env, &identity, id, device, "check", req).await,
+		("PUT", ["members", id, "devices", device, "key"]) => device_call(&env, &identity, id, device, "key", req).await,
+		("POST", ["members", id, "devices", device, "wiped"]) => device_call(&env, &identity, id, device, "wiped", req).await,
+		("POST", ["members", id, "devices", device, "leave"]) => device_call(&env, &identity, id, device, "leave", req).await,
+		("DELETE", ["members", id, "devices", device]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "DELETE", format!("devices/{device}"), None, actor)).await,
+		// ── Crypto-shredding: the destroy secret must exist and the confirm
+		// phrase must match, exactly. Without both: 403, always.
+		("DELETE", ["members", id, "vault"]) => {
+			match member_ctx(&env, &identity, id).await {
+				Ok(actor) => {
+					let confirm = req.url()?.query().unwrap_or("").contains("confirm=DESTROY%20VAULT%20KEY");
+					let armed = env.secret("VAULT_DESTROY_ENABLED").is_ok();
+					if !armed {
+						json_error(403, "vault destruction is not enabled on this deployment (VAULT_DESTROY_ENABLED secret missing)")
+					} else if !confirm {
+						json_error(403, "confirm with ?confirm=DESTROY VAULT KEY")
+					} else {
+						forward_member(&env, id, "DELETE", "vault", None, &actor).await
+					}
+				}
+				Err(resp) => Ok(resp),
+			}
+		}
 		("PUT", ["members", id, "files", "secrets"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "files/secrets", Some(body), actor)).await
@@ -161,6 +202,35 @@ where
 		Ok(actor) => f(actor).await,
 		Err(resp) => Ok(resp),
 	}
+}
+
+/// A device call: the body passes through untouched. These routes skip the
+/// member scope on purpose — the **device token** is the authority here (its
+/// hash lives in exactly one member's DO, so a token from member A cannot
+/// touch member B), and in production the perimeter is an Access service
+/// token, not a member email.
+async fn device_call(env: &Env, _identity: &Identity, member_id: &str, device: &str, what: &str, mut req: Request) -> Result<Response> {
+	let token = req.headers().get("x-gorani-device-token")?;
+	let body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+	// The device token is forwarded as a header — the DO authenticates the
+	// device with it (its hash lives in exactly one member's DO).
+	let namespace = env.durable_object("MEMBER")?;
+	let stub = namespace.id_from_name(&format!("member:{member_id}"))?.get_stub()?;
+	let mut headers = Headers::new();
+	headers.set("x-gorani-actor", "device")?;
+	headers.set("Content-Type", "application/json")?;
+	let Some(token) = token else { return json_error(401, "the device token header is required") };
+	headers.set("x-gorani-device-token", &token)?;
+	let request = Request::new_with_init(
+		&format!("https://do.internal/devices/{device}/{what}"),
+		&RequestInit {
+			method: if what == "key" { Method::Put } else { Method::Post },
+			headers,
+			body: Some(body.to_string().into()),
+			..Default::default()
+		},
+	)?;
+	stub.fetch_with_request(request).await
 }
 
 // ── DO plumbing ─────────────────────────────────────────────────────

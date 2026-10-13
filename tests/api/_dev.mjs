@@ -34,7 +34,7 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40) } 
 	const s3endpoint = lan ? `http://${lan}:${stub.address.port}` : `http://127.0.0.1:${stub.address.port}`;
 	fs.writeFileSync(
 		path.join(ROOT, ".dev.vars"),
-		["GORANI_DEV=1", `S3_ENDPOINT=${s3endpoint}`, "S3_REGION=us-east-1", "S3_BUCKET=gorani-test", "S3_ACCESS_KEY_ID=test", "S3_SECRET_KEY=test", ""].join("\n"),
+		["GORANI_DEV=1", `S3_ENDPOINT=${s3endpoint}`, "S3_REGION=us-east-1", "S3_BUCKET=gorani-test", "S3_ACCESS_KEY_ID=test", "S3_SECRET_KEY=test", "VAULT_DESTROY_ENABLED=1", ""].join("\n"),
 	);
 	const out = fs.openSync(path.join(ROOT, "tests/output/wrangler-dev.log"), "w");
 	// Fresh SQLite state per run: a private persist directory (created before

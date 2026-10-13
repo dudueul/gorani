@@ -83,7 +83,20 @@ impl DurableObject for GoraniFamilyDO {
 		Self { sql }
 	}
 
-	async fn fetch(&self, mut req: Request) -> Result<Response> {
+	async fn fetch(&self, req: Request) -> Result<Response> {
+		// Errors become JSON with their message: an opaque 500 helps nobody,
+		// least of all the tests that must tell refusals from faults.
+		match self.dispatch(req).await {
+			Ok(r) => Ok(r),
+			Err(e) => json_error(500, &e.to_string()),
+		}
+	}
+
+}
+
+impl GoraniFamilyDO {
+
+	async fn dispatch(&self, mut req: Request) -> Result<Response> {
 		let path = req.path().trim_start_matches('/').to_string();
 		let actor = req.headers().get("x-gorani-actor")?.unwrap_or_default();
 		match (req.method().to_string().as_str(), path.as_str()) {
@@ -107,9 +120,7 @@ impl DurableObject for GoraniFamilyDO {
 			_ => Response::error("Not Found", 404),
 		}
 	}
-}
 
-impl GoraniFamilyDO {
 	/// Which member (if any) an Access email belongs to, and its role — the
 	/// Worker resolves every member-scoped request through this. A child may
 	/// act only for themselves; a parent for anyone (routes.rs enforces).

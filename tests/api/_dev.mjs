@@ -62,7 +62,7 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 	fs.mkdirSync(persistDir, { recursive: true });
 	const wr = ["wrangler", "dev"];
 	if (config) wr.push("--config", config);
-	wr.push("--port", String(port), "--ip", "127.0.0.1", "--persist-to", persistDir);
+	wr.push("--port", String(port), "--ip", "127.0.0.1", "--persist-to", persistDir, "--test-scheduled");
 	const child = spawn("npx", wr, {
 		cwd: ROOT,
 		detached: true, // own process group: close() kills wrangler AND its workerd children

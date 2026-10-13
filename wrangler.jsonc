@@ -82,5 +82,13 @@
 
 	"observability": {
 		"enabled": true
+	},
+
+	// The nightly maintenance pass (worker/src/cron.rs → member DOs): retention
+	// housekeeping on the deployment defaults and backup-manifest pruning,
+	// 03:17 UTC — a deliberately odd minute so the family's own scheduled
+	// things (NAS snapshots &c.) don't all fire on the same instant.
+	"triggers": {
+		"crons": ["17 3 * * *"]
 	}
 }

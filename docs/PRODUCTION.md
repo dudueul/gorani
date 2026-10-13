@@ -63,11 +63,19 @@ then create each vault from the UI (commit ⑨'s setup screen).
 
 1. In the app, generate the backup key pair and **download the key file** —
    the only copy of the private bundle; the server stores the public half.
-2. `POST /api/v1/members/<id>/backup/run` (daily via cron/worker alarm
-   later) writes `backups/<stamp>.gbak` — sealed twice over (the objects
-   are already GV-sealed; the GB1 container wraps them under a key only
-   your key file opens).
-3. Keep the key file offline. Losing it loses the backups, not the vault.
+2. `POST /api/v1/members/<id>/backup/run` writes `backups/<stamp>.gbak` —
+   sealed twice over (the objects are already GV-sealed; the GB1 container
+   wraps them under a key only your key file opens). Runs are created on
+   purpose — by the owner in the app — not silently by the server: the
+   in-memory job is sized for on-demand runs, and a daily full copy is a
+   storage-economics decision a family should make knowingly.
+3. **The nightly pass** (`wrangler.jsonc › triggers › crons`, default
+   03:17 UTC, worker/src/cron.rs) maintains both ends of retention for
+   every member: the deployment-default housekeeping (trash, journal,
+   audit, dead shares) and backup-manifest pruning (the newest 7 `.gbak`
+   runs survive; older rows and their S3 objects go). The audit trail
+   records each pass under the actor `cron`. 4. Keep the key file offline.
+   Losing it loses the backups, not the vault.
 
 ## 5. Growth
 

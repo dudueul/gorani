@@ -31,6 +31,7 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `api:shares` | The recipient's walk (meta→claim→data) + exhaustion/revocation/expiry | fragment-secret authentication, honest statuses |
 | `api:backup` | Key file (private never crosses the wire) → job → download → decrypt → restore round trip | the container the server cannot open |
 | `api:housekeeping` | Retention levers with forced clocks; the growth metric | bounding the unbounded |
+| `api:cron` | The nightly pass fired like production fires it: fan-out over the registry, backup prune to 7, the `cron` actor in the audit | maintenance without an identity |
 | `api:client-live` | The REAL native binary: enrol, ls (opened names), zero-trust spot checks | two independent implementations agreeing over the wire |
 
 ## Writing the next suite (the house style)

@@ -30,12 +30,26 @@ use worker::*;
 
 mod auth;
 mod backup;
+mod cron;
 mod devices;
 mod family;
 mod files_store;
 mod member;
 mod routes;
 mod s3;
+
+/// The nightly maintenance pass (wrangler.jsonc › `triggers` › `crons`):
+/// per member — retention housekeeping on the deployment defaults and
+/// backup-manifest pruning. The fan-out lives in cron.rs; the DOs do the
+/// work, the audit trail records it under the system actor `cron`.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+	if let Err(e) = cron::run(env).await {
+		// A failed pass is loud in observability and retried by the next
+		// trigger; the family's data never depends on this having run.
+		console_log!("gorani cron failed: {e}");
+	}
+}
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {

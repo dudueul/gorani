@@ -367,6 +367,10 @@ impl GoraniMemberDO {
 				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
 				self.housekeeping(&actor, body).await
 			}
+			("POST", "cron") => {
+				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+				self.cron_pass(&actor, body).await
+			}
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.files_reseal(&actor, body).await
@@ -589,6 +593,30 @@ impl GoraniMemberDO {
 		}))?)
 	}
 
+	/// The nightly pass (worker/src/cron.rs knocks here as the system actor
+	/// `cron`): retention housekeeping on the deployment defaults, then
+	/// backup-manifest pruning — the newest `keep` .gbak runs survive, older
+	/// rows and their S3 objects go. Backups are CREATED by the browser flow
+	/// (docs/PRODUCTION.md › Backups): the in-memory GB1 job is sized for
+	/// that, so the cron only tends the museum, it doesn't fire the kiln.
+	async fn cron_pass(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let keep = body.get("keep").and_then(|v| v.as_i64()).unwrap_or(7).clamp(1, 100);
+		let mut house = self.housekeeping(actor, serde_json::json!({})).await?;
+		let house: serde_json::Value = house.json().await?;
+		let stale: Vec<BackupStamp> = self
+			.sql
+			.exec(&format!("SELECT stamp FROM backups ORDER BY created_at DESC, stamp DESC LIMIT -1 OFFSET {keep}"), None)?
+			.to_array()?;
+		let mut pruned = 0u64;
+		for r in &stale {
+			let _ = crate::s3::delete(&self.env, &format!("backups/{}.gbak", r.stamp)).await;
+			self.sql.exec("DELETE FROM backups WHERE stamp = ?1", Some(vec![r.stamp.clone().into()]))?.rows_written();
+			pruned += 1;
+		}
+		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned}"))).await?;
+		Ok(Response::from_json(&serde_json::json!({ "housekeeping": house, "backupsPruned": pruned }))?)
+	}
+
 	async fn stats(&self) -> Result<Response> {
 		let seq = self.sql.exec("SELECT v FROM files_seq WHERE n = 1", None)?.one::<Count>()?.v;
 		let music_seq = self.sql.exec("SELECT v FROM music_seq WHERE n = 1", None)?.one::<Count>()?.v;
@@ -603,6 +631,10 @@ impl GoraniMemberDO {
 #[derive(serde::Deserialize)]
 struct KvRow {
 	v: String,
+}
+#[derive(serde::Deserialize)]
+struct BackupStamp {
+	stamp: String,
 }
 #[derive(serde::Deserialize)]
 struct AuditRow {

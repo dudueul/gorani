@@ -40,6 +40,10 @@ Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at
 each tag to watch the app being constructed.
 
+## How to read the tests
+
+Tests are teaching material — each is an argument that runs. docs/TESTS.md maps every suite to the lesson it proves and states the house style (real paths, refusal-paired assertions, named behaviors).
+
 ## Conventions
 
 - Every source file begins: `// Copyright 2026- Seongwoo Hong. All rights reserved.`

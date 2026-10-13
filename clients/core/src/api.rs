@@ -48,7 +48,14 @@ pub struct Client {
 impl Client {
 	pub fn new(profile: DeviceProfile) -> Self {
 		// (platform shells swap in the system TLS connector; the CLI uses rustls)
-		Self { profile, agent: ureq::AgentBuilder::new().redirects(0).build() }
+		// Timeouts are hygiene: a stuck request must FAIL (and say so) in
+		// seconds, not hang the command for workerd's ~293 s wall clock —
+		// the ureq multipart hang (live test) is exactly why this exists.
+		let b = ureq::AgentBuilder::new()
+			.redirects(0)
+			.timeout_connect(std::time::Duration::from_secs(15))
+			.timeout(std::time::Duration::from_secs(60));
+		Self { profile, agent: b.build() }
 	}
 
 	fn url(&self, rest: &str) -> String {

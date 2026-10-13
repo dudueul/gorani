@@ -2,7 +2,16 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 
-## 1. Object storage (MinIO)
+## 1. Object storage (MinIO — or R2, the priority path)
+
+**Storage priority.** When `wrangler.jsonc` binds an R2 bucket (uncomment
+the `r2_buckets` block), every object operation uses the binding: an
+in-process call from the Worker into R2 — no SigV4 signing, no HTTP hop,
+no egress fees. Any S3-compatible endpoint keeps working through the
+signed adapter whenever the binding is absent; the choice is per
+deployment, made at boot. In dev, `tests/api/r2.test.mjs` runs the
+generated twin config (`wrangler.r2.jsonc`) against workerd's local R2
+simulator so both branches stay tested.
 
 1. Run MinIO on your NAS, fronted by TLS (Caddy/nginx or MinIO's own cert
    manager): `https://minio.example.com`. It must be publicly reachable —
@@ -15,6 +24,12 @@ accepts, e.g. `us-east-1`), `S3_BUCKET`. Secrets (`wrangler secret put`):
 `S3_ACCESS_KEY_ID`, `S3_SECRET_KEY`. The worker signs SigV4 with path-style
 addressing (`https://endpoint/bucket/key`) — verified against golden
 vectors in `crates/s3`.
+
+Part-size rule (both backends): a multipart upload's parts are GC01
+frames, and every part but the last must be ≥ 5 MiB. The chunk the client
+picks is the part size; the init route refuses smaller plans with an
+honest 400 (before a single part is uploaded). The clients' default chunk
+is 8 MiB.
 
 ## 2. Cloudflare Access (the perimeter)
 

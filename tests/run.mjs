@@ -51,7 +51,10 @@ if (wantKind("unit")) {
 if (wantKind("api")) {
 	const { suiteDev } = await import("./api/_dev.mjs");
 	for (const f of fs.readdirSync(path.join(ROOT, "tests/api")).filter((f) => f.endsWith(".test.mjs") || f.endsWith(".test.ts")).sort()) {
-		const dev = await suiteDev();
+		// Suites that bring their own server (the R2-bound twin config) don't
+		// get the runner's S3-configured one — it would sit unused.
+		const ownServer = f.startsWith("r2.");
+		const dev = ownServer ? null : await suiteDev();
 		try {
 			// Async spawn on purpose: the parent owns the S3 stub's event
 			// loop, and a spawnSync here would block it — the worker's
@@ -59,7 +62,7 @@ if (wantKind("api")) {
 			// until its own timeout. (Found the fun way: an accept queue of 1.)
 			const child = spawn(process.execPath, [path.join(ROOT, "tests/api", f)], {
 				cwd: ROOT,
-				env: { ...process.env, GORANI_URL: dev.base },
+				env: { ...process.env, ...(ownServer ? {} : { GORANI_URL: dev.base }) },
 			});
 			let out = "";
 			child.stdout.on("data", (d) => (out += d));
@@ -68,7 +71,7 @@ if (wantKind("api")) {
 			if (!ok) failures.push(`api:${f}`);
 			console.log(`${ok ? "ok  " : "FAIL"} api:${path.basename(f, ".test.mjs")}${ok ? "" : `\n    ${out.split("\n").filter((l) => /Error|error:|AssertionError|expected|actual/.test(l)).slice(0, 10).join("\n    ")}`}`);
 		} finally {
-			await dev.close();
+			if (dev) await dev.close();
 		}
 	}
 }

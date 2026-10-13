@@ -16,7 +16,22 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
-export async function startDev({ port = 8790 + Math.floor(Math.random() * 40) } = {}) {
+/**
+ * The R2 twin of wrangler.jsonc: the real config with the `R2BUCKET` binding
+ * injected. Generated on demand from the real file — so the two cannot drift
+ * — and gitignored. `wrangler dev` then backs the binding with its local R2
+ * simulator, which is how the api:r2 suite exercises the storage layer's
+ * R2-priority branch (worker/src/s3.rs) without a real bucket.
+ */
+export function r2Twin() {
+	const raw = fs.readFileSync(path.join(ROOT, "wrangler.jsonc"), "utf8");
+	const idx = raw.lastIndexOf("}");
+	const twin = `${raw.slice(0, idx).trimEnd()},\n\n\t"r2_buckets": [\n\t\t{ "binding": "R2BUCKET", "bucket_name": "gorani-test" }\n\t]\n}\n`;
+	fs.writeFileSync(path.join(ROOT, "wrangler.r2.jsonc"), twin);
+	return "wrangler.r2.jsonc";
+}
+
+export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist" } = {}) {
 	if (!fs.existsSync(path.join(ROOT, "web/dist/index.html"))) {
 		const b = spawnSync("npm", ["--prefix", "web", "run", "build"], { cwd: ROOT, encoding: "utf8" });
 		if (b.status !== 0) throw new Error(`web build failed:\n${b.stdout}\n${b.stderr}`);
@@ -39,11 +54,16 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40) } 
 	const out = fs.openSync(path.join(ROOT, "tests/output/wrangler-dev.log"), "w");
 	// Fresh SQLite state per run: a private persist directory (created before
 	// the server starts — workerd wants it present), cleared each run so the
-	// suites stay independent; production state lives in the cloud.
-	const persistDir = path.join(ROOT, "tests/output/persist");
+	// suites stay independent; production state lives in the cloud. Suites
+	// with their own config (the R2 twin) get their own directory — two live
+	// servers must never share one SQLite home.
+	const persistDir = path.join(ROOT, "tests/output", persist);
 	fs.rmSync(persistDir, { recursive: true, force: true });
 	fs.mkdirSync(persistDir, { recursive: true });
-	const child = spawn("npx", ["wrangler", "dev", "--port", String(port), "--ip", "127.0.0.1", "--persist-to", persistDir], {
+	const wr = ["wrangler", "dev"];
+	if (config) wr.push("--config", config);
+	wr.push("--port", String(port), "--ip", "127.0.0.1", "--persist-to", persistDir);
+	const child = spawn("npx", wr, {
 		cwd: ROOT,
 		detached: true, // own process group: close() kills wrangler AND its workerd children
 		env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "true", PATH: `${process.env.HOME}/.cargo/bin:${process.env.PATH ?? ""}` },

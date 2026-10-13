@@ -402,7 +402,6 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"bytesSealed": true,
 		"owner": actor_id_of(&env, &identity.email).await.unwrap_or_else(|| member_id.to_string()),
 	});
-	console_log!("gorani upload owner={:?}", body.get("owner"));
 	let resp = forward_member(&env, member_id, "POST", "files/put", Some(body), &actor).await?;
 	if resp.status_code() >= 400 {
 		// The DO refused the record — do not leave the object orphaned.
@@ -448,6 +447,22 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 		Err(resp) => return Ok(resp),
 	};
 	let body: serde_json::Value = req.json().await?;
+	let chunk = body.get("chunk").and_then(|v| v.as_u64()).unwrap_or(8 * 1024 * 1024);
+	let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+	// The backends' multipart rule (S3, MinIO and R2 alike): every part but
+	// the last must be ≥ 5 MiB. One GC01 frame rides each part, so the
+	// caller's chunk IS the part size — refuse a plan the backend would
+	// reject at complete time (an honest 400 now beats a 500 after every
+	// part has been paid for). Found by the R2 suite: the simulator enforces
+	// what the dev S3 stub politely doesn't.
+	const MIN_PART: u64 = 5 * 1024 * 1024;
+	if chunk < MIN_PART {
+		return json_error(400, &format!("chunk {chunk} is below the backend's minimum part size of {MIN_PART} bytes (every part but the last must be at least that)"));
+	}
+	let parts = ((size + chunk - 1) / chunk).max(1);
+	if parts > 10_000 {
+		return json_error(400, "this plan needs more than 10 000 parts (the backends' limit) — raise the chunk size");
+	}
 	let file_id = body.get("fileId").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(crate::files_store::uuid);
 	let object_key = format!("files/{member_id}/{file_id}/u-{}", crate::files_store::uuid());
 	let started = forward_member(&env, member_id, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key, "fileId": body.get("fileId") })), &actor).await?;
@@ -459,9 +474,6 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 	let upload_id: String = started_body.get("uploadId").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| Error::RustError("no uploadId".into()))?;
 	let s3_upload_id = s3::multipart_init(&env, &object_key).await?;
 	forward_member(&env, member_id, "PUT", format!("uploads/{upload_id}/s3"), Some(serde_json::json!({ "s3UploadId": s3_upload_id })), &actor).await?;
-	let chunk = body.get("chunk").and_then(|v| v.as_u64()).unwrap_or(8 * 1024 * 1024);
-	let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-	let parts = ((size + chunk - 1) / chunk).max(1);
 	Ok(Response::from_json(&serde_json::json!({ "uploadId": upload_id, "key": object_key, "parts": parts }))?)
 }
 

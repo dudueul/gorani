@@ -153,15 +153,23 @@ try {
 	assert.equal(stale.json.version, 2, "the conflict says where the file is now");
 
 	// ── 7. A chunked upload in parts, then a Range read in the middle ──
-	const bigPlain = new Uint8Array(200);
+	// The chunk is the multipart part size, and the backends (S3, MinIO, R2
+	// alike) require every part but the last to be ≥ 5 MiB — the init route
+	// refuses anything smaller (an honest 400 instead of a 500 after every
+	// part has been paid for). Two parts prove the multipart shape.
+	const chunk = 5 * 1024 * 1024;
+	const bigPlain = new Uint8Array(2 * chunk);
 	for (let i = 0; i < bigPlain.length; i++) bigPlain[i] = i % 251;
-	const chunk = 64;
 	const bigSealed = await sealChunked(key, bigPlain, chunk);
 	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: bigPlain.length, chunk } });
 	assert.equal(start.status, 200, JSON.stringify(start.json));
-	assert.equal(start.json.parts, 4);
+	assert.equal(start.json.parts, 2);
+	// The honest refusal: a chunk below the backends' minimum part size is
+	// rejected at init — before a single part is uploaded.
+	const tiny = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: 200, chunk: 64 } });
+	assert.equal(tiny.status, 400);
 	const partEtags = [];
-	for (let p = 1; p <= 4; p++) {
+	for (let p = 1; p <= 2; p++) {
 		const frame = bigSealed.subarray((p - 1) * (chunk + FRAME_OVERHEAD), p * (chunk + FRAME_OVERHEAD));
 		const r = await fetch(`${dev.base}/api/v1/members/jinu/files/uploads/${start.json.uploadId}/${p}?key=${encodeURIComponent(start.json.key)}`, {
 			method: "PUT",
@@ -185,16 +193,16 @@ try {
 	const bigId = done.json.id;
 
 	// A Range read in the middle. The contract (the Rust clients live by it):
-	// the caller computes the *ciphertext* span of the frames it needs —
-	// frames_for(100, 40) = frames 1..=2, stored bytes 92..276 — and the
-	// server passes the Range through verbatim.
+	// the caller computes the *ciphertext* span of the frames it needs and
+	// the server passes the Range through verbatim. Here: both frames minus
+	// the final byte (so the answer is honest 206, not 200).
 	const frame = chunk + FRAME_OVERHEAD;
-	const dl2 = await fetch(`${dev.base}/api/v1/members/jinu/files/${bigId}`, { headers: { "x-gorani-dev-email": "jinu@family.test", Range: `bytes=${frame}-${3 * frame - 1}` } });
+	const dl2 = await fetch(`${dev.base}/api/v1/members/jinu/files/${bigId}`, { headers: { "x-gorani-dev-email": "jinu@family.test", Range: `bytes=0-${2 * frame - 2}` } });
 	assert.equal(dl2.status, 206);
 	assert.ok(dl2.headers.get("x-gorani-chunk") === String(chunk), "chunked objects are marked");
 	const slice = new Uint8Array(await dl2.arrayBuffer());
-	assert.equal(slice.length, 2 * frame, "the two frames that hold the range");
-	assert.equal(sealedSize(200, chunk), bigSealed.length, "the server checked the object adds up");
+	assert.equal(slice.length, 2 * frame - 1, "both frames, one byte short");
+	assert.equal(sealedSize(bigPlain.length, chunk), bigSealed.length, "the server checked the object adds up");
 
 	// ── 8. Rename, trash, duplicates ───────────────────────────────────
 	const renamed = await api(dev.base, "PATCH", `/api/v1/members/jinu/files/${fileId}`, { email: "jinu@family.test", body: { name: await sealText(storePublic, "letter (1).txt") } });

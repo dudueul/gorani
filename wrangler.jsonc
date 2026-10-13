@@ -54,6 +54,18 @@
 		"S3_BUCKET": "gorani"
 	},
 
+	// ── Storage priority: Cloudflare R2 ──────────────────────────────────
+	// Uncomment this block to bind an R2 bucket, and the Worker routes EVERY
+	// object operation through it instead of the signed S3 transport: an
+	// in-process call — no SigV4 signing, no HTTP hop, no egress fees (the
+	// Worker and R2 then live in the same runtime). Leave it out to store
+	// objects in any S3-compatible endpoint (MinIO &c.) — the adapter above
+	// is the generic path. The binding wins whenever it exists; see
+	// worker/src/s3.rs (`r2_bucket`) and docs/PRODUCTION.md › Storage.
+	// "r2_buckets": [
+	// 	{ "binding": "R2BUCKET", "bucket_name": "gorani" }
+	// ],
+
 	// One SQLite-backed Durable Object per concern: the family registry
 	// (instance `family`) and one per member (instance `member:<id>`). The
 	// migration uses `new_sqlite_classes` — every DO gets its own SQLite

@@ -26,6 +26,7 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `unit:links` | GS01/GR01 derivations; id-bound AAD; password-gated keys | how "the key lives in the fragment" actually works |
 | `api:family` | Bootstrap, parents-only, master-once, last-parent guard | the registry's lifecycle through real HTTP |
 | `api:files` | Sealed-in boundary: unsealed bytes/names refused 400 **before storage**; feed, versions+409, Range, chunked multipart | the worker's contract, end to end |
+| `api:r2` | The R2 binding as the storage priority: same sealed contract over the binding (in-process, no SigV4), on workerd's local simulator | one contract, two backends |
 | `api:devices` | Enrol/token-once/unlock/rekey/revoke + crypto-shredding | the native device lifecycle |
 | `api:shares` | The recipient's walk (meta→claim→data) + exhaustion/revocation/expiry | fragment-secret authentication, honest statuses |
 | `api:backup` | Key file (private never crosses the wire) → job → download → decrypt → restore round trip | the container the server cannot open |

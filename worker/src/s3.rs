@@ -8,7 +8,8 @@
 //! not in a security-sensitive worker.
 //!
 //! ```text
-//! caller ──▶ ops (this file) ──▶ sign_request (gorani-s3) ──▶ Fetch ──▶ MinIO/S3
+//! caller ──▶ ops (this file) ──▶ R2 binding (when bound: in-process, no signing) ──▶ R2
+//!                            └─▶ sign_request (gorani-s3) ──▶ Fetch ──▶ MinIO/S3
 //! ```
 //!
 //! Every byte crossing this module is ciphertext (GV02/GC01 frames, sealed
@@ -23,6 +24,22 @@ use worker::*;
 pub struct HeadInfo {
 	pub size: u64,
 	pub etag: String,
+}
+
+/// The R2 binding name (wrangler.jsonc › `r2_buckets`). **Storage priority**:
+/// when the deployment binds an R2 bucket, every operation below takes the
+/// binding instead of the signed S3 transport — an in-process call with no
+/// signing, no HTTP hop and no egress fees (Cloudflare↔R2 is free and local
+/// to the runtime). Any S3-compatible endpoint (MinIO &c.) keeps working
+/// through the SigV4 path whenever the binding is absent.
+///
+/// Any error resolving the binding (absent, or misconfigured) means "not
+/// bound": the S3 adapter then serves and reports its own, honest error.
+async fn r2_bucket(env: &Env) -> Result<Option<Bucket>> {
+	match env.bucket("R2BUCKET") {
+		Ok(bucket) => Ok(Some(bucket)),
+		Err(_) => Ok(None),
+	}
 }
 
 /// Resolve the configuration: vars for endpoint/region/bucket, secrets (or
@@ -85,6 +102,15 @@ async fn fetch_signed(cfg: &S3Config, method: &str, object_key: &str, query_pair
 
 /// Full GET; None on 404.
 pub async fn get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		return match bucket.get(key).execute().await? {
+			Some(o) => match o.body() {
+				Some(b) => Ok(Some(b.bytes().await?)),
+				None => Ok(None),
+			},
+			None => Ok(None),
+		};
+	}
 	let cfg = config(env)?;
 	let mut resp = fetch_signed(&cfg, "GET", key, &[], None, None, None).await?;
 	match resp.status_code() {
@@ -97,6 +123,15 @@ pub async fn get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
 /// Ranged read — S3 answers 206; a server may answer 200 when the range
 /// covers the whole object, which is equally fine for a full read.
 pub async fn read_range(env: &Env, key: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		return match bucket.get(key).range(Range::OffsetWithLength { offset, length }).execute().await? {
+			Some(o) => match o.body() {
+				Some(b) => b.bytes().await,
+				None => Err(Error::RustError(format!("R2 range read {key}: no body"))),
+			},
+			None => Err(Error::RustError(format!("R2 range read {key}: missing"))),
+		};
+	}
 	let cfg = config(env)?;
 	let mut resp = fetch_signed(&cfg, "GET", key, &[], Some((offset, length)), None, None).await?;
 	let status = resp.status_code();
@@ -109,12 +144,41 @@ pub async fn read_range(env: &Env, key: &str, offset: u64, length: u64) -> Resul
 /// Full GET as a **streamable** Response (the file route pipes the body
 /// through with a Range header); None-style errors surfaced via status.
 pub async fn fetch_stream(env: &Env, method: &str, key: &str, range: Option<(u64, u64)>, query_pairs: &[(String, String)]) -> Result<Response> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		// (query_pairs serve the S3 signed URL; the binding needs none. The
+		// headers mirror what the S3 answer carries — length and an honest
+		// Content-Range — so the file route's passthrough keeps working.)
+		let mut g = bucket.get(key);
+		if let Some((off, len)) = range {
+			g = g.range(Range::OffsetWithLength { offset: off, length: len });
+		}
+		return match g.execute().await? {
+			Some(o) => {
+				let (status, cr) = match range {
+					Some((off, len)) => (206, Some(format!("bytes {off}-{}/*", off + len - 1))),
+					None => (200, None),
+				};
+				let headers = Headers::new();
+				headers.set("Content-Type", "application/octet-stream")?;
+				headers.set("Content-Length", &o.size().to_string())?;
+				if let Some(cr) = cr {
+					headers.set("Content-Range", &cr)?;
+				}
+				let body = o.body().ok_or_else(|| Error::RustError(format!("R2 stream {key}: no body")))?;
+				Ok(Response::from_stream(body.stream()?)?.with_status(status).with_headers(headers))
+			}
+			None => Ok(Response::error("Not Found", 404)?),
+		};
+	}
 	let cfg = config(env)?;
 	fetch_signed(&cfg, method, key, query_pairs, range, None, None).await
 }
 
 /// Size + etag via HEAD. None on 404.
 pub async fn head(env: &Env, key: &str) -> Result<Option<HeadInfo>> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		return Ok(bucket.head(key).await?.map(|o| HeadInfo { size: o.size(), etag: o.etag() }));
+	}
 	let cfg = config(env)?;
 	let resp = fetch_signed(&cfg, "HEAD", key, &[], None, None, None).await?;
 	match resp.status_code() {
@@ -129,6 +193,10 @@ pub async fn head(env: &Env, key: &str) -> Result<Option<HeadInfo>> {
 
 /// Simple PUT (small objects; big ones go through multipart).
 pub async fn put(env: &Env, key: &str, bytes: Vec<u8>) -> Result<()> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		bucket.put(key, bytes).execute().await?;
+		return Ok(());
+	}
 	let cfg = config(env)?;
 	let resp = fetch_signed(&cfg, "PUT", key, &[], None, Some(bytes), Some("application/octet-stream")).await?;
 	if resp.status_code() != 200 {
@@ -139,6 +207,12 @@ pub async fn put(env: &Env, key: &str, bytes: Vec<u8>) -> Result<()> {
 
 /// DELETE; a missing object counts as deleted.
 pub async fn delete(env: &Env, key: &str) -> Result<()> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		// (R2's delete resolves even when the key is absent — the same
+		// contract as the S3 path's 204|404.)
+		bucket.delete(key).await?;
+		return Ok(());
+	}
 	let cfg = config(env)?;
 	let resp = fetch_signed(&cfg, "DELETE", key, &[], None, None, None).await?;
 	match resp.status_code() {
@@ -151,6 +225,10 @@ pub async fn delete(env: &Env, key: &str) -> Result<()> {
 
 /// Initiate: returns the S3 UploadId.
 pub async fn multipart_init(env: &Env, key: &str) -> Result<String> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		let upload = bucket.create_multipart_upload(key).execute().await?;
+		return Ok(upload.upload_id().await);
+	}
 	let cfg = config(env)?;
 	let mut resp = fetch_signed(&cfg, "POST", key, &[("uploads".to_string(), String::new())], None, None, None).await?;
 	let status = resp.status_code();
@@ -163,6 +241,14 @@ pub async fn multipart_init(env: &Env, key: &str) -> Result<String> {
 
 /// Upload one part (1-based); returns its ETag (quoted, kept verbatim for the Complete request).
 pub async fn multipart_part(env: &Env, key: &str, upload_id: &str, part: u32, bytes: Vec<u8>) -> Result<String> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		// resume_* rebuilds the handle from the (key, uploadId) pair the DO
+		// already stores for the S3 path — one shape of upload state for both
+		// backends.
+		let upload = bucket.resume_multipart_upload(key, upload_id)?;
+		let uploaded = upload.upload_part(part as u16, bytes).await?;
+		return Ok(uploaded.etag());
+	}
 	let cfg = config(env)?;
 	let q = [("partNumber".to_string(), part.to_string()), ("uploadId".to_string(), upload_id.to_string())];
 	let resp = fetch_signed(&cfg, "PUT", key, &q, None, Some(bytes), Some("application/octet-stream")).await?;
@@ -176,6 +262,13 @@ pub async fn multipart_part(env: &Env, key: &str, upload_id: &str, part: u32, by
 
 /// Complete: parts are (number, etag) in ascending order.
 pub async fn multipart_complete(env: &Env, key: &str, upload_id: &str, parts: &[(u32, String)]) -> Result<()> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		let upload = bucket.resume_multipart_upload(key, upload_id)?;
+		upload
+			.complete(parts.iter().map(|(n, etag)| UploadedPart::new(*n as u16, etag.clone())))
+			.await?;
+		return Ok(());
+	}
 	let cfg = config(env)?;
 	let q = [("uploadId".to_string(), upload_id.to_string())];
 	let mut resp = fetch_signed(&cfg, "POST", key, &q, None, Some(complete_multipart_body(parts)), Some("application/xml")).await?;
@@ -190,6 +283,10 @@ pub async fn multipart_complete(env: &Env, key: &str, upload_id: &str, parts: &[
 /// Abort (frees the stored parts; the daily housekeeping also calls this on
 /// uploads that never finished).
 pub async fn multipart_abort(env: &Env, key: &str, upload_id: &str) -> Result<()> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		bucket.resume_multipart_upload(key, upload_id)?.abort().await?;
+		return Ok(());
+	}
 	let cfg = config(env)?;
 	let q = [("uploadId".to_string(), upload_id.to_string())];
 	let resp = fetch_signed(&cfg, "DELETE", key, &q, None, None, None).await?;
@@ -213,6 +310,15 @@ pub struct Listed {
 /// XML-escaped and percent-relevant; they are unescaped here and the caller
 /// treats them as the exact stored keys.
 pub async fn list_page(env: &Env, prefix: &str, continuation: Option<&str>, max_keys: u32) -> Result<(Vec<Listed>, Option<String>)> {
+	if let Some(bucket) = r2_bucket(env).await? {
+		let mut list = bucket.list().prefix(prefix.to_string()).limit(max_keys);
+		if let Some(c) = continuation {
+			list = list.cursor(c.to_string());
+		}
+		let page = list.execute().await?;
+		let objects = page.objects().into_iter().map(|o| Listed { key: o.key(), size: o.size() }).collect();
+		return Ok((objects, if page.truncated() { page.cursor() } else { None }));
+	}
 	let cfg = config(env)?;
 	let mut q = vec![
 		("list-type".to_string(), "2".to_string()),

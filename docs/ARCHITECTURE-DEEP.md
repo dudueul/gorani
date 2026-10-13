@@ -28,6 +28,12 @@ flowchart LR
     WKR <--> dos
 ```
 
+**Storage priority** (section 3's step W→S): if the deployment binds an R2
+bucket, every object operation is an in-process call into R2 — no signing,
+no HTTP hop, no egress — and the SigV4 adapter serves any other
+S3-compatible endpoint when no binding exists. One contract, two
+transports, chosen at boot (`worker/src/s3.rs › r2_bucket`).
+
 **Read the zones, not the boxes**: a device and the object storage never
 talk directly; the Worker sees only ciphertext; the DOs hold structure
 plus sealed text. The one thing that turns plaintext into ciphertext is

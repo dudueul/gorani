@@ -188,6 +188,15 @@ pub const MIGRATIONS: &[&str] = &[
 	"CREATE TRIGGER IF NOT EXISTS music_ins AFTER INSERT ON music_meta BEGIN
 		UPDATE music_seq SET v = v + 1 WHERE n = 1;
 	END",
+	// Migration v2 (commit ⑦): upload bookkeeping and duplicate fingerprints.
+	"CREATE TABLE IF NOT EXISTS uploads (
+		id TEXT PRIMARY KEY,
+		object_key TEXT NOT NULL,
+		file_id TEXT,
+		s3_upload_id TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	)",
+	"ALTER TABLE file_versions ADD COLUMN tag TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -202,7 +211,7 @@ pub const MIGRATIONS: &[&str] = &[
 /// | `GET /stats` | schema-present + counter values (tests, commit ⑥ only) |
 #[durable_object]
 pub struct GoraniMemberDO {
-	sql: worker::SqlStorage,
+	pub(crate) sql: worker::SqlStorage,
 }
 
 impl DurableObject for GoraniMemberDO {
@@ -230,9 +239,75 @@ impl DurableObject for GoraniMemberDO {
 				self.get_audit().await
 			}
 			("GET", "stats") => self.stats().await,
+			("GET", id) if id.starts_with("files-object/") => {
+				let rest = &id["files-object/".len()..];
+				let (file_id, version) = match rest.split_once('?') {
+					Some((f, qs)) => (f, urlquery(qs).get("version").and_then(|x| x.parse::<i64>().ok())),
+					None => (rest, None),
+				};
+				self.file_object_route(file_id, version).await
+			}
+			// ── Files (implemented in worker/src/files_store.rs) ──
+			("POST", "files/put") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.file_put(&actor, body).await
+			}
+			("POST", "files/versions") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.file_version_put(&actor, body).await
+			}
+			("GET", "files/list") => self.files_list(req).await,
+			("POST", "files/keys") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.files_keys(body).await
+			}
+			("GET", "files/changes") => self.files_changes(req).await,
+			("GET", "files/match") => self.files_match(req).await,
+			("GET", "files/secrets") => self.secrets_get().await,
+			("PUT", "files/secrets") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.secrets_put(&actor, body).await
+			}
+			("GET", "files/meta") => self.files_meta(req).await,
+			("POST", "files/folders") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.folder_put(&actor, body).await
+			}
+			("PATCH", id) if id.starts_with("files-folders/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.folder_patch(&actor, &id["files-folders/".len()..], body).await
+			}
+			("DELETE", id) if id.starts_with("files-folders/") => self.folder_trash(&actor, &id["files-folders/".len()..]).await,
+			("PATCH", id) if id.starts_with("files/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.file_patch(&actor, &id["files/".len()..], body).await
+			}
+			("DELETE", id) if id.starts_with("files/") => self.file_trash(&actor, &id["files/".len()..]).await,
+			("POST", "uploads/start") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.upload_start(&actor, body).await
+			}
+			("GET", id) if id.starts_with("uploads/") => self.upload_get(&id["uploads/".len()..]).await,
+			("PUT", id) if id.starts_with("uploads/") && id.ends_with("/s3") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let s3_id = body.get("s3UploadId").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| Error::RustError("missing s3UploadId".into()))?;
+				self.upload_set_s3(&id["uploads/".len()..id.len() - "/s3".len()], &s3_id).await
+			}
+			("POST", id) if id.starts_with("uploads/") && id.ends_with("/complete") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.upload_complete(&actor, &id["uploads/".len()..id.len() - "/complete".len()], body).await
+			}
+			("DELETE", id) if id.starts_with("uploads/") => self.upload_abort(&actor, &id["uploads/".len()..]).await,
 			_ => Response::error("Not Found", 404),
 		}
 	}
+}
+
+// The files operations live beside the core (worker/src/files_store.rs) —
+// same DO, another `impl` block, one module per concern.
+pub(crate) fn now_iso() -> String {
+	// The DO's SQL clock is the single source of time in this database.
+	"strftime".to_string()
 }
 
 impl GoraniMemberDO {
@@ -281,7 +356,7 @@ impl GoraniMemberDO {
 		Ok(Response::from_json(&lines)?)
 	}
 
-	async fn audit(&self, actor: &str, action: &str, target: &str, details_sealed: Option<&str>) -> Result<()> {
+	pub(crate) async fn audit(&self, actor: &str, action: &str, target: &str, details_sealed: Option<&str>) -> Result<()> {
 		// A sealed detail is accepted only in a sealed-text shape; the server
 		// stores what it cannot read, and never stores what it can in that
 		// column by accident.
@@ -343,4 +418,15 @@ struct AuditPut {
 	target: String,
 	#[serde(default)]
 	details_sealed: Option<String>,
+}
+
+/// A tiny query-string reader for the few DO routes that take one (the
+/// Worker forwards the caller's query verbatim).
+fn urlquery(qs: &str) -> std::collections::BTreeMap<String, String> {
+	qs.split('&')
+		.filter_map(|pair| {
+			let (k, v) = pair.split_once('=')?;
+			Some((k.to_string(), v.to_string()))
+		})
+		.collect()
 }

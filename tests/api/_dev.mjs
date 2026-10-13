@@ -10,6 +10,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -20,20 +21,31 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40) } 
 		const b = spawnSync("npm", ["--prefix", "web", "run", "build"], { cwd: ROOT, encoding: "utf8" });
 		if (b.status !== 0) throw new Error(`web build failed:\n${b.stdout}\n${b.stderr}`);
 	}
+	// The S3 stub, before anything fetches it.
+	const { startS3Stub } = await import("../lib/s3stub.mjs");
+	const stub = await startS3Stub();
 	// Dev vars: auth bypassed with a header, storage endpoints as placeholders
 	// (the registry routes never touch S3; file-route suites replace these).
+	// The S3 endpoint uses the machine's LAN IP, not loopback: `wrangler dev`
+	// (workerd) refuses outbound fetches to localhost, LAN addresses work.
+	const lan = Object.values(os.networkInterfaces())
+		.flatMap((xs) => xs ?? [])
+		.find((x) => x && !x.internal && x.family === "IPv4")?.address;
+	const s3endpoint = lan ? `http://${lan}:${stub.address.port}` : `http://127.0.0.1:${stub.address.port}`;
 	fs.writeFileSync(
 		path.join(ROOT, ".dev.vars"),
-		["GORANI_DEV=1", "S3_ENDPOINT=http://127.0.0.1:19000", "S3_REGION=us-east-1", "S3_BUCKET=gorani-test", "S3_ACCESS_KEY_ID=test", "S3_SECRET_KEY=test", ""].join("\n"),
+		["GORANI_DEV=1", `S3_ENDPOINT=${s3endpoint}`, "S3_REGION=us-east-1", "S3_BUCKET=gorani-test", "S3_ACCESS_KEY_ID=test", "S3_SECRET_KEY=test", ""].join("\n"),
 	);
 	const out = fs.openSync(path.join(ROOT, "tests/output/wrangler-dev.log"), "w");
-	// Fresh SQLite state per run: the DOs keep their databases in this
-	// directory, which the harness deletes after the run (tests stay
-	// independent; production state lives in the cloud, never here).
+	// Fresh SQLite state per run: a private persist directory (created before
+	// the server starts — workerd wants it present), cleared each run so the
+	// suites stay independent; production state lives in the cloud.
 	const persistDir = path.join(ROOT, "tests/output/persist");
 	fs.rmSync(persistDir, { recursive: true, force: true });
+	fs.mkdirSync(persistDir, { recursive: true });
 	const child = spawn("npx", ["wrangler", "dev", "--port", String(port), "--ip", "127.0.0.1", "--persist-to", persistDir], {
 		cwd: ROOT,
+		detached: true, // own process group: close() kills wrangler AND its workerd children
 		env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "true", PATH: `${process.env.HOME}/.cargo/bin:${process.env.PATH ?? ""}` },
 		stdio: ["ignore", out, out],
 	});
@@ -44,8 +56,8 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40) } 
 		try {
 			const r = await fetch(`${base}/api/healthz`);
 			if (r.ok) break;
-		} catch {
-			// not up yet
+			} catch (e) {
+			void e; // not up yet
 		}
 		if (Date.now() > deadline) {
 			child.kill("SIGKILL");
@@ -55,9 +67,14 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40) } 
 	}
 	return {
 		base,
-		close() {
-			child.kill("SIGTERM");
+		close: async () => {
+			try {
+				process.kill(-child.pid, "SIGKILL"); // the whole group: workerd dies with wrangler
+			} catch {
+				child.kill("SIGKILL");
+			}
 			fs.closeSync(out);
+			await stub.close();
 		},
 	};
 }
@@ -76,4 +93,15 @@ export async function api(base, method, path, { email = "mom@family.test", token
 		// non-JSON (an error page) — reported as text
 	}
 	return { status: r.status, json, text };
+}
+
+/**
+ * The suite's server: the runner (tests/run.mjs) starts one dev server for
+ * the whole run and hands its URL in GORANI_URL — suites reuse it, because a
+ * second server would clear the first one's SQLite state. A suite run
+ * directly (node tests/api/…test.mjs) starts its own.
+ */
+export async function suiteDev() {
+	if (process.env.GORANI_URL) return { base: process.env.GORANI_URL, close: async () => {} };
+	return startDev();
 }

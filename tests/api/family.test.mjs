@@ -8,9 +8,9 @@
  */
 
 import assert from "node:assert/strict";
-import { startDev, api } from "./_dev.mjs";
+import { suiteDev, api } from "./_dev.mjs";
 
-const dev = await startDev();
+const dev = await suiteDev();
 try {
 	// The health line: configured storage is a var question, not a secret.
 	const health = await api(dev.base, "GET", "/api/healthz", { email: null });
@@ -74,5 +74,5 @@ try {
 	assert.ok(actions.includes("member.create") && actions.includes("member.deactivate") && actions.includes("master.set"), JSON.stringify(actions));
 	console.log("ok  api:family — bootstrap, roles, master-once, guards, audit");
 } finally {
-	dev.close();
+	await dev.close();
 }

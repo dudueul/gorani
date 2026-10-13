@@ -30,6 +30,7 @@ use worker::*;
 
 mod auth;
 mod family;
+mod files_store;
 mod member;
 mod routes;
 mod s3;

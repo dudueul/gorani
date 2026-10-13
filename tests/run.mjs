@@ -12,7 +12,7 @@
  * Every commit stays green; tests/README.md maps groups to lessons.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,25 +46,30 @@ if (wantKind("unit")) {
 	}
 }
 
-// API suites: one dev server for the whole run (the Rust worker build is
-// cached after the first suite), each suite a fresh script against it.
+// API suites: one dev server per suite (fresh SQLite each time; the Rust
+// worker build is cached after the first), URL handed over in GORANI_URL.
 if (wantKind("api")) {
-	const { startDev } = await import("./api/_dev.mjs");
-	const dev = await startDev();
-	try {
-		for (const f of fs.readdirSync(path.join(ROOT, "tests/api")).filter((f) => f.endsWith(".test.mjs")).sort()) {
-			const r = spawnSync(process.execPath, [path.join(ROOT, "tests/api", f)], {
+	const { suiteDev } = await import("./api/_dev.mjs");
+	for (const f of fs.readdirSync(path.join(ROOT, "tests/api")).filter((f) => f.endsWith(".test.mjs")).sort()) {
+		const dev = await suiteDev();
+		try {
+			// Async spawn on purpose: the parent owns the S3 stub's event
+			// loop, and a spawnSync here would block it — the worker's
+			// storage calls would never be accepted and the suite would hang
+			// until its own timeout. (Found the fun way: an accept queue of 1.)
+			const child = spawn(process.execPath, [path.join(ROOT, "tests/api", f)], {
 				cwd: ROOT,
-				encoding: "utf8",
 				env: { ...process.env, GORANI_URL: dev.base },
 			});
-			const ok = r.status === 0;
+			let out = "";
+			child.stdout.on("data", (d) => (out += d));
+			child.stderr.on("data", (d) => (out += d));
+			const ok = await new Promise((resolve) => child.on("exit", (code) => resolve(code === 0)));
 			if (!ok) failures.push(`api:${f}`);
-			const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
 			console.log(`${ok ? "ok  " : "FAIL"} api:${path.basename(f, ".test.mjs")}${ok ? "" : `\n    ${out.split("\n").filter((l) => /Error|error:|AssertionError|expected|actual/.test(l)).slice(0, 10).join("\n    ")}`}`);
+		} finally {
+			await dev.close();
 		}
-	} finally {
-		dev.close();
 	}
 }
 

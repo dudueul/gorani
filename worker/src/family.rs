@@ -88,6 +88,7 @@ impl DurableObject for GoraniFamilyDO {
 		let actor = req.headers().get("x-gorani-actor")?.unwrap_or_default();
 		match (req.method().to_string().as_str(), path.as_str()) {
 			("GET", "state") => self.state().await,
+			("GET", "actor") => self.actor(&actor).await,
 			("POST", "members") => {
 				let body = req.json::<NewMember>().await?;
 				self.create_member(&actor, body).await
@@ -109,6 +110,24 @@ impl DurableObject for GoraniFamilyDO {
 }
 
 impl GoraniFamilyDO {
+	/// Which member (if any) an Access email belongs to, and its role — the
+	/// Worker resolves every member-scoped request through this. A child may
+	/// act only for themselves; a parent for anyone (routes.rs enforces).
+	async fn actor(&self, email: &str) -> Result<Response> {
+		if email.is_empty() {
+			return Ok(Response::from_json(&serde_json::Value::Null)?);
+		}
+		let rows: Vec<EmailRoleRow> = self.sql.exec("SELECT id, role, emails FROM members WHERE active = 1", None)?.to_array()?;
+		for r in rows {
+			if let Ok(list) = serde_json::from_str::<Vec<String>>(&r.emails) {
+				if list.iter().any(|e| e.eq_ignore_ascii_case(email)) {
+					return Ok(Response::from_json(&serde_json::json!({ "id": r.id, "role": r.role }))?);
+				}
+			}
+		}
+		Ok(Response::from_json(&serde_json::Value::Null)?)
+	}
+
 	async fn state(&self) -> Result<Response> {
 		let members: Vec<MemberRow> = self.sql.exec("SELECT id, name, role, emails, active, created_at FROM members ORDER BY created_at, id", None)?.to_array()?;
 		let master = self.sql.exec("SELECT v FROM family WHERE k = 'master'", None)?.to_array::<FamilyKv>().ok().and_then(|mut k| k.pop()).map(|k| serde_json::from_str(&k.v).unwrap_or(serde_json::Value::Null));
@@ -263,6 +282,12 @@ struct RoleRow {
 }
 #[derive(serde::Deserialize)]
 struct EmailRow {
+	emails: String,
+}
+#[derive(serde::Deserialize)]
+struct EmailRoleRow {
+	id: String,
+	role: String,
 	emails: String,
 }
 #[derive(Debug, Deserialize)]

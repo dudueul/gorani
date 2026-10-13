@@ -106,6 +106,13 @@ pub async fn read_range(env: &Env, key: &str, offset: u64, length: u64) -> Resul
 	resp.bytes().await
 }
 
+/// Full GET as a **streamable** Response (the file route pipes the body
+/// through with a Range header); None-style errors surfaced via status.
+pub async fn fetch_stream(env: &Env, method: &str, key: &str, range: Option<(u64, u64)>, query_pairs: &[(String, String)]) -> Result<Response> {
+	let cfg = config(env)?;
+	fetch_signed(&cfg, method, key, query_pairs, range, None, None).await
+}
+
 /// Size + etag via HEAD. None on 404.
 pub async fn head(env: &Env, key: &str) -> Result<Option<HeadInfo>> {
 	let cfg = config(env)?;

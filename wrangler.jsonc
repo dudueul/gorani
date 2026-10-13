@@ -25,8 +25,10 @@
 
 	// Build the Rust worker. `worker-build` compiles src/lib.rs to
 	// wasm32-unknown-unknown, runs wasm-bindgen and emits build/worker/.
+	// PATH: rustup installs cargo into ~/.cargo/bin, which a login shell has
+	// but wrangler's build shell may not — make it explicit.
 	"build": {
-		"command": "cd worker && cargo install -q worker-build && worker-build --release"
+		"command": "cd worker && export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo install -q worker-build && worker-build --release"
 	},
 
 	// The web app is a static Lit SPA built into web/dist and served by the
@@ -52,11 +54,21 @@
 		"S3_BUCKET": "gorani"
 	},
 
+	// One SQLite-backed Durable Object per concern: the family registry
+	// (instance `family`) and one per member (instance `member:<id>`). The
+	// migration uses `new_sqlite_classes` — every DO gets its own SQLite
+	// database; see worker/src/family.rs and worker/src/member.rs.
+	"durable_objects": {
+		"bindings": [
+			{ "name": "FAMILY", "class_name": "GoraniFamilyDO" },
+			{ "name": "MEMBER", "class_name": "GoraniMemberDO" }
+		]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["GoraniFamilyDO", "GoraniMemberDO"] }
+	],
+
 	"observability": {
 		"enabled": true
 	}
-
-	// Durable Object bindings arrive with commit ⑥ (GoraniMemberDO); the
-	// migration then uses `new_sqlite_classes` so each member gets a SQLite
-	// database. See docs/ARCHITECTURE.md → "The member object".
 }

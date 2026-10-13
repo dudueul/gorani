@@ -28,6 +28,10 @@
 
 use worker::*;
 
+mod auth;
+mod family;
+mod member;
+mod routes;
 mod s3;
 
 #[event(fetch)]
@@ -46,6 +50,10 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 				},
 			}))
 		}
+		// Everything under /api/v1 is routed (and authenticated) in routes.rs.
+		(_, p) if p.starts_with("/api/v1/") => routes::route(req, env).await,
+		// The asset layer handles static files and the SPA fallback; the
+		// Worker only ever sees what `run_worker_first` names.
 		_ => Response::error("Not Found", 404),
 	}
 }

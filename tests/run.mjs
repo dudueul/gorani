@@ -20,7 +20,7 @@ import { cargoCommand } from "./lib/cargo.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
-const kinds = args.filter((w) => ["unit", "rust"].includes(w));
+const kinds = args.filter((w) => ["unit", "rust", "api"].includes(w));
 const wantKind = (k) => !kinds.length || kinds.includes(k);
 const failures = [];
 
@@ -43,6 +43,28 @@ if (wantKind("unit")) {
 		const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
 		const failLines = out.split("\n").filter((l) => /Error|error:|AssertionError|expected|actual/.test(l)).slice(0, 10).join("\n    ");
 		console.log(`${ok ? "ok  " : "FAIL"} unit:${path.basename(f, ".test.mjs")}${ok ? "" : `\n    ${failLines}`}`);
+	}
+}
+
+// API suites: one dev server for the whole run (the Rust worker build is
+// cached after the first suite), each suite a fresh script against it.
+if (wantKind("api")) {
+	const { startDev } = await import("./api/_dev.mjs");
+	const dev = await startDev();
+	try {
+		for (const f of fs.readdirSync(path.join(ROOT, "tests/api")).filter((f) => f.endsWith(".test.mjs")).sort()) {
+			const r = spawnSync(process.execPath, [path.join(ROOT, "tests/api", f)], {
+				cwd: ROOT,
+				encoding: "utf8",
+				env: { ...process.env, GORANI_URL: dev.base },
+			});
+			const ok = r.status === 0;
+			if (!ok) failures.push(`api:${f}`);
+			const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+			console.log(`${ok ? "ok  " : "FAIL"} api:${path.basename(f, ".test.mjs")}${ok ? "" : `\n    ${out.split("\n").filter((l) => /Error|error:|AssertionError|expected|actual/.test(l)).slice(0, 10).join("\n    ")}`}`);
+		}
+	} finally {
+		dev.close();
 	}
 }
 

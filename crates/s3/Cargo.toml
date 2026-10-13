@@ -1,0 +1,16 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# The pure SigV4 signer for S3-compatible object storage (see src/lib.rs):
+# no worker dependency, host-testable, golden-vector proven. The wasm
+# transport lives in worker/src/s3.rs.
+
+[package]
+name = "gorani-s3"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

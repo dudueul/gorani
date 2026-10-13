@@ -28,11 +28,11 @@ if (wantKind("rust")) {
 	// The crates with Rust tests; the worker crate is wasm-only and joins via
 	// miniflare API suites (commit ⑥+), not host `cargo test`.
 	const { cmd: cargo, env } = cargoCommand();
-	const r = spawnSync(cargo, ["test", "-p", "gorani-formats"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+	const r = spawnSync(cargo, ["test", "-p", "gorani-formats", "-p", "gorani-s3"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 	const ok = r.status === 0;
 	if (!ok) failures.push("rust");
 	const out = `${String(r.stdout ?? "")}${String(r.stderr ?? "")}`;
-	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
+	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats -p gorani-s3${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
 }
 
 if (wantKind("unit")) {

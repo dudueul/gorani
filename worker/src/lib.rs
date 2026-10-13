@@ -9,13 +9,13 @@
 //! ```
 //!
 //! Everything this program receives from a client is already sealed in the
-//! client (GV2 content, GV3-wrapped keys, sealed names). It verifies who the
+//! client (GV02 content, GV03-wrapped keys, sealed names). It verifies who the
 //! caller is, checks shapes, stores and relays — and never holds a key that
-//! can open content. This scaffold wires the entrypoint and the health
-//! route; routes arrive per commit:
+//! can open content. This scaffold wires the entrypoint; routes arrive per
+//! commit:
 //!
-//!   ⑥ GoraniMemberDO (member metadata, SQLite)
-//!   ⑦ files routes   ⑧ vault/member/device routes   ⑨+ the SPA's API
+//!   ⑥ GoraniMemberDO (member metadata, SQLite)   ⑦ files routes
+//!   ⑧ vault/member/device routes                 ⑨+ the SPA's API
 //!
 //! Why Rust here? A bug that reads or corrupts bytes is a security bug in a
 //! file vault. Rust removes the whole class (memory unsafety) and shares the
@@ -28,15 +28,24 @@
 
 use worker::*;
 
+mod s3;
+
 #[event(fetch)]
-async fn main(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
-	// Liveness for the deploy and for tests. Everything else is 404 until its
-	// commit lands — the scaffold serves no content of its own.
+async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+	// Liveness for the deploy and for tests. The S3 line says whether the
+	// storage backend is *configured* — never what is in it, and never a key.
 	match (req.method(), req.path().as_str()) {
-		(Method::Get, "/api/healthz") => Response::from_json(&serde_json::json!({
-			"ok": true,
-			"service": "gorani",
-		})),
+		(Method::Get, "/api/healthz") => {
+			let s3 = s3::config(&env);
+			Response::from_json(&serde_json::json!({
+				"ok": true,
+				"service": "gorani",
+				"s3": match &s3 {
+					Ok(cfg) => serde_json::json!({ "configured": true, "bucket": cfg.bucket }),
+					Err(e) => serde_json::json!({ "configured": false, "error": e.to_string() }),
+				},
+			}))
+		}
 		_ => Response::error("Not Found", 404),
 	}
 }

@@ -359,6 +359,10 @@ impl GoraniMemberDO {
 				let body = req.json::<serde_json::Value>().await?;
 				self.backup_restore(&actor, body).await
 			}
+			("POST", "housekeeping") => {
+				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+				self.housekeeping(&actor, body).await
+			}
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.files_reseal(&actor, body).await
@@ -495,11 +499,100 @@ impl GoraniMemberDO {
 			.map_err(Error::from)
 	}
 
+	/// The retention levers that keep the member database inside its budget
+	/// (docs/ARCHITECTURE.md › Growth): the journal and audit are bounded by
+	/// age/count, trashed items purge after their window (their sealed
+	/// objects go from S3 too), dead share copies are removed. Every knob is
+	/// a parameter so tests can force the clocks.
+	pub(crate) async fn housekeeping(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let trash_days = body.get("trashDays").and_then(|v| v.as_i64()).unwrap_or(30).max(0);
+		let journal_days = body.get("journalDays").and_then(|v| v.as_i64()).unwrap_or(180).max(0);
+		let audit_keep = body.get("auditKeep").and_then(|v| v.as_i64()).unwrap_or(500).max(1);
+		let share_days = body.get("shareDays").and_then(|v| v.as_i64()).unwrap_or(1).max(0);
+
+		// 1. Trash purge: sealed objects leave S3, rows leave (triggers
+		// journal the purge).
+		let mut purged_objects: Vec<String> = Vec::new();
+		let purged_files: Vec<ObjRow> = self
+			.sql
+			.exec(
+				&format!("SELECT v.object_key AS object_key FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.deleted_at IS NOT NULL AND f.deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days')"),
+				None,
+			)?
+			.to_array()?;
+		for r in &purged_files {
+			purged_objects.push(r.object_key.clone());
+		}
+		let n_files_purged = self
+			.sql
+			.exec(
+				&format!("DELETE FROM files WHERE deleted_at IS NOT NULL AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days')"),
+				None,
+			)?
+			.rows_written();
+		let n_folders_purged = self
+			.sql
+			.exec(
+				&format!("DELETE FROM file_folders WHERE deleted_at IS NOT NULL AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days')"),
+				None,
+			)?
+			.rows_written();
+
+		// 2. Dead share copies: revoked or expired past the grace window.
+		let dead_shares: Vec<ShareObjRow> = self
+			.sql
+			.exec(
+				&format!("SELECT object_key, s3_upload_id FROM shares WHERE (revoked_at IS NOT NULL OR expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')) AND COALESCE(revoked_at, expires_at) < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{share_days} days')"),
+				None,
+			)?
+			.to_array()?;
+		for r in &dead_shares {
+			purged_objects.push(r.object_key.clone());
+		}
+		let n_shares_purged = self
+			.sql
+			.exec(
+				&format!("DELETE FROM shares WHERE (revoked_at IS NOT NULL OR expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')) AND COALESCE(revoked_at, expires_at) < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{share_days} days')"),
+				None,
+			)?
+			.rows_written();
+
+		// 3. The journal and the audit: the two append-only tables.
+		let journal_pruned = self
+			.sql
+			.exec(
+				&format!("DELETE FROM files_journal WHERE at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{journal_days} days')"),
+				None,
+			)?
+			.rows_written();
+		let audit_pruned = self
+			.sql
+			.exec(
+				&format!("DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT {audit_keep})"),
+				None,
+			)?
+			.rows_written();
+
+		for key in &purged_objects {
+			let _ = crate::s3::delete(&self.env, key).await;
+		}
+		if !purged_objects.is_empty() || n_files_purged + n_shares_purged > 0 {
+			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned}"))).await?;
+		}
+		Ok(Response::from_json(&serde_json::json!({
+			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged,
+			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": purged_objects.len(),
+		}))?)
+	}
+
 	async fn stats(&self) -> Result<Response> {
 		let seq = self.sql.exec("SELECT v FROM files_seq WHERE n = 1", None)?.one::<Count>()?.v;
 		let music_seq = self.sql.exec("SELECT v FROM music_seq WHERE n = 1", None)?.one::<Count>()?.v;
 		let files = self.sql.exec("SELECT COUNT(*) AS n FROM files", None)?.one::<TotalCount>()?.n;
-		Ok(Response::from_json(&serde_json::json!({ "filesSeq": seq, "musicSeq": music_seq, "files": files }))?)
+		// The growth metric (docs/ARCHITECTURE.md › Growth): the number the
+		// GoraniFilesDO split watches.
+		let db_size = self.sql.database_size();
+		Ok(Response::from_json(&serde_json::json!({ "filesSeq": seq, "musicSeq": music_seq, "files": files, "dbSize": db_size }))?)
 	}
 }
 
@@ -516,6 +609,15 @@ struct AuditRow {
 	target: String,
 	details_sealed: Option<String>,
 	details: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct ObjRow {
+	object_key: String,
+}
+#[derive(serde::Deserialize)]
+struct ShareObjRow {
+	object_key: String,
+	s3_upload_id: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct Count {

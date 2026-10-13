@@ -940,6 +940,7 @@ struct KvRow {
 #[derive(serde::Deserialize)]
 struct ShareObjRow {
 	object_key: String,
+	s3_upload_id: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct ShareRow {

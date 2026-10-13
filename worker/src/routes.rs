@@ -112,6 +112,7 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "vault", Some(body), actor)).await
 		}
 		("GET", ["members", id, "audit"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "audit", None, actor)).await,
+		("GET", ["members", id, "vault-stats"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "stats", None, actor)).await,
 
 		// ── Files ───────────────────────────────────────────────────────
 		("POST", ["members", id, "files"]) => file_upload_whole(req, env, &identity, id).await,
@@ -175,6 +176,10 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		}
 		("GET", ["members", id, "backups"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "backups", None, actor)).await,
 		("GET", ["members", id, "backups", stamp]) => backup_download(&env, &identity, id, stamp).await,
+		("POST", ["members", id, "housekeeping"]) => {
+			let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "housekeeping", Some(body), actor)).await
+		}
 		("POST", ["members", id, "backup", "restore"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "backup/restore", Some(body), actor)).await

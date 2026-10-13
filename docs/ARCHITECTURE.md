@@ -1,5 +1,7 @@
 # Architecture: the trust map first
 
+> Diagrams and sequence flows: **[ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md)** (Mermaid).
+
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 
 ## The one-sentence model

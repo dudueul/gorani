@@ -15,6 +15,8 @@ is the index: what to read, in what order, and what to build yourself.
 
 ## How to read this repository
 
+The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — Mermaid diagrams of every flow (unlock, upload, streaming, family graph, backup, growth).
+
 | # | Lesson | Where | You learn |
 |---|--------|-------|-----------|
 | 1 | The trust map | docs/ARCHITECTURE.md | Who can read what, and why that is a design decision, not an accident |

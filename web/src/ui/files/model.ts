@@ -116,6 +116,18 @@ export class FilesModel {
 		return this.state.subscribe(() => listener());
 	}
 
+	/** The transport (for features that drive their own endpoints — shares). */
+	get api(): FilesBridge {
+		return this.bridge;
+	}
+
+	/** Seal a value to the files store's public key (owner-side displays:
+	 * share link names in the owner's list). */
+	async sealForOwner(text: string): Promise<string> {
+		const pub = await this.bridge.storePublic();
+		return sealText(pub, text);
+	}
+
 	private set(patch: Partial<FilesState>): void {
 		this.state.set({ ...this.state.get(), ...patch });
 	}

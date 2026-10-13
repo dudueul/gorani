@@ -71,6 +71,10 @@ fn json_error_raw(status: u16, message: &str) -> Response {
 
 pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 	let path = req.path();
+	if path.starts_with("/s/") {
+		let segments: Vec<&str> = path.trim_start_matches("/s/").split('/').collect();
+		return public_share(req, env, &segments).await;
+	}
 	if !path.starts_with("/api/v1/") {
 		return Response::error("Not Found", 404);
 	}
@@ -147,6 +151,16 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		("POST", ["members", id, "devices", device, "wiped"]) => device_call(&env, &identity, id, device, "wiped", req).await,
 		("POST", ["members", id, "devices", device, "leave"]) => device_call(&env, &identity, id, device, "leave", req).await,
 		("DELETE", ["members", id, "devices", device]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "DELETE", format!("devices/{device}"), None, actor)).await,
+		// ── Share links (GS01): the client seals the copy; the worker stores
+		// ciphertext and bookkeeping. See files_store.rs + s.html. ────────
+		("POST", ["members", id, "files", "shares"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			member_call(&env, &identity, id, |actor| share_create(&env, id, actor, body)).await
+		}
+		("GET", ["members", id, "files", "shares"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/shares", None, actor)).await,
+		("PUT", ["members", id, "files", "shares", share, "parts", part]) => share_part(req, env, &identity, id, share, part).await,
+		("POST", ["members", id, "files", "shares", share, "complete"]) => share_complete(req, env, &identity, id, share).await,
+		("DELETE", ["members", id, "files", "shares", share]) => share_revoke(&env, &identity, id, share).await,
 		// ── Crypto-shredding: the destroy secret must exist and the confirm
 		// phrase must match, exactly. Without both: 403, always.
 		("DELETE", ["members", id, "vault"]) => {
@@ -583,4 +597,223 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 	}
 	let stream = s3_resp.stream()?;
 	Ok(Response::from_stream(stream)?.with_status(status).with_headers(headers))
+}
+// ── Public share routes (GS01) ──────────────────────────────────────────────
+// /s/f/<id>          the sealed share page (served from the asset s.html)
+// /s/f/<id>/meta     { metaSealed, kdf, expiresAt, downloadsLeft }
+// /s/f/<id>/claim    one download — decrements the counter
+// /s/f/<id>/data     the sealed copy (GC1 frames under the link's data key)
+//
+// Everything here is unauthenticated BY DESIGN: the link's fragment secret
+// is the credential, the server holds only sealed bytes, and the owner's
+// member DO is resolved through the registry's share index.
+async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response> {
+	let Some(id) = segs.get(1) else { return http_text(404, "no such share").await };
+	let id = id.to_string();
+	if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+		return http_text(404, "no such share").await;
+	}
+	let member = {
+		let namespace = env.durable_object("FAMILY")?;
+		let stub = namespace.id_from_name("family")?.get_stub()?;
+		let request = Request::new_with_init(&format!("https://do.internal/share-owner/{id}"), &RequestInit { method: Method::Get, ..Default::default() })?;
+		let resp = stub.fetch_with_request(request).await?;
+		let mut resp = resp;
+		let v: serde_json::Value = resp.json().await?;
+		match v.get("memberId").and_then(|m| m.as_str()).map(str::to_string) {
+			Some(m) if !m.is_empty() => m,
+			_ => return http_text(404, "no such share").await,
+		}
+	};
+	let namespace = env.durable_object("MEMBER")?;
+	let stub = namespace.id_from_name(&format!("member:{member}"))?.get_stub()?;
+	let do_call = |path: String, body: Option<serde_json::Value>| {
+		let stub = &stub;
+		async move {
+			let mut headers = Headers::new();
+			headers.set("Content-Type", "application/json")?;
+			let request = Request::new_with_init(
+				&format!("https://do.internal/{path}"),
+				&RequestInit {
+					method: Method::Post,
+					headers,
+					body: body.map(|b| b.to_string().into()),
+					..Default::default()
+				},
+			)?;
+			stub.fetch_with_request(request).await
+		}
+	};
+	match segs.get(2) {
+		None => {
+			// Serve the self-contained recipient page. s.html lives outside
+			// /s/* (the asset server owns it), so this self-fetch cannot loop.
+			let origin = { let url = req.url()?; format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()) };
+			let page = Fetch::Url(Url::parse(&format!("{origin}/s.html")).map_err(|_| Error::RustError("page missing".into()))?).send().await?;
+			let mut page = page;
+			let body = page.bytes().await?;
+			let mut headers = Headers::new();
+			headers.set("Content-Type", "text/html; charset=utf-8")?;
+			headers.set("Cache-Control", "no-store")?;
+			Ok(Response::from_bytes(body)?.with_headers(headers))
+		}
+		Some(&"meta") => {
+			let resp = do_call(format!("shares/{id}/public-meta"), Some(serde_json::json!({}))).await?;
+			let mut resp = resp;
+			let status = resp.status_code();
+			let v: serde_json::Value = resp.json().await?;
+			Ok(Response::from_json(&v)?.with_status(status))
+		}
+		Some(&"claim") => {
+			let resp = do_call(format!("shares/{id}/claim"), Some(serde_json::json!({}))).await?;
+			let mut resp = resp;
+			let status = resp.status_code();
+			let v: serde_json::Value = resp.json().await?;
+			Ok(Response::from_json(&v)?.with_status(status))
+		}
+		Some(&"data") => {
+			// State check via the DO, then stream the sealed object from S3.
+			let resp = do_call(format!("shares/{id}/public-object"), Some(serde_json::json!({}))).await?;
+			let mut resp = resp;
+			let status = resp.status_code();
+			if status >= 400 {
+				return Ok(resp);
+			}
+			let v: serde_json::Value = resp.json().await?;
+			let object = v.get("objectKey").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+			let range_header = req.headers().get("Range")?.unwrap_or_default();
+			let range = parse_range(&range_header);
+			let mut s3_resp = s3::fetch_stream(&env, "GET", &object, range, &[]).await?;
+			let mut s3_resp = s3_resp;
+			let mut headers = Headers::new();
+			headers.set("Content-Type", "application/octet-stream")?;
+			headers.set("Accept-Ranges", "bytes")?;
+			if let Some(len) = s3_resp.headers().get("Content-Length")? {
+				headers.set("Content-Length", &len)?;
+			}
+			if let Some(cr) = s3_resp.headers().get("Content-Range")? {
+				headers.set("Content-Range", &cr)?;
+			}
+			let status = s3_resp.status_code();
+			let stream = s3_resp.stream()?;
+			Ok(Response::from_stream(stream)?.with_status(status).with_headers(headers))
+		}
+		_ => http_text(404, "no such share").await,
+		}
+}
+
+
+/// Range header → (start, end) for the S3 fetch (the plaintext is sealed
+/// ciphertext; the recipient's ranges pass through verbatim).
+fn parse_range(header: &str) -> Option<(u64, u64)> {
+	let r = header.trim().strip_prefix("bytes=")?;
+	let mut it = r.split('-');
+	let start: u64 = it.next()?.parse().ok()?;
+	let end: u64 = it.next()?.parse().ok()?;
+	if end < start {
+		return None;
+	}
+	Some((start, end))
+}
+
+async fn http_text(status: u16, text: &str) -> Result<Response> {
+	let mut h = Headers::new();
+	h.set("Content-Type", "text/plain; charset=utf-8")?;
+	let mut r = Response::from_bytes(text.as_bytes().to_vec())?;
+	r = r.with_status(status).with_headers(h);
+	Ok(r)
+}
+
+// ── Share plumbing (the Worker's half; the DO owns rows) ───────────────────
+
+const SHARE_CHUNK: u64 = 8 * 1024 * 1024; // GC1 frames, one per part
+
+async fn share_create(env: &Env, member_id: &str, actor: String, mut body: serde_json::Value) -> Result<Response> {
+	let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+	let frames = gorani_formats::chunked::frame_count(size, SHARE_CHUNK);
+	let object_key = format!("shares/{}", body.get("id").and_then(|v| v.as_str()).unwrap_or_default());
+	let s3_upload_id = s3::multipart_init(env, &object_key).await?;
+	body["s3UploadId"] = serde_json::json!(s3_upload_id);
+	let resp = forward_member(env, member_id, "POST", "files/shares", Some(body), actor).await?;
+	if resp.status_code() >= 400 {
+		let _ = s3::multipart_abort(env, &object_key, &s3_upload_id).await;
+		return Ok(resp);
+	}
+	// The public /s/f/:id routes resolve the owner through the registry's
+	// share index (the share id alone must find its member DO).
+	let index = forward_family(env, "internal", "POST", "shares-index", Some(serde_json::json!({ "id": object_key.trim_start_matches("shares/"), "memberId": member_id }))).await?;
+	if index.status_code() >= 400 {
+		return Ok(index);
+	}
+	Response::from_json(&serde_json::json!({ "parts": frames }))
+}
+
+async fn share_part(mut req: Request, env: Env, identity: &Identity, member_id: &str, share: &str, part: &str) -> Result<Response> {
+	match member_ctx(&env, identity, member_id).await {
+		Ok(_) => {}
+		Err(resp) => return Ok(resp),
+	}
+	let meta = match share_obj(&env, member_id, share).await {
+		Ok(m) => m,
+		Err(resp) => return Ok(resp),
+	};
+	let bytes = req.bytes().await?;
+	let n: u32 = part.parse().map_err(|_| Error::RustError("bad part number".into()))?;
+	let etag = s3::multipart_part(&env, &meta.object_key, &meta.s3_upload_id, n, bytes.to_vec()).await?;
+	Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
+}
+
+async fn share_complete(mut req: Request, env: Env, identity: &Identity, member_id: &str, share: &str) -> Result<Response> {
+	let actor = match member_ctx(&env, identity, member_id).await {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	let meta = match share_obj(&env, member_id, share).await {
+		Ok(m) => m,
+		Err(resp) => return Ok(resp),
+	};
+	let body: serde_json::Value = req.json().await?;
+	let parts: Vec<(u32, String)> = body
+		.get("parts")
+		.and_then(|p| serde_json::from_value(p.clone()).ok())
+		.unwrap_or_default();
+	s3::multipart_complete(&env, &meta.object_key, &meta.s3_upload_id, &parts).await?;
+	let size = body.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+	forward_member(&env, member_id, "POST", &format!("shares/{share}/complete"), Some(serde_json::json!({ "size": size })), &actor).await
+}
+
+async fn share_revoke(env: &Env, identity: &Identity, member_id: &str, share: &str) -> Result<Response> {
+	let actor = match member_ctx(&env, identity, member_id).await {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	let meta = match share_obj(&env, member_id, share).await {
+		Ok(m) => m,
+		Err(resp) => return Ok(resp),
+	};
+	let resp = forward_member(&env, member_id, "DELETE", &format!("shares/{share}"), None, &actor).await?;
+	if resp.status_code() < 400 {
+		let _ = s3::delete(env, &meta.object_key).await;
+	}
+	Ok(resp)
+}
+
+struct ShareObjMeta {
+	object_key: String,
+	s3_upload_id: String,
+}
+
+async fn share_obj(env: &Env, member_id: &str, share: &str) -> std::result::Result<ShareObjMeta, Response> {
+	let resp = forward_member(env, member_id, "GET", &format!("shares/{share}/obj"), None, "internal").await;
+	match resp {
+		Ok(mut r) if r.status_code() == 200 => {
+			let v: serde_json::Value = r.json().await.map_err(|e| json_error_raw(500, &e.to_string()))?;
+			Ok(ShareObjMeta {
+				object_key: v.get("objectKey").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+				s3_upload_id: v.get("s3UploadId").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+			})
+		}
+		Ok(r) => Err(r),
+		Err(e) => Err(json_error_raw(500, &e.to_string())),
+	}
 }

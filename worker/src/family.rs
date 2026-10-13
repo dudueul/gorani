@@ -39,6 +39,10 @@ pub const MIGRATIONS: &[&str] = &[
 		active INTEGER NOT NULL DEFAULT 1,
 		created_at TEXT NOT NULL
 	)",
+	// Share links are created inside a member's DO; the PUBLIC route only
+	// knows the share id, so the registry indexes id → member (no secrets —
+	// the share's keys live in the link's fragment).
+	"CREATE TABLE IF NOT EXISTS share_index (id TEXT PRIMARY KEY, member_id TEXT NOT NULL)",
 	// The registry's own audit lines (actor, action, target; readable — this
 	// table holds no secrets).
 	"CREATE TABLE IF NOT EXISTS audit (
@@ -117,6 +121,11 @@ impl GoraniFamilyDO {
 				let body = req.json::<serde_json::Value>().await?;
 				self.set_master(&actor, body).await
 			}
+			("POST", "shares-index") => {
+				let body = req.json::<ShareIndexPut>().await?;
+				self.share_index_put(body).await
+			}
+			("GET", id) if id.starts_with("share-owner/") => self.share_owner(&id["share-owner/".len()..]).await,
 			_ => Response::error("Not Found", 404),
 		}
 	}
@@ -234,6 +243,25 @@ impl GoraniFamilyDO {
 		self.state().await
 	}
 
+	/// Index a share id → its owner member (called by the route at create
+	/// time; the public /s/f/:id routes resolve through this).
+	async fn share_index_put(&self, body: ShareIndexPut) -> Result<Response> {
+		self.sql
+			.exec(
+				"INSERT OR REPLACE INTO share_index (id, member_id) VALUES (?1, ?2)",
+				Some(vec![body.id.into(), body.member_id.into()]),
+			)
+			.map(|_| ())
+			.map_err(Error::from)?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	async fn share_owner(&self, id: &str) -> Result<Response> {
+		let rows: Vec<OwnerRow> = self.sql.exec("SELECT member_id FROM share_index WHERE id = ?1", Some(vec![id.into()]))?.to_array()?;
+		let member = rows.into_iter().next().map(|r| r.member_id);
+		Ok(Response::from_json(&serde_json::json!({ "memberId": member }))?)
+	}
+
 	async fn is_parent(&self, email: &str) -> Result<bool> {
 		if email.is_empty() {
 			return Ok(false);
@@ -294,6 +322,16 @@ struct RoleRow {
 #[derive(serde::Deserialize)]
 struct EmailRow {
 	emails: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareIndexPut {
+	id: String,
+	member_id: String,
+}
+#[derive(serde::Deserialize)]
+struct OwnerRow {
+	member_id: String,
 }
 #[derive(serde::Deserialize)]
 struct EmailRoleRow {

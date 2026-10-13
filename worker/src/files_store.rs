@@ -17,6 +17,7 @@
 //! opaque ids (`files/<member>/<file>/<v-uuid>`), never file names.
 
 use rand_core::{OsRng, RngCore};
+use base64::Engine;
 use serde::Deserialize;
 use worker::{Request, Response, Result};
 
@@ -523,6 +524,170 @@ impl GoraniMemberDO {
 		Ok(Response::from_json(&serde_json::json!({ "folders": n, "files": files }))?)
 	}
 
+	// ── Share links (GS01): rows + multipart bookkeeping ────────────────
+
+	/// Create a share row. The route has already opened the S3 multipart
+	/// upload for the sealed copy (object `shares/<id>`) and hands its id in.
+	pub(crate) async fn share_create(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		self.vault_gate().await?;
+		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+		let id = get("id").ok_or_else(|| worker::Error::RustError("missing id".into()))?;
+		if !(22..=64).contains(&id.len()) || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+			return json_error(400, "share id shape");
+		}
+		let name = get("nameSealed").ok_or_else(|| worker::Error::RustError("missing nameSealed".into()))?;
+		let meta = get("metaSealed").ok_or_else(|| worker::Error::RustError("missing metaSealed".into()))?;
+		// The name is sealed to the owner's store key (GV*); the meta is
+		// sealed to the link's meta key (GS01) — different keys, different
+		// readers, both opaque here.
+		if !gorani_formats::formats::is_sealed_text(&name) {
+			return json_error(400, "the share name must be sealed text");
+		}
+		// sealShareMeta returns base64("GS01" ‖ nonce ‖ ct) — check the magic
+		// after decoding (the recipient's page derives the meta key and opens
+		// it; the server never can).
+		let meta_ok = base64::engine::general_purpose::STANDARD.decode(&meta).map(|b| b.starts_with(b"GS01")).unwrap_or(false);
+		if !meta_ok {
+			return json_error(400, "the share meta must be sealed (GS01)");
+		}
+		let Some(expires_at) = get("expiresAt") else { return json_error(400, "expiresAt required") };
+		let Some(s3_upload_id) = get("s3UploadId") else { return json_error(400, "s3UploadId required") };
+		let downloads_left = body.get("downloadsLeft").and_then(|v| v.as_i64()).unwrap_or(9999);
+		self.sql
+			.exec(
+				"INSERT INTO shares (id, file_id, version, name_sealed, object_key, meta_sealed, kdf, expires_at, downloads_left, created_at, s3_upload_id, ready, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?10, 0, ?11)",
+				Some(vec![
+					id.clone().into(),
+					bind(get("fileId")),
+					body.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(),
+					name.into(),
+					format!("shares/{id}").into(),
+					meta.into(),
+					bind(body.get("kdf").map(|k| k.to_string())),
+					expires_at.into(),
+					downloads_left.into(),
+					s3_upload_id.into(),
+					body.get("size").and_then(|v| v.as_i64()).into(),
+				]),
+			)
+			.map_err(|e| worker::Error::RustError(format!("share insert: {e}")))?;
+		self.audit(actor, "share.create", &id, None, None).await?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	/// The object + multipart id for the route's S3 calls (auth'd path only).
+	pub(crate) async fn share_obj(&self, id: &str) -> Result<Response> {
+		let rows: Vec<ShareRow> = self.sql.exec("SELECT object_key, s3_upload_id FROM shares WHERE id = ?1", Some(vec![id.into()]))?.to_array()?;
+		match rows.into_iter().next() {
+			Some(r) => Ok(Response::from_json(&serde_json::json!({ "objectKey": r.object_key, "s3UploadId": r.s3_upload_id }))?),
+			None => json_error(404, "no such share"),
+		}
+	}
+
+	pub(crate) async fn share_complete(&self, actor: &str, id: &str, body: serde_json::Value) -> Result<Response> {
+		let size = body.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+		let n = self.sql.exec("UPDATE shares SET ready = 1, size = ?1 WHERE id = ?2", Some(vec![size.into(), id.into()]))?.rows_written();
+		if n == 0 {
+			return json_error(404, "no such share");
+		}
+		self.audit(actor, "share.ready", id, None, None).await?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	/// The owner's list (names re-sealed to the files key — opened by the UI).
+	pub(crate) async fn shares_list(&self) -> Result<Response> {
+		let rows: Vec<ShareListRow> = self
+			.sql
+			.exec("SELECT id, file_id, name_sealed, expires_at, downloads_left, created_at, revoked_at, ready, size FROM shares ORDER BY created_at DESC", None)?
+			.to_array()?;
+		Ok(Response::from_json(&serde_json::Value::Array(
+			rows.into_iter()
+				.map(|r| {
+					serde_json::json!({
+						"id": r.id, "fileId": r.file_id, "name": r.name_sealed,
+						"expiresAt": r.expires_at, "downloadsLeft": r.downloads_left,
+						"createdAt": r.created_at, "revoked": r.revoked_at.is_some(),
+						"ready": r.ready != 0, "size": r.size,
+					})
+				})
+				.collect(),
+		))?)
+	}
+
+	pub(crate) async fn share_revoke(&self, actor: &str, id: &str) -> Result<Response> {
+		let n = self.sql.exec("UPDATE shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND revoked_at IS NULL", Some(vec![id.into()]))?.rows_written();
+		if n == 0 {
+			return json_error(404, "no such share");
+		}
+		self.audit(actor, "share.revoke", id, None, None).await?;
+		let object = self.share_object_key(id).await?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true, "objectKey": object }))?)
+	}
+
+	async fn share_object_key(&self, id: &str) -> Result<String> {
+		let rows: Vec<ShareObjRow> = self.sql.exec("SELECT object_key FROM shares WHERE id = ?1", Some(vec![id.into()]))?.to_array()?;
+		Ok(rows.into_iter().next().map(|r| r.object_key).ok_or_else(|| worker::Error::RustError("no such share".into()))?)
+	}
+	// (ShareObjRow below)
+
+	/// The share's state for the PUBLIC endpoints: ready, not revoked, not
+	/// expired, downloads left. Errors carry the status the route returns.
+	async fn share_public_check(&self, id: &str) -> std::result::Result<ShareRow2, Response> {
+		let rows: Vec<ShareRow2> = match self
+			.sql
+			.exec("SELECT meta_sealed, kdf, expires_at, downloads_left, object_key, ready, revoked_at, expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') AS expired FROM shares WHERE id = ?1", Some(vec![id.into()]))
+		{
+			Ok(c) => match c.to_array() {
+				Ok(rows) => rows,
+				Err(e) => return Err(json_error_raw(500, &e.to_string())),
+			},
+			Err(e) => return Err(json_error_raw(500, &e.to_string())),
+		};
+		let Some(r) = rows.into_iter().next() else { return Err(json_error_raw(404, "no such share")) };
+		if r.ready == 0 {
+			return Err(json_error_raw(404, "the link is still being prepared"));
+		}
+		if r.revoked_at.is_some() {
+			return Err(json_error_raw(404, "no such share"));
+		}
+		if r.expired == 1 {
+			return Err(json_error_raw(410, "this link has expired"));
+		}
+		if r.downloads_left <= 0 {
+			return Err(json_error_raw(410, "this link is used up"));
+		}
+		Ok(r)
+	}
+
+	pub(crate) async fn share_public_meta(&self, id: &str) -> Result<Response> {
+		match self.share_public_check(id).await {
+			Ok(r) => Ok(Response::from_json(&serde_json::json!({
+				"metaSealed": r.meta_sealed, "kdf": r.kdf.and_then(|k| serde_json::from_str::<serde_json::Value>(&k).ok()),
+				"expiresAt": r.expires_at, "downloadsLeft": r.downloads_left,
+			}))?),
+			Err(resp) => Ok(resp),
+		}
+	}
+
+	/// One download: decrement the counter (0 and below stay refused above).
+	pub(crate) async fn share_claim(&self, id: &str) -> Result<Response> {
+		match self.share_public_check(id).await {
+			Ok(r) => {
+				let left = r.downloads_left - 1;
+				self.sql.exec("UPDATE shares SET downloads_left = ?1 WHERE id = ?2", Some(vec![left.into(), id.into()]))?;
+				Ok(Response::from_json(&serde_json::json!({ "downloadsLeft": left }))?)
+			}
+			Err(resp) => Ok(resp),
+		}
+	}
+
+	pub(crate) async fn share_public_object(&self, id: &str) -> std::result::Result<String, Response> {
+		match self.share_public_check(id).await {
+			Ok(r) => Ok(r.object_key),
+			Err(resp) => Err(resp),
+		}
+	}
+
 	// ── Files secrets (fingerprint + index keys, sealed) ────────────────
 
 	pub(crate) async fn secrets_get(&self) -> Result<Response> {
@@ -771,6 +936,42 @@ struct UploadRow {
 #[derive(serde::Deserialize)]
 struct KvRow {
 	v: String,
+}
+#[derive(serde::Deserialize)]
+struct ShareObjRow {
+	object_key: String,
+}
+#[derive(serde::Deserialize)]
+struct ShareRow {
+	object_key: String,
+	s3_upload_id: Option<String>,
+}
+#[derive(Clone, serde::Deserialize)]
+struct ShareListRow {
+	id: String,
+	file_id: Option<String>,
+	name_sealed: String,
+	expires_at: String,
+	downloads_left: i64,
+	created_at: String,
+	revoked_at: Option<String>,
+	ready: i64,
+	size: Option<i64>,
+}
+#[derive(Clone, serde::Deserialize)]
+struct ShareRow2 {
+	meta_sealed: String,
+	kdf: Option<String>,
+	expires_at: String,
+	downloads_left: i64,
+	object_key: String,
+	ready: i64,
+	revoked_at: Option<String>,
+	expired: i64,
+}
+
+fn json_error_raw(status: u16, message: &str) -> Response {
+	Response::from_json(&serde_json::json!({ "error": message })).unwrap().with_status(status)
 }
 #[derive(serde::Deserialize)]
 struct TrashedWithRow {

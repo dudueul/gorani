@@ -28,6 +28,8 @@ import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
+import "../viewer/viewer.ts";
+import "./share-dialog.ts";
 
 type ViewMode = "icon" | "list" | "column";
 
@@ -47,6 +49,13 @@ export class GoraniFinder extends LitElement {
 	private typeTimer: ReturnType<typeof setTimeout> | undefined;
 	@state() private quickLook: { id: string; name: string; url?: string; text?: string; kind: FileKind; meta?: { size: number; version: number; updatedAt: string } } | null = null;
 	@state() private info: Awaited<ReturnType<FilesModel["info"]>> = null;
+	@state() private shareTarget: { id: string; name: string; size: number; version: number } | null = null;
+
+	private openShare(id: string): void {
+		const row = this.s().files.find((f) => f.id === id);
+		if (!row) return;
+		this.shareTarget = { id, name: row.name, size: row.size, version: row.version };
+	}
 	/** Column view: the walked path of folders + the deepest selection. */
 	@state() private columnPath: string[] = [];
 
@@ -165,6 +174,7 @@ export class GoraniFinder extends LitElement {
 					{ label: kind === "folder" ? "Open" : "Quick Look", run: () => void this.openEntry(kind, id), disabled: many },
 					{ label: "Get Info", run: () => void this.getInfo(id), disabled: many || kind === "folder" },
 					{ separator: true, label: "" },
+					{ label: "Share…", run: () => this.openShare(id), disabled: kind === "folder" || many },
 					{ label: "Duplicate", run: () => { this.model.copy(); void this.model.paste(); }, disabled: kind === "folder" || many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
 					{ separator: true, label: "" },
@@ -355,6 +365,7 @@ export class GoraniFinder extends LitElement {
 				</div>
 				${this.quickLook ? this.quickLookModal() : nothing}
 				${this.info ? this.infoPanel() : nothing}
+				${this.shareTarget ? html`<gorani-share .model=${this.model} .target=${this.shareTarget} @closed=${() => (this.shareTarget = null)}></gorani-share>` : nothing}
 				${s.loading ? html`<div class="pointer-events-none fixed right-4 top-4 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs text-neutral-300 shadow">Opening…</div>` : nothing}
 			</div>
 		`;

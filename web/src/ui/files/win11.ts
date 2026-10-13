@@ -29,6 +29,8 @@ import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
+import "../viewer/viewer.ts";
+import "./share-dialog.ts";
 
 type ViewMode = "details" | "list" | "small" | "large";
 
@@ -117,6 +119,13 @@ export class GoraniWin11 extends LitElement {
 	}
 
 	@state() private previewFile: { id: string; name: string; url?: string; text?: string; kind: FileKind } | null = null;
+	@state() private shareTarget: { id: string; name: string; size: number; version: number } | null = null;
+
+	private openShare(id: string, name: string): void {
+		const row = this.s().files.find((f) => f.id === id);
+		if (!row) return;
+		this.shareTarget = { id, name, size: row.size, version: row.version };
+	}
 
 	private async previewId(id: string): Promise<void> {
 		const row = this.s().files.find((f) => f.id === id);
@@ -198,6 +207,7 @@ export class GoraniWin11 extends LitElement {
 					{ label: "Cut", run: () => this.model.cut() },
 					{ label: "Copy", run: () => this.model.copy() },
 					{ separator: true, label: "" },
+					{ label: "Share…", run: () => this.openShare(id, name), disabled: kind === "folder" || many },
 					{ label: "Rename", run: () => void this.renameSelection(), disabled: many },
 					{ label: "Move to…", run: () => void 0, disabled: many },
 					{ label: "Delete", run: () => void this.deleteSelection() },
@@ -426,6 +436,7 @@ export class GoraniWin11 extends LitElement {
 					</div>
 					${this.showPreview ? this.previewPane() : nothing}
 				</div>
+				${this.shareTarget ? html`<gorani-share .model=${this.model} .target=${this.shareTarget} @closed=${() => (this.shareTarget = null)}></gorani-share>` : nothing}
 			</div>
 		`;
 	}

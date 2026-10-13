@@ -202,6 +202,12 @@ pub const MIGRATIONS: &[&str] = &[
 	// column beside the sealed one (device names and the like are structure,
 	// not content).
 	"ALTER TABLE audit ADD COLUMN details TEXT",
+	// Migration v4 (commit ⑪): share-link copies. The sealed copy lives in
+	// S3 under shares/<id>; the row tracks its multipart bookkeeping, the
+	// plaintext size (the recipient's progress), and readiness.
+	"ALTER TABLE shares ADD COLUMN s3_upload_id TEXT",
+	"ALTER TABLE shares ADD COLUMN ready INTEGER DEFAULT 0",
+	"ALTER TABLE shares ADD COLUMN size INTEGER",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -303,6 +309,31 @@ impl GoraniMemberDO {
 			("POST", "files/trash/restore") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.trash_restore(&actor, body).await
+			}
+			("POST", "files/shares") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.share_create(&actor, body).await
+			}
+			("GET", "files/shares") => self.shares_list().await,
+			("GET", id) if id.starts_with("shares/") && id.ends_with("/obj") => {
+				self.share_obj(&id["shares/".len()..id.len() - "/obj".len()]).await
+			}
+			("POST", id) if id.starts_with("shares/") && id.ends_with("/complete") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.share_complete(&actor, &id["shares/".len()..id.len() - "/complete".len()], body).await
+			}
+			("DELETE", id) if id.starts_with("shares/") => self.share_revoke(&actor, &id["shares/".len()..]).await,
+			("POST", id) if id.starts_with("shares/") && id.ends_with("/public-meta") => {
+				self.share_public_meta(&id["shares/".len()..id.len() - "/public-meta".len()]).await
+			}
+			("POST", id) if id.starts_with("shares/") && id.ends_with("/claim") => {
+				self.share_claim(&id["shares/".len()..id.len() - "/claim".len()]).await
+			}
+			("POST", id) if id.starts_with("shares/") && id.ends_with("/public-object") => {
+				match self.share_public_object(&id["shares/".len()..id.len() - "/public-object".len()]).await {
+					Ok(object) => Ok(Response::from_json(&serde_json::json!({ "objectKey": object }))?),
+					Err(resp) => Ok(resp),
+				}
 			}
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;

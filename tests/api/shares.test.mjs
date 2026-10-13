@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { generateHybridKey, importVaultKey, sealText, sealWith, openWith, newContentKey, importContentKey, wrapContentKey, unwrapContentKey } from "../../web/src/vault/vault-crypto.ts";
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
-import { newShareId, newShareSecret, shareKeys, sealShareMeta, openShareMeta } from "../../web/src/vault/share-crypto.ts";
+import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta, openShareMeta } from "../../web/src/vault/share-crypto.ts";
 import { splitFrame, frameAad } from "../../web/public/gorani-media-lib.js";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 import { toBase64, fromBase64 } from "../../web/src/lib/encoding.ts";
@@ -123,10 +123,8 @@ try {
 
 	// ── 3. Exhaustion: 2 downloads allowed, 2 claimed ──────────────────
 	const claim2 = await fetch(`${dev.base}/s/f/${id}/claim`, { method: "POST" });
-	console.error("CLAIM2", claim2.status, await claim2.text());
 	assert.equal(claim2.status, 200);
 	const claim3 = await fetch(`${dev.base}/s/f/${id}/claim`, { method: "POST" });
-	console.error("CLAIM3", claim3.status, await claim3.text());
 	assert.equal(claim3.status, 410, "used up");
 	const metaGone = await fetch(`${dev.base}/s/f/${id}/meta`);
 	assert.equal(metaGone.status, 410, `used up: ${await metaGone.text()}`);
@@ -168,10 +166,56 @@ try {
 	const expired = await fetch(`${dev.base}/s/f/${id3}/meta`);
 	assert.equal(expired.status, 410, `expired: ${expired.status} ${await expired.text()}`);
 
-	// ── 6. The share index: public routes found the member every time ──
+	// ── 6. A password-protected share: both halves, end to end ─────────
+// The dialog's exact server flow (kdf rides the share's record —
+// parameters, not secrets), then the recipient walk WITH the password:
+// wrong-password refused, right one opens and decrypts. The page's module
+// does this derivation too — unit:share-lib proves the two agree.
+	const pwId = newShareId();
+	const pwSecret = newShareSecret();
+	const pwKdf = newShareKdf();
+	const pwKeys = await shareKeys(pwId, pwSecret, "bread-secret-2026", pwKdf);
+	const pwCopy = await sealChunked(pwKeys.data, plain, DEFAULT_CHUNK);
+	const pwMetaSealed = await sealShareMeta(pwKeys.meta, pwId, { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
+	const pwStart = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
+		email: "jinu@family.test",
+		body: { id: pwId, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: pwMetaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf: pwKdf },
+	});
+	assert.equal(pwStart.status, 200, JSON.stringify(pwStart.json));
+	const pwEtagRes = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${pwId}/parts/1`, {
+		method: "PUT",
+		headers: { "x-gorani-dev-email": "jinu@family.test", "content-type": "application/octet-stream" },
+		body: pwCopy,
+	});
+	const pwEtag = (await pwEtagRes.json()).etag;
+	assert.equal((await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${pwId}/complete`, { email: "jinu@family.test", body: { parts: [{ partNumber: 1, etag: pwEtag }], size: plain.length } })).status, 200);
+
+	// The server declares the kdf; the link's secret ALONE opens nothing.
+	const pwMetaRes = await fetch(`${dev.base}/s/f/${pwId}/meta`);
+	assert.equal(pwMetaRes.status, 200);
+	const pwInfo = await pwMetaRes.json();
+	assert.deepEqual(pwInfo.kdf, pwKdf, "the Argon2id settings ride the meta");
+	await assert.rejects(() => shareKeys(pwId, pwSecret).then((k) => openShareMeta(k.meta, pwId, pwInfo.metaSealed)), /Wrong password|incomplete/);
+
+	// The right password: the full recipient walk.
+	const pwOpen = await shareKeys(pwId, pwSecret, "bread-secret-2026", pwInfo.kdf);
+	assert.deepEqual(await openShareMeta(pwOpen.meta, pwId, pwInfo.metaSealed), { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
+	const pwClaim = await fetch(`${dev.base}/s/f/${pwId}/claim`, { method: "POST" });
+	assert.equal(pwClaim.status, 200);
+	const pwData = await fetch(`${dev.base}/s/f/${pwId}/data`);
+	assert.equal(pwData.status, 200);
+	const pwSealedCopy = new Uint8Array(await pwData.arrayBuffer());
+	const pwOut = new Uint8Array(plain.length);
+	for (let i = 0; i < 1; i++) {
+		const { iv, body } = splitFrame(pwSealedCopy, 0, pwSealedCopy.length);
+		pwOut.set(await openChunk(pwOpen.data, new Uint8Array([...iv, ...body]), 0, true));
+	}
+	assert.deepEqual(pwOut, plain, "the password-gated copy opens to the exact bytes");
+
+	// ── 7. The share index: public routes found the member every time ──
 	// (implicit: /s/f/:id resolved mom↔jinu without any identity header).
 
-	console.log("ok  api:shares — create/upload/complete, recipient decrypt, exhaustion, revocation, expiry");
+	console.log("ok  api:shares — create/upload/complete, recipient decrypt, exhaustion, revocation, expiry, password links");
 } finally {
 	await dev.close();
 }

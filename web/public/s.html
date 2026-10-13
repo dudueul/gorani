@@ -5,9 +5,11 @@
 	The share recipient page (self-contained, no sign-in): the link is
 	/s/f/<id>#<secret> — the part after # never reaches any server, so the
 	keys derived from it (GS01: data key + meta key) exist only here. The
-	server holds the sealed copy, the sealed meta and a download counter;
-	this page opens the name and assembles the file from GC1 frames in the
-	browser.
+	server holds the sealed copy, the sealed meta, the Argon2id settings
+	(password links) and a download counter; this page opens the name and
+	assembles the file from GC1 frames in the browser. Password-protected
+	links need BOTH the link and the password — the password is stretched
+	(Argon2id) and mixed into the key material here, and is never sent.
 -->
 <html lang="en" class="h-full">
 	<head>
@@ -26,6 +28,14 @@
 			<section class="w-full max-w-md rounded-2xl border border-neutral-800 bg-neutral-900 p-6 text-center shadow-xl">
 				<p class="text-sm font-semibold" style="color: var(--accent)">Gorani</p>
 				<p id="status" class="mt-3 text-sm text-neutral-400">Opening the share…</p>
+				<div id="pwform" class="mt-4 hidden">
+					<p class="text-sm text-neutral-300">This link is password-protected.</p>
+					<input id="pw" type="password" autocomplete="off" placeholder="Password" class="mt-3 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-[var(--accent)]" />
+					<button id="unlock" class="mt-3 w-full rounded-xl px-4 py-2.5 text-sm font-medium text-neutral-950 hover:opacity-90" style="background: var(--accent)">
+						Unlock
+					</button>
+					<p class="mt-3 text-xs text-neutral-500">Stretched with Argon2id in this tab — the password is never sent.</p>
+				</div>
 				<div id="details" class="mt-4 hidden">
 					<div id="icon" class="text-neutral-600"></div>
 					<p id="name" class="mt-2 break-all text-lg font-medium"></p>
@@ -37,55 +47,74 @@
 				</div>
 			</section>
 		</div>
+		<!-- Argon2id (hash-wasm, MIT — see NOTICE) sets globalThis.hashwasm. -->
+		<script src="/vendor/argon2.umd.min.js"></script>
 		<script type="module">
 			import { splitFrame, frameAad } from "/gorani-media-lib.js";
+			import { shareKeys, openShareMeta } from "/gorani-share-lib.js";
 
-			const enc = new TextEncoder();
 			const CHUNK = 8 * 1024 * 1024; // GC1 frames, one per part (GS01's contract)
 			const status = document.getElementById("status");
 			const say = (t) => (status.textContent = t);
 
-			const b64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
-			const hex = (b) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-
 			const id = location.pathname.split("/").pop();
 			const secret = location.hash.startsWith("#") ? decodeURIComponent(location.hash.slice(1)) : "";
-
-			const subtle = crypto.subtle;
-			async function shareKeys(id, secret) {
-				const s = b64u(secret);
-				const ikm = await subtle.importKey("raw", s, "HKDF", false, ["deriveKey"]);
-				const salt = enc.encode(`gorani-share${id}`);
-				const derive = (info) =>
-					subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt, info: enc.encode(info) }, ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-				return { data: await derive("gorani-share-data-v1"), meta: await derive("gorani-share-meta-v1") };
-			}
-
-			async function openMeta(metaKey, id, sealed) {
-				const b = b64u(sealed);
-				const aad = new Uint8Array([...enc.encode("GS01"), ...enc.encode(id)]);
-				const plain = await subtle.decrypt({ name: "AES-GCM", iv: b.subarray(4, 16), additionalData: aad }, metaKey, b.subarray(16));
-				return JSON.parse(new TextDecoder().decode(plain));
-			}
 
 			let meta = null;
 			let keys = null;
 
-			try {
-				if (!secret) throw new Error("This link is incomplete — the part after # is missing.");
-				keys = await shareKeys(id, secret);
-				const mres = await fetch(`/s/f/${id}/meta`, { method: "GET" });
-				if (!mres.ok) throw new Error((await mres.json().catch(() => ({}))).error ?? `link refused (${mres.status})`);
-				const info = await mres.json();
-				if (info.kdf) throw new Error("This link needs a password — password links arrive soon.");
-				meta = await openMeta(keys.meta, id, info.metaSealed);
+			async function show() {
 				document.getElementById("name").textContent = meta.name;
 				document.getElementById("meta").textContent = `${fmt(meta.size)} · expires ${new Date(info.expiresAt).toLocaleString()} · ${info.downloadsLeft} download${info.downloadsLeft === 1 ? "" : "s"} left`;
 				document.getElementById("icon").innerHTML = kindIcon(meta.name);
 				document.getElementById("details").classList.remove("hidden");
 				say("");
+			}
+
+			/** The first key derivation, with whatever the server declared. */
+			async function derive(password) {
+				keys = await shareKeys(id, secret, password, info.kdf);
+				meta = await openShareMeta(keys.meta, id, info.metaSealed);
+				await show();
+			}
+
+			let info = null;
+			try {
+				if (!secret) throw new Error("This link is incomplete — the part after # is missing.");
+				const mres = await fetch(`/s/f/${id}/meta`, { method: "GET" });
+				if (!mres.ok) throw new Error((await mres.json().catch(() => ({}))).error ?? `link refused (${mres.status})`);
+				info = await mres.json();
+				if (!info.kdf) {
+					await derive(null);
+				} else {
+					// Password links: ask here — the derivation needs BOTH the
+					// link's secret and this password, and only this tab ever
+					// sees either.
+					document.getElementById("pwform").classList.remove("hidden");
+					say("");
+					document.getElementById("unlock").addEventListener("click", unlock);
+					document.getElementById("pw").addEventListener("keydown", (e) => e.key === "Enter" && unlock());
+				}
 			} catch (e) {
 				say(e instanceof Error ? e.message : String(e));
+			}
+
+			async function unlock() {
+				const pw = document.getElementById("pw").value;
+				if (!pw) return;
+				const btn = document.getElementById("unlock");
+				btn.disabled = true;
+				say("Stretching the password…");
+				try {
+					await derive(pw);
+					document.getElementById("pwform").classList.add("hidden");
+				} catch (e) {
+					// A wrong password is an AEAD failure in openShareMeta — say
+					// exactly that, and let the recipient try again (the cost of
+					// each try is the Argon2id stretch itself).
+					say(e instanceof Error ? e.message : String(e));
+					btn.disabled = false;
+				}
 			}
 
 			document.getElementById("download").addEventListener("click", async () => {

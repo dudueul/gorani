@@ -494,7 +494,7 @@ export async function makePasswordMethod(keyBytes: Uint8Array, password: string,
 	return { id: methodId(), kind: "password", label, wrapped: await wrapPrivateKey(keyBytes, kek), salt: toBase64(salt), kdf: "argon2id", argon2: { ...ARGON2ID_PARAMS }, createdAt: new Date().toISOString() };
 }
 
-export async function makeRecoveryMethod(keyBytes: Uint8Array): Promise<{ method: UnlockMethod; code: string }> {
+export async function makeRecoveryMethod(keyBytes: Uint8Array, label = "Recovery code"): Promise<{ method: UnlockMethod; code: string }> {
 	const code = generateRecoveryCode();
 	const salt = randomBytes(16);
 	const kek = await kekFromSecret(recoveryCodeBytes(code), salt, "gorani-recovery-v1");

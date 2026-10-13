@@ -27,6 +27,7 @@ import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
+import type { ViewerTarget } from "../viewer/viewer.ts";
 
 type ViewMode = "icon" | "list" | "column";
 
@@ -97,7 +98,10 @@ export class GoraniFinder extends LitElement {
 			await this.model.setFolder(id);
 			return;
 		}
-		await this.quickLookOn(id);
+		const row = this.s().files.find((f) => f.id === id) ?? this.s().trashFiles.find((f) => f.id === id);
+		if (!row) return;
+		this.quickLook = null;
+		this.dispatchEvent(new CustomEvent("open-viewer", { detail: { id, name: row.name, kind: row.kind, size: row.size, version: row.version } as ViewerTarget, bubbles: true, composed: true }));
 	}
 
 	private async quickLookOn(id: string): Promise<void> {
@@ -591,7 +595,7 @@ export class GoraniFinder extends LitElement {
 							<p class="font-medium text-neutral-100">${q.name}</p>
 							${q.meta ? html`<p class="text-xs text-neutral-400">${fmtSize(q.meta.size)} · v${q.meta.version} · ${fmtDate(q.meta.updatedAt)} — decrypted here, sealed everywhere else</p>` : nothing}
 						</div>
-						<button class="rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.downloadSelection()}>Download</button>
+						<div class="flex gap-2"><button class="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-neutral-950 hover:opacity-90" @click=${() => void this.openEntry("file", q.id)}>Open</button><button class="rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.downloadSelection()}>Download</button></div>
 					</div>
 					${q.text ? html`<pre class="mt-3 max-h-80 overflow-auto rounded-xl bg-neutral-950 p-3 text-xs text-neutral-300">${q.text}</pre>` : nothing}
 					<p class="mt-3 text-center text-xs text-neutral-500">space / esc closes</p>

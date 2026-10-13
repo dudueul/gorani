@@ -28,6 +28,7 @@ import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
+import type { ViewerTarget } from "../viewer/viewer.ts";
 
 type ViewMode = "details" | "list" | "small" | "large";
 
@@ -110,10 +111,9 @@ export class GoraniWin11 extends LitElement {
 			await this.model.setFolder(id);
 			return;
 		}
-		// Files open in the viewer pane for now (the full viewer lands with
-		// the streaming commit); images and text preview here.
-		await this.previewId(id);
-		void name;
+		const row = this.s().files.find((f) => f.id === id);
+		if (!row) return;
+		this.dispatchEvent(new CustomEvent("open-viewer", { detail: { id, name: row.name, kind: row.kind, size: row.size, version: row.version } as ViewerTarget, bubbles: true, composed: true }));
 	}
 
 	@state() private previewFile: { id: string; name: string; url?: string; text?: string; kind: FileKind } | null = null;

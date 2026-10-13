@@ -8,7 +8,7 @@
  * same sealed model.
  */
 
-import { LitElement, html } from "lit";
+import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { Member } from "../lib/api.ts";
 import { watchAutoLock, type VaultSession } from "../vault/session.ts";
@@ -16,6 +16,8 @@ import { FilesModel } from "./files/model.ts";
 import { sessionBridge } from "./files/bridge.ts";
 import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
 import { LocalIndex } from "../vault/index.ts";
+import "./viewer/viewer.ts";
+import type { ViewerTarget } from "./viewer/viewer.ts";
 import "./files/win11.ts";
 import "./files/finder.ts";
 
@@ -28,6 +30,7 @@ export class GoraniShell extends LitElement {
 	@state() private mode: PlatformMode = loadMode();
 	private model: FilesModel | null = null;
 	private index: import("../vault/index.ts").LocalIndex | null = null;
+	@state() private viewer: ViewerTarget | null = null;
 
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
@@ -111,7 +114,17 @@ export class GoraniShell extends LitElement {
 						</button>
 					</div>
 				</header>
-				<main class="min-h-0 flex-1">
+				<main class="relative min-h-0 flex-1" @open-viewer=${(e: CustomEvent) => {
+					this.viewer = e.detail as ViewerTarget;
+					void this.requestUpdate();
+				}}>
+					${this.model
+						? this.mode === "win11"
+							? html`<gorani-win11 .model=${this.model} member-name=${this.member.name} member-role=${this.member.role}></gorani-win11>`
+							: html`<gorani-finder .model=${this.model} member-name=${this.member.name}></gorani-finder>`
+						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
+				</main>
+				${this.viewer ? html`<gorani-viewer .model=${this.model} .target=${this.viewer} @closed=${() => (this.viewer = null)}></gorani-viewer>` : nothing}
 					${this.model
 						? this.mode === "win11"
 							? html`<gorani-win11 .model=${this.model} member-name=${this.member.name} member-role=${this.member.role}></gorani-win11>`

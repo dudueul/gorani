@@ -21,6 +21,8 @@
 //!   P-256 public), what unlock methods wrap and sealed keys hold.
 //! - **GW01** — a private key wrapped under a key-encryption key (unlock
 //!   methods, device copies).
+//! - **GC01** (`chunked`) — a large file in authenticated 8 MiB frames that
+//!   each open on their own (position and finality bound as AAD).
 //!
 //! Text columns carry `"GV01:"`, `"GV02:"` or `"GV03:"` followed by standard
 //! base64. The HKDF info strings ("gorani-vault-v1", "gorani-vault-v3", the
@@ -33,6 +35,7 @@
 //! `GORANI_RUST_OUT=<path>` — writes what Rust sealed for the TypeScript
 //! tests to open. Both directions, every commit.
 
+pub mod chunked;
 pub mod formats;
 pub mod unlock;
 

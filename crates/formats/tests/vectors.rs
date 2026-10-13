@@ -11,6 +11,7 @@
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use gorani_formats::chunked;
 use gorani_formats::formats::{self, VaultPrivateKey, VaultPublicKey};
 use gorani_formats::unlock::{self, DeviceCopy, Secret, UnlockMethod};
 use serde_json::{json, Value};
@@ -75,6 +76,27 @@ fn opens_what_the_browser_sealed_and_seals_what_it_opens() {
 	assert_eq!(&formats::open_with(&key, &b(&c["sealed"])).unwrap()[..], b"an attachment's bytes");
 	assert_eq!(&formats::open_text_with(&key, s(&c["sealedText"])).unwrap()[..], "한국어 문서");
 
+	// Chunked files (GC01): the browser's frames open whole and by span
+	let ch = &v["chunked"];
+	let chunk = ch["chunk"].as_u64().unwrap();
+	let plain = b(&ch["plain"]);
+	let sealed = b(&ch["sealed"]);
+	assert_eq!(chunked::sealed_size(plain.len() as u64, chunk), sealed.len() as u64, "sealed size arithmetic");
+	assert_eq!(&chunked::open_chunked(&key, &sealed, chunk).unwrap()[..], &plain[..], "chunked whole");
+	// The middle span (as a Range fetch would bring it) opens to those two
+	// whole frames' plaintext (frames 1..=2 cover plain bytes 64..192); the
+	// caller slices out the requested range in memory.
+	let span = chunked::frames_for(100, 40, plain.len() as u64, chunk);
+	let fetched = &sealed[span.start as usize..span.end as usize];
+	let opened = chunked::open_span(&key, fetched, span, plain.len() as u64, chunk).unwrap();
+	assert_eq!(&opened[..], &plain[64..192], "chunked span");
+	// A reordered frame fails (position is authenticated)
+	let frame = (chunk + chunked::FRAME_OVERHEAD) as usize;
+	let mut reordered = sealed.clone();
+	reordered[0..frame].copy_from_slice(&sealed[frame..frame * 2]);
+	reordered[frame..frame * 2].copy_from_slice(&sealed[0..frame]);
+	assert!(chunked::open_chunked(&key, &reordered, chunk).is_err(), "reordered frames must fail");
+
 	// Every unlock method opens the root (the hybrid bundle)
 	let root_bytes = b(&h["bundle"]);
 	let ms = methods(&v);
@@ -108,10 +130,18 @@ fn opens_what_the_browser_sealed_and_seals_what_it_opens() {
 
 	// What Rust sealed, for the TypeScript side (GORANI_RUST_OUT=<path>)
 	if let Ok(out_path) = std::env::var("GORANI_RUST_OUT") {
+		let mut rust_sealed = Vec::new();
+		let n = chunked::frame_count(plain.len() as u64, chunk);
+		for (i, frame) in plain.chunks(chunk as usize).enumerate() {
+			rust_sealed.extend_from_slice(&chunked::seal_chunk(&key, frame, i as u64, i as u64 == n - 1));
+		}
 		let out = json!({
 			"p256Sealed": STANDARD.encode(formats::seal(&p_pub, b"sealed by rust (GV01)")),
 			"hybridSealed": STANDARD.encode(formats::seal(&h_pub, b"sealed by rust (GV03)")),
 			"contentSealed": STANDARD.encode(formats::seal_with(&key, b"sealed by rust (GV02)")),
+			"chunkedSealed": STANDARD.encode(&rust_sealed),
+			"chunkedChunk": chunk,
+			"chunkedPlain": STANDARD.encode(&plain),
 			"textSealed": formats::seal_text(&h_pub, "러스트가 봉인한 이름.txt"),
 			"rewrapped": formats::wrap_content_key(&p_pub, &key),
 		});

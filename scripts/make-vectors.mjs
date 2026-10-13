@@ -74,8 +74,22 @@ const vectors = {
 	vectors.content.key = toBase64(key);
 	vectors.content.wrapped = await wrapContentKey(hybridPublic, key);
 	vectors.content.wrappedP256 = await wrapContentKey(p256.publicKey, key);
-	vectors.content.sealed = toBase64(await sealWith(await importContentKey(key), new TextEncoder().encode("an attachment's bytes")));
-	vectors.content.sealedText = await sealTextWith(await importContentKey(key), "한국어 문서");
+	const ck = await importContentKey(key);
+	vectors.content.sealed = toBase64(await sealWith(ck, new TextEncoder().encode("an attachment's bytes")));
+	vectors.content.sealedText = await sealTextWith(ck, "한국어 문서");
+
+	// A chunked file (GC01) under the same key, with a small chunk so there
+	// are several frames: the Rust side opens it whole and by span.
+	const { sealChunked, FRAME_OVERHEAD } = await import("../web/src/vault/chunked-file.ts");
+	const chunk = 64;
+	const plain = crypto.getRandomValues(new Uint8Array(200));
+	vectors.chunked = {
+		chunk,
+		plain: toBase64(plain),
+		sealed: toBase64(await sealChunked(ck, plain, chunk)),
+		size: plain.length,
+		chunkOverhead: FRAME_OVERHEAD,
+	};
 }
 
 // ── unlock methods: the hybrid root wrapped by every kind ───────────

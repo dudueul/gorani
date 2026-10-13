@@ -36,13 +36,13 @@ if (wantKind("rust")) {
 }
 
 if (wantKind("unit")) {
-	for (const f of fs.readdirSync(path.join(ROOT, "tests/unit")).filter((f) => f.endsWith(".test.mjs")).sort()) {
+	for (const f of fs.readdirSync(path.join(ROOT, "tests/unit")).filter((f) => f.endsWith(".test.mjs") || f.endsWith(".test.ts")).sort()) {
 		const r = spawnSync(process.execPath, [path.join(ROOT, "tests/unit", f)], { cwd: ROOT, encoding: "utf8" });
 		const ok = r.status === 0;
 		if (!ok) failures.push(`unit:${f}`);
 		const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
 		const failLines = out.split("\n").filter((l) => /Error|error:|AssertionError|expected|actual/.test(l)).slice(0, 10).join("\n    ");
-		console.log(`${ok ? "ok  " : "FAIL"} unit:${path.basename(f, ".test.mjs")}${ok ? "" : `\n    ${failLines}`}`);
+		console.log(`${ok ? "ok  " : "FAIL"} unit:${path.basename(f).replace(/\.test\.(mjs|ts)$/, "")}${ok ? "" : `\n    ${failLines}`}`);
 	}
 }
 
@@ -50,7 +50,7 @@ if (wantKind("unit")) {
 // worker build is cached after the first), URL handed over in GORANI_URL.
 if (wantKind("api")) {
 	const { suiteDev } = await import("./api/_dev.mjs");
-	for (const f of fs.readdirSync(path.join(ROOT, "tests/api")).filter((f) => f.endsWith(".test.mjs")).sort()) {
+	for (const f of fs.readdirSync(path.join(ROOT, "tests/api")).filter((f) => f.endsWith(".test.mjs") || f.endsWith(".test.ts")).sort()) {
 		const dev = await suiteDev();
 		try {
 			// Async spawn on purpose: the parent owns the S3 stub's event

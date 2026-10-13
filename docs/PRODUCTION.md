@@ -1,0 +1,70 @@
+# Production: deploying gorani (MinIO + Cloudflare)
+
+> Copyright 2026- Seongwoo Hong. All rights reserved.
+
+## 1. Object storage (MinIO)
+
+1. Run MinIO on your NAS, fronted by TLS (Caddy/nginx or MinIO's own cert
+   manager): `https://minio.example.com`. It must be publicly reachable —
+   the Worker signs requests to it over HTTPS.
+2. Create a bucket `gorani`, policy **private** (no anonymous access).
+3. Create a dedicated access key scoped to that bucket.
+
+`wrangler.jsonc` vars: `S3_ENDPOINT`, `S3_REGION` (any string MinIO
+accepts, e.g. `us-east-1`), `S3_BUCKET`. Secrets (`wrangler secret put`):
+`S3_ACCESS_KEY_ID`, `S3_SECRET_KEY`. The worker signs SigV4 with path-style
+addressing (`https://endpoint/bucket/key`) — verified against golden
+vectors in `crates/s3`.
+
+## 2. Cloudflare Access (the perimeter)
+
+1. Enable Access on the Worker (one-click modal or manual app).
+2. `wrangler secret put POLICY_AUD` and `TEAM_DOMAIN` from the modal — the
+   Worker verifies every request's JWT (issuer, audience, expiry, signature
+   against the team JWKS) and **fails closed** when they are missing.
+3. People: an Allow policy for the family (One-time PIN / GitHub / your
+   IdP). Each member's Access email is registered on their member row
+   (`POST /api/v1/family/members` with `emails`).
+4. **Bypass for the public share surface**: the Access application needs an
+   exception for `/s/*` (and `/s.html`) — the share pages authenticate with
+   the link's fragment secret, not Access. Same for `/api/healthz`.
+5. Desktop clients (commit ⑬): give each computer an Access **service
+   token** with a Service Auth policy — the client sends
+   `CF-Access-Client-Id/Secret`; the Worker receives the resulting JWT.
+
+## 3. Deploy
+
+```sh
+npm install && npm --prefix web install
+npm run deploy          # builds web/ + the Rust worker (worker-build)
+```
+
+First-run bootstrap: sign in through Access, `POST /api/v1/family/members`
+with your parent member (the first member is created by any authenticated
+caller), `PUT /api/v1/family/master` with the generated master public half,
+then create each vault from the UI (commit ⑨'s setup screen).
+
+## 4. Backups
+
+1. In the app, generate the backup key pair and **download the key file** —
+   the only copy of the private bundle; the server stores the public half.
+2. `POST /api/v1/members/<id>/backup/run` (daily via cron/worker alarm
+   later) writes `backups/<stamp>.gbak` — sealed twice over (the objects
+   are already GV-sealed; the GB1 container wraps them under a key only
+   your key file opens).
+3. Keep the key file offline. Losing it loses the backups, not the vault.
+
+## 5. Growth
+
+`GET /api/v1/members/<id>/vault-stats` reports `dbSize` — the Durable
+Object's SQLite size. Strategy: retention (built), the reserved
+`GoraniFilesDO` split, sharding — see `docs/ARCHITECTURE.md › Growth`.
+
+## 6. Known gaps
+
+- Password-protected share links: GS01's Argon2id path is built; the
+  packaged recipient page lands soon.
+- Worker request caps: uploads are chunked (8 MiB frames); a *restore* of
+  very large backups is client-driven for the same reason.
+- The backup job buffers one container in memory — right for family scale;
+  multipart streaming is the documented next step.

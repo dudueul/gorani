@@ -20,7 +20,7 @@ import { cargoCommand } from "./lib/cargo.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
-const kinds = args.filter((w) => ["unit", "rust", "api"].includes(w));
+const kinds = args.filter((w) => ["unit", "rust", "api", "e2e"].includes(w));
 const wantKind = (k) => !kinds.length || kinds.includes(k);
 const failures = [];
 
@@ -73,6 +73,21 @@ if (wantKind("api")) {
 		} finally {
 			if (dev) await dev.close();
 		}
+	}
+}
+
+// E2E suites: the real browser (Playwright's chromium). Each brings its own
+// dev server; the suite itself prints a skip and exits 0 when playwright is
+// not installed, so a browser-less checkout stays green.
+if (wantKind("e2e")) {
+	for (const f of fs.readdirSync(path.join(ROOT, "tests/e2e")).filter((f) => f.endsWith(".test.mjs") || f.endsWith(".test.ts")).sort()) {
+		const child = spawn(process.execPath, [path.join(ROOT, "tests/e2e", f)], { cwd: ROOT });
+		let out = "";
+		child.stdout.on("data", (d) => (out += d));
+		child.stderr.on("data", (d) => (out += d));
+		const ok = await new Promise((resolve) => child.on("exit", (code) => resolve(code === 0)));
+		if (!ok) failures.push(`e2e:${f}`);
+		console.log(`${ok ? "ok  " : "FAIL"} e2e:${path.basename(f, ".test.mjs")}${ok ? "" : `\n    ${out.split("\n").filter((l) => /Error|error:|AssertionError|expected|actual/.test(l)).slice(0, 10).join("\n    ")}`}`);
 	}
 }
 

@@ -129,15 +129,15 @@ export class GoraniShell extends LitElement {
 				}}>
 					${this.model
 						? this.mode === "win11"
-							? html`<gorani-win11 .model=${this.model} member-name=${this.member.name} member-role=${this.member.role}></gorani-win11>`
-							: html`<gorani-finder .model=${this.model} member-name=${this.member.name}></gorani-finder>`
+							? html`<gorani-win11 .model=${this.model} .memberName=${this.member.name} .memberRole=${this.member.role}></gorani-win11>`
+							: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
 						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
 				${this.viewer ? html`<gorani-viewer .model=${this.model} .target=${this.viewer} @closed=${() => (this.viewer = null)}></gorani-viewer>` : nothing}
 					${this.model
 						? this.mode === "win11"
-							? html`<gorani-win11 .model=${this.model} member-name=${this.member.name} member-role=${this.member.role}></gorani-win11>`
-							: html`<gorani-finder .model=${this.model} member-name=${this.member.name}></gorani-finder>`
+							? html`<gorani-win11 .model=${this.model} .memberName=${this.member.name} .memberRole=${this.member.role}></gorani-win11>`
+							: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
 						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
 				<div class="pointer-events-none fixed bottom-4 left-1/2 z-50 -translate-x-1/2 space-y-2">

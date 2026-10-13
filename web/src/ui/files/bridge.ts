@@ -11,6 +11,7 @@
  */
 
 import type { FilesBridge } from "./model.ts";
+import { devIdentityHeaders } from "../../lib/api.ts";
 import { openWith, unwrapContentKey, type VaultPrivateKey, type SealTarget } from "../../vault/vault-crypto.ts";
 import type { VaultSession } from "../../vault/session.ts";
 
@@ -40,7 +41,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		storePublic: () => store().then((s) => s.publicKey),
 
 		async fetchObject(memberId, id, version, range) {
-			const headers: Record<string, string> = {};
+			const headers: Record<string, string> = { ...devIdentityHeaders() };
 			if (range) headers.Range = `bytes=${range[0]}-${range[1]}`;
 			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`, { headers });
 			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
@@ -52,7 +53,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		},
 
 		async fetchObjectStream(memberId, id, version, sink) {
-			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`);
+			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`, { headers: devIdentityHeaders() });
 			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
 			const ck = res.headers.get("x-gorani-ck") ?? "";
 			const chunk = Number(res.headers.get("x-gorani-chunk")) || 0;
@@ -85,7 +86,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 
 		async putWhole(memberId, fields, sealed) {
 			const form = formBody(fields, sealed);
-			const res = await fetch(`/api/v1/members/${memberId}/files`, { method: "POST", headers: { "content-type": form.contentType }, body: form.body });
+			const res = await fetch(`/api/v1/members/${memberId}/files`, { method: "POST", headers: { ...devIdentityHeaders(), "content-type": form.contentType }, body: form.body });
 			await throwIfError(res);
 		},
 
@@ -97,7 +98,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 				const frame = sealed.subarray((p - 1) * (chunk + 28), Math.min(sealed.length, p * (chunk + 28)));
 				const res = await fetch(`/api/v1/members/${memberId}/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, {
 					method: "PUT",
-					headers: { "content-type": "application/octet-stream" },
+					headers: { ...devIdentityHeaders(), "content-type": "application/octet-stream" },
 					body: frame as unknown as BodyInit, // (TS 5.9 ArrayBufferLike vs ArrayBuffer — the bytes are the same)
 				});
 				await throwIfError(res);
@@ -106,7 +107,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 			const form = formBody({ ...fields, key: start.key, parts: JSON.stringify(parts) }, null);
 			const res = await fetch(`/api/v1/members/${memberId}/files/uploads/${start.uploadId}/complete`, {
 				method: "POST",
-				headers: { "content-type": form.contentType },
+				headers: { ...devIdentityHeaders(), "content-type": form.contentType },
 				body: form.body,
 			});
 			await throwIfError(res);
@@ -133,7 +134,7 @@ function formBody(fields: Record<string, string>, file: Uint8Array | null): { co
 async function fetchJson<T>(method: string, path: string, body?: unknown): Promise<T> {
 	const res = await fetch(path, {
 		method,
-		headers: body === undefined ? undefined : { "content-type": "application/json" },
+		headers: { ...devIdentityHeaders(), ...(body === undefined ? {} : { "content-type": "application/json" }) },
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
 	return throwIfError(res);

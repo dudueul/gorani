@@ -95,7 +95,7 @@ export class GoraniUnlock extends LitElement {
 						: html`
 								<input
 									class="w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2.5 text-sm outline-none focus:border-accent"
-									:type=${this.kind === "password" ? "password" : "text"}
+									.type=${this.kind === "password" ? "password" : "text"}
 									.placeholder=${this.kind === "password" ? "Password" : "Recovery code (XXXXX-XXXXX-…)"}
 									.value=${this.secret}
 									@input=${(e: InputEvent) => (this.secret = (e.target as HTMLInputElement).value)}

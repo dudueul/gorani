@@ -1,7 +1,7 @@
 # Tests as teaching material
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
-> The runner: `node tests/run.mjs` (unit / api / rust / live). Every suite's header states the behavior it proves; this doc teaches how to READ them — and how to write the next one.
+> The runner: `node tests/run.mjs` (rust / unit / api / e2e). Every suite's header states the behavior it proves; this doc teaches how to READ them — and how to write the next one.
 
 ## The exemplary pattern (every suite follows it)
 
@@ -32,6 +32,7 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `api:backup` | Key file (private never crosses the wire) → job → download → decrypt → restore round trip | the container the server cannot open |
 | `api:housekeeping` | Retention levers with forced clocks; the growth metric | bounding the unbounded |
 | `api:cron` | The nightly pass fired like production fires it: fan-out over the registry, backup prune to 7, the `cron` actor in the audit | maintenance without an identity |
+| `e2e:app` | The SPA in a real browser (Playwright): boot, in-browser vault setup, password + recovery unlock, a sealed upload through the file picker, the decrypted listing, the wrong-password refusal | the product surface, finally watched — non-extractable keys as shipped |
 | `api:client-live` | The REAL native binary: enrol, ls (opened names), zero-trust spot checks | two independent implementations agreeing over the wire |
 
 ## Writing the next suite (the house style)

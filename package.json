@@ -12,6 +12,8 @@
 		"test": "node tests/run.mjs"
 	},
 	"devDependencies": {
+		"playwright": "file:../../../../tmp/opencode/playwright-1.60.0.tgz",
+		"playwright-core": "file:../../../../tmp/opencode/playwright-core-1.60.0.tgz",
 		"wrangler": "^4.74.0"
 	}
 }

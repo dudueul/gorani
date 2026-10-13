@@ -43,6 +43,22 @@ export class GoraniApp extends LitElement {
 		return this;
 	}
 
+	// The screens live in the store; Lit re-renders only when told, so the
+	// subscription IS the wiring (caught by the browser e2e: without it the
+	// app renders "Loading…" forever — a fetch succeeds and nobody looks).
+	private unsub: (() => void) | null = null;
+
+	override connectedCallback(): void {
+		super.connectedCallback();
+		this.unsub = screen.subscribe(() => this.requestUpdate());
+	}
+
+	override disconnectedCallback(): void {
+		this.unsub?.();
+		this.unsub = null;
+		super.disconnectedCallback();
+	}
+
 	protected override async firstUpdated(): Promise<void> {
 		void this.boot();
 	}
@@ -71,9 +87,9 @@ export class GoraniApp extends LitElement {
 			case "choose":
 				return this.renderChoose(s.family);
 			case "locked":
-				return html`<gorani-unlock member-id=${s.member.id} member-name=${s.member.name} .settings=${s.settings} @unlocked=${(e: CustomEvent) => this.onUnlocked(s.member, e.detail)}></gorani-unlock>`;
+				return html`<gorani-unlock .memberId=${s.member.id} .memberName=${s.member.name} .settings=${s.settings} @unlocked=${(e: CustomEvent) => this.onUnlocked(s.member, e.detail)}></gorani-unlock>`;
 			case "setup":
-				return html`<gorani-setup member-id=${s.member.id} member-name=${s.member.name} @settings=${(e: CustomEvent) => screen.set({ at: "locked", member: s.member, settings: e.detail.settings })} @setup-done=${() => void this.bootMember(s.member)}></gorani-setup>`;
+				return html`<gorani-setup .memberId=${s.member.id} .memberName=${s.member.name} @settings=${(e: CustomEvent) => screen.set({ at: "locked", member: s.member, settings: e.detail.settings })} @setup-done=${() => void this.bootMember(s.member)}></gorani-setup>`;
 			case "unlocked":
 				return html`<gorani-shell .member=${s.member} .session=${s.session} .stay=${s.stay} @locked=${() => void this.bootMember(s.member)}></gorani-shell>`;
 		}

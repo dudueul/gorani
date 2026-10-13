@@ -34,6 +34,7 @@ export class GoraniSetup extends LitElement {
 	@state() private busy = false;
 	@state() private error = "";
 	@state() private recoveryCode: string | null = null;
+	@state() private lastSettings: VaultSettings | null = null;
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -48,7 +49,10 @@ export class GoraniSetup extends LitElement {
 						The recovery code is the only other way in if the password is forgotten. It is shown once; gorani cannot show it again.
 					</p>
 					<code class="mt-3 block select-all rounded-xl bg-neutral-950 p-3 text-center text-sm tracking-widest text-accent">${this.recoveryCode}</code>
-					<button class="mt-4 w-full rounded-xl bg-accent px-4 py-2.5 font-medium text-neutral-950 hover:opacity-90" @click=${() => this.dispatchEvent(new CustomEvent("setup-done", { bubbles: true, composed: true }))}>
+					<button class="mt-4 w-full rounded-xl bg-accent px-4 py-2.5 font-medium text-neutral-950 hover:opacity-90" @click=${() => {
+						this.dispatchEvent(new CustomEvent("settings", { detail: { settings: this.lastSettings }, bubbles: true, composed: true }));
+						this.dispatchEvent(new CustomEvent("setup-done", { bubbles: true, composed: true }));
+					}}>
 						I wrote it down
 					</button>
 				</section>
@@ -95,7 +99,11 @@ export class GoraniSetup extends LitElement {
 			const res = await api.put<{ keyId: string }>(`/api/v1/members/${this.memberId}/vault`, { settings: bundle.settings });
 			if (res.keyId !== bundle.keyId) throw new Error("the server did not keep the settings it was given");
 			this.recoveryCode = bundle.recoveryCode;
-			this.dispatchEvent(new CustomEvent("settings", { detail: { settings: bundle.settings }, bubbles: true, composed: true }));
+			this.lastSettings = bundle.settings;
+			// (The "settings" event waits for the button below: the code is
+			// shown ONCE, and the app must not leave this screen before the
+			// member has seen it — caught by the browser e2e, which found the
+			// event firing on save and skipping the code screen entirely.)
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {

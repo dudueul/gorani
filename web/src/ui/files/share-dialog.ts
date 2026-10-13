@@ -17,6 +17,7 @@ import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta } from "../../vault/share-crypto.ts";
 import { sealChunked, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
+import { devIdentityHeaders } from "../../lib/api.ts";
 import { sealText } from "../../vault/vault-crypto.ts";
 import type { FilesModel } from "./model.ts";
 
@@ -146,7 +147,7 @@ export class GoraniShare extends LitElement {
 			for (let p = 1; p <= frames; p++) {
 				const res = await fetch(`/api/v1/members/${this.model.memberId}/files/shares/${id}/parts/${p}`, {
 					method: "PUT",
-					headers: { "content-type": "application/octet-stream" },
+					headers: { ...devIdentityHeaders(), "content-type": "application/octet-stream" },
 					body: copy.subarray((p - 1) * frame, Math.min(copy.length, p * frame)) as unknown as BodyInit,
 				});
 				if (!res.ok) throw new Error(`part ${p} refused (${res.status})`);

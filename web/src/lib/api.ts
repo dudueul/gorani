@@ -7,6 +7,21 @@
  * UI decides what to show.
  */
 
+/**
+ * Dev identity: in `GORANI_DEV=1` deployments the Worker accepts this
+ * header the way it accepts Access's JWT in production — and production
+ * ignores it entirely (Access owns identity there), so attaching it when
+ * the developer set it is always safe. Set once per browser profile:
+ *   localStorage.setItem("gorani-dev-email", "you@family.test")
+ * Shared by every fetch the app makes (the files transport included — a
+ * missed one shows up as a mysterious 401 mid-session; the browser e2e
+ * caught exactly that).
+ */
+export function devIdentityHeaders(): Record<string, string> {
+	const email = localStorage.getItem("gorani-dev-email");
+	return email ? { "x-gorani-dev-email": email } : {};
+}
+
 export class ApiError extends Error {
 	constructor(
 		readonly status: number,
@@ -17,11 +32,8 @@ export class ApiError extends Error {
 }
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
-	const res = await fetch(path, {
-		method,
-		headers: body === undefined ? undefined : { "content-type": "application/json" },
-		body: body === undefined ? undefined : JSON.stringify(body),
-	});
+	const headers: Record<string, string> = { ...devIdentityHeaders(), ...(body === undefined ? {} : { "content-type": "application/json" }) };
+	const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
 	const text = await res.text();
 	let json: unknown = null;
 	try {

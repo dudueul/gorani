@@ -56,7 +56,7 @@ const INFO_V1: &[u8] = b"gorani-vault-v1";
 const INFO_V3: &[u8] = b"gorani-vault-v3";
 const EPH_LEN: usize = 65;
 const NONCE_LEN: usize = 12;
-const TAG_LEN: usize = 16;
+pub(crate) const TAG_LEN: usize = 16;
 const KEM_CT_LEN: usize = 1088;
 const KEM_PK_LEN: usize = 1184;
 const KEM_SEED_LEN: usize = 64;
@@ -351,6 +351,12 @@ pub fn open_text_with(key: &[u8; 32], value: &str) -> Result<Zeroizing<String>, 
 pub fn wrap_content_key(public: &VaultPublicKey, key: &[u8; 32]) -> String {
 	let b64 = Zeroizing::new(STANDARD.encode(key));
 	seal_text(public, &b64)
+}
+
+/// A content key as an AES cipher handle for direct sealing (the TS module's
+/// importContentKey twin — bytes in, Aes256Gcm out, via seal_with/open_with).
+pub fn import_content_key(raw: &ContentKey) -> [u8; 32] {
+	**raw
 }
 
 pub fn unwrap_content_key(private: &VaultPrivateKey, sealed: &str) -> Result<ContentKey, Error> {

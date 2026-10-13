@@ -61,3 +61,31 @@ private; the Worker holds its S3 keys in secrets; clients never see them.
 - No third-party origins anywhere: no CDN fonts, no analytics, no remote images.
 - No DRM: family content is end-to-end encrypted; the MSE player plays
   bytes the family's own devices decrypted.
+## Growth (the 10 GB question)
+
+A member DO holds **metadata only** — file bytes live in S3/MinIO. What
+grows: rows (~1 KB per file-version), the change-feed journal, audit,
+music/video meta. The levers, in order:
+
+1. **Retention** (landed, commit 13): the journal is pruned by age (180
+   days = the restore window), audit is capped, trash purges (objects go
+   from S3), dead share copies removed. `housekeeping` takes forced clocks
+   for tests; the stats endpoint reports `database_size()`.
+2. **Fat blobs move out** (when needed): music/video meta sidecars become
+   sealed S3 objects with pointer rows.
+3. **The reserved split — `GoraniFilesDO`**: a member's file store moves to
+   its own DO (`files:<member>`: rows, folders, versions, journal,
+   secrets — the change feed lives with them); the member DO keeps vault,
+   devices, shares, audit. First-use copy migration; routes resolve two
+   stubs. The feed + cursor design makes the split clean.
+4. **Horizontal sharding** (rare): file rows across N DOs by id hash, with
+   per-shard feed cursors merged at read (Mailflare's per-shard pattern).
+5. **External SQL (PlanetScale/D1) is the last resort**: the sync design
+   rests on SQLite triggers + a single-writer counter transactionally
+   colocated with every row write; external SQL turns that into
+   application logic over HTTP (10–100 ms/query vs zero), adds a vendor to
+   the trust surface, and buys capacity sharding already provides. It
+   becomes right only for multi-tenant SaaS (central registry in SQL) or
+   tens-of-GB-per-member metadata.
+
+Decision input: the stats endpoint's `dbSize` — measured, not assumed.

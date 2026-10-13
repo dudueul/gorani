@@ -55,6 +55,15 @@ export class GoraniShell extends LitElement {
 
 	private async setupExplorer(): Promise<void> {
 		{
+			// The media service worker: scope /media/ ONLY (the app's own
+			// requests never pass through it — see public/sw-media.js).
+			if (typeof navigator !== "undefined" && navigator.serviceWorker) {
+				try {
+					await navigator.serviceWorker.register("/sw-media.js", { scope: "/media/" });
+				} catch (e) {
+					console.warn("media worker unavailable:", e);
+				}
+			}
 			// The local index: opened with the session's indexKey (derived from
 			// the root — the unlock ceremony gates it), fed by the model,
 			// persisted as ciphertext. The server never sees a query.

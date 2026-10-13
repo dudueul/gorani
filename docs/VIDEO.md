@@ -69,10 +69,20 @@ in NOTICE.
 
 ## Status
 
-- ⑩a (this commit): the viewer plays images, text/code, and audio/video
-  from the decrypted blob — seeking inside the downloaded blob works
-  because GC1 frames open independently; ≤256 MB inline.
-- ⑩b (next): vendor `crates/media` → WASM; build `.hlsmeta` at upload; the
-  MSE player reads the sidecar and streams ranges; the sidecar routes.
-  The design above is the contract; the wire formats are shared with
-  stream-worker's `index.json` shape where they agree.
+- ⑩a: the viewer plays images, text/code, and audio/video from the
+  decrypted blob — seeking inside the downloaded blob works because GC1
+  frames open independently; ≤256 MB inline.
+- ⑩b (landed): **streaming playback through a scoped service worker** —
+  the browser's own `<video>` player drives; the worker (scope /media/
+  ONLY, so the app's requests never pass through it — Mailflare's iOS
+  pass-through lesson) answers Range requests with decrypted plaintext:
+  `gorani-media-lib.js` maps a plaintext range to whole GC01 frames, one
+  ciphertext range fetch, frame-by-frame decrypt (the content key rides
+  from the page as a cloned, still non-extractable CryptoKey), honest 206
+  headers. Multi-GB files seek without downloading; no MSE, no box
+  surgery, no DRM. The frame math is imported by the worker AND tested in
+  Node from the same file.
+- ⑩b-next: the `.hlsmeta` sidecar (mp4-hls-core → WASM) as an
+  *optimization* on top — keyframe-accurate prefetch and instant seek
+  hints; the streaming path above works without it, because the browser
+  parses the MP4 itself.

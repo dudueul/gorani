@@ -40,6 +40,7 @@ export class GoraniViewer extends LitElement {
 
 	@state() private mode: ViewerMode = "unsupported";
 	@state() private url: string | null = null;
+	@state() private streamed = false;
 	@state() private text: string | null = null;
 	@state() private truncated = false;
 	@state() private busy = true;
@@ -55,7 +56,7 @@ export class GoraniViewer extends LitElement {
 
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
-		if (this.url) URL.revokeObjectURL(this.url);
+		if (this.url && !this.streamed) URL.revokeObjectURL(this.url);
 	}
 
 	private async load(): Promise<void> {
@@ -77,10 +78,24 @@ export class GoraniViewer extends LitElement {
 					this.truncated = head.bytes.length >= TEXT_CAP && (info?.size ?? 0) > TEXT_CAP;
 					this.text = new TextDecoder().decode(head.bytes.subarray(0, TEXT_CAP));
 				}
+			} else if ((this.mode === "video" || this.mode === "audio") && (info?.size ?? 0) > 8 * 1024 * 1024) {
+				// Streaming path: the scoped media worker serves decrypted
+				// ranges; the browser's player seeks natively. Only for larger
+				// media — small ones are simpler as blobs.
+				const handle = await this.model.mediaHandle(id);
+				if (handle) {
+					this.streamed = true;
+					this.url = handle.url;
+					return;
+				}
+				const parts: Uint8Array[] = [];
+				await this.model.openBytes(id, this.target.version, (plain) => { parts.push(plain); });
+				this.url = URL.createObjectURL(new Blob([concat(parts) as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
 			} else {
 				const parts: Uint8Array[] = [];
 				await this.model.openBytes(id, this.target.version, (plain) => {
 					parts.push(plain);
+					return Promise.resolve();
 				});
 				const whole = concat(parts);
 				const url = URL.createObjectURL(new Blob([whole as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
@@ -117,7 +132,7 @@ export class GoraniViewer extends LitElement {
 			case "image":
 				return this.url ? html`<img class="max-h-full max-w-full rounded-lg object-contain shadow-2xl" src=${this.url} alt=${this.target.name} />` : this.unknown();
 			case "video":
-				return this.url ? html`<video class="max-h-full max-w-full rounded-lg shadow-2xl" src=${this.url} controls autoplay></video>` : this.unknown();
+				return this.url ? html`<video class="max-h-full max-w-full rounded-lg shadow-2xl" src=${this.url} controls ${this.streamed ? nothing : html`autoplay`}></video>` : this.unknown();
 			case "audio":
 				return this.url
 					? html`<div class="w-full max-w-xl rounded-2xl bg-neutral-900 p-8 text-center shadow-2xl">

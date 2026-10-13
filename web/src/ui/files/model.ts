@@ -452,6 +452,32 @@ export class FilesModel {
 		return { bytes: plain.subarray(0, maxBytes), name: row.name, mime };
 	}
 
+	// ── streaming playback (the media service worker) ───────────────────
+
+	/** A playable URL for a video/audio file: the scoped media service
+	 * worker answers the browser's native Range requests with decrypted
+	 * plaintext (the content key is handed over as a cloned, still
+	 * non-extractable CryptoKey). Returns null where service workers are
+	 * unavailable — the viewer falls back to the decrypted blob. */
+	async mediaHandle(id: string): Promise<{ url: string } | null> {
+		if (typeof navigator === "undefined" || !navigator.serviceWorker) return null;
+		const keys = await this.bridge.apiGet<{ keys: Record<string, { key: string; chunk: number | null }> }>(`/api/v1/members/${this.memberId}/files/keys`);
+		const meta = keys.keys[id];
+		if (!meta) return null;
+		const s = this.state.get();
+		const row = s.files.find((f) => f.id === id);
+		if (!row) return null;
+		const priv = await this.bridge.storePrivate();
+		const key = await unwrapContentKey(priv, meta.key);
+		const url = `/media/${id}`;
+		await navigator.serviceWorker.ready;
+		const reg = await navigator.serviceWorker.getRegistration("/media/");
+		const target = reg?.active ?? (await navigator.serviceWorker.ready).active;
+		if (!target) return null;
+		target.postMessage({ type: "media", url, memberId: this.memberId, fileId: id, key, chunk: meta.chunk, size: row.size });
+		return { url };
+	}
+
 	// ── clipboard ───────────────────────────────────────────────────────
 
 	copy(): void {

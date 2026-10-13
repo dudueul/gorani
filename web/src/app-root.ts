@@ -1,63 +1,128 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 
-//! <gorani-app>: the application shell.
-//!
-//! What you see now is the lock screen — the state the app starts in. The
-//! unlock flow arrives at commit ⑨ (passkey PRF / Argon2id password /
-//! recovery code, exactly as docs/VAULT.md will describe); until then this
-//! component demonstrates the house rules every Gorani component follows:
-//!
-//!  1. **No Shadow DOM.** `createRenderRoot()` returns the element itself,
-//!     so the one global Tailwind stylesheet applies (see global.css).
-//!  2. **No strings-turned-HTML.** Lit's `html` tagged template escapes by
-//!     default and is Trusted-Types compatible — the only way markup is
-//!     built here. `innerHTML` never appears in this codebase.
-//!  3. **State lives outside components.** Components read stores and
-//!     re-render; the stores (src/lib/store.ts, commit ⑨) are plain,
-//!     testable TypeScript. This component holds none for now.
-//!  4. **Every file teaches.** Headers like this one say what the file is,
-//!     why it exists and where it is going next (docs/COURSE.md tracks it).
+/**
+ * <gorani-app>: the application shell and its four screens.
+ *
+ * ```text
+ * loading ──▶ locked ──▶ unlocked ──┐
+ *              │                    │ lock (button, auto-lock, visibility)
+ *              └──▶ setup ──────────┘
+ * ```
+ *
+ * The state machine is a small store (src/lib/store.ts); components read it
+ * and re-render. The vault session is the only precious state in the app, and
+ * it lives in exactly one variable here — the shell drops it on lock and
+ * hands it to the explorer (next commit) as a read-only dependency.
+ */
 
-import { LitElement, html } from "lit";
-import { customElement } from "lit/decorators.js";
+import { LitElement, html, nothing } from "lit";
+import { customElement, state } from "lit/decorators.js";
+import { store } from "./lib/store.ts";
+import { api, type FamilyState, type Member } from "./lib/api.ts";
+import type { VaultSettings } from "./vault/methods.ts";
+import type { VaultSession } from "./vault/session.ts";
+import { watchAutoLock } from "./vault/session.ts";
+import "./ui/unlock.ts";
+import "./ui/setup.ts";
+import "./ui/shell.ts";
+
+type Screen =
+	| { at: "loading" }
+	| { at: "error"; message: string }
+	| { at: "choose"; family: FamilyState }
+	| { at: "locked"; member: Member; settings: VaultSettings }
+	| { at: "setup"; member: Member }
+	| { at: "unlocked"; member: Member; session: VaultSession; stay: boolean };
+
+const screen = store<Screen>({ at: "loading" });
 
 @customElement("gorani-app")
 export class GoraniApp extends LitElement {
-	// Rule 1: no Shadow DOM, so Tailwind's global utilities apply.
+	// Rule 1: no Shadow DOM, so the global Tailwind stylesheet applies.
 	protected override createRenderRoot(): HTMLElement {
 		return this;
 	}
 
-	protected override render() {
-		return html`
-			<div class="flex h-full flex-col items-center justify-center gap-6 px-6">
-				<header class="text-center">
-					<h1 class="text-4xl font-semibold tracking-tight text-accent">Gorani</h1>
-					<p class="mt-2 text-neutral-400">The family's encrypted NAS.</p>
-				</header>
+	protected override async firstUpdated(): Promise<void> {
+		void this.boot();
+	}
 
-				<!-- The vault lock screen placeholder: the real unlock (passkey
-				     first) replaces this at commit ⑨. -->
-				<section
-					class="w-full max-w-sm rounded-2xl border border-neutral-800 bg-neutral-900 p-6 text-center shadow-xl"
-					aria-label="Vault locked"
-				>
-					<p class="text-sm text-neutral-300">
-						The vault is locked. Contents stay sealed — the server holds
-						ciphertext only.
-					</p>
-					<button
-						class="mt-4 w-full rounded-xl bg-accent px-4 py-2.5 font-medium text-neutral-950 hover:opacity-90"
-						disabled
-						title="Unlock arrives with the vault commit"
-					>
-						Unlock
-					</button>
-					<p class="mt-3 text-xs text-neutral-500">
-						Commit ① scaffold · <a class="underline" href="/api/healthz">/api/healthz</a>
-					</p>
-				</section>
-			</div>
+	private async boot(): Promise<void> {
+		try {
+			const family = await api.get<FamilyState>("/api/v1/family");
+			const active = family.members.filter((m) => m.active);
+			if (!active.length) {
+				screen.set({ at: "error", message: "No members yet — the first member is created by the family admin (a parent signs in first)." });
+				return;
+			}
+			screen.set({ at: "choose", family });
+		} catch (e) {
+			screen.set({ at: "error", message: e instanceof Error ? e.message : String(e) });
+		}
+	}
+
+	protected override render() {
+		const s = screen.get();
+		switch (s.at) {
+			case "loading":
+				return html`<div class="flex h-full items-center justify-center text-neutral-500">Loading…</div>`;
+			case "error":
+				return html`<div class="flex h-full items-center justify-center px-6"><p class="max-w-md text-center text-red-400">${s.message}</p></div>`;
+			case "choose":
+				return this.renderChoose(s.family);
+			case "locked":
+				return html`<gorani-unlock member-id=${s.member.id} member-name=${s.member.name} .settings=${s.settings} @unlocked=${(e: CustomEvent) => this.onUnlocked(s.member, e.detail)}></gorani-unlock>`;
+			case "setup":
+				return html`<gorani-setup member-id=${s.member.id} member-name=${s.member.name} @settings=${(e: CustomEvent) => screen.set({ at: "locked", member: s.member, settings: e.detail.settings })} @setup-done=${() => void this.bootMember(s.member)}></gorani-setup>`;
+			case "unlocked":
+				return html`<gorani-shell .member=${s.member} .session=${s.session} .stay=${s.stay} @locked=${() => void this.bootMember(s.member)}></gorani-shell>`;
+		}
+	}
+
+	private renderChoose(family: FamilyState) {
+		const active = family.members.filter((m) => m.active);
+		return html`
+			<section class="w-full max-w-sm rounded-2xl border border-neutral-800 bg-neutral-900 p-6 shadow-xl">
+				<h2 class="text-lg font-medium">Who's opening?</h2>
+				<ul class="mt-3 space-y-2">
+					${active.map(
+						(m) => html`
+							<li>
+								<button class="w-full rounded-xl border border-neutral-700 px-3 py-2.5 text-left text-sm hover:border-accent" @click=${() => void this.bootMember(m)}>
+									${m.name} <span class="text-neutral-500">· ${m.role}</span>
+								</button>
+							</li>
+						`,
+					)}
+				</ul>
+			</section>
 		`;
 	}
+
+	private async bootMember(member: Member): Promise<void> {
+		screen.set({ at: "loading" });
+		try {
+			const settings = await api.get<VaultSettings | null>(`/api/v1/members/${member.id}/vault`);
+			if (!settings || !settings.methods?.length) {
+				screen.set({ at: "setup", member });
+				return;
+			}
+			// A reload inside the device-hold window opens by itself.
+			const { GoraniUnlock } = await import("./ui/unlock.ts");
+			const fromHold = await GoraniUnlock.fromHold(member.id, settings);
+			if (fromHold) {
+				screen.set({ at: "unlocked", member, session: fromHold.session, stay: true });
+				return;
+			}
+			screen.set({ at: "locked", member, settings });
+		} catch (e) {
+			screen.set({ at: "error", message: e instanceof Error ? e.message : String(e) });
+		}
+	}
+
+	private onUnlocked(member: Member, detail: { session: VaultSession; stay: boolean }): void {
+		screen.set({ at: "unlocked", member, session: detail.session, stay: detail.stay });
+	}
 }
+
+export { screen };

@@ -19,6 +19,8 @@ import { newContentKey, importContentKey, sealText, openText, sealWith, openWith
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { kindOf, type FileKind } from "./icons.ts";
+import type { LocalIndexLike } from "../../vault/index.ts";
+import type { IndexEntry } from "../../vault/index-engine.ts";
 
 export interface FolderRow {
 	id: string;
@@ -98,12 +100,15 @@ export class FilesModel {
 	private readonly listeners = new Set<() => void>();
 
 	readonly memberId: string;
+	/** The local index, if the shell opened one (search/recents, no server). */
+	readonly index?: LocalIndexLike;
 
 	private readonly bridge: FilesBridge;
 
-	constructor(bridge: FilesBridge, memberId: string) {
+	constructor(bridge: FilesBridge, memberId: string, index?: LocalIndexLike) {
 		this.bridge = bridge;
 		this.memberId = memberId;
+		this.index = index;
 		this.state = store<FilesState>({ folderId: null, folders: [], files: [], selection: [], sort: { by: "name", dir: "asc" }, loading: false, error: null, trashMode: false, trashFiles: [], trashFolders: [] });
 	}
 
@@ -509,6 +514,15 @@ export class FilesModel {
 			const since = this.cursor;
 			const feed = await this.bridge.apiGet<{ cursor: number; changes: { seq: number; kind: string; data: unknown }[] }>(`/api/v1/members/${this.memberId}/files/changes?since=${since}&limit=500`);
 			this.cursor = feed.cursor;
+			// The index follows the feed's tombstones: trashed and purged
+			// entries leave the search results exactly as they leave the lists.
+			const gone: string[] = [];
+			for (const c of feed.changes) {
+				const d = c.data as { id?: string; file?: { id?: string; deleted?: boolean } };
+				if ((c.kind === "file.put" && d.file?.deleted && d.file.id) || c.kind === "file.purge") gone.push(d.file?.id ?? d.id ?? "");
+				if ((c.kind === "folder.put" && (d as { folder?: { deleted?: boolean } }).folder?.deleted && (d as { folder?: { id?: string } }).folder?.id) || c.kind === "folder.purge") gone.push((d as { id?: string }).id ?? "");
+			}
+			this.index?.remove(gone.filter(Boolean));
 			if (feed.changes.length) await this.refresh();
 		} catch {
 			// offline — the next poll retries

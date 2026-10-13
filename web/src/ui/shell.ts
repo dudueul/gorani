@@ -15,6 +15,7 @@ import { watchAutoLock, type VaultSession } from "../vault/session.ts";
 import { FilesModel } from "./files/model.ts";
 import { sessionBridge } from "./files/bridge.ts";
 import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
+import { LocalIndex } from "../vault/index.ts";
 import "./files/win11.ts";
 import "./files/finder.ts";
 
@@ -26,6 +27,15 @@ export class GoraniShell extends LitElement {
 
 	@state() private mode: PlatformMode = loadMode();
 	private model: FilesModel | null = null;
+	private index: import("../vault/index.ts").LocalIndex | null = null;
+
+	override disconnectedCallback(): void {
+		super.disconnectedCallback();
+		// Locking/unmounting: the index worker's memory (decrypted names)
+		// dies here, after one last encrypted snapshot to IndexedDB.
+		void this.index?.close();
+		this.index = null;
+	}
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -36,6 +46,20 @@ export class GoraniShell extends LitElement {
 			// The auto-lock clock: 10 minutes hidden — the same window the
 			// device hold promises.
 			watchAutoLock(this.session, 10);
+			void this.setupExplorer();
+		}
+	}
+
+	private async setupExplorer(): Promise<void> {
+		{
+			// The local index: opened with the session's indexKey (derived from
+			// the root — the unlock ceremony gates it), fed by the model,
+			// persisted as ciphertext. The server never sees a query.
+			try {
+				this.index = await LocalIndex.open(this.member.id, await this.session.indexKey);
+			} catch (e) {
+				console.warn("local index unavailable:", e);
+			}
 			// The explorer's model: bridge = the session's non-extractable keys.
 			this.model = new FilesModel(sessionBridge(this.session, {
 				confirmDuplicate: async (count) =>
@@ -43,7 +67,7 @@ export class GoraniShell extends LitElement {
 						? "keep"
 						: "skip",
 				toast: (m) => this.toast(m),
-			}), this.member.id);
+			}), this.member.id, this.index ?? undefined);
 			window.__goraniMember = this.member.id;
 			void this.model.open();
 			void this.requestUpdate();

@@ -39,6 +39,11 @@ export class GoraniFinder extends LitElement {
 	@state() private v = 0;
 	@state() private renaming: Selection | null = null;
 	@state() private query = "";
+	@state() private searchHits: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; size?: number }[] | null = null;
+	@state() private recentsMode = false;
+	@state() private recentRows: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; updatedAt: number; size?: number }[] = [];
+	private typeBuffer = "";
+	private typeTimer: ReturnType<typeof setTimeout> | undefined;
 	@state() private quickLook: { id: string; name: string; url?: string; text?: string; kind: FileKind; meta?: { size: number; version: number; updatedAt: string } } | null = null;
 	@state() private info: Awaited<ReturnType<FilesModel["info"]>> = null;
 	/** Column view: the walked path of folders + the deepest selection. */
@@ -167,6 +172,32 @@ export class GoraniFinder extends LitElement {
 
 	// ── keyboard (the Finder grammar) ───────────────────────────────────
 
+	private async onSearch(q: string): Promise<void> {
+		this.query = q;
+		if (q.trim().length < 2 || !this.model.index) {
+			this.searchHits = null;
+			return;
+		}
+		const hits = await this.model.index.search(q, 40);
+		this.searchHits = hits.map((h) => ({ id: h.id, kind: h.kind, folderId: h.folderId, name: h.name, size: h.size }));
+	}
+
+	private async jumpTo(hit: { id: string; kind: "file" | "folder"; folderId: string | null; name: string }): Promise<void> {
+		this.searchHits = null;
+		this.query = "";
+		this.recentsMode = false;
+		if (this.view === "column") this.columnPath = [];
+		await this.model.setFolder(hit.kind === "folder" ? hit.id : hit.folderId);
+		if (hit.kind === "file") this.model.select({ kind: "file", id: hit.id });
+	}
+
+	private async showRecents(): Promise<void> {
+		this.recentsMode = true;
+		this.recentRows = this.model.index ? await this.model.index.recents(40) : [];
+		this.v++;
+		await this.requestUpdate();
+	}
+
 	private onKeydown(e: KeyboardEvent): void {
 		if (this.renaming || this.quickLook) {
 			if (this.quickLook && (e.key === "Escape" || e.key === " " || e.key === "q")) {
@@ -235,6 +266,18 @@ export class GoraniFinder extends LitElement {
 			case "v":
 				if (cmd) void this.model.paste();
 				return;
+			default:
+				// Type-to-jump (Finder's muscle memory too).
+				if (e.key.length === 1 && !cmd && !e.altKey && !e.ctrlKey) {
+					this.typeBuffer = (this.typeBuffer + e.key.toLowerCase()).slice(-16);
+					clearTimeout(this.typeTimer);
+					this.typeTimer = setTimeout(() => (this.typeBuffer = ""), 500);
+					const fileHit = files.find((x) => x.name.toLowerCase().startsWith(this.typeBuffer));
+					const folderHit = folders.find((x) => x.name.toLowerCase().startsWith(this.typeBuffer));
+					const hit = folderHit ?? fileHit;
+					if (hit) this.model.select({ kind: folderHit ? "folder" : "file", id: hit.id }, { add: false });
+				}
+				return;
 		}
 	}
 
@@ -301,7 +344,7 @@ export class GoraniFinder extends LitElement {
 					${this.sidebar()}
 					<div class="flex min-w-0 flex-1 flex-col">
 						<div data-body class="relative min-h-0 flex-1 overflow-auto outline-none" @pointerdown=${(e: PointerEvent) => this.onBodyPointerDown(e)}>
-							${this.view === "icon" ? this.iconView(folders, files) : this.view === "list" ? this.listView(folders, files) : this.columnView()}
+							${this.recentsMode ? this.recentsBody() : this.view === "icon" ? this.iconView(folders, files) : this.view === "list" ? this.listView(folders, files) : this.columnView()}
 						</div>
 						${this.pathBar()}
 					</div>
@@ -326,7 +369,23 @@ export class GoraniFinder extends LitElement {
 				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800" @click=${() => void this.newFolder()}>＋ New Folder</button>
 				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800 disabled:opacity-40" ?disabled=${!this.selection().length} @click=${() => void this.deleteSelection()}>🗑</button>
 				<div class="flex-1"></div>
-				<input class="w-56 rounded-lg bg-neutral-950 px-3 py-1.5 text-sm outline-none placeholder:text-neutral-600 focus:ring-1 focus:ring-accent" placeholder="Search" .value=${this.query} @input=${(e: InputEvent) => (this.query = (e.target as HTMLInputElement).value)} />
+				<div class="relative">
+					<input class="w-56 rounded-lg bg-neutral-950 px-3 py-1.5 text-sm outline-none placeholder:text-neutral-600 focus:ring-1 focus:ring-accent" placeholder="Search (local index)" .value=${this.query} @input=${(e: InputEvent) => void this.onSearch((e.target as HTMLInputElement).value)} />
+					${this.searchHits
+						? html`<div class="absolute right-0 top-9 z-40 max-h-96 w-96 overflow-y-auto rounded-xl border border-neutral-700 bg-neutral-900/95 p-1.5 shadow-2xl backdrop-blur">
+								${this.searchHits.map(
+									(h) => html`
+										<button class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm hover:bg-neutral-800" @click=${() => void this.jumpTo(h)}>
+											${icon(h.kind === "folder" ? "folder" : "file", "h-4 w-4 shrink-0 text-neutral-400")}
+											<span class="min-w-0 flex-1 truncate text-neutral-100">${h.name}</span>
+											<span class="shrink-0 text-xs text-neutral-500">${h.kind === "folder" ? "Folder" : fmtSize(h.size ?? 0)}</span>
+										</button>
+									`,
+								)}
+								${!this.searchHits.length ? html`<p class="p-3 text-center text-xs text-neutral-500">Nothing in the index yet</p>` : nothing}
+							</div>`
+						: nothing}
+				</div>
 			</div>
 		`;
 	}
@@ -340,6 +399,8 @@ export class GoraniFinder extends LitElement {
 				<p class="px-2 pb-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Favorites</p>
 				${fav("Home", "🏠", s.folderId === null && !s.trashMode, () => void this.model.closeTrash())}
 				${s.folders.filter((f) => !f.parent).map((f) => fav(f.name, "📁", s.folderId === f.id && !s.trashMode, () => void this.model.setFolder(f.id)))}
+				<p class="px-2 pt-3 pb-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Recents</p>
+				${fav("Recent files", "⏱", this.recentsMode, () => void this.showRecents())}
 				<p class="px-2 pt-3 pb-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Locations</p>
 				${fav("Trash", "🗑", s.trashMode, () => void this.model.openTrash())}
 			</aside>
@@ -470,6 +531,27 @@ export class GoraniFinder extends LitElement {
 				<p class="mt-3 truncate font-medium">${row?.name ?? ""}</p>
 				${row ? html`<p class="mt-1 text-xs text-neutral-400">${kindLabel(row.kind)} · ${fmtSize(row.size)}</p>` : nothing}
 				<button class="mt-3 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.quickLookOn(id)}>Quick Look (space)</button>
+			</div>
+		`;
+	}
+
+	/** Recents (fed by the local index, no server). */
+	private recentsBody(): TemplateResult {
+		const rows = this.recentRows;
+		return html`
+			<div class="p-3 text-sm">
+				<p class="px-1 pb-2 text-xs uppercase tracking-wide text-neutral-500">Recently touched on this device — from the local index</p>
+				${rows.map(
+					(r) => html`
+						<button class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left hover:bg-neutral-800/60" @click=${() => void this.jumpTo(r)}>
+							${icon(r.kind === "folder" ? "folder" : "file", "h-5 w-5 text-neutral-400")}
+							<span class="min-w-0 flex-1 truncate">${r.name}</span>
+							${r.size !== undefined ? html`<span class="text-xs text-neutral-400">${fmtSize(r.size)}</span>` : nothing}
+							<span class="text-xs text-neutral-500">${fmtDate(new Date(r.updatedAt).toISOString())}</span>
+						</button>
+					`,
+				)}
+				${!rows.length ? html`<p class="py-16 text-center text-sm text-neutral-500">Nothing indexed yet — browse a folder first.</p>` : nothing}
 			</div>
 		`;
 	}

@@ -43,6 +43,10 @@ export class GoraniWin11 extends LitElement {
 	@state() private expanded = new Set<string>();
 	@state() private renaming: Selection | null = null;
 	@state() private query = "";
+	@state() private searchHits: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; size?: number }[] | null = null;
+	@state() private recentsMode = false;
+	private typeBuffer = "";
+	private typeTimer: ReturnType<typeof setTimeout> | undefined;
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -216,6 +220,34 @@ export class GoraniWin11 extends LitElement {
 
 	// ── keyboard (the Explorer grammar) ─────────────────────────────────
 
+	private async onSearch(q: string): Promise<void> {
+		this.query = q;
+		if (q.trim().length < 2 || !this.model.index) {
+			this.searchHits = null;
+			return;
+		}
+		const hits = await this.model.index.search(q, 40);
+		this.searchHits = hits.map((h) => ({ id: h.id, kind: h.kind, folderId: h.folderId, name: h.name, size: h.size }));
+	}
+
+	/** Search/recents jump: open the folder, then select the entry. */
+	private async jumpTo(hit: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; size?: number }): Promise<void> {
+		this.searchHits = null;
+		this.query = "";
+		this.recentsMode = false;
+		await this.model.setFolder(hit.kind === "folder" ? hit.id : hit.folderId);
+		if (hit.kind === "file") this.model.select({ kind: "file", id: hit.id });
+	}
+
+	private async showRecents(): Promise<void> {
+		this.recentsMode = true;
+		this.recentRows = this.model.index ? await this.model.index.recents(40) : [];
+		this.v++;
+		await this.requestUpdate();
+	}
+
+	@state() private recentRows: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; updatedAt: number; size?: number }[] = [];
+
 	private onKeydown(e: KeyboardEvent): void {
 		if (this.renaming) return;
 		const s = this.s();
@@ -265,6 +297,15 @@ export class GoraniWin11 extends LitElement {
 				}
 				e.preventDefault();
 				return;
+			case " ":
+				if (at >= 0) {
+					const sel = order[at];
+					if (sel && sel.kind === "file") {
+						void this.previewId(sel.id);
+						e.preventDefault();
+					}
+				}
+				return;
 			case "Escape":
 				this.model.clearSelection();
 				return;
@@ -273,6 +314,20 @@ export class GoraniWin11 extends LitElement {
 				if (e[modKey()]) {
 					this.model.selectAll();
 					e.preventDefault();
+				}
+				return;
+			default:
+				// Type-to-jump: plain characters accumulate (500 ms) and select
+				// the first item that starts with them — Explorer and Finder
+				// share this muscle memory.
+				if (e.key.length === 1 && !e[modKey()] && !e.altKey && !e.ctrlKey) {
+					this.typeBuffer = (this.typeBuffer + e.key.toLowerCase()).slice(-16);
+					clearTimeout(this.typeTimer);
+					this.typeTimer = setTimeout(() => (this.typeBuffer = ""), 500);
+					const fileHit = files.find((x) => x.name.toLowerCase().startsWith(this.typeBuffer));
+					const folderHit = folders.find((x) => x.name.toLowerCase().startsWith(this.typeBuffer));
+					const hit = folderHit ?? fileHit;
+					if (hit) this.model.select({ kind: folderHit ? "folder" : "file", id: hit.id }, { add: false });
 				}
 				return;
 			case "c":
@@ -365,7 +420,7 @@ export class GoraniWin11 extends LitElement {
 					${this.navPane()}
 					<div class="flex min-w-0 flex-1 flex-col">
 						<div data-body class="relative min-h-0 flex-1 overflow-auto outline-none" @pointerdown=${(e: PointerEvent) => this.onBodyPointerDown(e)}>
-							${this.view === "details" ? this.detailsBody(folders, files) : this.iconsBody(folders, files)}
+							${this.recentsMode ? this.recentsBody() : this.view === "details" ? this.detailsBody(folders, files) : this.iconsBody(folders, files)}
 						</div>
 						${this.statusBar(folders.length, files.length)}
 					</div>
@@ -434,7 +489,23 @@ export class GoraniWin11 extends LitElement {
 						<button class="whitespace-nowrap rounded px-1.5 py-0.5 hover:bg-neutral-800 ${i === crumbs.length - 1 ? "text-neutral-100" : "text-neutral-400"}" @click=${() => c.id !== null && void this.model.setFolder(c.id)}>${c.name}</button>`,
 					)}
 				</nav>
-				<input class="w-52 rounded-lg bg-neutral-950 px-3 py-1.5 text-sm outline-none placeholder:text-neutral-600 focus:ring-1 focus:ring-accent" placeholder="Search" .value=${this.query} @input=${(e: InputEvent) => (this.query = (e.target as HTMLInputElement).value)} />
+				<div class="relative">
+					<input class="w-52 rounded-lg bg-neutral-950 px-3 py-1.5 text-sm outline-none placeholder:text-neutral-600 focus:ring-1 focus:ring-accent" placeholder="Search (this device's index)" .value=${this.query} @input=${(e: InputEvent) => void this.onSearch((e.target as HTMLInputElement).value)} />
+					${this.searchHits
+						? html`<div class="absolute right-0 top-9 z-40 max-h-96 w-96 overflow-y-auto rounded-xl border border-neutral-700 bg-neutral-900/95 p-1.5 shadow-2xl backdrop-blur">
+								${this.searchHits.map(
+									(h) => html`
+										<button class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm hover:bg-neutral-800" @click=${() => void this.jumpTo(h)}>
+											${icon(h.kind === "folder" ? "folder" : "file", "h-4 w-4 shrink-0 text-neutral-400")}
+											<span class="min-w-0 flex-1 truncate text-neutral-100">${h.name}</span>
+											<span class="shrink-0 text-xs text-neutral-500">${h.kind === "folder" ? "Folder" : fmtSize(h.size ?? 0)}</span>
+										</button>
+									`,
+								)}
+								${!this.searchHits.length ? html`<p class="p-3 text-center text-xs text-neutral-500">Nothing in the index yet</p>` : nothing}
+							</div>`
+						: nothing}
+				</div>
 			</div>
 		`;
 	}
@@ -446,6 +517,9 @@ export class GoraniWin11 extends LitElement {
 				<p class="px-2 pb-1 text-xs uppercase tracking-wide text-neutral-500">Quick access</p>
 				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.folderId === null && !s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.model.closeTrash()}>
 					${icon("folder")} Home
+				</button>
+				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${this.recentsMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.showRecents()}>
+					⏱ Recent files
 				</button>
 				<p class="px-2 pt-3 pb-1 text-xs uppercase tracking-wide text-neutral-500">${this.memberName}'s folders</p>
 				${this.treeRows(null, 0)}
@@ -544,6 +618,26 @@ export class GoraniWin11 extends LitElement {
 				${folders.map((f) => cell("folder", f.id, f.name, "folder"))}
 				${files.map((f) => cell("file", f.id, f.name, f.kind))}
 				${!folders.length && !files.length ? html`<p class="col-span-full p-8 text-center text-sm text-neutral-500">${this.s().loading ? "Opening…" : "This folder is empty"}</p>` : nothing}
+			</div>
+		`;
+	}
+
+	/** Recents (both OSes have it; fed by the local index, no server). */
+	private recentsBody(): TemplateResult {
+		const rows = this.recentRows;
+		return html`
+			<div class="p-2 text-sm">
+				<p class="px-2 pb-2 text-xs uppercase tracking-wide text-neutral-500">Recently touched on this device — opened from the local index</p>
+				${rows.map(
+					(r) => html`
+						<button class="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-neutral-800/60" @click=${() => void this.jumpTo(r)}>
+							${icon(r.kind === "folder" ? "folder" : "file")}<span class="min-w-0 flex-1 truncate">${r.name}</span>
+							${r.size !== undefined ? html`<span class="text-xs text-neutral-400">${fmtSize(r.size)}</span>` : nothing}
+							<span class="text-xs text-neutral-500">${fmtDate(new Date(r.updatedAt).toISOString())}</span>
+						</button>
+					`,
+				)}
+				${!rows.length ? html`<p class="p-8 text-center text-sm text-neutral-500">Nothing indexed yet — browse a folder first.</p>` : nothing}
 			</div>
 		`;
 	}

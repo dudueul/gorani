@@ -206,6 +206,14 @@ pub const MIGRATIONS: &[&str] = &[
 	// S3 under shares/<id>; the row tracks its multipart bookkeeping, the
 	// plaintext size (the recipient's progress), and readiness.
 	"ALTER TABLE shares ADD COLUMN s3_upload_id TEXT",
+	// Migration v5 (commit ⑫): backup manifests (one row per .gbak run).
+	"CREATE TABLE IF NOT EXISTS backups (
+		stamp TEXT PRIMARY KEY,
+		kind TEXT NOT NULL,
+		size INTEGER NOT NULL,
+		entries INTEGER NOT NULL,
+		created_at TEXT NOT NULL
+	)",
 	"ALTER TABLE shares ADD COLUMN ready INTEGER DEFAULT 0",
 	"ALTER TABLE shares ADD COLUMN size INTEGER",
 ];
@@ -223,15 +231,16 @@ pub const MIGRATIONS: &[&str] = &[
 #[durable_object]
 pub struct GoraniMemberDO {
 	pub(crate) sql: worker::SqlStorage,
+	pub(crate) env: Env,
 }
 
 impl DurableObject for GoraniMemberDO {
-	fn new(state: State, _env: Env) -> Self {
+	fn new(state: State, env: Env) -> Self {
 		let sql = state.storage().sql();
 		for stmt in MIGRATIONS {
 			sql.exec(stmt, None).expect("member migration");
 		}
-		Self { sql }
+		Self { sql, env }
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
@@ -335,6 +344,17 @@ impl GoraniMemberDO {
 					Err(resp) => Ok(resp),
 				}
 			}
+			("PUT", "backup-key") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.backup_key_put(&actor, body).await
+			}
+			("GET", "backup-key") => self.backup_key_get().await,
+			("POST", "backup/run") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.backup_run(&actor, body).await
+			}
+			("GET", "backups") => self.backups_list().await,
+			("GET", id) if id.starts_with("backups/") => self.backup_object(&id["backups/".len()..]).await,
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.files_reseal(&actor, body).await

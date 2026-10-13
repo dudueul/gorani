@@ -161,6 +161,20 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		("PUT", ["members", id, "files", "shares", share, "parts", part]) => share_part(req, env, &identity, id, share, part).await,
 		("POST", ["members", id, "files", "shares", share, "complete"]) => share_complete(req, env, &identity, id, share).await,
 		("DELETE", ["members", id, "files", "shares", share]) => share_revoke(&env, &identity, id, share).await,
+		// ── Backups (GB1): the browser PUT the backup PUBLIC key (the private
+		// bundle never leaves it as the key file); the DO job writes .gbak
+		// containers the server cannot open. ──────────────────────────────
+		("PUT", ["members", id, "backup-key"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "backup-key", Some(body), actor)).await
+		}
+		("GET", ["members", id, "backup-key"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "backup-key", None, actor)).await,
+		("POST", ["members", id, "backup", "run"]) => {
+			let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "backup/run", Some(body), actor)).await
+		}
+		("GET", ["members", id, "backups"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "backups", None, actor)).await,
+		("GET", ["members", id, "backups", stamp]) => backup_download(&env, &identity, id, stamp).await,
 		// ── Crypto-shredding: the destroy secret must exist and the confirm
 		// phrase must match, exactly. Without both: 403, always.
 		("DELETE", ["members", id, "vault"]) => {
@@ -815,5 +829,34 @@ async fn share_obj(env: &Env, member_id: &str, share: &str) -> std::result::Resu
 		}
 		Ok(r) => Err(r),
 		Err(e) => Err(json_error_raw(500, &e.to_string())),
+	}
+}
+
+// ── Backup plumbing ─────────────────────────────────────────────────────────
+
+async fn backup_download(env: &Env, identity: &Identity, member_id: &str, stamp: &str) -> Result<Response> {
+	match member_ctx(env, identity, member_id).await {
+		Ok(_) => {}
+		Err(resp) => return Ok(resp),
+	}
+	if !stamp.chars().all(|c| c.is_ascii_hexdigit()) {
+		return json_error(400, "bad backup stamp");
+	}
+	let resp = forward_member(env, member_id, "GET", &format!("backups/{stamp}"), None, "internal").await;
+	match resp {
+		Ok(r) if r.status_code() >= 400 => Ok(r),
+		Ok(_) => {
+			let bytes = crate::s3::get(env, &format!("backups/{stamp}.gbak")).await?;
+			match bytes {
+				Some(b) => {
+					let mut headers = Headers::new();
+					headers.set("Content-Type", "application/octet-stream")?;
+					headers.set("Content-Disposition", &format!("attachment; filename=\"gorani-{stamp}.gbak\""))?;
+					Ok(Response::from_bytes(b)?.with_headers(headers))
+				}
+				None => json_error(404, "backup object missing"),
+			}
+		}
+		Err(e) => json_error(500, &e.to_string()),
 	}
 }

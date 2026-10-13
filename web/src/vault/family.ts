@@ -228,6 +228,23 @@ export async function sealFamilyStoreKey(store: NewStoreKey, memberRootPublics: 
 	return out;
 }
 
+/**
+ * Rotate the FAMILY SHARED AREA's store key — the step that must run when a
+ * member leaves, BEFORE their deactivation: a fresh store pair, its private
+ * sealed to every REMAINING member's root. The departing member's root opens
+ * none of the new copies, and every family-area content key re-wraps to the
+ * new public half (the client drives it exactly like a child-store rotation:
+ * unwrap each wrap with the old private half, wrap to the new public half,
+ * store via files/reseal) — so their old copy of the old key decrypts
+ * nothing, not even bytes already stored. Two small seals per member; no
+ * file is re-encrypted. (Same shape as rotateChildStoreKey; the difference
+ * is who holds copies — every member's own settings, not the master.)
+ */
+export async function rotateFamilyStoreKey(remainingRootPublics: SealTarget[]): Promise<{ key: NewStoreKey; copies: SealingKey[] }> {
+	const store = await createStoreKey();
+	return { key: store, copies: await sealFamilyStoreKey(store, remainingRootPublics) };
+}
+
 // ── the guardian enrolment code ─────────────────────────────────────
 
 /**

@@ -49,6 +49,24 @@ GV03 = "GV03" ‖ eph pub (65) ‖ ML-KEM ct (1088) ‖ nonce (12) ‖ ct ‖ ta
        key    = HKDF-SHA256(ikm = ss_ec ‖ ss_kem, salt, info = "gorani-vault-v3")
 ```
 
+Decisions a security review should know about (considered, not overlooked):
+
+- **GV01's 65-byte salt** is longer than HMAC-SHA256's block, so HKDF
+  pre-hashes it — standard, well-defined HMAC behavior (RFC 2104), not a
+  weakness. The raw salt is kept for GV01 byte compatibility; GV03 already
+  standardizes on a 32-byte digest.
+- **Domain separation** inside GV03: one `info` serves all purposes. That
+  is deliberate — transposition is already defeated structurally: content
+  keys are sealed to *store* public keys while store/master private keys
+  are sealed to *root* public keys (different recipients → different
+  keys), the whole header rides as AAD, and payload shapes differ (a 32-byte
+  content key cannot parse as a GK01 bundle). Purpose tags inside the
+  sealed payloads were considered and rejected: they change the wire format
+  for defense-in-depth that shape checks already provide.
+- **One fresh content key per file version** (`model.ts › uploadOne`): the
+  API tolerates a reused key, but the client never reuses one, so a key
+  encrypts exactly one object's frames — see GC01 below.
+
 The GV03 salt binds both ciphertexts and both recipient halves — the "X-Wing" combiner: neither half can be swapped or replayed against another recipient, and an attacker must break **both** P-256 (a quantum computer) **and** ML-KEM-768 (a flaw in the new scheme) to open anything.
 
 ### GK01 / GW01 — key containers
@@ -67,6 +85,14 @@ GW01 = "GW01" ‖ nonce (12) ‖ AES-256-GCM(KEK, key bytes) ‖ tag,   AAD = "G
 | passkey | HKDF-SHA256(WebAuthn PRF output, salt, "gorani-passkey-v1") | 256 bits inside the authenticator |
 | device copy | HKDF-SHA256(device secret, salt, "gorani-device-v1") | the platform's TPM/Enclave/keyring |
 
+The KDF matches the secret's entropy, on purpose: memory-hardness (Argon2id)
+protects low-entropy secrets — passwords; it adds nothing against a
+196-bit uniform-random code, where single-step HKDF is already beyond
+reach. The invariant that keeps this true: **recovery codes are
+machine-generated, never chosen** (`generateRecoveryCode`, 40 characters of
+a 30-character alphabet). If a user-chosen code is ever supported, it must
+move behind Argon2id.
+
 ### GC01 — chunked files (docs/VIDEO.md rides on this)
 
 ```text
@@ -76,6 +102,18 @@ AAD     = "GC01" ‖ i (8 BE) ‖ final (1)
 ```
 
 Any frame opens alone → Range seeking, streaming downloads, on-demand desktop sync, and the media service worker's native-video streaming (docs/VIDEO.md).
+
+Nonce rules, explicit: each frame carries a **fresh random 96-bit nonce**,
+stored in the frame. Under one content key that is at most one object's
+frames — a fresh content key is minted per file version (`model.ts ›
+uploadOne`) — so the birthday bound stays absurdly far away (a 100 GB file
+at 8 MiB chunks is ~12 800 frames; collision probability ≈ 10⁻²¹). Where
+one key DOES span many encryptions by design — GB1 backup segments — the
+nonces are counter-based instead (`backup.rs`: `0x00000000 ‖ seg, u64 BE`;
+they can never repeat). If a caller ever reuses a content key across
+objects (the API tolerates it; the client never does), the random-nonce
+bound degrades gracefully but the per-version rule is the invariant to
+keep.
 
 ### GB1 — backups
 

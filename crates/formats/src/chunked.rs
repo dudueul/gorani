@@ -14,6 +14,11 @@
 //! AAD     = "GC01" ‖ i (8 bytes, big-endian) ‖ final (1 byte: 1 for the last frame, else 0)
 //! ```
 //!
+//! Nonce scope: one content key seals one object (a fresh key is minted per
+//! file version), so random per-frame 96-bit nonces stay far from the
+//! birthday bound (~10⁻²¹ for 12 800 frames — a 100 GB file at 8 MiB). GB1
+//! backups, where one file key spans many segments, use counter nonces.
+//!
 //! Because every frame stands alone, any byte range of the file can be
 //! fetched and opened without the rest: what lets the file explorer and the
 //! video player open a large file on demand, part by part. An empty file is

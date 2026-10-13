@@ -52,6 +52,32 @@ Two parents (Mom, Dad) and two children (Jinu, Sora):
    client enrols exactly as it would for any member) — and can regain
    Jinu's vault without knowing Jinu's password.
 
+## Removing a member (the runbook that closes their access)
+
+Deactivation only flips the registry flag — the crypto step is separate,
+and its order matters:
+
+1. **Rotate the family shared-area key first** (`family.ts ›
+   rotateFamilyStoreKey`): a fresh store pair, its private sealed to every
+   REMAINING member's root. The departing member's root opens none of the
+   new copies.
+2. **Re-wrap the family area's content keys** — unwrap each with the old
+   store private half, wrap to the new public half, store via
+   `files/reseal` (the same client-driven walk as a child-store rotation;
+   no file is re-encrypted). After this, their old store key unwraps
+   nothing — not even bytes already stored.
+3. **Update each remaining member's settings**: the new family key copy
+   replaces the old (`stores.family`, sealed to their root — a parent can
+   act for any member).
+4. **Deactivate** the member (`POST /api/v1/family/members/<id>/deactivate`
+   — parents only). The audit line records `familyKeyRotationRequired`,
+   because deactivation WITHOUT steps 1–3 leaves the former member able to
+   decrypt future family-area files: they still hold the old store private
+   key, and new content keys would still be wrapped to it.
+
+A child's OWN area never needs this: their store key is sealed to their
+root and the master, and a parent alone can rotate it any time (scenario 6).
+
 ## Registry (readable structure, `GoraniFamilyDO`)
 
 Member ids, readable names, roles, Access emails, active flags; the master's

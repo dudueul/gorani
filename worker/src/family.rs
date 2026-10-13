@@ -219,7 +219,11 @@ impl GoraniFamilyDO {
 			}
 		}
 		self.sql.exec("UPDATE members SET active = 0 WHERE id = ?1", Some(vec![id.into()]))?;
-		self.audit(actor, "member.deactivate", id, None).await?;
+		// The removed member's root still holds their copy of the family
+		// shared-area key — the audit line says so, because the NEXT step
+		// (the client-driven family-area rotation, docs/FAMILY.md › Removing
+		// a member) is what actually closes their access.
+		self.audit(actor, "member.deactivate", id, Some(&serde_json::json!({ "familyKeyRotationRequired": true }))).await?;
 		self.state().await
 	}
 

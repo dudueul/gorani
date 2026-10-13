@@ -14,6 +14,8 @@
 //! |----------|---------------------------------------------------------------------------------------|
 //! | password | Argon2id(NFKC(password), salt, m, t, p) → 32 bytes — the only password KDF gorani has  |
 //! | recovery | HKDF-SHA256(normalised code, salt, "gorani-recovery-v1")                              |
+//!            (codes are machine-generated ≈196-bit secrets — never chosen;
+//!             a user-chosen code would need Argon2id instead)
 //! | passkey  | HKDF-SHA256(WebAuthn PRF output, salt, "gorani-passkey-v1")                           |
 //! | device   | HKDF-SHA256(the device's 32-byte secret, salt, "gorani-device-v1")                    |
 //!

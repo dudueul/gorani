@@ -24,6 +24,7 @@ import {
 	makeGuardianEnrolmentMethod,
 	rotateMaster,
 	rotateChildStoreKey,
+	rotateFamilyStoreKey,
 } from "../../web/src/vault/family.ts";
 import {
 	importVaultKey,
@@ -31,6 +32,7 @@ import {
 	unlockWithMethod,
 	wrapContentKey,
 	unwrapContentKey,
+	rewrapContentKey,
 	sealText,
 	openText,
 	sealWith,
@@ -151,4 +153,35 @@ const k1StoreAfter = await openChildStoreKey(aRoot, rotation.parentSealed[0], ro
 assert.deepEqual(await unwrapContentKey(k1StoreAfter, fileKeySealed), openedKey, "the chain still opens after rotation");
 void aNewMaster;
 
-console.log("ok  family: hierarchy, denials, enrolment code, rotations");
+// ── 12. A member leaves: the family shared area rotates ─────────────
+// Deactivation alone closes nothing: the departing member's root holds
+// their copy of the family store key, and new family-area files would
+// stay readable to them. The rotation (docs/FAMILY.md › Removing a
+// member) runs BEFORE deactivation — a fresh pair sealed to the remaining
+// roots, every content key re-wrapped — and afterwards their material
+// opens nothing at all.
+const familyArea = await createStoreKey();
+const familyCopies = await sealFamilyStoreKey(familyArea, [hybridPublicOf(parentA), hybridPublicOf(kid1), hybridPublicOf(kid2)]);
+const familyPrivOld = await openStoreKey(aRoot, familyCopies[0]);
+const areaKey = newContentKey();
+const areaCk = await importContentKey(areaKey);
+const areaSealed = await wrapContentKey(hybridPublicOf(familyArea), areaKey);
+const areaPlain = enc.encode("family photo bytes");
+const areaData = await sealWith(areaCk, areaPlain);
+assert.deepEqual(dec.decode(await openWith(await unwrapContentKey(familyPrivOld, areaSealed), areaData)), dec.decode(areaPlain), "baseline: the family area opens");
+
+// kid1 leaves. The parent rotates to a fresh pair sealed to the remaining roots…
+const familyRotation = await rotateFamilyStoreKey([hybridPublicOf(parentA), hybridPublicOf(kid2)]);
+assert.equal(familyRotation.copies.length, 2);
+// …re-wraps the content key to the new public half — the canonical walk
+// (`rewrapContentKey`: open the old wrap with the old private half, seal
+// to the new public half; exactly what files/reseal stores)…
+const areaRewrapped = await rewrapContentKey(familyPrivOld, hybridPublicOf(familyRotation.key), areaSealed);
+// …and from here the departing member's material opens nothing:
+await assert.rejects(() => openStoreKey(kid1Root, familyRotation.copies[0]), "their root opens none of the new copies");
+await assert.rejects(() => unwrapContentKey(familyPrivOld, areaRewrapped), "their old store key unwraps no re-wrapped key");
+// The remaining family keeps reading everything.
+const familyPrivNew = await openStoreKey(aRoot, familyRotation.copies[0]);
+assert.deepEqual(dec.decode(await openWith(await unwrapContentKey(familyPrivNew, areaRewrapped), areaData)), dec.decode(areaPlain), "the family keeps reading; the leaver does not");
+
+console.log("ok  family: hierarchy, denials, enrolment code, rotations, member removal");

@@ -20,7 +20,7 @@ is the index: what to read, in what order, and what to build yourself.
 | 1 | The trust map | docs/ARCHITECTURE.md | Who can read what, and why that is a design decision, not an accident |
 | 2 | Why each runtime gets its language | docs/ARCHITECTURE.md §Languages | TS+WebCrypto in the browser (non-extractable keys), Rust on the server and in clients, WASM only for key-free media parsing |
 | 3 | The dependency budget | web/package.json, NOTICE | Why ~12 runtime packages, why Trusted Types, why the supply chain is part of the threat model |
-| 4 | The sealed formats | crates/formats/ (commit ②), docs/ENCRYPTION.md | GV1/GV2/GV3/GK1/GW1 byte by byte; how to read a crypto spec |
+| 4 | The sealed formats | crates/formats/ (commit ②), docs/ENCRYPTION.md | GV01/GV02/GV03/GK01/GW01 byte by byte; how to read a crypto spec |
 | 5 | Chunked files | crates/formats/ GC1 (commit ③) | 8 MiB authenticated frames; seeking into the middle of a video without the rest |
 | 6 | A family key hierarchy | shared family model (commit ④), docs/FAMILY.md | Parents' master key, dual-sealed kids' store keys, why kids *cannot* open parents |
 | 7 | Speaking S3 from a Worker | worker/src/s3/ (commit ⑤) | SigV4 by hand, streaming, multipart |
@@ -39,8 +39,8 @@ each tag to watch the app being constructed.
 
 - Every source file begins: `// Copyright 2026- Seongwoo Hong. All rights reserved.`
 - Durable Object classes are always prefixed `Gorani*DO` (`GoraniMemberDO`, …).
-- Sealed formats are named GV* (values), GC1 (chunked files), GB1 (backups),
-  GK1/GW1 (key containers) — gorani's own names for layouts shared with
+- Sealed formats are named GV01/GV02/GV03 (values), GC01 (chunked files, commit ③), GB01 (backups),
+  GK01/GW01 (key containers) — gorani's own names for layouts shared with
   Mailflare's MFV* (byte layouts identical; see NOTICE for provenance).
 - Family model: readable member names; the shared "Family" area is
   parents-write, all-read.

@@ -16,3 +16,5 @@ worker/build/
 # Editors and OS noise
 .DS_Store
 *.local
+# Test outputs (generated per run)
+tests/output/

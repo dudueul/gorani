@@ -1,0 +1,28 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# The sealed formats — gorani's reference implementation (see src/lib.rs).
+# Every crypto primitive comes from the audited RustCrypto set and the
+# maintained ML-KEM crate; nothing here implements a primitive by hand.
+# Versions follow Mailflare's battle-tested desktop core (NOTICE).
+
+[package]
+name = "gorani-formats"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+p256 = { version = "0.13", features = ["ecdh", "pkcs8"] }
+hkdf = "0.12"
+sha2 = "0.10"
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+ml-kem = { version = "0.2", features = ["deterministic", "zeroize"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+serde_json = "1"

@@ -6,8 +6,8 @@
 //! debug binary is not built (cargo builds it with `cargo test`).
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { suiteDev, api } from "../api/_dev.mjs";
@@ -27,13 +27,23 @@ fs.rmSync(home, { recursive: true, force: true });
 fs.mkdirSync(home, { recursive: true });
 
 function sync(args: string[], env: Record<string, string> = {}) {
-	const r = spawnSync(BIN, args, {
-		cwd: ROOT,
-		encoding: "utf8",
-		env: { ...process.env, ...env },
+	// spawn — NOT spawnSync. This process also runs the S3 stub; a sync
+	// spawn freezes its event loop, and the worker's S3 round-trips then
+	// hang for the whole CLI run. That freeze WAS the "293 s hang" (uploads
+	// and streamed downloads both touch the stub; JSON routes never did —
+	// which is why only push/pull stalled). Bisected with a TCP dump proxy.
+	const c = spawn(BIN, args, { cwd: ROOT, env: { ...process.env, ...env } });
+	let out = "";
+	c.stdout.on("data", (d) => (out += d));
+	c.stderr.on("data", (d) => (out += d));
+	return new Promise<{ status: number; out: string }>((resolve) => {
+		const t = setTimeout(() => c.kill("SIGKILL"), 120_000);
+		c.on("exit", (s) => {
+			clearTimeout(t);
+			if (s !== 0) console.error("SYNC-FAIL", out);
+			resolve({ status: s ?? 1, out });
+		});
 	});
-	if (r.status !== 0) console.error("SYNC-FAIL", r.stdout, r.stderr);
-	return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 }
 
 
@@ -55,7 +65,7 @@ try {
 	// ── 1. enrol: the real binary, the real worker ──────────────────────
 	const deviceSecret = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 	console.error("STEP setup");
-	const setup = sync(
+	const setup = await sync(
 		[
 			"setup",
 			"--server", dev.base,
@@ -74,52 +84,33 @@ try {
 	const devices = await api(dev.base, "GET", "/api/v1/members/jinu/devices", { email: "mom@family.test" });
 	assert.ok(devices.json.find((d) => d.platform === "linux"), "the enrolled device is listed");
 
-	// ── 2. Upload via HTTP (the web path), then the native side reads it ─
-	// NOTE: the CLI's multipart PUSH hangs workerd's form parser (293 s →
-	// 500; ureq send_bytes + form_data interaction — known issue, debug next
-	// session with a captured request). GET flows work; the pull/ls steps
-	// below exercise the native crypto against real stored objects.
+	// ── 2. push: the native write path — the CLI seals and uploads ──────
+	// (The old stall had two stacked causes, both found by bisecting raw
+	// sockets and a TCP dump proxy: spawnSync froze this process's S3 stub
+	// while the CLI ran, and ureq's default `Accept-Encoding` makes workerd
+	// compress + chunk every response — ~5 s/request. The client now sends
+	// `Accept-Encoding: identity`; the spawn above is async.)
 	const localFile = path.join(home, "hello.txt");
 	fs.writeFileSync(localFile, "hello from the native client — sealed on the way up");
 	const plainHello = fs.readFileSync(localFile);
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
-	const { newContentKey, importContentKey, sealWith, wrapContentKey, sealText } = await import("../../web/src/vault/vault-crypto.ts");
-	const ck = newContentKey();
-	const key = await importContentKey(ck);
-	const sealedHello = await sealWith(key, plainHello);
-	const upBody = await (async () => {
-			const head = new TextEncoder().encode(
-				[
-					["ck", await wrapContentKey(storePublic, ck)],
-					["name", await sealText(storePublic, "hello.txt")],
-					["type", await sealText(storePublic, "text/plain")],
-					["size", String(plainHello.length)],
-				]
-					.map(([k, v]) => `--b1\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)
-					.join("") + `--b1\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`,
-			);
-			return new Uint8Array([...head, ...sealedHello, ...new TextEncoder().encode(`\r\n--b1--\r\n`)]);
-		})();
-	const up = await fetch(`${dev.base}/api/v1/members/jinu/files`, {
-		method: "POST",
-		headers: { "content-type": "multipart/form-data; boundary=b1", "x-gorani-dev-email": "jinu@family.test" },
-		body: upBody,
-	});
-	const upJson = await up.json().catch(() => null);
-	assert.equal(up.status, 200, JSON.stringify(upJson));
-	const fileId = upJson.id;
+	console.error("STEP push");
+	const push = await sync(["push", "--file", localFile, "--name", "hello.txt", "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	assert.equal(push.status, 0, `push failed: ${push.out}`);
+	const fileId = push.out.match(/pushed: (\S+)/)?.[1];
+	assert.ok(fileId && fileId !== "?", `push printed the file id: ${push.out}`);
 
 	// ── 3. ls: the change feed with names opened by the client ─────────
 	console.error("STEP ls");
-	const ls = sync(["ls", "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	const ls = await sync(["ls", "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
 	assert.equal(ls.status, 0, `ls failed: ${ls.out}`);
 	assert.match(ls.out, /hello\.txt/, "the client opened the upload's name");
 
-	// ── 4. pull: KNOWN ISSUE — the streamed GET hangs against workerd when
-	// the client is ureq (293 s → 500; Node fetch on the same route works).
-	// Investigated next session with a captured request; the decrypt logic
-	// itself is covered by unit:formats + unit:explorer (open_chunk_frame).
-	console.error("STEP pull (skipped: known ureq/stream hang — see test header)");
+	// ── 4. pull: the native client decrypts and the bytes match ────────
+	console.error("STEP pull");
+	const outPath = path.join(home, "pulled.txt");
+	const pull = await sync(["pull", "--id", fileId, "--out", outPath, "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	assert.equal(pull.status, 0, `pull failed: ${pull.out}`);
+	assert.equal(fs.readFileSync(outPath, "utf8"), plainHello.toString("utf8"), "round trip: the exact bytes");
 
 	// ── 5. Zero-trust spot check: the server stored only sealed shapes ──
 	const keys = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [fileId] } });

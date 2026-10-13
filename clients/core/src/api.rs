@@ -64,6 +64,13 @@ impl Client {
 
 	fn req(&self, method: &str, url: &str) -> ureq::Request {
 		let mut r = self.agent.request(method, url);
+		// The CLI never wants compressed bodies: ciphertext passes through
+		// unchanged and JSON answers are tiny. Asking for compression is also
+		// measurably harmful against workerd — its streaming paths stall
+		// ~5 s per request when the client sends `Accept-Encoding: deflate,
+		// gzip` (ureq's default; bisected in the live-test session). Setting
+		// `identity` explicitly both opts out and stops ureq adding its own.
+		r = r.set("Accept-Encoding", "identity");
 		if let (Some(id), Some(secret)) = (&self.profile.access_id, &self.profile.access_secret) {
 			r = r.set("CF-Access-Client-Id", id).set("CF-Access-Client-Secret", secret);
 		}

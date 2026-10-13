@@ -1,0 +1,22 @@
+Gorani — a zero-trust encrypted family NAS
+Copyright 2026- Seongwoo Hong. All rights reserved.
+
+This product contains portions derived from third-party works, used under the
+Apache License, Version 2.0 (the "Apache License"). You may obtain a copy of
+the Apache License at http://www.apache.org/licenses/LICENSE-2.0. Where those
+portions are marked, their original notices are retained in place.
+
+1. Mailflare (Cloudflare, Inc. — https://github.com/cloudflare/mailflare)
+   Portions of the file-management design, the vault encryption formats
+   (byte layouts), the desktop-sync protocol ideas and several document /
+   archive parsers were ported or adapted from Mailflare. The derived files
+   carry both the Gorani copyright header and the original notice.
+
+2. mp4-hls-core (from the stream-worker project)
+   The ISO-BMFF parser, keyframe index builder and fMP4 segment assembly
+   engine, vendored under crates/media/ in a later commit, with the license
+   and notices as marked in that repository.
+
+3. Runtime dependencies retain their own licenses (RustCrypto crates,
+   @noble/*, hash-wasm, pdf.js, SQLite WASM, Lit, and others). They are
+   declared in Cargo.toml / package.json and are not reproduced here.

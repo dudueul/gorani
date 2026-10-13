@@ -1,0 +1,23 @@
+{
+	// Copyright 2026- Seongwoo Hong. All rights reserved.
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
+		// Strict from the first commit: this app's whole point is that code
+		// can be trusted to do what it says.
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"noImplicitOverride": true,
+		"forceConsistentCasingInFileNames": true,
+		// Lit's decorators follow the (legacy) proposal Lit documents; these
+		// two flags are the recommended pairing.
+		"experimentalDecorators": true,
+		"useDefineForClassFields": false,
+		"skipLibCheck": true,
+		"noEmit": true,
+		"types": ["vite/client"]
+	},
+	"include": ["src", "vite.config.ts"]
+}

@@ -1,0 +1,33 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# The Cargo workspace: every Rust target of Gorani builds from here.
+#
+#   worker/          the Cloudflare Worker (compiles to wasm32-unknown-unknown)
+#   crates/formats/  the GV*/GC1/GB1 sealed formats — the reference implementation
+#                    (joins at commit ②; used by the Worker and the native clients)
+#   crates/media/    mp4-hls-core vendored for the video sidecar (commit ⑩)
+#   clients/         the native Rust clients: core + Windows + Linux + macOS
+#                    (commits ⑬–⑭)
+#
+# New members are appended here as their commits land, so every intermediate
+# commit still builds with a plain `cargo check --workspace`.
+[workspace]
+resolver = "2"
+members = ["worker"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Gorani itself is proprietary (see LICENSE); Apache-2.0-derived portions are
+# listed in NOTICE.
+license-file = "LICENSE"
+
+# Small, deployable wasm: optimise for size, strip symbols, and abort on
+# panic (a panic kills the isolate rather than serving broken responses —
+# the platform restarts it clean; see docs/ARCHITECTURE.md → "Failure").
+[profile.release]
+opt-level = "z"
+lto = true
+strip = "debuginfo"
+panic = "abort"
+codegen-units = 1

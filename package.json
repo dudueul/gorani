@@ -1,0 +1,17 @@
+{
+	"_copyright": "Copyright 2026- Seongwoo Hong. All rights reserved.",
+	"_note": "The root package only orchestrates: the web app has its own package in web/, the Rust side is a Cargo workspace (see Cargo.toml).",
+	"name": "gorani",
+	"private": true,
+	"scripts": {
+		"build:web": "npm --prefix web run build",
+		"build": "npm run build:web",
+		"dev": "npm run build:web && wrangler dev",
+		"deploy": "npm run build:web && wrangler deploy",
+		"typecheck": "npm --prefix web run typecheck",
+		"test": "node tests/run.mjs"
+	},
+	"devDependencies": {
+		"wrangler": "^4.74.0"
+	}
+}

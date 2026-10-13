@@ -1,0 +1,18 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# Node / web build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Rust
+target/
+worker/build/
+
+# Wrangler local state and secrets (never commit)
+.wrangler/
+.dev.vars
+
+# Editors and OS noise
+.DS_Store
+*.local

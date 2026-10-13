@@ -1,0 +1,62 @@
+// Copyright 2026- Seongwoo Hong. All rights reserved.
+
+// Gorani: a zero-trust, end-to-end encrypted family NAS.
+//
+// Everything is sealed in the browser (or the native clients) before the
+// server sees a byte; the Worker stores ciphertext, wrapped keys and just
+// enough readable structure (sizes, times, folder shape) to sync and browse.
+// This file is the deployment recipe: what runs, where the code lives, and
+// which Cloudflare bindings it needs. See docs/ARCHITECTURE.md for the
+// guided tour and docs/COURSE.md for the lesson index.
+{
+	// The JSON schema so editors validate and autocomplete this file.
+	"$schema": "node_modules/wrangler/config-schema.json",
+
+	// The Worker's name on Cloudflare. The deployed URL is https://<name>.<account>.workers.dev
+	// unless a custom domain/route is attached (recommended; passkeys and
+	// Cloudflare Access are registered per domain).
+	"name": "gorani",
+
+	// The Rust worker builds with worker-build into a JS shim + a wasm module.
+	// wrangler runs `build.command` automatically on deploy/dev, then uploads
+	// these paths as the Worker's entry module.
+	"main": "worker/build/worker/shim.mjs",
+	"compatibility_date": "2026-09-01",
+
+	// Build the Rust worker. `worker-build` compiles src/lib.rs to
+	// wasm32-unknown-unknown, runs wasm-bindgen and emits build/worker/.
+	"build": {
+		"command": "cd worker && cargo install -q worker-build && worker-build --release"
+	},
+
+	// The web app is a static Lit SPA built into web/dist and served by the
+	// platform's asset server (fast, and outside the Worker's CPU budget).
+	// API and public share paths run this Worker first; everything else is a
+	// static file, with unknown paths handed index.html (a single-page app).
+	"assets": {
+		"directory": "./web/dist",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": ["/api/*", "/s/*"]
+	},
+
+	// Non-secret configuration. Replace with your own values at deploy time.
+	// Secrets (S3_ACCESS_KEY_ID, S3_SECRET_KEY) are NOT here: `wrangler secret put`.
+	"vars": {
+		// The public URL the app is served from (used for CORS, share links).
+		"PUBLIC_ORIGIN": "https://gorani.example.com",
+		// Any S3-compatible endpoint, reachable over HTTPS from the internet.
+		// MinIO: your reverse-proxied (TLS) address; region can be any string MinIO accepts.
+		"S3_ENDPOINT": "https://minio.example.com",
+		"S3_REGION": "us-east-1",
+		"S3_BUCKET": "gorani"
+	},
+
+	"observability": {
+		"enabled": true
+	}
+
+	// Durable Object bindings arrive with commit ⑥ (GoraniMemberDO); the
+	// migration then uses `new_sqlite_classes` so each member gets a SQLite
+	// database. See docs/ARCHITECTURE.md → "The member object".
+}

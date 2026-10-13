@@ -1,0 +1,21 @@
+{
+	"_copyright": "Copyright 2026- Seongwoo Hong. All rights reserved.",
+	"_note": "The web app's dependency budget is a security decision (docs/COURSE.md, Lesson 3): the runtime list stays deliberately short - Lit for UI, later pdf.js / sqlite-wasm / @noble / hash-wasm for viewers and the vault. No framework, no router package, no state library: those three are ours to write and they are small (web/src/lib/).",
+	"name": "gorani-web",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "vite",
+		"build": "vite build",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"lit": "^3.3.0"
+	},
+	"devDependencies": {
+		"@tailwindcss/vite": "^4.1.4",
+		"tailwindcss": "^4.1.4",
+		"typescript": "^5.8.3",
+		"vite": "^7.1.0"
+	}
+}

@@ -1,0 +1,27 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* Tailwind v4: one import, compiled at build time. No runtime CSS-in-JS —
+   the built stylesheet is a hashed static file the CSP allows from self.
+
+   Why every Lit component opts out of Shadow DOM (createRenderRoot returns
+   the element itself): Tailwind's utilities live in this one global
+   stylesheet, and shadow roots would hide them. The trade — component
+   styles could clash — is accepted on purpose: Gorani owns every element
+   name on the page (gorani-*), the CSP forbids third-party CSS, and
+   src/styles/ keeps the few hand-written rules that exist. */
+
+@import "tailwindcss";
+
+@theme {
+	/* The app's palette, named once so components never hard-code hexes. */
+	--color-accent: oklch(0.72 0.17 145); /* gorani green */
+}
+
+html,
+body {
+	height: 100%;
+}
+
+body {
+	overscroll-behavior: none;
+}

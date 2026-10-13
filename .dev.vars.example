@@ -1,0 +1,18 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+#
+# Secrets for `wrangler dev` (copy to `.dev.vars`, never commit it).
+# In production, set each with: wrangler secret put <NAME>
+
+# The S3 keys gorani uses to reach your bucket (MinIO or any S3-compatible
+# endpoint). Create a dedicated key whose policy is limited to this bucket.
+S3_ACCESS_KEY_ID=changeme
+S3_SECRET_KEY=changeme
+
+# Cloudflare Access (production only). The Worker verifies every request's
+# Access JWT against your team and fails closed when these are missing.
+POLICY_AUD=changeme
+TEAM_DOMAIN=https://yourteam.cloudflareaccess.com
+
+# Optional kill switch for crypto-shredding: only with this secret set does
+# DELETE …/vault accept "DESTROY VAULT KEY" (commit ⑧).
+VAULT_DESTROY_ENABLED=

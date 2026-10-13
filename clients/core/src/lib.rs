@@ -65,6 +65,9 @@ pub struct DeviceProfile {
 	pub access_id: Option<String>,
 	#[serde(default)]
 	pub access_secret: Option<String>,
+	/// Dev-mode identity (wrangler dev only; production uses Access).
+	#[serde(default)]
+	pub dev_email: Option<String>,
 }
 
 /// The unlocked session: the root bundle (bytes, Zeroizing) + the settings.

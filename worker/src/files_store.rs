@@ -19,7 +19,7 @@
 use rand_core::{OsRng, RngCore};
 use base64::Engine;
 use serde::Deserialize;
-use worker::{Request, Response, Result};
+use worker::{Error, Request, Response, Result};
 
 use crate::family::json_error;
 use crate::member::GoraniMemberDO;
@@ -71,6 +71,7 @@ struct FileSqlRow {
 	version: i64,
 	created_at: String,
 	updated_at: String,
+	owner: Option<String>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -125,10 +126,11 @@ impl GoraniMemberDO {
 		let size = body.get("size").and_then(|v| v.as_i64()).ok_or_else(|| worker::Error::RustError("missing size".into()))?;
 		self.sql
 			.exec(
-				"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-				Some(vec![file_id.clone().into(), bind(get("folderId")), name.clone().into(), size.into(), version.into()]),
+				"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?6)",
+				Some(vec![file_id.clone().into(), bind(get("folderId")), name.clone().into(), size.into(), version.into(), bind(get("owner"))]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("file insert: {e}")))?;
+		self.contributor_add(&file_id, actor).await?;
 		self.sql
 			.exec(
 				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
@@ -204,8 +206,24 @@ impl GoraniMemberDO {
 			"UPDATE files SET version = ?1, size = ?2, name_sealed = COALESCE(?3, name_sealed), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?4",
 			Some(vec![next.into(), size.into(), bind(name), file_id.clone().into()]),
 		)?;
+		self.contributor_add(&file_id, actor).await?;
 		self.audit(actor, "file.version", &file_id, None, None).await?;
 		self.file_row(&file_id).await
+	}
+
+	/// The contributors trail: one row per (file, member) — readable
+	/// structure, resolved to display names by the UI via the registry.
+	pub(crate) async fn contributor_add(&self, file_id: &str, actor_email: &str) -> Result<()> {
+		if actor_email.is_empty() || actor_email == "internal" || actor_email == "device" {
+			return Ok(());
+		}
+		self.sql
+			.exec(
+				"INSERT OR IGNORE INTO file_contributors (file_id, member, at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+				Some(vec![file_id.into(), actor_email.into()]),
+			)
+			.map(|_| ())
+			.map_err(Error::from)
 	}
 
 	// ── Files: reads ────────────────────────────────────────────────────
@@ -221,14 +239,14 @@ impl GoraniMemberDO {
 		let offset = q.get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
 		let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
 		let (rows, total): (Vec<FileSqlRow>, TotalCount) = if folder == "all" {
-			let rows = self.sql.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at FROM files WHERE deleted_at IS NULL ORDER BY created_at, id LIMIT ?1 OFFSET ?2", Some(vec![limit.into(), offset.into()]))?.to_array()?;
+			let rows = self.sql.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner FROM files WHERE deleted_at IS NULL ORDER BY created_at, id LIMIT ?1 OFFSET ?2", Some(vec![limit.into(), offset.into()]))?.to_array()?;
 			let total = self.sql.exec("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NULL", None)?.one::<TotalCount>()?;
 			(rows, total)
 		} else {
 			let parent = if folder == "root" { None } else { Some(folder.clone()) };
 			let rows = self
 				.sql
-				.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at FROM files WHERE deleted_at IS NULL AND folder_id IS ?1 ORDER BY created_at, id LIMIT ?2 OFFSET ?3", Some(vec![bind(parent.clone()), limit.into(), offset.into()]))?
+				.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner FROM files WHERE deleted_at IS NULL AND folder_id IS ?1 ORDER BY created_at, id LIMIT ?2 OFFSET ?3", Some(vec![bind(parent.clone()), limit.into(), offset.into()]))?
 				.to_array()?;
 			let total = self.sql.exec("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NULL AND folder_id IS ?1", Some(vec![bind(parent)]))?.one::<TotalCount>()?;
 			(rows, total)
@@ -238,7 +256,7 @@ impl GoraniMemberDO {
 			"total": total.n,
 			"files": rows.into_iter().map(|f| serde_json::json!({
 				"id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size,
-				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at,
+				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner,
 			})).collect::<Vec<_>>(),
 			"folders": folders.into_iter().map(|f| serde_json::json!({
 				"id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at,
@@ -319,11 +337,11 @@ impl GoraniMemberDO {
 		let rows: Vec<MatchRow> = self
 			.sql
 			.exec(
-				"SELECT f.id, v.tag FROM files f JOIN file_versions v ON v.file_id = f.id AND v.version = f.version WHERE f.size = ?1 AND f.deleted_at IS NULL",
+				"SELECT f.id, v.tag, f.owner AS owner, (SELECT group_concat(member, ',') FROM file_contributors c WHERE c.file_id = f.id) AS contributors FROM files f JOIN file_versions v ON v.file_id = f.id AND v.version = f.version WHERE f.size = ?1 AND f.deleted_at IS NULL",
 				Some(vec![size.into()]),
 			)?
 			.to_array()?;
-		Ok(Response::from_json(&serde_json::json!({ "files": rows.into_iter().map(|r| serde_json::json!({ "id": r.id, "tag": r.tag })).collect::<Vec<_>>() }))?)
+		Ok(Response::from_json(&serde_json::json!({ "files": rows.into_iter().map(|r| serde_json::json!({ "id": r.id, "tag": r.tag, "owner": r.owner, "contributors": r.contributors })).collect::<Vec<_>>() }))?)
 	}
 
 	/// The `files-object/:id` route: the object's location + wrapped key, for
@@ -880,7 +898,7 @@ impl GoraniMemberDO {
 		match self.file_sql_row(id).await? {
 			Some(f) => Ok(Response::from_json(&serde_json::json!({
 				"id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size,
-				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at,
+				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner,
 			}))?),
 			None => json_error(404, "no such file"),
 		}
@@ -914,6 +932,8 @@ struct JournalRow {
 struct MatchRow {
 	id: String,
 	tag: Option<String>,
+	owner: Option<String>,
+	contributors: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct ObjectRow {

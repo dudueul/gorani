@@ -97,7 +97,7 @@ impl GoraniMemberDO {
 		let folders: Vec<FolderJsonRow> = self.sql.exec("SELECT id, parent_id, name_sealed, created_at, updated_at FROM file_folders WHERE deleted_at IS NULL", None)?.to_array()?;
 		let files: Vec<FileJsonRow> = self
 			.sql
-			.exec("SELECT f.id, f.folder_id, f.name_sealed, f.size, f.version, f.created_at, f.updated_at FROM files f WHERE f.deleted_at IS NULL", None)?
+			.exec("SELECT f.id, f.folder_id, f.name_sealed, f.size, f.version, f.created_at, f.updated_at, f.owner FROM files f WHERE f.deleted_at IS NULL", None)?
 			.to_array()?;
 		let versions: Vec<VersionJsonRow> = self
 			.sql
@@ -133,7 +133,7 @@ impl GoraniMemberDO {
 		}
 		for f in files {
 			push_entry(
-				serde_json::json!({ "kind": "file", "id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size, "version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at }),
+				serde_json::json!({ "kind": "file", "id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size, "version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner }),
 				None,
 				&mut writer,
 				&mut out,
@@ -210,6 +210,7 @@ struct FileJsonRow {
 	version: i64,
 	created_at: String,
 	updated_at: String,
+	owner: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct VersionJsonRow {
@@ -279,10 +280,11 @@ impl GoraniMemberDO {
 				}
 				self.sql
 					.exec(
-						"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(id) DO UPDATE SET folder_id = ?2, name_sealed = ?3, size = ?4, deleted_at = NULL, trashed_with = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-						Some(vec![id.clone().into(), bind(get("folder")), name.into(), f.get("size").and_then(|v| v.as_i64()).unwrap_or(0).into(), f.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(), bind(get("createdAt"))]),
+						"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7) ON CONFLICT(id) DO UPDATE SET folder_id = ?2, name_sealed = ?3, size = ?4, deleted_at = NULL, trashed_with = NULL, owner = COALESCE(?7, owner), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+						Some(vec![id.clone().into(), bind(get("folder")), name.into(), f.get("size").and_then(|v| v.as_i64()).unwrap_or(0).into(), f.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(), bind(get("createdAt")), bind(get("owner"))]),
 					)
 					.map_err(|e| worker::Error::RustError(format!("restore file: {e}")))?;
+				self.contributor_add(&id, actor).await?;
 			}
 		}
 		if let Some(versions) = body.get("versions").and_then(|v| v.as_array()) {

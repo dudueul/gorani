@@ -39,21 +39,46 @@ fn read_secret(prompt: &str) -> String {
 }
 
 fn run(args: &[String]) -> Result<(), Error> {
-	match args.first().map(String::as_str) {
+	// Flags: --server --member --name --secret --device-secret --dev-email
+	//        --file --id --out --profile
+	let mut flags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+	let mut pos: Vec<String> = Vec::new();
+	let mut i = 0;
+	while i < args.len() {
+		let a = &args[i];
+		if let Some(name) = a.strip_prefix("--") {
+			if let Some(v) = args.get(i + 1) {
+				flags.insert(name.to_string(), v.clone());
+				i += 2;
+				continue;
+			}
+		}
+		pos.push(a.clone());
+		i += 1;
+	}
+	let flag = |k: &str| flags.get(k).cloned();
+	let req_flag = |k: &str| -> Result<String, Error> { flag(k).ok_or_else(|| Error::Config(format!("--{k} is required"))) };
+
+	match pos.first().map(String::as_str) {
 		Some("setup") => {
-			let server = read_line("Server: ");
-			let member = read_line("Member id: ");
-			let mut profile = DeviceProfile { server, member, device_id: String::new(), token: String::new(), access_id: None, access_secret: None };
-			let name = read_line("This computer's name: ");
-			let secret = read_secret("Vault password or recovery code: ");
+			let mut profile = DeviceProfile {
+				server: req_flag("server")?,
+				member: req_flag("member")?,
+				device_id: String::new(),
+				token: String::new(),
+				access_id: flag("access-id"),
+				access_secret: flag("device-secret"),
+				dev_email: flag("dev-email"),
+			};
+			let name = flag("name").unwrap_or_else(|| "this computer".into());
+			let secret = flag("secret").unwrap_or_else(|| read_secret("Vault password or recovery code: "));
 			let sess = session::enrol(&mut profile, &name, &secret, "cli")?;
-			let dev_secret = profile.access_secret.clone().unwrap_or_default();
-			session::save_profile(&profile_path(), &profile)?;
-			println!("enrolled: device {} (root {})", profile.device_id, sess.settings.key_id);
-			println!("device secret (kept in the profile): {dev_secret}");
+			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
+			session::save_profile(&path, &profile)?;
+			println!("enrolled device {} for root {} (member {})", profile.device_id, sess.settings.key_id, profile.member);
 		}
 		Some("ls") => {
-			let (profile, sess) = unlocked()?;
+			let (profile, sess) = unlocked(&flag, &req_flag)?;
 			let client = api::Client::new(profile);
 			let (cursor, changes) = client.changes(0)?;
 			println!("cursor {cursor}, {} changes", changes.len());
@@ -62,13 +87,16 @@ fn run(args: &[String]) -> Result<(), Error> {
 				if let Some(file) = c["data"].get("file") {
 					let name = open_name(&sess, file["name"].as_str().unwrap_or_default());
 					println!("  {kind:>12}  {}", name.unwrap_or_else(|| "(sealed)".into()));
+				} else if let Some(folder) = c["data"].get("folder") {
+					let name = open_name(&sess, folder["name"].as_str().unwrap_or_default());
+					println!("  {kind:>12}  [folder] {}", name.unwrap_or_else(|| "(sealed)".into()));
 				}
 			}
 		}
 		Some("pull") => {
-			let (profile, sess) = unlocked()?;
-			let id = args.get(1).ok_or(Error::Config("pull <file-id> [out]".into()))?.clone();
-			let out = args.get(2).cloned().unwrap_or_else(|| format!("./{id}"));
+			let (profile, sess) = unlocked(&flag, &req_flag)?;
+			let id = req_flag("id")?;
+			let out = flag("out").unwrap_or_else(|| format!("./{id}"));
 			let client = api::Client::new(profile);
 			let keys = client.keys(&[id.clone()])?;
 			let ck = keys["keys"][&id]["key"].as_str().unwrap_or_default().to_string();
@@ -88,24 +116,22 @@ fn run(args: &[String]) -> Result<(), Error> {
 					let mut aad = vec![b'G', b'C', b'0', b'1'];
 					aad.extend_from_slice(&(i as u64).to_be_bytes());
 					aad.push(u8::from(i == frames - 1));
-					let nonce = &sealed[at..at + 12];
-					let plain = gorani_formats::chunked::open_chunk_frame(&ck_key, nonce, body, &aad).map_err(|_| Error::Open("frame"))?;
+					let plain = gorani_formats::chunked::open_chunk_frame(&ck_key, iv, body, &aad).map_err(|_| Error::Open("frame"))?;
 					out_bytes.extend_from_slice(&plain);
 				}
 				out_bytes
 			} else {
 				let sealed = client.fetch(&id, None, None)?;
-				let plain = gorani_formats::formats::open_with(&ck_key, &sealed).map_err(|_| Error::Open("content"))?;
-				plain.to_vec()
+				gorani_formats::formats::open_with(&ck_key, &sealed).map_err(|_| Error::Open("content"))?.to_vec()
 			};
-			std::fs::write(out, plain)?;
-			println!("pulled {id}");
+			std::fs::write(&out, plain)?;
+			println!("pulled {id} → {out}");
 		}
 		Some("push") => {
-			let (profile, sess) = unlocked()?;
-			let path = args.get(1).ok_or(Error::Config("push <path> [name]".into()))?;
-			let name = args.get(2).cloned().unwrap_or_else(|| std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-			let bytes = std::fs::read(path)?;
+			let (profile, sess) = unlocked(&flag, &req_flag)?;
+			let path = req_flag("file")?;
+			let name = flag("name").unwrap_or_else(|| std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+			let bytes = std::fs::read(&path)?;
 			let client = api::Client::new(profile);
 			let name_sealed = sess.seal_for_files(&name)?;
 			let type_sealed = sess.seal_for_files("application/octet-stream")?;
@@ -125,18 +151,25 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {}", row["id"].as_str().unwrap_or("?"));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|ls|pull <id> [out]|push <path> [name]>");
+			eprintln!("usage: gorani-sync <setup|ls|pull|push> [--server S --member M --name N --secret S --device-secret H --dev-email E --file P --id I --out O --profile P]");
 			std::process::exit(2);
 		}
 	}
 	Ok(())
 }
 
-fn unlocked() -> Result<(DeviceProfile, Session), Error> {
-	let profile = session::load_profile(&profile_path())?;
-	let sess = session::unlock(&profile, &read_secret("Vault password or recovery code: "))?;
+fn unlocked(flag: &dyn Fn(&str) -> Option<String>, req_flag: &dyn Fn(&str) -> Result<String, Error>) -> Result<(DeviceProfile, Session), Error> {
+	let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
+	let mut profile = session::load_profile(&path)?;
+	if let Some(e) = flag("dev-email") {
+		profile.dev_email = Some(e);
+	}
+	let secret = flag("secret").unwrap_or_else(|| read_secret("Vault password or recovery code: "));
+	let sess = session::unlock(&profile, &secret)?;
 	Ok((profile, sess))
 }
+
+
 
 fn files_public(sess: &Session) -> Result<gorani_formats::formats::VaultPublicKey, Error> {
 	let key = sess.settings.stores.get("files").ok_or(Error::Open("no files store key"))?;

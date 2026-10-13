@@ -44,6 +44,11 @@ async fn member_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Re
 	}
 }
 
+/// The acting uploader's member id (strict ownership attribution).
+async fn actor_id_of(env: &Env, email: &str) -> Option<String> {
+	actor_of(env, email).await.ok().flatten().map(|a| a.id)
+}
+
 async fn actor_of(env: &Env, email: &str) -> Result<Option<Actor>> {
 	let namespace = env.durable_object("FAMILY")?;
 	let stub = namespace.id_from_name("family")?.get_stub()?;
@@ -395,7 +400,9 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"tag": form.fields.get("tag"),
 		"objectKey": object_key,
 		"bytesSealed": true,
+		"owner": actor_id_of(&env, &identity.email).await.unwrap_or_else(|| member_id.to_string()),
 	});
+	console_log!("gorani upload owner={:?}", body.get("owner"));
 	let resp = forward_member(&env, member_id, "POST", "files/put", Some(body), &actor).await?;
 	if resp.status_code() >= 400 {
 		// The DO refused the record — do not leave the object orphaned.
@@ -511,6 +518,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"type": form.fields.get("type"),
 		"size": size,
 		"chunkSize": chunk,
+		"owner": actor_id_of(&env, &identity.email).await.unwrap_or_else(|| member_id.to_string()), // (acting uploader attribution below)
 		"folderId": form.fields.get("folder_id"),
 		"baseVersion": form.fields.get("base_version").and_then(|s| s.parse::<u64>().ok()),
 		"tag": form.fields.get("tag"),

@@ -207,6 +207,10 @@ pub const MIGRATIONS: &[&str] = &[
 	// plaintext size (the recipient's progress), and readiness.
 	"ALTER TABLE shares ADD COLUMN s3_upload_id TEXT",
 	// Migration v5 (commit ⑫): backup manifests (one row per .gbak run).
+	// Migration v6 (commit 15): strict ownership (first uploader) + the
+	// contributors trail, readable structure like the rest.
+	"ALTER TABLE files ADD COLUMN owner TEXT",
+	"CREATE TABLE IF NOT EXISTS file_contributors (file_id TEXT NOT NULL, member TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (file_id, member))",
 	"CREATE TABLE IF NOT EXISTS backups (
 		stamp TEXT PRIMARY KEY,
 		kind TEXT NOT NULL,

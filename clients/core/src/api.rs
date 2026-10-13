@@ -60,6 +60,10 @@ impl Client {
 		if let (Some(id), Some(secret)) = (&self.profile.access_id, &self.profile.access_secret) {
 			r = r.set("CF-Access-Client-Id", id).set("CF-Access-Client-Secret", secret);
 		}
+		if let Some(email) = &self.profile.dev_email {
+			// Dev mode only (GORANI_DEV=1 on the worker); ignored in production.
+			r = r.set("x-gorani-dev-email", email);
+		}
 		r
 	}
 

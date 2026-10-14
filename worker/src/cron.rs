@@ -13,8 +13,8 @@
 
 use worker::*;
 
-/// The active member ids from the family registry (GoraniFamilyDO ›
-/// `member-ids`, an internal route — the Worker never exposes it).
+/// Ids from the family registry's internal doors (GoraniFamilyDO ›
+/// `member-ids`, the active members — the Worker never exposes it).
 ///
 /// This used to read `GET state`, the members' own registry view. When the
 /// security review (commit 23) made that view members-only, the cron — which
@@ -22,19 +22,29 @@ use worker::*;
 /// the nightly pass quietly did nothing. The lesson is in the shape: a
 /// system job reads a system answer, and an answer it cannot parse is an
 /// error, not an empty list.
-async fn member_ids(env: &Env) -> Result<Vec<String>> {
+///
+/// The same door serves the case ids (`case-ids`, commit 26): a case is a
+/// store like a member's own (area.rs), so it gets the same nightly pass.
+async fn registry_ids(env: &Env, route: &str) -> Result<Vec<String>> {
 	let namespace = env.durable_object("FAMILY")?;
 	let stub = namespace.id_from_name("family")?.get_stub()?;
-	let req = Request::new_with_init("https://do.internal/member-ids", &RequestInit { method: Method::Get, ..Default::default() })?;
+	let req = Request::new_with_init(&format!("https://do.internal/{route}"), &RequestInit { method: Method::Get, ..Default::default() })?;
 	let mut resp = stub.fetch_with_request(req).await?;
 	if resp.status_code() != 200 {
-		return Err(Error::RustError(format!("registry member-ids: HTTP {}", resp.status_code())));
+		return Err(Error::RustError(format!("registry {route}: HTTP {}", resp.status_code())));
 	}
 	let body: serde_json::Value = resp.json().await?;
 	body.get("ids")
 		.and_then(|m| m.as_array())
 		.map(|ids| ids.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-		.ok_or_else(|| Error::RustError("registry member-ids: no ids".into()))
+		.ok_or_else(|| Error::RustError(format!("registry {route}: no ids")))
+}
+
+/// Every area the pass visits: each active member's own, then each case.
+async fn areas(env: &Env) -> Result<Vec<String>> {
+	let mut out = registry_ids(env, "member-ids").await?;
+	out.extend(registry_ids(env, "case-ids").await?.into_iter().map(|c| format!("case:{c}")));
+	Ok(out)
 }
 
 /// The pass itself. No identity exists at 03:17 UTC — the DOs see the system
@@ -46,9 +56,9 @@ async fn member_ids(env: &Env) -> Result<Vec<String>> {
 /// whose deletes never reached S3, looked exactly like a healthy one.
 pub async fn run(env: Env) -> Result<()> {
 	let mut failures: Vec<String> = Vec::new();
-	for member in member_ids(&env).await? {
+	for member in areas(&env).await? {
 		let namespace = env.durable_object("MEMBER")?;
-		let stub = namespace.id_from_name(&format!("member:{member}"))?.get_stub()?;
+		let stub = namespace.id_from_name(&crate::area::do_name(&member))?.get_stub()?;
 		let headers = Headers::new();
 		headers.set("x-gorani-actor", "cron")?;
 		let req = Request::new_with_init(

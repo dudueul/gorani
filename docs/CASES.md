@@ -130,13 +130,68 @@ old CHECK constraint allowed only parent/child.
    auditor writes refused; externals see only their grants. Transitional
    rule: a lead may still act for a member's own area (the parent rule)
    until stage 5 removes it.
-3. **Cases** — the registry's cases and grants; `case:<id>` stores;
-   `/api/v1/cases/<id>/files/…`; the client's case-key grant and revoke
-   (revoke = rotate + the reseal walk).
+3. **Cases** (landed: commit 26d, `api:cases`) — the registry's cases and
+   grants; `case:<id>` stores; `/api/v1/cases/<id>/files/…`; the client's
+   case-key grant and revoke (revoke = rotate + the reseal walk). What the
+   build settled, below in **Stage 3 as built**.
 4. **Identity keys** — signing keys and fingerprints; signed grants.
 5. **Recovery** — the team recovery key, shares to leads, recovery copies,
    the ceremony; then the parent act-for rule and the master key go.
 6. **UI** — the case list, grant dialog, ceremony screens.
+
+## Stage 3 as built
+
+**One abstraction, not two stores.** An *area* is a member id or
+`case:<id>` (worker/src/area.rs, web/src/lib/area.ts); the DO instance, the
+object-key prefix (`files/<member>/…`, `cases/<case>/…`) and the GV04
+`store` all follow from it. Member ids cannot contain `:`, so the
+namespaces cannot meet. The Worker rewrites `/api/v1/cases/<id>/<rest>` to
+the member routes with the area, after one check:
+
+| The request | Needs |
+|---|---|
+| any GET of files, storage, backups; `POST files/keys` | a grant (read, write or manage) |
+| any other files write | write or manage — and not an auditor; refused on a closed case |
+| `PUT files/reseal`, the backup key and runs, restores, retention | manage |
+| `GET audit`, `GET reads` | a grant, or the lead/auditor audit view |
+| `files/shares…`, devices, vault settings, vault destruction | — (a case has none: 404) |
+
+**Routes** (management, all the registry's policy):
+
+| Route | Who |
+|---|---|
+| `POST /api/v1/cases` `{id, kind, keyId, publicKey{ec,kem}, keySealed, titleSealed}` | a lead; becomes the first manager |
+| `GET /api/v1/cases` | each caller's own grants (with key copies); leads and auditors also see every case's structure, without keys; externals do not see other grantees |
+| `PUT /api/v1/cases/<id>/grants/<member>` `{permission, keySealed, keyId, expiresAt?}` | a manager; the copy must name the current key |
+| `DELETE /api/v1/cases/<id>/grants/<member>` | a manager; never the last manager; sets "rotation required" |
+| `PUT /api/v1/cases/<id>/key` then `POST …/key/done` | a manager: the two steps of a rotation |
+| `POST /api/v1/cases/<id>/close` | a manager; the case becomes read-only |
+| `GET /api/v1/members/<id>/root` | any non-external member: the public halves a grant is sealed to |
+
+**Decisions the build made:**
+
+- **A rotation commits before it walks.** A member store's runbook walks
+  first and then switches settings — survivable there because the member
+  keeps their old key. A case's key lives only in grants, so a walk that
+  ran first and crashed would leave half the case sealed to a key that
+  existed only in the dead tab. So: commit the new key (each grantee's old
+  copy moves to `prev_key_sealed`), walk, prove the old key opens nothing
+  (rotation.ts › opensAnything), then `key/done` drops the old copies. A
+  tab that dies mid-walk resumes from the grants (`rotateCase` sees
+  `rotating`). While a walk runs, readers fall back to the previous key.
+- **Ended grants count as a revoke.** An external whose grant or own
+  access expired, or a deactivated member, kept their copy; the case lists
+  `rotationRequired` until a rotation drops those grants with the old key.
+- **Externals have a vault root, not an area.** A grant is sealed to a
+  root, so an external sets up their own vault (unlock methods, root) —
+  and still has no files beside it.
+- **No public links from a case**, evidence or working: a case shares by
+  grant. D11 decides whether working cases get links later.
+- **The O3 gap is still open for grants**: a copy sealed to you by someone
+  else is checked for consistency against the registry's public halves for
+  the case (`openCaseKey`), not for authenticity — a server that replaced
+  both before your first open is not caught. Stage 4's signed grants close
+  it; `GET …/root` is likewise the server's word until fingerprints.
 
 ## What this does NOT change
 

@@ -25,16 +25,21 @@
  * row fails under both keys. Re-sealing under the new key also moves every
  * value to the new store PSK: what the departing member could still mint
  * with the OLD key is refused from here on.
+ *
+ * Areas (commit 26): `memberId` is an AREA — a member id or `case:<id>`
+ * (lib/area.ts). A case rotates through the same walk (cases.ts ›
+ * rotateCase), because a case is a store like any other.
  */
 
 import { openPlacedText, sealPlacedText, type VaultPrivateKey } from "./vault-crypto.ts";
 import { places } from "./places.ts";
+import { areaPath } from "../lib/area.ts";
 
 export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets"] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
 
 /** A JSON call against the API (the browser's bridge, or a test's helper). */
-export type ApiCall = (method: "GET" | "PUT", path: string, body?: unknown) => Promise<unknown>;
+export type ApiCall = (method: "GET" | "PUT" | "POST", path: string, body?: unknown) => Promise<unknown>;
 
 interface SealedItem {
 	row: number;
@@ -93,7 +98,7 @@ async function reseal(value: string, place: Uint8Array, oldPrivate: VaultPrivate
 async function* pages(call: ApiCall, memberId: string, kind: SealedKind): AsyncGenerator<SealedItem[]> {
 	let after = 0;
 	for (;;) {
-		const page = (await call("GET", `/api/v1/members/${memberId}/files/sealed?kind=${kind}&after=${after}&limit=500`)) as SealedPage;
+		const page = (await call("GET", `${areaPath(memberId)}/files/sealed?kind=${kind}&after=${after}&limit=500`)) as SealedPage;
 		yield page.items;
 		if (page.next === null) return;
 		after = page.next;
@@ -126,7 +131,7 @@ export async function resealStore(call: ApiCall, memberId: string, oldPrivate: V
 				items.push({ kind, row: it.row, v1: v1 ?? it.v1, ...(v2 ? { v2 } : {}) });
 			}
 			if (items.length) {
-				await call("PUT", `/api/v1/members/${memberId}/files/reseal`, { items });
+				await call("PUT", `${areaPath(memberId)}/files/reseal`, { items });
 				report.resealed[kind] += items.length;
 			}
 		}

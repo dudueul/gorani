@@ -72,6 +72,38 @@ pub const MIGRATIONS: &[&str] = &[
 	"INSERT OR IGNORE INTO members_v2 (id, name, role, emails, active, created_at) SELECT id, name, CASE role WHEN 'parent' THEN 'lead' ELSE 'analyst' END, emails, active, created_at FROM members",
 	"DROP TABLE members",
 	"ALTER TABLE members_v2 RENAME TO members",
+	// Migration v3 (commit 26, docs/CASES.md › Areas and their keys): cases
+	// and grants. A case's title is sealed (GV04, place `case.title`) — the
+	// id is readable structure, an incident code. The key's PUBLIC halves
+	// sit here so the registry can check every grant names the current key;
+	// each grant holds one copy of the case key sealed to the grantee's root.
+	// `prev_*` hold the key being rotated AWAY from while the reseal walk
+	// runs (case_rekey → case_rekey_done): a walk interrupted half-way can
+	// resume, because the old key is not gone until the walk says so.
+	"CREATE TABLE IF NOT EXISTS cases (
+		id TEXT PRIMARY KEY,
+		kind TEXT NOT NULL CHECK (kind IN ('evidence','working')),
+		title_sealed TEXT,
+		key_id TEXT NOT NULL,
+		public_key TEXT NOT NULL,
+		created_by TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		closed_at TEXT,
+		rotation_required INTEGER NOT NULL DEFAULT 0,
+		prev_key_id TEXT
+	)",
+	"CREATE TABLE IF NOT EXISTS case_grants (
+		case_id TEXT NOT NULL,
+		member_id TEXT NOT NULL,
+		permission TEXT NOT NULL CHECK (permission IN ('read','write','manage')),
+		key_sealed TEXT NOT NULL,
+		key_id TEXT NOT NULL,
+		granted_by TEXT NOT NULL,
+		granted_at TEXT NOT NULL,
+		expires_at TEXT,
+		prev_key_sealed TEXT,
+		PRIMARY KEY (case_id, member_id)
+	)",
 ];
 
 /// The four roles (docs/CASES.md), with the family's names accepted as
@@ -198,6 +230,37 @@ impl GoraniFamilyDO {
 				self.share_index_release(&id["shares-index/".len()..], &member).await
 			}
 			("GET", id) if id.starts_with("share-owner/") => self.share_owner(&id["share-owner/".len()..]).await,
+			// ── Cases (commit 26, docs/CASES.md) ──
+			("POST", "cases") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.case_create(&actor, body).await
+			}
+			("GET", "cases") => self.case_list(&actor).await,
+			("GET", "case-access") => {
+				let case = req.headers().get("x-gorani-case")?.unwrap_or_default();
+				self.case_access(&actor, &case).await
+			}
+			("GET", "case-ids") => {
+				let rows: Vec<IdRow> = self.sql.exec("SELECT id FROM cases ORDER BY id", None)?.to_array()?;
+				Ok(Response::from_json(&serde_json::json!({ "ids": rows.into_iter().map(|r| r.id).collect::<Vec<_>>() }))?)
+			}
+			("PUT", id) if id.starts_with("case-grants/") => match id["case-grants/".len()..].split_once('/') {
+				Some((case, member)) => {
+					let body = req.json::<serde_json::Value>().await?;
+					self.case_grant(&actor, case, member, body).await
+				}
+				None => json_error(400, "case-grants/<case>/<member>"),
+			},
+			("DELETE", id) if id.starts_with("case-grants/") => match id["case-grants/".len()..].split_once('/') {
+				Some((case, member)) => self.case_revoke(&actor, case, member).await,
+				None => json_error(400, "case-grants/<case>/<member>"),
+			},
+			("POST", id) if id.starts_with("case-key-done/") => self.case_rekey_done(&actor, &id["case-key-done/".len()..]).await,
+			("PUT", id) if id.starts_with("case-key/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.case_rekey(&actor, &id["case-key/".len()..], body).await
+			}
+			("POST", id) if id.starts_with("case-close/") => self.case_close(&actor, &id["case-close/".len()..]).await,
 			_ => Response::error("Not Found", 404),
 		}
 	}
@@ -468,6 +531,299 @@ impl GoraniFamilyDO {
 		Ok(false)
 	}
 
+	// ── Cases and grants (commit 26, docs/CASES.md) ─────────────────────
+	//
+	// The registry decides WHO may hold a case's key; it never holds one.
+	// A grant row carries the case key sealed (by the granter's client) to
+	// the grantee's root; the registry checks the shape and the policy:
+	//
+	//   - only a lead creates a case, and becomes its first manager;
+	//   - only a MANAGER of the case grants and revokes (holding the key is
+	//     what lets them seal it — a lead who is not on the case cannot add
+	//     anyone to it: D2's least privilege; D4's quorum is the way in);
+	//   - an auditor's grant is read-only; an external's must expire, no
+	//     later than the external themselves;
+	//   - every grant names the CURRENT key id (a stale copy is refused);
+	//   - revoking marks the case `rotation_required` until a manager commits
+	//     a new key with a fresh copy for every remaining grantee.
+
+	fn member_by_email(&self, email: &str) -> Result<Option<EmailRoleRow>> {
+		self.actor_row(email)
+	}
+
+	fn grant_of(&self, case: &str, member: &str) -> Result<Option<GrantRow>> {
+		Ok(self
+			.sql
+			.exec(
+				"SELECT permission, key_sealed, key_id, expires_at, prev_key_sealed FROM case_grants WHERE case_id = ?1 AND member_id = ?2 AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+				Some(vec![case.into(), member.into()]),
+			)?
+			.to_array::<GrantRow>()?
+			.into_iter()
+			.next())
+	}
+
+	/// Grants that no longer let anyone in — an expired grant, a deactivated
+	/// or expired member — but whose holder KEPT the key copy. They count as
+	/// a pending rotation exactly like a revoke, and a rotation drops them.
+	const STALE_GRANTS: &'static str = "case_id = ?1 AND (
+		(expires_at IS NOT NULL AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		OR member_id IN (SELECT id FROM members WHERE active = 0 OR (expires_at IS NOT NULL AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))))";
+
+	fn stale_grants(&self, case: &str) -> Result<i64> {
+		Ok(self.sql.exec(&format!("SELECT COUNT(*) AS n FROM case_grants WHERE {}", Self::STALE_GRANTS), Some(vec![case.into()]))?.one::<Count>()?.n)
+	}
+
+	fn case_row(&self, case: &str) -> Result<Option<CaseRow>> {
+		Ok(self
+			.sql
+			.exec("SELECT id, kind, title_sealed, key_id, public_key, created_by, created_at, closed_at, rotation_required, prev_key_id FROM cases WHERE id = ?1", Some(vec![case.into()]))?
+			.to_array::<CaseRow>()?
+			.into_iter()
+			.next())
+	}
+
+	async fn case_create(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let Some(me) = self.member_by_email(actor)? else { return json_error(403, "not a team member") };
+		if me.role != "lead" {
+			return json_error(403, "only a lead opens a case");
+		}
+		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+		let Some(id) = get("id").filter(|i| crate::area::valid_case_id(i)) else { return json_error(400, "case id: 2–40 of a–z, 0–9, dashes") };
+		let kind = get("kind").unwrap_or_else(|| "working".into());
+		if kind != "evidence" && kind != "working" {
+			return json_error(400, "kind: evidence or working");
+		}
+		let (Some(key_id), Some(key_sealed)) = (get("keyId"), get("keySealed")) else { return json_error(400, "keyId and keySealed (the case key, sealed to your root) are required") };
+		let Some(public_key) = body.get("publicKey").filter(|p| p.is_object()) else { return json_error(400, "publicKey { ec, kem } required") };
+		if !gorani_formats::formats::is_sealed_text(&key_sealed) || get("titleSealed").is_some_and(|t| !gorani_formats::placed::is_placed_text(&t)) {
+			return json_error(400, "the key copy must be sealed; the title placed (GV04)");
+		}
+		if self.case_row(&id)?.is_some() {
+			return json_error(409, "a case with this id exists");
+		}
+		self.sql.exec(
+			"INSERT INTO cases (id, kind, title_sealed, key_id, public_key, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+			Some(vec![id.clone().into(), kind.clone().into(), crate::files_store::bind(get("titleSealed")), key_id.clone().into(), public_key.to_string().into(), me.id.clone().into()]),
+		)?;
+		self.sql.exec(
+			"INSERT INTO case_grants (case_id, member_id, permission, key_sealed, key_id, granted_by, granted_at) VALUES (?1, ?2, 'manage', ?3, ?4, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+			Some(vec![id.clone().into(), me.id.clone().into(), key_sealed.into(), key_id.into()]),
+		)?;
+		self.audit(actor, "case.create", &id, Some(&serde_json::json!({ "kind": kind }))).await?;
+		Ok(Response::from_json(&serde_json::json!({ "id": id, "kind": kind }))?)
+	}
+
+	/// The caller's cases: every case they are granted (with their key copy),
+	/// and — for leads and auditors — every case's structure, without keys.
+	async fn case_list(&self, actor: &str) -> Result<Response> {
+		let Some(me) = self.member_by_email(actor)? else { return json_error(403, "not a team member") };
+		let cases: Vec<CaseRow> = self.sql.exec("SELECT id, kind, title_sealed, key_id, public_key, created_by, created_at, closed_at, rotation_required, prev_key_id FROM cases ORDER BY created_at, id", None)?.to_array()?;
+		let mut out = Vec::new();
+		for c in cases {
+			let grant = self.grant_of(&c.id, &me.id)?;
+			if grant.is_none() && me.role != "lead" && me.role != "auditor" {
+				continue;
+			}
+			// Who else is on the case — not for externals, who see only their
+			// own grant (the registry view is closed to them, stage 2).
+			let grantees: Vec<GranteeRow> = if me.role == "external" {
+				Vec::new()
+			} else {
+				self.sql.exec("SELECT member_id, permission, expires_at FROM case_grants WHERE case_id = ?1 ORDER BY member_id", Some(vec![c.id.clone().into()]))?.to_array()?
+			};
+			out.push(serde_json::json!({
+				"id": c.id, "kind": c.kind, "titleSealed": c.title_sealed, "keyId": c.key_id,
+				"publicKey": serde_json::from_str::<serde_json::Value>(&c.public_key).unwrap_or(serde_json::Value::Null),
+				"createdBy": c.created_by, "createdAt": c.created_at, "closed": c.closed_at.is_some(), "rotationRequired": c.rotation_required != 0 || self.stale_grants(&c.id)? > 0,
+				// A rotation whose reseal walk has not finished: the previous
+				// key (id here, each grantee's copy in their grant) still opens
+				// what the walk has not reached.
+				"rotating": c.prev_key_id.as_ref().map(|k| serde_json::json!({ "prevKeyId": k })),
+				"grant": grant.map(|g| serde_json::json!({ "permission": g.permission, "keySealed": g.key_sealed, "keyId": g.key_id, "expiresAt": g.expires_at, "prevKeySealed": g.prev_key_sealed })),
+				"grantees": grantees.into_iter().map(|g| serde_json::json!({ "member": g.member_id, "permission": g.permission, "expiresAt": g.expires_at })).collect::<Vec<_>>(),
+			}));
+		}
+		Ok(Response::from_json(&serde_json::json!({ "cases": out }))?)
+	}
+
+	/// The Worker's per-request question (internal): may this email use this
+	/// case, and how? `null` when not (no member, no live grant, no case).
+	async fn case_access(&self, actor: &str, case: &str) -> Result<Response> {
+		let (Some(me), Some(c)) = (self.member_by_email(actor)?, self.case_row(case)?) else { return Ok(Response::from_json(&serde_json::Value::Null)?) };
+		match self.grant_of(case, &me.id)? {
+			Some(g) => Ok(Response::from_json(&serde_json::json!({ "id": me.id, "role": me.role, "permission": g.permission, "closed": c.closed_at.is_some() }))?),
+			// Auditors and leads read every case's AUDIT and read log (not its
+			// content — they would need the key); the Worker narrows by route.
+			None if me.role == "auditor" || me.role == "lead" => Ok(Response::from_json(&serde_json::json!({ "id": me.id, "role": me.role, "permission": "audit", "closed": c.closed_at.is_some() }))?),
+			None => Ok(Response::from_json(&serde_json::Value::Null)?),
+		}
+	}
+
+	fn require_manager(&self, actor: &str, case: &str) -> std::result::Result<EmailRoleRow, Response> {
+		let me = self.member_by_email(actor).ok().flatten().ok_or_else(|| json_error_raw(403, "not a team member"))?;
+		match self.grant_of(case, &me.id).ok().flatten() {
+			Some(g) if g.permission == "manage" => Ok(me),
+			_ => Err(json_error_raw(403, "only a manager of this case may change its grants")),
+		}
+	}
+
+	async fn case_grant(&self, actor: &str, case: &str, member: &str, body: serde_json::Value) -> Result<Response> {
+		let me = match self.require_manager(actor, case) {
+			Ok(m) => m,
+			Err(r) => return Ok(r),
+		};
+		let Some(c) = self.case_row(case)? else { return json_error(404, "no such case") };
+		if c.closed_at.is_some() {
+			return json_error(409, "the case is closed");
+		}
+		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+		let permission = get("permission").unwrap_or_else(|| "read".into());
+		if !["read", "write", "manage"].contains(&permission.as_str()) {
+			return json_error(400, "permission: read, write or manage");
+		}
+		let Some(target) = self.sql.exec("SELECT role, expires_at FROM members WHERE id = ?1 AND active = 1", Some(vec![member.into()]))?.to_array::<RoleExpiryRow>()?.into_iter().next() else {
+			return json_error(404, "no such active member");
+		};
+		// Role caps (docs/CASES.md › Roles).
+		if target.role == "auditor" && permission != "read" {
+			return json_error(400, "an auditor's grant is read-only");
+		}
+		if target.role == "external" {
+			if permission == "manage" {
+				return json_error(400, "an external member cannot manage a case");
+			}
+			match (get("expiresAt"), target.expires_at.as_deref()) {
+				(None, _) => return json_error(400, "an external member's grant needs expiresAt"),
+				(Some(g), Some(m)) if g.as_str() > m => return json_error(400, "a grant cannot outlive the external member's own expiry"),
+				_ => {}
+			}
+		} else if get("expiresAt").is_some() {
+			return json_error(400, "only an external member's grant expires");
+		}
+		let (Some(key_sealed), Some(key_id)) = (get("keySealed"), get("keyId")) else { return json_error(400, "keySealed and keyId required") };
+		if key_id != c.key_id {
+			return json_error(409, "the grant names an old case key — rotate first, or seal the current key");
+		}
+		if !gorani_formats::formats::is_sealed_text(&key_sealed) {
+			return json_error(400, "the key copy must be sealed text");
+		}
+		self.sql.exec(
+			"INSERT INTO case_grants (case_id, member_id, permission, key_sealed, key_id, granted_by, granted_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7) ON CONFLICT (case_id, member_id) DO UPDATE SET permission = ?3, key_sealed = ?4, key_id = ?5, granted_by = ?6, granted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), expires_at = ?7",
+			Some(vec![case.into(), member.into(), permission.clone().into(), key_sealed.into(), key_id.into(), me.id.into(), crate::files_store::bind(get("expiresAt"))]),
+		)?;
+		self.audit(actor, "case.grant", case, Some(&serde_json::json!({ "member": member, "permission": permission, "expiresAt": get("expiresAt") }))).await?;
+		self.case_list(actor).await
+	}
+
+	async fn case_revoke(&self, actor: &str, case: &str, member: &str) -> Result<Response> {
+		if let Err(r) = self.require_manager(actor, case) {
+			return Ok(r);
+		}
+		let managers = self.sql.exec("SELECT COUNT(*) AS n FROM case_grants WHERE case_id = ?1 AND permission = 'manage' AND member_id != ?2", Some(vec![case.into(), member.into()]))?.one::<Count>()?.n;
+		if managers == 0 {
+			return json_error(409, "cannot remove the case's last manager");
+		}
+		let gone = self.sql.exec("DELETE FROM case_grants WHERE case_id = ?1 AND member_id = ?2", Some(vec![case.into(), member.into()]))?.rows_written();
+		if gone == 0 {
+			return json_error(404, "no such grant");
+		}
+		// The revoked member KEPT their copy of the case key (it was theirs to
+		// open): until a manager rotates, they can still open anything sealed
+		// to it that they can get hold of. The flag makes that visible.
+		self.sql.exec("UPDATE cases SET rotation_required = 1 WHERE id = ?1", Some(vec![case.into()]))?;
+		self.audit(actor, "case.revoke", case, Some(&serde_json::json!({ "member": member, "rotationRequired": true }))).await?;
+		self.case_list(actor).await
+	}
+
+	/// Rotate a case key, step 1 of 2: the new public halves and a fresh copy
+	/// for EVERY remaining grantee, in one write. Each grantee's old copy
+	/// moves to `prev_key_sealed` — the reseal walk (client-side,
+	/// rotation.ts) runs AFTER this commit and needs the old key to open
+	/// what it re-seals; a tab that dies mid-walk resumes from the grants.
+	/// (The order matters: walking first, as a member store's rotation does,
+	/// would leave a crashed walk's values under a key that lived only in
+	/// the dead tab.) Step 2 is case_rekey_done.
+	async fn case_rekey(&self, actor: &str, case: &str, body: serde_json::Value) -> Result<Response> {
+		if let Err(r) = self.require_manager(actor, case) {
+			return Ok(r);
+		}
+		let Some(c) = self.case_row(case)? else { return json_error(404, "no such case") };
+		if c.prev_key_id.is_some() {
+			return json_error(409, "a rotation is still walking — finish it (POST …/key/done) before starting another");
+		}
+		if body.get("keyId").and_then(|k| k.as_str()) == Some(c.key_id.as_str()) {
+			return json_error(409, "a rotation needs a NEW key");
+		}
+		if body.get("titleSealed").and_then(|t| t.as_str()).is_some_and(|t| !gorani_formats::placed::is_placed_text(t)) {
+			return json_error(400, "the title must be placed sealed text (GV04)");
+		}
+		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+		let Some(key_id) = get("keyId") else { return json_error(400, "keyId required") };
+		let Some(public_key) = body.get("publicKey").filter(|p| p.is_object()) else { return json_error(400, "publicKey required") };
+		let copies: std::collections::BTreeMap<String, String> = body
+			.get("grants")
+			.and_then(|g| g.as_array())
+			.map(|list| list.iter().filter_map(|g| Some((g.get("member")?.as_str()?.to_string(), g.get("keySealed")?.as_str()?.to_string()))).collect())
+			.unwrap_or_default();
+		// Grants that ended by themselves (expiry, deactivation) go with the
+		// old key: nobody seals the new one to a holder who left.
+		let dropped = self.sql.exec(&format!("DELETE FROM case_grants WHERE {}", Self::STALE_GRANTS), Some(vec![case.into()]))?.rows_written();
+		if dropped > 0 {
+			// Their holders still hold the old key: the rotation is owed even
+			// if THIS attempt is refused below.
+			self.sql.exec("UPDATE cases SET rotation_required = 1 WHERE id = ?1", Some(vec![case.into()]))?;
+		}
+		let current: Vec<GranteeRow> = self.sql.exec("SELECT member_id, permission, expires_at FROM case_grants WHERE case_id = ?1", Some(vec![case.into()]))?.to_array()?;
+		let want: std::collections::BTreeSet<&str> = current.iter().map(|g| g.member_id.as_str()).collect();
+		let have: std::collections::BTreeSet<&str> = copies.keys().map(String::as_str).collect();
+		if want != have {
+			return json_error(409, "a rotation re-seals the key for exactly the current grantees — no more, no fewer");
+		}
+		if copies.values().any(|k| !gorani_formats::formats::is_sealed_text(k)) {
+			return json_error(400, "every copy must be sealed text");
+		}
+		for (member, sealed) in &copies {
+			self.sql.exec(
+				"UPDATE case_grants SET prev_key_sealed = key_sealed, key_sealed = ?1, key_id = ?2 WHERE case_id = ?3 AND member_id = ?4",
+				Some(vec![sealed.clone().into(), key_id.clone().into(), case.into(), member.clone().into()]),
+			)?;
+		}
+		// `rotation_required` stays set until the walk is done: until then the
+		// old key still opens part of the store.
+		self.sql.exec(
+			"UPDATE cases SET prev_key_id = key_id, key_id = ?1, public_key = ?2, title_sealed = COALESCE(?3, title_sealed) WHERE id = ?4",
+			Some(vec![key_id.clone().into(), public_key.to_string().into(), crate::files_store::bind(get("titleSealed")), case.into()]),
+		)?;
+		self.audit(actor, "case.rekey", case, Some(&serde_json::json!({ "keyId": key_id, "grantees": copies.len(), "endedGrantsDropped": dropped }))).await?;
+		self.case_list(actor).await
+	}
+
+	/// Rotate a case key, step 2 of 2: the walk re-sealed everything, so the
+	/// previous copies go and the case is no longer owed a rotation. (The
+	/// registry cannot verify the walk — it cannot open anything; the
+	/// manager's client proves it first with rotation.ts › opensAnything.)
+	async fn case_rekey_done(&self, actor: &str, case: &str) -> Result<Response> {
+		if let Err(r) = self.require_manager(actor, case) {
+			return Ok(r);
+		}
+		let Some(c) = self.case_row(case)? else { return json_error(404, "no such case") };
+		let Some(prev) = c.prev_key_id else { return json_error(409, "no rotation is walking") };
+		self.sql.exec("UPDATE case_grants SET prev_key_sealed = NULL WHERE case_id = ?1", Some(vec![case.into()]))?;
+		self.sql.exec("UPDATE cases SET prev_key_id = NULL, rotation_required = 0 WHERE id = ?1", Some(vec![case.into()]))?;
+		self.audit(actor, "case.rekey.done", case, Some(&serde_json::json!({ "keyId": c.key_id, "retired": prev }))).await?;
+		self.case_list(actor).await
+	}
+
+	async fn case_close(&self, actor: &str, case: &str) -> Result<Response> {
+		if let Err(r) = self.require_manager(actor, case) {
+			return Ok(r);
+		}
+		self.sql.exec("UPDATE cases SET closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND closed_at IS NULL", Some(vec![case.into()]))?;
+		self.audit(actor, "case.close", case, None).await?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
 	async fn audit(&self, actor: &str, action: &str, target: &str, details: Option<&serde_json::Value>) -> Result<()> {
 		self.sql
 			.exec(
@@ -522,6 +878,39 @@ struct OwnerRow {
 	member_id: String,
 }
 #[derive(serde::Deserialize)]
+struct GrantRow {
+	permission: String,
+	key_sealed: String,
+	key_id: String,
+	expires_at: Option<String>,
+	prev_key_sealed: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct GranteeRow {
+	member_id: String,
+	permission: String,
+	expires_at: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct RoleExpiryRow {
+	role: String,
+	expires_at: Option<String>,
+}
+#[derive(serde::Deserialize)]
+#[allow(dead_code)] // the full row: some readers use part of it
+struct CaseRow {
+	id: String,
+	kind: String,
+	title_sealed: Option<String>,
+	key_id: String,
+	public_key: String,
+	created_by: String,
+	created_at: String,
+	closed_at: Option<String>,
+	rotation_required: i64,
+	prev_key_id: Option<String>,
+}
+#[derive(serde::Deserialize)]
 struct IdRow {
 	id: String,
 }
@@ -566,4 +955,9 @@ struct PatchMember {
 /// gorani route and test relies on.
 pub fn json_error(status: u16, message: &str) -> Result<Response> {
 	Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
+}
+
+/// The same, as a bare Response (for `Result<_, Response>` refusals).
+fn json_error_raw(status: u16, message: &str) -> Response {
+	json_error(status, message).unwrap_or_else(|_| Response::error(message, status).expect("a plain error response"))
 }

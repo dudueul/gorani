@@ -18,6 +18,7 @@ import { customElement, property, state } from "lit/decorators.js";
 import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta } from "../../vault/share-crypto.ts";
 import { sealChunked, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
 import { devIdentityHeaders } from "../../lib/api.ts";
+import { areaPath } from "../../lib/area.ts";
 import { sealText } from "../../vault/vault-crypto.ts";
 import type { FilesModel } from "./model.ts";
 
@@ -129,7 +130,7 @@ export class GoraniShare extends LitElement {
 			const nameSealed = await this.model.sealShareName(id, this.target.name);
 			const expiresAt = new Date(Date.now() + this.expiry * 86_400_000).toISOString();
 
-			const start = await this.model.api.apiSend<{ parts: number }>("POST", `/api/v1/members/${this.model.memberId}/files/shares`, {
+			const start = await this.model.api.apiSend<{ parts: number }>("POST", `${areaPath(this.model.memberId)}/files/shares`, {
 				id,
 				fileId: this.target.id,
 				version: this.target.version,
@@ -145,7 +146,7 @@ export class GoraniShare extends LitElement {
 			if (start.parts !== frames) throw new Error("the server counted a different number of parts");
 			const etags: { partNumber: number; etag: string }[] = [];
 			for (let p = 1; p <= frames; p++) {
-				const res = await fetch(`/api/v1/members/${this.model.memberId}/files/shares/${id}/parts/${p}`, {
+				const res = await fetch(`${areaPath(this.model.memberId)}/files/shares/${id}/parts/${p}`, {
 					method: "PUT",
 					headers: { ...devIdentityHeaders(), "content-type": "application/octet-stream" },
 					body: copy.subarray((p - 1) * frame, Math.min(copy.length, p * frame)) as unknown as BodyInit,
@@ -153,7 +154,7 @@ export class GoraniShare extends LitElement {
 				if (!res.ok) throw new Error(`part ${p} refused (${res.status})`);
 				etags.push((await res.json()) as { partNumber: number; etag: string });
 			}
-			await this.model.api.apiSend("POST", `/api/v1/members/${this.model.memberId}/files/shares/${id}/complete`, { parts: etags, size: plain.length });
+			await this.model.api.apiSend("POST", `${areaPath(this.model.memberId)}/files/shares/${id}/complete`, { parts: etags, size: plain.length });
 			this.link = `${location.origin}/s/f/${id}#${secret}`;
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);

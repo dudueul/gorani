@@ -109,6 +109,11 @@ impl Place {
 	pub fn store_secrets(store: &str) -> Self {
 		Self::new("store.secrets", store, "", None)
 	}
+	/// A case's title (commit 26): sealed with the case key, kept in the
+	/// registry. `store` is the case's area, `case:<id>`.
+	pub fn case_title(store: &str) -> Self {
+		Self::new("case.title", store, "", None)
+	}
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.0
 	}

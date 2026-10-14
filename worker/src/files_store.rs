@@ -437,11 +437,12 @@ impl GoraniMemberDO {
 		}))?)
 	}
 
-	/// Does a version row point at `files/<member>/<file>/<obj>`? The
-	/// restore fill (routes.rs › backup_object_fill) writes only to keys a
-	/// restore minted — this is how it asks.
+	/// Does a version row point at `<area prefix>/<file>/<obj>`
+	/// (`files/<member>/…` or `cases/<case>/…`, area.rs)? The restore fill
+	/// (routes.rs › backup_object_fill) writes only to keys a restore
+	/// minted — this is how it asks.
 	pub(crate) async fn restore_target(&self, member: &str, file_id: &str, obj: &str) -> Result<Response> {
-		let key = format!("files/{member}/{file_id}/{obj}");
+		let key = format!("{}/{file_id}/{obj}", crate::area::key_prefix(member));
 		let n = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE file_id = ?1 AND object_key = ?2", Some(vec![file_id.into(), key.into()]))?.one::<TotalCount>()?.n;
 		if n == 0 {
 			return json_error(404, "no such restore target");

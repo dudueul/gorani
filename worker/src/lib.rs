@@ -28,6 +28,7 @@
 
 use worker::*;
 
+mod area;
 mod auth;
 mod backup;
 mod cache;

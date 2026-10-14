@@ -25,6 +25,7 @@ import { controllingMediaWorker, registerMedia } from "../../lib/media-worker.ts
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
+import { areaPath } from "../../lib/area.ts";
 import { kindOf, type FileKind } from "./icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
@@ -204,7 +205,7 @@ export class FilesModel {
 		this.set({ loading: true, error: null, folderId });
 		try {
 			if (opts.trash) {
-				const t = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[]; trashedWith: { id: string; with: string }[] }>(`/api/v1/members/${this.memberId}/files/trash`);
+				const t = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[]; trashedWith: { id: string; with: string }[] }>(`${areaPath(this.memberId)}/files/trash`);
 				const withMap = new Map(t.trashedWith.map((x) => [x.id, x.with]));
 				this.set({
 					trashFiles: await this.decryptFiles(t.files.map((f) => ({ ...f, trashedWith: withMap.get(f.id) ?? null }))),
@@ -213,7 +214,7 @@ export class FilesModel {
 				});
 				return;
 			}
-			const l = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[] }>(`/api/v1/members/${this.memberId}/files/list?folder=${folderId ?? "root"}&limit=1000`);
+			const l = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[] }>(`${areaPath(this.memberId)}/files/list?folder=${folderId ?? "root"}&limit=1000`);
 			this.set({
 				folders: await this.decryptFolders(l.folders),
 				files: await this.decryptFiles(l.files),
@@ -330,7 +331,7 @@ export class FilesModel {
 		if (!newName.trim()) return;
 		const priv = await this.bridge.storePrivate();
 		const sealed = await sealPlacedText(priv, kind === "file" ? places.fileName(this.memberId, id) : places.folderName(this.memberId, id), newName.trim());
-		const path = kind === "file" ? `/api/v1/members/${this.memberId}/files/${id}` : `/api/v1/members/${this.memberId}/files/folders/${id}`;
+		const path = kind === "file" ? `${areaPath(this.memberId)}/files/${id}` : `${areaPath(this.memberId)}/files/folders/${id}`;
 		await this.bridge.apiSend("PATCH", path, kind === "file" ? { name: sealed } : { name: sealed });
 		this.names.set(id, newName.trim());
 		await this.refresh();
@@ -339,7 +340,7 @@ export class FilesModel {
 
 	async move(kind: "file" | "folder", ids: string[], folderId: string | null): Promise<void> {
 		for (const id of ids) {
-			const path = kind === "file" ? `/api/v1/members/${this.memberId}/files/${id}` : `/api/v1/members/${this.memberId}/files/folders/${id}`;
+			const path = kind === "file" ? `${areaPath(this.memberId)}/files/${id}` : `${areaPath(this.memberId)}/files/folders/${id}`;
 			await this.bridge.apiSend("PATCH", path, kind === "file" ? { folderId } : { parentId: folderId });
 		}
 		await this.refresh();
@@ -348,7 +349,7 @@ export class FilesModel {
 
 	async trash(kind: "file" | "folder", ids: string[]): Promise<void> {
 		for (const id of ids) {
-			const path = kind === "file" ? `/api/v1/members/${this.memberId}/files/${id}` : `/api/v1/members/${this.memberId}/files/folders/${id}`;
+			const path = kind === "file" ? `${areaPath(this.memberId)}/files/${id}` : `${areaPath(this.memberId)}/files/folders/${id}`;
 			await this.bridge.apiSend("DELETE", path);
 		}
 		await this.refresh();
@@ -356,7 +357,7 @@ export class FilesModel {
 	}
 
 	async restore(files: string[], folders: string[]): Promise<void> {
-		await this.bridge.apiSend("POST", `/api/v1/members/${this.memberId}/files/trash/restore`, { files, folders });
+		await this.bridge.apiSend("POST", `${areaPath(this.memberId)}/files/trash/restore`, { files, folders });
 		await this.openTrash();
 		this.bridge.toast(`Restored ${files.length + folders.length} item${files.length + folders.length > 1 ? "s" : ""}`);
 	}
@@ -365,7 +366,7 @@ export class FilesModel {
 		// The id first, then the name sealed into it (the place names the folder).
 		const id = newItemId();
 		const sealed = await sealPlacedText(await this.bridge.storePrivate(), places.folderName(this.memberId, id), name.trim());
-		const created = await this.bridge.apiSend<{ id: string }>("POST", `/api/v1/members/${this.memberId}/files/folders`, { id, name: sealed, parentId });
+		const created = await this.bridge.apiSend<{ id: string }>("POST", `${areaPath(this.memberId)}/files/folders`, { id, name: sealed, parentId });
 		await this.refresh();
 		return created.id;
 	}
@@ -378,7 +379,7 @@ export class FilesModel {
 			const plain = new Uint8Array(await file.arrayBuffer());
 			const tag = await this.fingerprint(plain);
 			// The duplicate check: same size on the server, compare tags locally.
-			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null }[] }>(`/api/v1/members/${this.memberId}/files/match?size=${plain.length}`);
+			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${plain.length}`);
 			const twins = same.files.filter((x) => x.tag && x.tag === tag);
 			if (twins.length) {
 				const answer = await this.bridge.confirmDuplicate(twins.length);
@@ -433,7 +434,7 @@ export class FilesModel {
 	 * are skipped honestly rather than failing the library.
 	 */
 	async musicLibrary(): Promise<(AudioMeta & { id: string; version: number; size: number })[]> {
-		const feed = await this.bridge.apiGet<{ tracks: { id: string; version: number; blobSealed: string; size: number }[] }>(`/api/v1/members/${this.memberId}/files/music`);
+		const feed = await this.bridge.apiGet<{ tracks: { id: string; version: number; blobSealed: string; size: number }[] }>(`${areaPath(this.memberId)}/files/music`);
 		const priv = await this.bridge.storePrivate();
 		const out: (AudioMeta & { id: string; version: number; size: number })[] = [];
 		for (const t of feed.tracks) {
@@ -461,7 +462,7 @@ export class FilesModel {
 	private async ensureSecrets(): Promise<void> {
 		if (this.secrets) return;
 		const priv = await this.bridge.storePrivate();
-		const existing = await this.bridge.apiGet<{ sealed: string | null }>(`/api/v1/members/${this.memberId}/files/secrets`);
+		const existing = await this.bridge.apiGet<{ sealed: string | null }>(`${areaPath(this.memberId)}/files/secrets`);
 		if (existing.sealed) {
 			const json = JSON.parse(await openPlacedText(priv, places.storeSecrets(this.memberId), existing.sealed)) as { fp: string; idx: string };
 			this.secrets = { fp: fromBase64(json.fp), idx: fromBase64(json.idx) };
@@ -470,7 +471,7 @@ export class FilesModel {
 		const fp = crypto.getRandomValues(new Uint8Array(32));
 		const idx = crypto.getRandomValues(new Uint8Array(32));
 		const sealed = await sealPlacedText(priv, places.storeSecrets(this.memberId), JSON.stringify({ fp: toBase64(fp), idx: toBase64(idx) }));
-		await this.bridge.apiSend("PUT", `/api/v1/members/${this.memberId}/files/secrets`, { sealed });
+		await this.bridge.apiSend("PUT", `${areaPath(this.memberId)}/files/secrets`, { sealed });
 		this.secrets = { fp, idx };
 	}
 
@@ -587,8 +588,8 @@ export class FilesModel {
 		if (!clip) return;
 		const folderId = this.state.get().folderId;
 		if (clip.mode === "cut") {
-			for (const id of clip.files) await this.bridge.apiSend("PATCH", `/api/v1/members/${this.memberId}/files/${id}`, { folderId });
-			for (const id of clip.folders) await this.bridge.apiSend("PATCH", `/api/v1/members/${this.memberId}/files/folders/${id}`, { parentId: folderId });
+			for (const id of clip.files) await this.bridge.apiSend("PATCH", `${areaPath(this.memberId)}/files/${id}`, { folderId });
+			for (const id of clip.folders) await this.bridge.apiSend("PATCH", `${areaPath(this.memberId)}/files/folders/${id}`, { parentId: folderId });
 			this.clipboard = null;
 			await this.refresh();
 			this.bridge.toast("Pasted (moved)");
@@ -628,7 +629,7 @@ export class FilesModel {
 			void s;
 			// The cursor starts at 0 the first time; each poll advances it.
 			const since = this.cursor;
-			const feed = await this.bridge.apiGet<{ cursor: number; changes: { seq: number; kind: string; data: unknown }[] }>(`/api/v1/members/${this.memberId}/files/changes?since=${since}&limit=500`);
+			const feed = await this.bridge.apiGet<{ cursor: number; changes: { seq: number; kind: string; data: unknown }[] }>(`${areaPath(this.memberId)}/files/changes?since=${since}&limit=500`);
 			this.cursor = feed.cursor;
 			// The index follows the feed's tombstones: trashed and purged
 			// entries leave the search results exactly as they leave the lists.
@@ -654,7 +655,7 @@ export class FilesModel {
 	 * Asking for exactly the file being opened keeps the view's key material
 	 * minimal (docs/ENCRYPTION.md: the listing never carries keys). */
 	private keysFor<T>(id: string): Promise<T> {
-		return this.bridge.apiSend<T>("POST", `/api/v1/members/${this.memberId}/files/keys`, { ids: [id] });
+		return this.bridge.apiSend<T>("POST", `${areaPath(this.memberId)}/files/keys`, { ids: [id] });
 	}
 
 	/** Info for the Get Info / details pane: everything readable, opened. */

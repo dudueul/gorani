@@ -108,6 +108,34 @@ audited and visible to all leads, and the recovery key is **rotated** after
 any ceremony (new shares to the current leads, every recovery copy
 re-sealed) so a key that existed whole once does not stay valid.
 
+### The protocol, concretely (stage 5)
+
+Everything the ceremony depends on is either SIGNED by a trusted identity
+(stage 4) or VERIFIED against something that is. Each row closes a way a
+server that controls the registry could otherwise win:
+
+| Piece | Made by | Signed / checked | Without it, the server… |
+|---|---|---|---|
+| **recovery key** (hybrid pair; public halves, full digest, threshold M, holders) | a lead's browser | the lead signs `"gorani-recovery-v1" ‖ digest ‖ M ‖ holders` | …publishes its OWN recovery public key and collects every recovery copy |
+| **shares** (Shamir M-of-N of the private bundle, one per holder) | the same browser | each sealed to the holder's TRUSTED root (`trustedRoot`) | …gets a share sealed to a root of its own |
+| **recovery copies** (an area key sealed to the recovery public key) | whoever holds the area key: the member, a case's manager | sealed only after the recovery record's signature verifies against a trusted identity | …see the first row |
+| **ceremony** (target, reason, ephemeral public key, its digest) | the coordinator's browser | the coordinator signs `"gorani-ceremony-v1" ‖ id ‖ target ‖ reason ‖ ephemeral digest ‖ recovery key id`; approvers verify before re-sealing their share | …swaps the ephemeral key for its own and collects M shares — the whole recovery key |
+| **combine** | the coordinator's browser | the reconstructed key's digest must equal the SIGNED recovery digest | …feeds a wrong share; Shamir would silently produce a wrong key (shamir.ts › Integrity) |
+| **outcome** — case: a manage grant for a new holder; member: their area key sealed to the new root they enrolled | the coordinator's browser | the grant is signed (stage 4); the new root is read aloud as a fingerprint between the member and the coordinator | …redirects the outcome to a root of its own |
+
+After any completed ceremony the registry marks the recovery key
+**rotation required**: it existed whole in one browser. A lead rotates it
+(new key, new shares); every holder of an area key re-seals their copy the
+next time they unlock (a copy names the recovery key id it was sealed to,
+so a stale one is visible, and leads see the coverage).
+
+A member who lost every unlock method **re-enrols** first: their browser
+(signed in through Access, so the registry knows who they are) makes a new
+root, unlock methods and identity, and posts them as a DRAFT. The ceremony
+for that member names the draft's root digest; completing it writes the
+draft as the member's vault settings with the recovered area key sealed to
+the new root — the only path by which a vault's root can change.
+
 ## Migration from the family model
 
 | Family | Team |
@@ -138,7 +166,9 @@ old CHECK constraint allowed only parent/child.
    — signing keys and fingerprints; signed grants. What the build settled,
    below in **Stage 4 as built**.
 5. **Recovery** — the team recovery key, shares to leads, recovery copies,
-   the ceremony; then the parent act-for rule and the master key go.
+   the ceremony (landed: commit 27b, `api:recovery`; the protocol above is
+   what was built); then the parent act-for rule and the master key go
+   (27c).
 6. **UI** — the case list, grant dialog, ceremony screens.
 
 ## Stage 3 as built
@@ -243,6 +273,14 @@ labels (~84 bits), too short to sign against a server that can grind.
   names (`trustedRoot`).
 - A resumed rotation handed an unsigned old key: the previous copy keeps its
   signature (`prev_signature`) and is verified like the current one.
+
+**Departed members.** Their identities stay listed, flagged inactive: what
+they signed while on the team (a grant, the recovery key's record) must
+still verify, or the team could not run a ceremony for the case its lead
+left behind (`api:recovery` does exactly that). The registry takes no new
+signature from them; the limit is a colluding server presenting a new one
+as old — re-pin and rotate the recovery key after a lead leaves (the
+recovery record reports it as owed).
 
 **What it does not:** rollback — a validly signed OLDER grant replayed to a
 member who never saw the newer key (identity.ts › the honest limits); and

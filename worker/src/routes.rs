@@ -419,6 +419,33 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			let body = req.json::<serde_json::Value>().await?;
 			forward_family(&env, &identity.email, "PUT", format!("certs/{id}"), Some(body)).await
 		}
+		// ── Team recovery (commit 27, docs/CASES.md › Recovery) ──
+		("GET", ["recovery"]) => forward_family(&env, &identity.email, "GET", "recovery", None).await,
+		("PUT", ["recovery"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "recovery", Some(body)).await
+		}
+		("GET", ["recovery", "copies"]) => forward_family(&env, &identity.email, "GET", "recovery-copies", None).await,
+		("PUT", ["recovery", "copies"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "recovery-copies", Some(body)).await
+		}
+		("PUT", ["recovery", "reenrol"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "reenrol", Some(body)).await
+		}
+		("GET", ["recovery", "ceremonies"]) => forward_family(&env, &identity.email, "GET", "ceremonies", None).await,
+		("POST", ["recovery", "ceremonies"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "POST", "ceremonies", Some(body)).await
+		}
+		("PUT", ["recovery", "ceremonies", id, "shares"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", format!("ceremony-shares/{id}"), Some(body)).await
+		}
+		("GET", ["recovery", "ceremonies", id, "material"]) => forward_family(&env, &identity.email, "GET", format!("ceremony-material/{id}"), None).await,
+		("POST", ["recovery", "ceremonies", id, "complete"]) => ceremony_complete(req, &env, identity, id).await,
+		("POST", ["recovery", "ceremonies", id, "cancel"]) => forward_family(&env, &identity.email, "POST", format!("ceremony-cancel/{id}"), Some(serde_json::json!({}))).await,
 		("PUT", ["family", "master"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			forward_family(&env, &identity.email, "PUT", "master", Some(body)).await
@@ -575,6 +602,28 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 
 		_ => json_error(404, "no such route"),
 	}
+}
+
+/// Complete a recovery ceremony. A case's outcome (a signed grant) is the
+/// registry's alone. A member's needs three steps, in this order, each
+/// safe to retry: the registry validates and hands back the new settings
+/// (the ceremony waits in `applying`), the member's store takes them (the
+/// one write that may change a root), the registry closes the ceremony. A
+/// failure between the steps leaves the ceremony open, not half-applied.
+async fn ceremony_complete(mut req: Request, env: &Env, identity: &Identity, id: &str) -> Result<Response> {
+	let body = req.json::<serde_json::Value>().await?;
+	let mut first = forward_family(env, &identity.email, "POST", format!("ceremony-complete/{id}"), Some(body)).await?;
+	if first.status_code() != 200 {
+		return Ok(first);
+	}
+	let v: serde_json::Value = first.json().await?;
+	let Some(reroot) = v.get("reroot") else { return Response::from_json(&v) };
+	let Some(member) = reroot.get("member").and_then(|m| m.as_str()).filter(|m| auth::valid_member_id(m)) else { return json_error(500, "the registry named no member to re-root") };
+	let wrote = forward_member(env, member, "PUT", "vault-reroot", Some(serde_json::json!({ "settings": reroot["settings"] })), identity.email.clone()).await?;
+	if wrote.status_code() >= 300 {
+		return Ok(wrote);
+	}
+	forward_family(env, &identity.email, "POST", format!("ceremony-close/{id}"), Some(serde_json::json!({}))).await
 }
 
 /// The public halves of a member's vault root, for any active team member

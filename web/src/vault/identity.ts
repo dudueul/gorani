@@ -39,6 +39,12 @@
  *   That is the whole PKI: no chains, no expiry dates, no revocation lists —
  *   a team re-verifies when someone re-enrolls (the registry drops their
  *   certificates when their identity changes).
+ * - **Departures.** A member who left keeps their identity key. What they
+ *   signed while on the team still verifies (it must: a ceremony checks the
+ *   recovery record its departed creator signed), so a server colluding
+ *   with them could present a NEW signature as an old one. The registry
+ *   flags them inactive (`Trusted.active`); re-pin and rotate the recovery
+ *   key after a lead leaves (the recovery record says it is owed).
  * - **Rollback.** A server can replay an older, validly signed grant (an
  *   earlier case key) to a member who never saw the newer one. A client
  *   that has seen a newer key id should refuse an older one; this module
@@ -128,6 +134,9 @@ export interface RegistryIdentity {
 	publicKey: JsonWebKey;
 	rootDigest: string;
 	signature: string;
+	/** False once the member left: their past signatures still verify (a
+	 * grant, the recovery record); the registry takes no new ones. */
+	active?: boolean;
 	certs: { by: string; keyId: string; rootDigest: string; signature: string }[];
 }
 
@@ -215,6 +224,8 @@ export interface Trusted {
 	keyId: string;
 	rootDigest: string;
 	via: "pin" | `cert:${string}`;
+	/** False for a member who left (see RegistryIdentity.active). */
+	active: boolean;
 	verify(statement: Uint8Array, signature: string): Promise<boolean>;
 }
 
@@ -252,7 +263,7 @@ export async function buildTrust(member: string, root: VaultPrivateKey, rec: Ide
 		sound.set(e.member, { entry: e, verify });
 	}
 	const trusted = new Map<string, Trusted>();
-	const make = (e: RegistryIdentity, verify: Trusted["verify"], via: Trusted["via"]): Trusted => ({ member: e.member, keyId: e.keyId, rootDigest: e.rootDigest, via, verify });
+	const make = (e: RegistryIdentity, verify: Trusted["verify"], via: Trusted["via"]): Trusted => ({ member: e.member, keyId: e.keyId, rootDigest: e.rootDigest, via, active: e.active !== false, verify });
 	for (const [m, { entry, verify }] of sound) if (pinned.get(m) === entry.keyId) trusted.set(m, make(entry, verify, "pin"));
 	// One hop: a certificate counts only from a PINNED certifier.
 	for (const [m, { entry, verify }] of sound) {

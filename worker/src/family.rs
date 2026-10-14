@@ -26,6 +26,8 @@ use worker::{durable_object, DurableObject, Env, Error, Request, Response, Resul
 
 use crate::auth;
 
+mod recovery;
+
 /// APPEND-ONLY: a statement's index is its identity in the schema ledger
 /// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
 pub const MIGRATIONS: &[&str] = &[
@@ -131,6 +133,29 @@ pub const MIGRATIONS: &[&str] = &[
 	"ALTER TABLE case_grants ADD COLUMN signed_by TEXT",
 	"ALTER TABLE case_grants ADD COLUMN prev_signature TEXT",
 	"ALTER TABLE case_grants ADD COLUMN prev_signed_by TEXT",
+	// Migration v5 (commit 27, docs/CASES.md › The protocol, concretely):
+	// team recovery — the recovery key's public record, one share per lead,
+	// each area's recovery copy, ceremonies and their approvals, and the
+	// drafts of members re-enrolling after losing every unlock method.
+	"CREATE TABLE IF NOT EXISTS recovery (
+		k TEXT PRIMARY KEY CHECK (k = 'current'),
+		key_id TEXT NOT NULL, public_key TEXT NOT NULL, digest TEXT NOT NULL,
+		threshold INTEGER NOT NULL, holders TEXT NOT NULL,
+		created_by TEXT NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL,
+		rotation_required INTEGER NOT NULL DEFAULT 0
+	)",
+	"CREATE TABLE IF NOT EXISTS recovery_shares (member_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, share_sealed TEXT NOT NULL)",
+	"CREATE TABLE IF NOT EXISTS recovery_copies (area TEXT PRIMARY KEY, key_id TEXT NOT NULL, sealed TEXT NOT NULL, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)",
+	"CREATE TABLE IF NOT EXISTS ceremonies (
+		id TEXT PRIMARY KEY,
+		coordinator TEXT NOT NULL, target TEXT NOT NULL, reason TEXT NOT NULL,
+		ephemeral_public TEXT NOT NULL, ephemeral_digest TEXT NOT NULL,
+		recovery_key_id TEXT NOT NULL, signature TEXT NOT NULL,
+		state TEXT NOT NULL CHECK (state IN ('open','applying','done','cancelled')),
+		created_at TEXT NOT NULL, closed_at TEXT
+	)",
+	"CREATE TABLE IF NOT EXISTS ceremony_shares (ceremony_id TEXT NOT NULL, member_id TEXT NOT NULL, share_sealed TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (ceremony_id, member_id))",
+	"CREATE TABLE IF NOT EXISTS reenrol_drafts (member_id TEXT PRIMARY KEY, settings TEXT NOT NULL, root_digest TEXT NOT NULL, at TEXT NOT NULL)",
 ];
 
 /// The four roles (docs/CASES.md), with the family's names accepted as
@@ -295,6 +320,37 @@ impl GoraniFamilyDO {
 				self.identity_put(&actor, body).await
 			}
 			("DELETE", id) if id.starts_with("identity/") => self.identity_reset(&actor, &id["identity/".len()..]).await,
+			// ── Recovery (commit 27, family/recovery.rs) ──
+			("GET", "recovery") => self.recovery_get(&actor).await,
+			("PUT", "recovery") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.recovery_put(&actor, body).await
+			}
+			("GET", "recovery-copies") => self.recovery_copies(&actor).await,
+			("PUT", "recovery-copies") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.recovery_copy_put(&actor, body).await
+			}
+			("PUT", "reenrol") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.reenrol_put(&actor, body).await
+			}
+			("GET", "ceremonies") => self.ceremonies(&actor).await,
+			("POST", "ceremonies") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.ceremony_open(&actor, body).await
+			}
+			("PUT", id) if id.starts_with("ceremony-shares/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.ceremony_approve(&actor, &id["ceremony-shares/".len()..], body).await
+			}
+			("GET", id) if id.starts_with("ceremony-material/") => self.ceremony_material(&actor, &id["ceremony-material/".len()..]).await,
+			("POST", id) if id.starts_with("ceremony-complete/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.ceremony_complete(&actor, &id["ceremony-complete/".len()..], body).await
+			}
+			("POST", id) if id.starts_with("ceremony-close/") => self.ceremony_close(&actor, &id["ceremony-close/".len()..]).await,
+			("POST", id) if id.starts_with("ceremony-cancel/") => self.ceremony_cancel(&actor, &id["ceremony-cancel/".len()..]).await,
 			("PUT", id) if id.starts_with("certs/") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.cert_put(&actor, &id["certs/".len()..], body).await
@@ -906,22 +962,26 @@ impl GoraniFamilyDO {
 	//   - only leads certify, and a certificate must name the member's
 	//     CURRENT identity key and root digest.
 
-	/// Every active member's identity and its certificates — for any member,
+	/// Every member's identity and its certificates — for any member,
 	/// externals included (an external must verify who granted them; ids and
-	/// keys, no emails).
+	/// keys, no emails). Departed members are listed too, flagged inactive:
+	/// what they signed while on the team (a grant, the recovery key's
+	/// record) must still verify after they leave, or the team could not run
+	/// a ceremony for the case its lead left behind. The registry takes no
+	/// NEW signature from them (every write needs an active member).
 	async fn identities(&self, actor: &str) -> Result<Response> {
 		if self.member_by_email(actor)?.is_none() {
 			return json_error(403, "not a team member");
 		}
 		let rows: Vec<IdentityRow> = self
 			.sql
-			.exec("SELECT i.member_id, i.key_id, i.public_key, i.root_digest, i.signature FROM identities i JOIN members m ON m.id = i.member_id WHERE m.active = 1 ORDER BY i.member_id", None)?
+			.exec("SELECT i.member_id, i.key_id, i.public_key, i.root_digest, i.signature, m.active FROM identities i JOIN members m ON m.id = i.member_id ORDER BY i.member_id", None)?
 			.to_array()?;
 		let mut out = Vec::new();
 		for r in rows {
 			let certs: Vec<CertRow> = self.sql.exec("SELECT by_member, key_id, root_digest, signature FROM identity_certs WHERE member_id = ?1 ORDER BY by_member", Some(vec![r.member_id.clone().into()]))?.to_array()?;
 			out.push(serde_json::json!({
-				"member": r.member_id, "keyId": r.key_id, "rootDigest": r.root_digest, "signature": r.signature,
+				"member": r.member_id, "keyId": r.key_id, "rootDigest": r.root_digest, "signature": r.signature, "active": r.active != 0,
 				"publicKey": serde_json::from_str::<serde_json::Value>(&r.public_key).unwrap_or(serde_json::Value::Null),
 				"certs": certs.into_iter().map(|c| serde_json::json!({ "by": c.by_member, "keyId": c.key_id, "rootDigest": c.root_digest, "signature": c.signature })).collect::<Vec<_>>(),
 			}));
@@ -1095,6 +1155,11 @@ struct IdentityRow {
 	public_key: String,
 	root_digest: String,
 	signature: String,
+	#[serde(default = "one")]
+	active: i64,
+}
+fn one() -> i64 {
+	1
 }
 #[derive(serde::Deserialize)]
 struct CertRow {

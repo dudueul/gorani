@@ -22,7 +22,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | Stage | Decision | What |
 |---|---|---|
 | 1 *(landed: commit 29, `api:audit`)* | D7 + D5.3 | the audit leaves the area database: an outbox ships each line to a per-area **audit Durable Object** that hash-chains it, keeps it 7 years with no line cap, and checkpoints daily to object storage; `…/audit/verify` |
-| 2 | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
+| 2 *(landed: commit 29b, `api:retention`)* | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
 | 3 | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
 | 4 | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
@@ -79,3 +79,22 @@ area DO (member:<id>, case:<id>, the registry)
   leads and auditors. Statuses per checkpoint: `ok`, `mismatch` (the chain
   and the bucket disagree), `missing` (the bucket names lines the chain no
   longer has), `pruned` (older than the retention).
+
+## Stage 2 — retention by kind, as built
+
+- The case's kind travels into its own store when it is opened
+  (`routes.rs › case_open` writes `{ case, kind }` into the case store's
+  settings); no route rewrites a case's settings afterwards, so the kind is
+  fixed for the case's life.
+- **Evidence** (`files_store.rs › evidence_refusal`): a file or folder is
+  never trashed — 409 — so the trash purge has nothing to purge; the
+  version retention skips the store entirely. Files still gain versions,
+  are renamed and moved, and the audit records each.
+- **Working** (members' own areas and working cases): `housekeeping`'s
+  version retention prunes versions older than the window (deployment
+  default 365 days; `versionDays` only under `GORANI_DEV`) that are not a
+  file's current version — objects into the deletion outbox first, then the
+  rows (the O10 order).
+- What stage 3 adds underneath: the evidence OBJECTS become write-once in
+  the bucket itself, so the rule holds even against a credential that
+  bypasses the Worker.

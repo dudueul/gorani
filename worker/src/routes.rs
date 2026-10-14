@@ -368,16 +368,20 @@ async fn case_open(mut req: Request, env: Env, identity: &Identity) -> Result<Re
 	let Some(id) = body.get("id").and_then(|v| v.as_str()).filter(|i| crate::area::valid_case_id(i)).map(str::to_string) else {
 		return json_error(400, "case id: 2–40 of a–z, 0–9, dashes");
 	};
-	let created = forward_family(&env, &identity.email, "POST", "cases", Some(body)).await?;
+	let mut created = forward_family(&env, &identity.email, "POST", "cases", Some(body)).await?;
 	if created.status_code() != 200 {
 		return Ok(created);
 	}
-	let settings = serde_json::json!({ "settings": { "enabled": true, "case": id } });
+	let answer: serde_json::Value = created.json().await?;
+	// The kind travels into the case's own store (commit 29b): an evidence
+	// store refuses deletion and keeps every version without asking anyone.
+	let kind = answer.get("kind").and_then(|k| k.as_str()).unwrap_or("working");
+	let settings = serde_json::json!({ "settings": { "enabled": true, "case": id, "kind": kind } });
 	let stored = forward_member(&env, &format!("case:{id}"), "PUT", "vault", Some(settings), identity.email.clone()).await?;
 	if stored.status_code() >= 300 {
 		return Ok(stored);
 	}
-	Ok(created)
+	Response::from_json(&answer)
 }
 
 /// The member routes — a member's own area, or (rewritten by route_case) a

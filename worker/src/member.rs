@@ -670,6 +670,11 @@ impl GoraniMemberDO {
 		let journal_days = knob("journalDays", 180).max(0);
 		let share_days = knob("shareDays", 1).max(0);
 		let upload_days = knob("uploadDays", 2).max(0);
+		// D7 (commit 29b): a working area keeps a file's OLDER versions for a
+		// year; an evidence case keeps every version for its whole life (its
+		// files cannot even be trashed — files_store.rs › evidence_refusal).
+		let version_days = knob("versionDays", 365).max(0);
+		let evidence = self.is_evidence().await?;
 
 		// 1. Trash purge: sealed objects leave S3, rows leave (triggers
 		// journal the purge). Every object key goes into the deletion outbox
@@ -710,6 +715,31 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
+
+		// 1b. Version retention (D7), working areas only: versions older than
+		// the window that are NOT a file's current one. Objects into the
+		// outbox first, then the rows — the same order as the trash purge.
+		let mut n_versions_pruned = 0u64;
+		if !evidence {
+			#[derive(serde::Deserialize)]
+			struct OldVersion {
+				file_id: String,
+				version: i64,
+				object_key: String,
+			}
+			let old: Vec<OldVersion> = self
+				.sql
+				.exec(
+					&format!("SELECT v.file_id, v.version, v.object_key FROM file_versions v JOIN files f ON f.id = v.file_id WHERE v.version < f.version AND v.created_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{version_days} days')"),
+					None,
+				)?
+				.to_array()?;
+			for v in &old {
+				purged_objects.push(v.object_key.clone());
+				self.enqueue_delete(&v.object_key, None, "version retention")?;
+				n_versions_pruned += self.sql.exec("DELETE FROM file_versions WHERE file_id = ?1 AND version = ?2", Some(vec![v.file_id.clone().into(), v.version.into()]))?.rows_written() as u64;
+			}
+		}
 
 		// 2. Dead share copies: revoked or expired past the grace window.
 		let dead_shares: Vec<ShareObjRow> = self
@@ -779,10 +809,10 @@ impl GoraniMemberDO {
 		// 4. Drain the outbox — this pass's keys and any earlier failures.
 		let drained = self.drain_deletes().await?;
 		if !purged_objects.is_empty() || n_files_purged + n_shares_purged > 0 || drained.failed > 0 {
-			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned},deleted:{},deletesPending:{}", drained.done, drained.pending))).await?;
+			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},versions:{n_versions_pruned},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned},deleted:{},deletesPending:{}", drained.done, drained.pending))).await?;
 		}
 		Ok(Response::from_json(&serde_json::json!({
-			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged,
+			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged, "versionsPruned": n_versions_pruned, "evidence": evidence,
 			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": drained.done,
 			"uploadsAborted": stale_uploads.len(), "deletesFailed": drained.failed, "deletesPending": drained.pending,
 		}))?)

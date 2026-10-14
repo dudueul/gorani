@@ -517,7 +517,24 @@ impl GoraniMemberDO {
 
 	/// To the Trash (deleted_at; bytes stay). Purges come with the
 	/// housekeeping commit.
+	/// Is this store an EVIDENCE case (D6/D7, commit 29b)? Its settings say
+	/// so from the moment the case is opened (routes.rs › case_open).
+	pub(crate) async fn is_evidence(&self) -> Result<bool> {
+		Ok(self.vault_settings().await?.is_some_and(|s| s.get("kind").and_then(|k| k.as_str()) == Some("evidence")))
+	}
+
+	/// Evidence is never deleted (D7: "every version, for the case's life
+	/// + retention"; D6 makes the objects themselves write-once). A file can
+	/// gain versions, be renamed and moved — the audit records each — but
+	/// it does not go to the Trash, so nothing ever purges it.
+	async fn evidence_refusal(&self) -> Result<Option<Response>> {
+		Ok(if self.is_evidence().await? { Some(json_error(409, "this is an evidence case: its files and folders are never deleted — they leave with the case's retention")?) } else { None })
+	}
+
 	pub(crate) async fn file_trash(&self, actor: &str, id: &str) -> Result<Response> {
+		if let Some(refused) = self.evidence_refusal().await? {
+			return Ok(refused);
+		}
 		let n = self
 			.sql
 			.exec("UPDATE files SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND deleted_at IS NULL", Some(vec![id.into()]))?
@@ -615,6 +632,9 @@ impl GoraniMemberDO {
 	/// (trashed_with names the folder so restore can bring back exactly what
 	/// the deletion took).
 	pub(crate) async fn folder_trash(&self, actor: &str, id: &str) -> Result<Response> {
+		if let Some(refused) = self.evidence_refusal().await? {
+			return Ok(refused);
+		}
 		let n = self
 			.sql
 			.exec(

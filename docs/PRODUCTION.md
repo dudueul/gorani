@@ -65,6 +65,17 @@ console differs from the MinIO steps above.
 - **Prove it** with step 5, then once with `GORANI_LIVE_S3_LOCK=1`
   (it reads the bucket's Object Lock and versioning settings first, and
   writes nothing if they are not what gorani expects).
+- **What was probed** (2026-10-14, bucket `gorani-dev`, eu-central-1):
+  anonymous list, read and write all answered with a 302 to e2's homepage
+  (a refusal — no S3 answer — but not the 403 AWS gives; `api:s3-live`
+  accepts either); path-style SigV4 accepted; a bucket created with Object Lock reports it
+  enabled, versioning on, no default retention; the Worker's exact
+  `PutObjectRetention` (COMPLIANCE, Content-MD5) answers **204** (AWS: 200
+  — the Worker accepts both); the retention reads back as COMPLIANCE; both
+  shortening it and deleting the locked version are refused with **400
+  InvalidRequest** (AWS: 403), and the version survives. Not yet run from a
+  deployed Worker: the full `api:s3-live` against e2, which the sandbox
+  this was written in could not route the Worker to.
 - **Cost shape**: e2 bills storage only, with egress included up to a
   multiple of what is stored (check the current terms) — the edge cache
   (below) matters less for the bill here than for latency.

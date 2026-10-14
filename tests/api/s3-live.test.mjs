@@ -72,11 +72,20 @@ const lockProbe = env.GORANI_LIVE_S3_LOCK === "1";
 
 // ── 1. Transport and bucket posture, before the worker is involved ────
 assert.ok(s3.endpoint.startsWith("https://"), "the S3 endpoint must be https (the worker refuses http outside dev)");
-const anonList = await fetch(`${s3.endpoint}/${encodeURIComponent(s3.bucket)}?list-type=2&max-keys=1`);
-assert.ok([401, 403].includes(anonList.status), `anonymous LIST must be refused — got ${anonList.status}: the bucket is not private`);
+// Refused, the provider's way: 401/403 (AWS, MinIO), or a redirect OFF the
+// S3 host with no S3 answer in it — IDrive e2 sends anonymous requests to
+// its homepage (302, probed 2026-10-14). Redirects are not followed: a
+// followed one would only measure the website.
+const refusedAnonymously = async (r) => {
+	if ([401, 403].includes(r.status)) return true;
+	const to = r.headers.get("location");
+	return r.status >= 300 && r.status < 400 && !!to && new URL(to, s3.endpoint).host !== new URL(s3.endpoint).host && !/<ListBucketResult/.test(await r.text());
+};
+const anonList = await fetch(`${s3.endpoint}/${encodeURIComponent(s3.bucket)}?list-type=2&max-keys=1`, { redirect: "manual" });
+assert.ok(await refusedAnonymously(anonList), `anonymous LIST must be refused — got ${anonList.status}: the bucket is not private`);
 const probe = `gorani-anon-probe-${Date.now()}`;
-const anonPut = await fetch(`${s3.endpoint}/${encodeURIComponent(s3.bucket)}/${probe}`, { method: "PUT", body: "x" });
-assert.ok([401, 403].includes(anonPut.status), `anonymous PUT must be refused — got ${anonPut.status}`);
+const anonPut = await fetch(`${s3.endpoint}/${encodeURIComponent(s3.bucket)}/${probe}`, { method: "PUT", body: "x", redirect: "manual" });
+assert.ok(await refusedAnonymously(anonPut), `anonymous PUT must be refused — got ${anonPut.status}`);
 // …and the credential works at all, before a server starts: a refused
 // signature here is a key, region or addressing problem, named as such.
 const signedList = await s3fetch(s3, "GET", "", { "list-type": "2", "max-keys": "1" });
@@ -216,8 +225,11 @@ try {
 		const head = await s3fetch(s3, "HEAD", objectKey);
 		const versionId = head.headers.get("x-amz-version-id");
 		assert.ok(versionId && versionId !== "null", "a versioned object (Object Lock protects versions)");
+		// Refused how is the provider's choice: AWS and MinIO say 403
+		// AccessDenied, IDrive e2 says 400 InvalidRequest (probed 2026-10-14).
+		// What matters is that it is refused and the version survives.
 		const del = await s3fetch(s3, "DELETE", objectKey, { versionId });
-		assert.equal(del.status, 403, `the server must refuse to delete a locked version — got ${del.status}: ${(await del.text()).slice(0, 300)}`);
+		assert.ok(del.status >= 400 && del.status < 500, `the server must refuse to delete a locked version — got ${del.status}: ${(await del.text()).slice(0, 300)}`);
 		assert.equal((await s3fetch(s3, "HEAD", objectKey, { versionId })).status, 200, "…and the version is still there");
 		const dl2 = await fetch(`${dev.base}${evidence.base}/files/${eup.json.id}`, { headers: { "x-gorani-dev-email": email } });
 		assert.equal(dl2.status, 200, "the Worker still serves it");

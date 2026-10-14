@@ -214,3 +214,44 @@ any reader:          opens the record in its place, verifies the signature again
   area only, where the hash is optional; when it gains cases it must sign
   too. A re-enrolled member's earlier signatures read as `untrusted` until
   the signed export (stage 7) carries signers' past keys.
+
+## Stage 5 — malware samples (D8), the design
+
+```text
+upload as a sample:  sealed type = "application/x-gorani-sample; original=<mime>"   (GV04, per version)
+                     form field sample=1 → files.sample = 1                          (readable: the server enforces)
+mark as a sample:    PATCH files/<id> { sample: true, types: { <n>: <sealed>, … } } — one way, every version
+any reader:          sample = the flag OR the sealed type says so
+                     the viewer, previews, thumbnails and the media worker refuse it;
+                     a download is <name>.zip, ZipCrypto under the password "infected"
+```
+
+- **Two marks, for two jobs.** The readable flag lets the SERVER enforce
+  what it can: a sample is never shared by link (409 — D11's partners get
+  the case instead), the flag shows in listings, the change is audited.
+  The sealed type lets the CLIENT refuse to render even when the server
+  lies: a server that clears the flag cannot clear the type (GV04 — it
+  cannot seal into the store), and a server that SETS the flag on a normal
+  file only makes the client more careful. The client treats a file as a
+  sample if either says so — the safe direction is the only one a server
+  can push.
+- **One way.** A sample never becomes a normal file again (`sample: false`
+  is refused): to "unmark", someone uploads a new file, on the record.
+  Marking re-seals every version's type in the same request — the DO
+  refuses a mark that leaves a version unmarked.
+- **Never rendered, anywhere in this app.** The viewer shows a refusal
+  panel instead of a mode; `preview` and `mediaHandle` return nothing
+  (no bytes decrypted for rendering); audio tags are not parsed at upload
+  (a parser is an attack surface too); a COPY of a sample is a sample.
+- **Downloads zipped with "infected".** The industry convention
+  (MalwareBazaar, VirusShare, vendor exchanges): desktop antivirus would
+  otherwise quarantine the sample mid-investigation, or a double-click
+  would run it. ZipCrypto (traditional PKWARE encryption), stored, UTF-8
+  names — the one every unzip tool and Windows Explorer opens. It is NOT
+  confidentiality (ZipCrypto is broken, and the password is public); the
+  sample's confidentiality is the vault's job, which ends at the analyst's
+  machine. Up to 4 GiB (no ZIP64 — refused above, said plainly). The signed
+  content hash (stage 4) is checked before the zip is made, and the
+  plaintext's SHA-256 is in the toast, for the reputation lookup.
+- **The sync client** (`gorani-sync pull`) refuses to write a sample to
+  disk raw.

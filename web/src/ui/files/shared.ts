@@ -251,3 +251,40 @@ export async function markSample(model: { markSample(id: string): Promise<void>;
 		model.api.toast(`Not marked: ${e instanceof Error ? e.message : String(e)}`);
 	}
 }
+
+/**
+ * "Custody…" (commit 29g): the file's chain as THIS client verified it, and
+ * the one action open to this member — accept an offer made to them, or,
+ * as the custodian, hand the file over (who, and why: sealed and signed).
+ */
+export async function custodyAction(
+	model: {
+		custody(id: string): Promise<{ me: string; ok: boolean; custodian: string; pending: { from: string; to: string } | null; links: { seq: number; from: string; to: string; reason: string | null; ok: boolean; why: string }[] }>;
+		offerCustody(id: string, to: string, reason: string): Promise<void>;
+		acceptCustody(id: string): Promise<void>;
+		api: { toast(m: string): void };
+	},
+	id: string,
+	name: string,
+): Promise<void> {
+	try {
+		const c = await model.custody(id);
+		const lines = c.links.map((l) => `${l.seq}. ${l.from} → ${l.to}${l.reason ? ` — ${l.reason}` : ""}${l.ok ? "" : `   ⚠ ${l.why}`}`).join("\n");
+		const head = `Custody of “${name}”: held by ${c.custodian}${c.ok ? "" : " — ⚠ the chain does NOT verify"}\n\n${lines || "No transfers yet — the uploader holds it."}`;
+		if (c.pending?.to === c.me) {
+			if (window.confirm(`${head}\n\n${c.pending.from} offers it to you. Accept custody?`)) await model.acceptCustody(id);
+			return;
+		}
+		if (c.custodian === c.me && !c.pending) {
+			const to = window.prompt(`${head}\n\nYou hold it. Hand it over to (member id):`)?.trim();
+			if (!to) return;
+			const reason = window.prompt(`Why does ${to} take it? (sealed and signed)`)?.trim();
+			if (!reason) return;
+			await model.offerCustody(id, to, reason);
+			return;
+		}
+		window.alert(c.pending ? `${head}\n\nOffered to ${c.pending.to} — waiting for them.` : head);
+	} catch (e) {
+		model.api.toast(`Custody: ${e instanceof Error ? e.message : String(e)}`);
+	}
+}

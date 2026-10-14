@@ -28,7 +28,7 @@ import { customElement, property, state } from "lit/decorators.js";
 import { styleMap } from "lit/directives/style-map.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, type MenuItem } from "./shared.ts";
+import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -209,6 +209,7 @@ export class GoraniWin11 extends LitElement {
 					{ label: "Open", run: () => void this.openEntry(kind, id, name), disabled: many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
 					{ label: "Verify signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },
+					{ label: "Custody…", run: () => void custodyAction(this.model, id, name), disabled: kind === "folder" || many },
 					{ separator: true, label: "" },
 					{ label: "Cut", run: () => this.model.cut() },
 					{ label: "Copy", run: () => this.model.copy() },

@@ -32,6 +32,8 @@ import type { LocalIndexLike } from "../../vault/index.ts";
 import type { Signer, Trust } from "../../vault/identity.ts";
 import { checkContentHash, describeHashCheck, sha256Stream, signContentHash, type HashCheck } from "../../vault/content-hash.ts";
 import { SAMPLE_PASSWORD, isSampleType, originalType, sampleType, zipEncrypted } from "../../vault/samples.ts";
+import { signIntake, type IntakeFields } from "../../vault/intake.ts";
+import { acceptCustody, offerCustody, verifyChain, type CustodyCall, type CustodyChain } from "../../vault/custody.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
 
 /** What a name that does not open in its place is shown as (O6). */
@@ -116,6 +118,12 @@ export interface FilesBridge {
 	 * own area works without it; an evidence case refuses an unsigned
 	 * upload. Optional, so a test bridge may leave it out. */
 	identity?(): { signer: Signer; trust: Trust } | null;
+	/** What kind of area this is (commit 29g): an evidence case's uploads
+	 * carry an intake record. Optional — a test bridge may leave it out. */
+	areaKind?(): "evidence" | "working" | "own" | null;
+	/** Ask the person for an upload batch's intake record (evidence only);
+	 * null when they cancel. */
+	intake?(files: File[]): Promise<IntakeFields | null>;
 }
 
 export type DuplicateAnswer = "skip" | "keep" | "version" | null;
@@ -392,6 +400,16 @@ export class FilesModel {
 	async upload(files: File[], { sample = false }: { sample?: boolean } = {}): Promise<void> {
 		await this.ensureSecrets();
 		const folderId = this.state.get().folderId;
+		// An evidence case asks where the batch came from, once, before a
+		// byte is sealed (commit 29g): each file signs its own record of it.
+		let intake: IntakeFields | null = null;
+		if (this.bridge.areaKind?.() === "evidence") {
+			intake = (await this.bridge.intake?.(files)) ?? null;
+			if (!intake) {
+				this.bridge.toast("Upload cancelled — an evidence file needs its intake record");
+				return;
+			}
+		}
 		for (const file of files) {
 			const plain = new Uint8Array(await file.arrayBuffer());
 			// One SHA-256, two uses: the duplicate tag (keyed, below) and the
@@ -412,12 +430,12 @@ export class FilesModel {
 				// nothing new. (A dead `asVersion` parameter used to pretend
 				// otherwise; removed in commit 25.)
 			}
-			await this.uploadOne(file, plain, tag, folderId, hexOf(digest), sample);
+			await this.uploadOne(file, plain, tag, folderId, hexOf(digest), sample, intake);
 		}
 		await this.refresh();
 	}
 
-	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null, sha256: string, sample = false): Promise<void> {
+	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null, sha256: string, sample = false, intakeFields: IntakeFields | null = null): Promise<void> {
 		// The file id first: the name, the type and the content key are sealed
 		// INTO places that name it (O6) — so the server cannot move them to
 		// another file, and could not have made them up (it lacks the PSK).
@@ -447,7 +465,10 @@ export class FilesModel {
 		// without one, so there the missing identity is said plainly.
 		const me = this.bridge.identity?.() ?? null;
 		const hash = me ? await signContentHash(me.signer, priv, this.memberId, id, 1, sha256, plain.length) : undefined;
-		const extra = { ...(mmeta ? { mmeta } : {}), ...(hash ? { hash } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}) };
+		// …and, in an evidence case, its intake record, sealed into this
+		// file's place and signed the same way (commit 29g, intake.ts).
+		const intake = me && intakeFields ? await signIntake(me.signer, priv, this.memberId, id, intakeFields) : undefined;
+		const extra = { ...(mmeta ? { mmeta } : {}), ...(hash ? { hash } : {}), ...(intake ? { intake } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}) };
 		try {
 			if (plain.length > 48 * 1024 * 1024) {
 				const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
@@ -650,6 +671,40 @@ export class FilesModel {
 		return this.checkHash(id, served, { sha256: h.hex(), size });
 	}
 
+	// ── custody (commit 29g, docs/CUSTODY.md › stage 6) ─────────────────
+
+	private custodyCall: CustodyCall = <T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown) => (method === "GET" ? this.bridge.apiGet<T>(path) : this.bridge.apiSend<T>(method, path, body));
+
+	private identityOrThrow(): { signer: Signer; trust: Trust } {
+		const me = this.bridge.identity?.() ?? null;
+		if (!me) throw new Error("your identity is not open yet — custody is signed and checked with it");
+		return me;
+	}
+
+	/** A file's custody chain, verified by THIS member's client. */
+	async custody(id: string): Promise<{ chain: CustodyChain; me: string } & Awaited<ReturnType<typeof verifyChain>>> {
+		const me = this.identityOrThrow();
+		const chain = await this.bridge.apiGet<CustodyChain>(`${areaPath(this.memberId)}/files/${id}/custody`);
+		return { chain, me: me.signer.member, ...(await verifyChain(await this.bridge.storePrivate(), me.trust, this.memberId, id, chain)) };
+	}
+
+	/** Hand a file over (the custodian): the next link, signed. */
+	async offerCustody(id: string, to: string, reason: string): Promise<void> {
+		const me = this.identityOrThrow();
+		const c = await this.custody(id);
+		await offerCustody(this.custodyCall, me.signer, await this.bridge.storePrivate(), areaPath(this.memberId), this.memberId, id, c.chain, to, reason);
+		this.bridge.toast(`Offered “${this.names.get(id) ?? id}” to ${to} — custody moves when they accept`);
+	}
+
+	/** Accept the open offer made to this member. */
+	async acceptCustody(id: string): Promise<void> {
+		const me = this.identityOrThrow();
+		const c = await this.custody(id);
+		if (!c.pending || c.pending.to !== me.signer.member) throw new Error("no offer of this file is waiting for you");
+		await acceptCustody(this.custodyCall, me.signer, me.trust, await this.bridge.storePrivate(), areaPath(this.memberId), this.memberId, id, c.pending);
+		this.bridge.toast(`You hold “${this.names.get(id) ?? id}” now — signed by you and ${c.pending.from}`);
+	}
+
 	/** `verify`, said to the person (the explorers' "Verify signature"). */
 	async verifyAndReport(id: string): Promise<HashCheck | null> {
 		const name = this.names.get(id) ?? id;
@@ -789,7 +844,11 @@ export class FilesModel {
 			// as a sample too: the careful side.)
 			const sample = (await this.renderPolicy(id)) !== "normal";
 			const original = sample ? (await this.info(id))?.shownType ?? "" : "";
-			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original }), plain, await this.fingerprint(digest), folderId, hexOf(digest), sample);
+			// A copy inside an evidence case is a new item: its intake says
+			// exactly what it is — this case's own copy, checked first.
+			const me = this.bridge.identity?.() ?? null;
+			const intake: IntakeFields | null = this.bridge.areaKind?.() === "evidence" ? { source: `a copy of “${name}” (${id}) in this case`, collector: me?.signer.member ?? "", method: "duplicated in gorani from the case's own copy, after its signature was checked", collectedAt: new Date().toISOString(), notes: "" } : null;
+			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original }), plain, await this.fingerprint(digest), folderId, hexOf(digest), sample, intake);
 		}
 		await this.refresh();
 		this.bridge.toast(`Duplicated ${clip.files.length} file${clip.files.length > 1 ? "s" : ""}`);

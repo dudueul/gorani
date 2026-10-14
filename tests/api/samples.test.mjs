@@ -24,7 +24,7 @@ import { newContentKey, importContentKey, sealWith, openPlacedText } from "../..
 import { places } from "../../web/src/vault/places.ts";
 import { isSampleType, originalType, sampleType } from "../../web/src/vault/samples.ts";
 import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
-import { member, vouch, openCase, signedHash } from "../lib/team.mjs";
+import { member, vouch, openCase, signedHash, signedIntake } from "../lib/team.mjs";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -107,7 +107,8 @@ try {
 	// ── 5. On a case: with evidence, and by permission ──────────────────
 	const ev = await openCase(dev, ana, "ir-sample", "Phishing kit", [[bo, "write"], [cy, "read"]], "evidence");
 	// Evidence needs each version signed (stage 4); a sample is no exception.
-	const signed = (sample) => async (id, plain) => ({ ...(sample ? { sample: "1" } : {}), hash: await signedHash(bo, ev.sealer, id, 1, plain) });
+	// (…and, since 29g, each new evidence file its intake record.)
+	const signed = (sample) => async (id, plain) => ({ ...(sample ? { sample: "1" } : {}), hash: await signedHash(bo, ev.sealer, id, 1, plain), intake: await signedIntake(bo, ev.sealer, id) });
 	const kit = await put(bo, ev.base, ev.sealer, "kit.zip", sampleType("application/zip"), signed(true));
 	assert.equal((await listed(bo, ev.base)).find((f) => f.id === kit.id).sample, true, "a signed sample in an evidence case");
 	const { id: emlId } = await put(bo, ev.base, ev.sealer, "mail.eml", "message/rfc822", signed(false));

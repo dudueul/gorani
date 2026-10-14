@@ -26,7 +26,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 3 *(landed: commit 29c, `api:objectlock`)* | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
-| 6 *(29f landed: `api:approvals`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
+| 6 *(landed: 29f `api:approvals`, 29g `api:custody`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
 | 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
 ## Stage 1 — the audit, tamper-evident
@@ -370,3 +370,29 @@ custody, per evidence file:   custodian = the uploader, then each accepted trans
 - **What it does not do**: custody here is a RECORD of responsibility, not
   an access control — everyone granted on the case still reads the file.
   That is what the read log (O14) and the grants are for.
+
+#### 29g as built
+
+- `web/src/vault/intake.ts` — `signIntake` (source, collector and method
+  required; the signed statement lists every field) and `checkIntake`
+  (open in this file's place, then the signer's trust and key, then the
+  signature). The Worker takes the form field `intake` on new files (whole
+  and multipart), refuses one that is not sealed, and requires it in an
+  evidence store (`files.intake_sealed`, migration v14); `files/keys`
+  hands it back. Versions carry hashes, not intake: an item is acquired
+  once.
+- `worker/src/custody.rs` + `web/src/vault/custody.ts` — the chain per
+  evidence file (`custody` table): offer (the custodian, link number
+  `seq` signed, no gaps, one open offer), accept (only the person named;
+  a read-only grantee too — the case route asks only Read), withdraw (the
+  offerer). `verifyChain` walks it: both signatures per link, every `from`
+  the previous `to`, the reason opening in its place with the digest the
+  offer signed; withdrawn links are skipped.
+- Rotation walks both (kinds `intake`, `custody`); backups carry the
+  intake in each file entry and every custody link as its own entry; a
+  restore fills custody links into gaps only.
+- The web app: an intake dialog once per evidence upload batch
+  (`ui/files/intake-dialog.ts`), signed per file; a copy inside an
+  evidence case gets an automatic intake naming its source; "Custody…" in
+  both explorers shows the chain as this client verified it and offers
+  the one action open to the member (accept, or hand over).

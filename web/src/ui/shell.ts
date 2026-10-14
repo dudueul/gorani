@@ -22,6 +22,7 @@ import { watchAutoLock, AUTO_LOCK, type VaultSession } from "../vault/session.ts
 import { revokeAllBlobURLs } from "../lib/blob-urls.ts";
 import { FilesModel } from "./files/model.ts";
 import { sessionBridge } from "./files/bridge.ts";
+import { askIntake } from "./files/intake-dialog.ts";
 import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
 import { LocalIndex } from "../vault/index.ts";
 import "./viewer/viewer.ts";
@@ -180,6 +181,10 @@ export class GoraniShell extends LitElement {
 			// 29d) — read at each use, so it works from the moment the team
 			// context opens, whichever finishes first.
 			identity: () => (this.team ? { signer: this.team.signer, trust: this.team.trust } : null),
+			// An evidence case's uploads carry an intake record (commit 29g),
+			// asked here once per batch.
+			areaKind: () => (own ? "own" : (this.grantedCases.find((c) => c.id === caseId)?.kind ?? null)),
+			intake: (files) => askIntake(files, this.member.id),
 		}, openKey), area, own ? (this.index ?? undefined) : undefined);
 		this.area = area;
 		this.areaTitle = title;

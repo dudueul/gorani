@@ -25,6 +25,8 @@
  * | `file.type` | member | file id | n | version n's MIME type |
  * | `file.music` | member | file id | n | version n's tag summary |
  * | `file.hash` | member | file id | n | version n's signed content hash (content-hash.ts) |
+ * | `file.intake` | member | file id | — | an evidence file's signed intake record (intake.ts) |
+ * | `custody.reason` | member | file id | n | custody link n's reason (custody.ts) |
  * | `folder.name` | member | folder id | — | the folder's name |
  * | `share.name` | member | share id | — | the owner's copy of a link's name |
  * | `store.secrets` | member | — | — | fingerprint + index keys |
@@ -59,6 +61,8 @@ export const places = {
 	fileType: (store: string, file: string, version: number) => place("file.type", store, file, version),
 	fileMusic: (store: string, file: string, version: number) => place("file.music", store, file, version),
 	fileHash: (store: string, file: string, version: number) => place("file.hash", store, file, version),
+	fileIntake: (store: string, file: string) => place("file.intake", store, file),
+	custodyReason: (store: string, file: string, seq: number) => place("custody.reason", store, file, seq),
 	folderName: (store: string, folder: string) => place("folder.name", store, folder),
 	shareName: (store: string, share: string) => place("share.name", store, share),
 	storeSecrets: (store: string) => place("store.secrets", store, ""),

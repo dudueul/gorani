@@ -280,6 +280,23 @@ pub const MIGRATIONS: &[&str] = &[
 	// share links; one way); the client's own mark is the sealed type
 	// (web/src/vault/samples.ts), which a server cannot clear.
 	"ALTER TABLE files ADD COLUMN sample INTEGER NOT NULL DEFAULT 0",
+	// Migration v14 (commit 29g, docs/CUSTODY.md › Stage 6, D5.6): an
+	// evidence file's intake record (sealed, signed by the uploader), and
+	// its custody chain — offers and acceptances, each signed (custody.rs).
+	"ALTER TABLE files ADD COLUMN intake_sealed TEXT",
+	"CREATE TABLE IF NOT EXISTS custody (
+		file_id TEXT NOT NULL,
+		seq INTEGER NOT NULL,
+		from_member TEXT NOT NULL,
+		to_member TEXT NOT NULL,
+		reason_sealed TEXT NOT NULL,
+		offered_at TEXT NOT NULL,
+		offer_signature TEXT NOT NULL,
+		accepted_at TEXT,
+		accept_signature TEXT,
+		cancelled_at TEXT,
+		PRIMARY KEY (file_id, seq)
+	)",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -487,6 +504,21 @@ impl GoraniMemberDO {
 			}
 			// A case's legal hold placed or released (commit 29f): internal,
 			// from routes.rs after the registry recorded it. No public path.
+			// Custody (commit 29g, custody.rs). The Worker names the acting
+			// member in the body (`member`), from its own check of the caller.
+			("GET", id) if id.starts_with("custody/") => self.custody_get(&id["custody/".len()..]).await,
+			("POST", id) if id.starts_with("custody/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				match id["custody/".len()..].split('/').collect::<Vec<_>>().as_slice() {
+					[file] => self.custody_offer(&actor, file, body).await,
+					[file, seq, "accept"] => self.custody_accept(&actor, file, seq.parse().unwrap_or(0), body).await,
+					[file, seq, "cancel"] => {
+						let member = body.get("member").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+						self.custody_cancel(&actor, file, seq.parse().unwrap_or(0), &member).await
+					}
+					_ => json_error(404, "custody/<file>[/<seq>/accept|cancel]"),
+				}
+			}
 			("PUT", "case-hold") => {
 				let body = req.json::<serde_json::Value>().await?;
 				let hold = body.get("hold").and_then(|h| h.as_bool()).unwrap_or(false);

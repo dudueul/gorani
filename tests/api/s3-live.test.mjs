@@ -49,7 +49,7 @@ import { startDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, openWith } from "../../web/src/vault/vault-crypto.ts";
 import { sealChunked, openChunk, FRAME_OVERHEAD } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
-import { member, vouch, openCase, signedHash } from "../lib/team.mjs";
+import { member, vouch, openCase, signedHash, signedIntake } from "../lib/team.mjs";
 import { s3fetch } from "../lib/sigv4.mjs";
 
 const env = process.env;
@@ -209,7 +209,7 @@ try {
 		const eck = newContentKey();
 		const ef = await evidence.sealer.newFile("probe.bin", "application/octet-stream", eck);
 		const eplain = enc.encode("one small object, locked for one day");
-		const eup = await post("/files", { ...ef.fields, size: String(eplain.length), hash: await signedHash(bo, evidence.sealer, ef.id, 1, eplain) }, await sealWith(await importContentKey(eck), eplain), evidence.base);
+		const eup = await post("/files", { ...ef.fields, size: String(eplain.length), hash: await signedHash(bo, evidence.sealer, ef.id, 1, eplain), intake: await signedIntake(bo, evidence.sealer, ef.id, { source: "the live suite", method: "a 1-day lock probe" }) }, await sealWith(await importContentKey(eck), eplain), evidence.base);
 		assert.equal(eup.status, 200, `evidence upload: ${JSON.stringify(eup.json)}`);
 		// The bucket's own word on what is under the case's prefix.
 		const listed = await (await s3fetch(s3, "GET", "", { "list-type": "2", prefix: `cases/${caseId}/` })).text();

@@ -105,6 +105,14 @@ impl Place {
 	pub fn file_hash(store: &str, file: &str, version: i64) -> Self {
 		Self::new("file.hash", store, file, Some(version))
 	}
+	/// An evidence file's signed intake record (commit 29g, stage 6).
+	pub fn file_intake(store: &str, file: &str) -> Self {
+		Self::new("file.intake", store, file, None)
+	}
+	/// Custody link n's reason (commit 29g, stage 6).
+	pub fn custody_reason(store: &str, file: &str, seq: i64) -> Self {
+		Self::new("custody.reason", store, file, Some(seq))
+	}
 	pub fn folder_name(store: &str, folder: &str) -> Self {
 		Self::new("folder.name", store, folder, None)
 	}

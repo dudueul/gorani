@@ -40,7 +40,7 @@ import { buildTrust, certify, createIdentity, hybridDigest, pin, statements } fr
 import { opensAnything } from "../../web/src/vault/rotation.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "../lib/placed.mjs";
-import { signedHash } from "../lib/team.mjs";
+import { signedHash, signedIntake } from "../lib/team.mjs";
 import { approveRequest, requestApproval } from "../../web/src/vault/approvals.ts";
 
 const dev = await suiteDev();
@@ -104,7 +104,7 @@ async function putFile(who, sealer, name, text) {
 	const ck = newContentKey();
 	const f = await sealer.newFile(name, "text/plain", ck);
 	const plain = enc.encode(text);
-	const r = await upload(who, { ...f.fields, size: String(plain.length), hash: await signedHash(who, sealer, f.id, 1, plain) }, await sealWith(await importContentKey(ck), plain));
+	const r = await upload(who, { ...f.fields, size: String(plain.length), hash: await signedHash(who, sealer, f.id, 1, plain), intake: await signedIntake(who, sealer, f.id) }, await sealWith(await importContentKey(ck), plain));
 	return { ...r, id: f.id, plain };
 }
 

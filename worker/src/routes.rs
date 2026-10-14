@@ -380,6 +380,10 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
+		// Custody (commit 29g) is a record of responsibility, not access:
+		// anyone on the case may hold an item — a read-only analyst too, and
+		// after the case closed. custody.rs decides WHO, link by link.
+		("POST", ["files", _, "custody"] | ["files", _, "custody", _, "accept" | "cancel"]) => Some(Need::Read),
 		// Rotation's reseal walk, the backup key and runs, restores and
 		// retention: the case's managers.
 		("PUT", ["files", "reseal"] | ["backup-key"] | ["backup", "restore", "object"]) | ("GET", ["backup-key"]) | ("POST", ["backup", "run"] | ["backup", "restore"] | ["housekeeping"]) => Some(Need::Manage),
@@ -543,6 +547,27 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		}
 		("GET", ["members", id, "files", "list"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/list", &req, actor)).await,
 		("GET", ["members", id, "files", "changes"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/changes", &req, actor)).await,
+		// ── Custody (commit 29g, custody.rs) ── the acting member rides in the
+		// body, from the Worker's own check (a case grant, or the member).
+		("GET", ["members", id, "files", file, "custody"]) => {
+			let path = format!("custody/{file}");
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", path, None, actor)).await
+		}
+		("POST", ["members", id, "files", file, "custody", ..]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			let rest: &[&str] = &segments[5..];
+			let path = match rest {
+				[] => format!("custody/{file}"),
+				[seq, verb @ ("accept" | "cancel")] if seq.parse::<i64>().is_ok() => format!("custody/{file}/{seq}/{verb}"),
+				_ => return json_error(404, "files/<id>/custody[/<seq>/accept|cancel]"),
+			};
+			let mut body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+			body["member"] = serde_json::json!(actor.id);
+			forward_member(&env, id, "POST", &path, Some(body), &actor.email).await
+		}
 		("GET", ["members", id, "files", "music"]) => {
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "music/feed", None, actor)).await
 		}
@@ -827,8 +852,9 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	// The known text fields; FormData has no iteration in workers-rs, so we
 	// ask for each by name (the upload contract is fixed anyway).
 	// (`hash`: the uploader's signed content hash, sealed — commit 29d.
-	// `sample`: "1" uploads a malware sample — commit 29e.)
-	const KNOWN: [&str; 14] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample"];
+	// `sample`: "1" uploads a malware sample — commit 29e. `intake`: an
+	// evidence file's sealed, signed intake record — commit 29g.)
+	const KNOWN: [&str; 15] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -910,6 +936,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
 		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
+		"intake": form.fields.get("intake"),
 		"objectKey": object_key,
 		"bytesSealed": true,
 		"owner": actor.id,
@@ -1081,6 +1108,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"hash": form.fields.get("hash"),
 		// (A new file only: a version of a sample is a sample already.)
 		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
+		"intake": form.fields.get("intake"),
 		"key": form.fields.get("key"),
 		// The Worker's attestation: the object added up to its declared size
 		// (size + frames × 28). GC01 frames carry no magic — their sealing is

@@ -88,6 +88,8 @@ struct VersionSqlRow {
 	hash_sealed: Option<String>,
 	#[serde(default)]
 	sample: i64,
+	#[serde(default)]
+	intake_sealed: Option<String>,
 }
 
 impl GoraniMemberDO {
@@ -121,6 +123,16 @@ impl GoraniMemberDO {
 		if let Some(refused) = self.hash_refusal(get("hash").as_deref()).await? {
 			return Ok(refused);
 		}
+		// The intake record (commit 29g): where the item came from — sealed,
+		// signed, and required on evidence, like the hash. A NEW file only:
+		// an item is acquired once; its later versions are its processing.
+		let intake = get("intake");
+		if intake.as_ref().is_some_and(|i| !gorani_formats::placed::is_placed_text(i)) {
+			return json_error(400, "the intake record must arrive sealed into its place (GV04)");
+		}
+		if intake.is_none() && self.is_evidence().await? {
+			return json_error(400, "an evidence file needs its intake record — source, collector, method, when (docs/CUSTODY.md › stage 6) — this client did not send one");
+		}
 		let Some(file_id) = get("id") else { return json_error(400, "the file id is chosen by the client (file_id)") };
 		let taken: Option<ExistsRow> = self.sql.exec("SELECT 1 AS one FROM files WHERE id = ?1", Some(vec![file_id.clone().into()]))?.to_array::<ExistsRow>().ok().and_then(|mut r| r.pop());
 		if taken.is_some() {
@@ -138,8 +150,8 @@ impl GoraniMemberDO {
 		let sample = body.get("sample").and_then(|v| v.as_bool()).unwrap_or(false);
 		self.sql
 			.exec(
-				"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?6, ?7)",
-				Some(vec![file_id.clone().into(), bind(get("folderId")), name.clone().into(), size.into(), version.into(), bind(get("owner")), (sample as i64).into()]),
+				"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample, intake_sealed) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?6, ?7, ?8)",
+				Some(vec![file_id.clone().into(), bind(get("folderId")), name.clone().into(), size.into(), version.into(), bind(get("owner")), (sample as i64).into(), bind(intake)]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("file insert: {e}")))?;
 		self.contributor_add(&file_id, actor).await?;
@@ -339,7 +351,7 @@ impl GoraniMemberDO {
 			let row: Option<VersionSqlRow> = self
 				.sql
 				.exec(
-					"SELECT v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.hash_sealed, f.sample AS sample FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE v.file_id = ?1",
+					"SELECT v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.hash_sealed, f.sample AS sample, f.intake_sealed AS intake_sealed FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE v.file_id = ?1",
 					Some(vec![id.clone().into()]),
 				)?
 				.to_array::<VersionSqlRow>()
@@ -351,7 +363,7 @@ impl GoraniMemberDO {
 					serde_json::json!({
 						"key": v.content_key, "vaultKeyId": v.vault_key_id, "chunk": v.chunk_size,
 						"version": v.version, "type": v.type_sealed, "size": v.size, "object": v.object_key,
-						"hash": v.hash_sealed, "sample": v.sample != 0,
+						"hash": v.hash_sealed, "sample": v.sample != 0, "intake": v.intake_sealed,
 					}),
 				);
 			}
@@ -1126,6 +1138,8 @@ impl GoraniMemberDO {
 	/// | `share` | shares | the owner's copy of the name |
 	/// | `secrets` | files_secrets | fingerprint + index keys |
 	/// | `hash` | file_versions | the uploader's signed content hash (29d) |
+	/// | `intake` | files | an evidence file's signed intake record (29g) |
+	/// | `custody` | custody | each custody link's sealed reason (29g) |
 	///
 	/// Before commit 24 the rotation walk could reach only each file's LIVING
 	/// version (via `files/keys`) and file names — so a departed member's old
@@ -1147,7 +1161,9 @@ impl GoraniMemberDO {
 			// (Its own kind, not a third value of `version`: most versions
 			// carry no hash, and a walk's items stay one or two values.)
 			"hash" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, hash_sealed AS v1, NULL AS v2 FROM file_versions WHERE rowid > ?1 AND hash_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
-			_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash"),
+			"intake" => "SELECT rowid AS row, id AS a, NULL AS b, intake_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 AND intake_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
+			"custody" => "SELECT rowid AS row, file_id AS a, CAST(seq AS TEXT) AS b, reason_sealed AS v1, NULL AS v2 FROM custody WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody"),
 		};
 		// `&file=<id>` narrows `version` to one file's versions (commit 29e:
 		// marking a sample re-seals each of ITS versions' types — a walk of
@@ -1204,7 +1220,9 @@ impl GoraniMemberDO {
 				"secrets" => "UPDATE files_secrets SET v = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				// (Only a row that HAS a hash: a reseal never adds a claim.)
 				"hash" => "UPDATE file_versions SET hash_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND hash_sealed IS NOT NULL",
-				_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash"),
+				"intake" => "UPDATE files SET intake_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND intake_sealed IS NOT NULL",
+				"custody" => "UPDATE custody SET reason_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody"),
 			};
 			plan.push((sql, row, v1, v2));
 		}

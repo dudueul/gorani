@@ -21,6 +21,7 @@
 import { store, type Store } from "../../lib/store.ts";
 import { newContentKey, importContentKey, sealWith, openWith, sealPlacedText, openPlacedText, wrapPlacedKey, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
 import { places, newItemId } from "../../vault/places.ts";
+import { controllingMediaWorker, registerMedia } from "../../lib/media-worker.ts";
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
@@ -93,6 +94,10 @@ export interface FilesBridge {
 	fetchObject(memberId: string, id: string, version: number | undefined, range?: [number, number]): Promise<{ body: Uint8Array; ck: string; chunk: number | null; version: number }>;
 	fetchObjectStream(memberId: string, id: string, version: number | undefined, sink: (plain: Uint8Array) => Promise<void> | void): Promise<void>;
 	putWhole(memberId: string, fields: Record<string, string>, sealed: Uint8Array): Promise<void>;
+	/** Headers that identify this client to the API beyond its cookies (the
+	 * dev server's identity header; nothing in production) — for fetches
+	 * made outside the bridge, i.e. by the media service worker. */
+	identityHeaders(): Record<string, string>;
 	putMultipart(memberId: string, fields: Record<string, string>, sealed: Uint8Array, chunk: number): Promise<void>;
 	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
 	toast(message: string): void;
@@ -542,8 +547,9 @@ export class FilesModel {
 	 * plaintext (the content key is handed over as a cloned, still
 	 * non-extractable CryptoKey). Returns null where service workers are
 	 * unavailable — the viewer falls back to the decrypted blob. */
-	async mediaHandle(id: string): Promise<{ url: string } | null> {
-		if (typeof navigator === "undefined" || !navigator.serviceWorker) return null;
+	async mediaHandle(id: string, mime: string | null = null): Promise<{ url: string } | null> {
+		const worker = await controllingMediaWorker();
+		if (!worker) return null;
 		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
@@ -553,11 +559,12 @@ export class FilesModel {
 		const priv = await this.bridge.storePrivate();
 		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, meta.version), meta.key);
 		const url = `/media/${id}`;
-		await navigator.serviceWorker.ready;
-		const reg = await navigator.serviceWorker.getRegistration("/media/");
-		const target = reg?.active ?? (await navigator.serviceWorker.ready).active;
-		if (!target) return null;
-		target.postMessage({ type: "media", url, memberId: this.memberId, fileId: id, key, chunk: meta.chunk, size: row.size });
+		// The version rides along: the worker fetches exactly the version
+		// this key was opened for (a newer one would not open with it).
+		// (`headers`: the dev server's identity header — a service worker cannot
+		// read the page's localStorage. Empty in production, where Access's
+		// cookie rides every same-origin fetch, the worker's included.)
+		await registerMedia(worker, { url, memberId: this.memberId, fileId: id, version: meta.version, key, chunk: meta.chunk, size: row.size, mime, headers: this.bridge.identityHeaders() });
 		return { url };
 	}
 

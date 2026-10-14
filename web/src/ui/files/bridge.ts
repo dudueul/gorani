@@ -46,6 +46,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		apiGet: <T>(path: string) => fetchJson<T>("GET", path),
 		apiSend: <T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) => fetchJson<T>(method, path, body),
 		storePrivate: () => store().then((s) => s.privateKey),
+		identityHeaders: devIdentityHeaders,
 
 		async fetchObject(memberId, id, version, range) {
 			const headers: Record<string, string> = { ...devIdentityHeaders() };

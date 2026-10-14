@@ -25,6 +25,7 @@ import { pickViewerMode, renderMime, TEXT_CAP, type ViewerMode } from "./mode.ts
 import { icon, type FileKind } from "../files/icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
+import { forgetMedia } from "../../lib/media-worker.ts";
 
 export interface ViewerTarget {
 	id: string;
@@ -69,7 +70,7 @@ export class GoraniViewer extends LitElement {
 		if (!this.url) return;
 		if (this.streamed) {
 			const url = this.url;
-			void navigator.serviceWorker?.getRegistration("/media/").then((reg) => reg?.active?.postMessage({ type: "media-forget", url }));
+			void forgetMedia(url);
 		} else {
 			revokeBlobURL(this.url);
 		}
@@ -99,7 +100,7 @@ export class GoraniViewer extends LitElement {
 				// Streaming path: the scoped media worker serves decrypted
 				// ranges; the browser's player seeks natively. Only for larger
 				// media — small ones are simpler as blobs.
-				const handle = await this.model.mediaHandle(id);
+				const handle = await this.model.mediaHandle(id, renderMime(kind, mime, this.target.name));
 				if (handle) {
 					this.streamed = true;
 					this.url = handle.url;

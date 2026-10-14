@@ -146,6 +146,7 @@ const bridge: FilesBridge = {
 	apiGet: <T>(path: string) => Promise.resolve(server.get(path) as T),
 	apiSend: <T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) => Promise.resolve(server.send(method, path, body) as T),
 	storePrivate: async () => storePrivate,
+	identityHeaders: () => ({}),
 	async fetchObject(_member, id, _version, range) {
 		const v = versions.get(id)!;
 		const obj = objects.get(v.object)!;

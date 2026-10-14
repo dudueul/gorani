@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { framesForRange, frameAad, splitFrame, resolveRange, FRAME_OVERHEAD } from "../../web/public/gorani-media-lib.js";
+import { framesForRange, frameAad, splitFrame, resolveRange, cutToRange, FRAME_OVERHEAD } from "../../web/public/gorani-media-lib.js";
 
 const chunk = 64;
 const size = 200; // four frames: 64, 64, 64, 8
@@ -63,4 +63,18 @@ assert.deepEqual(resolveRange("bytes=-50", size), { start: 150, end: 199 });
 assert.equal(resolveRange("bytes=500-600", size), null, "past the end");
 assert.equal(resolveRange(null, size), null);
 
-console.log("ok  media frames: range mapping, AAD binding, split, range resolution");
+// ── 5. The answer is EXACTLY the asked range (commit 25, O11) ───────
+// Plaintext 100..139 lives in frames 1..2 (bytes 64..191 decrypted); the
+// worker used to answer with all 128 of them, starting at 64 — a response
+// that begins before the requested offset. Now: bytes 100..139, 40 of them.
+const plainFrames = new Uint8Array(128).map((_, i) => 64 + i); // byte value = its offset in the file
+const cut = cutToRange(plainFrames, 64, 100, 139);
+assert.equal(cut.length, 40);
+assert.equal(cut[0], 100, "starts at the requested offset");
+assert.equal(cut[cut.length - 1], 139, "ends at the requested end");
+// An end past the decrypted frames (the last frame is short) is clamped.
+assert.equal(cutToRange(plainFrames, 64, 180, 500).length, 12);
+// A start outside the frames is a bug, not a silent empty answer.
+assert.throws(() => cutToRange(plainFrames, 64, 10, 20));
+
+console.log("ok  media frames: range mapping, AAD binding, split, range resolution, exact cuts");

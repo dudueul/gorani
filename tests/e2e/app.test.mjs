@@ -167,6 +167,37 @@ try {
 		await page.keyboard.press("Escape");
 		await assertNoViolations(page, "unlock → upload → open");
 
+		// ── Streaming media through the service worker (O11) ───────────
+		// A video over the 8 MiB streaming threshold opens as /media/<id>,
+		// answered by the media service worker with decrypted bytes. Before
+		// commit 25 it was registered at scope "/media/" — it controlled no
+		// page the app shows, so these requests never reached it — and its
+		// whole-file path used the wrong AAD. Both would fail right here.
+		const clip = Buffer.alloc(9 * 1024 * 1024);
+		for (let i = 0; i < clip.length; i++) clip[i] = (i * 7) % 251;
+		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "clip.mp4", mimeType: "video/mp4", buffer: clip });
+		await page.locator("text=clip.mp4").first().waitFor({ timeout: 120_000 });
+		await page.locator("text=clip.mp4").first().dblclick();
+		const video = page.locator("gorani-viewer video").first();
+		await video.waitFor({ state: "attached", timeout: 30_000 });
+		const mediaUrl = (await video.getAttribute("src")) ?? "";
+		assert.match(mediaUrl, /^\/media\//, `streamed through the media worker, not a blob (src=${mediaUrl})`);
+		assert.equal(await page.evaluate(() => Boolean(navigator.serviceWorker.controller)), true, "the media worker controls the app page (scope /)");
+		const ranged = await page.evaluate(async (u) => {
+			const r = await fetch(u, { headers: { Range: "bytes=1000-1999" } });
+			return { status: r.status, range: r.headers.get("content-range"), type: r.headers.get("content-type"), bytes: Array.from(new Uint8Array(await r.arrayBuffer())) };
+		}, mediaUrl);
+		assert.equal(ranged.status, 206);
+		assert.equal(ranged.range, `bytes 1000-1999/${clip.length}`, "exactly the asked range, honestly labelled");
+		assert.equal(ranged.type, "video/mp4", "the file's own type, not a guess");
+		assert.deepEqual(ranged.bytes, Array.from(clip.subarray(1000, 2000)), "the decrypted bytes, byte for byte");
+		// Close the viewer: the worker forgets this file's key — the URL stops working.
+		await page.keyboard.press("Escape");
+		await page.waitForFunction(async (u) => (await fetch(u, { headers: { Range: "bytes=0-9" } })).status === 404, mediaUrl, { timeout: 10_000 });
+		// Everything else still goes to the network untouched (the worker never answers it).
+		assert.equal(await page.evaluate(async () => (await fetch("/api/healthz")).status), 200);
+		await assertNoViolations(page, "streamed media");
+
 		// ── Lock means locked (docs/SECURITY-REVIEW.md › O2) ───────────
 		// An image opened in the viewer is a blob: URL over DECRYPTED bytes.
 		// After Lock, that handle must stop resolving, the explorer must be

@@ -461,7 +461,9 @@ anyone      tools/verify-export.mjs package.zip — Node only, no gorani code, n
   the two people, "Re-verify now" with the last run's result per evidence
   case.
 - Not yet: a package is built in memory (D12's large-file work will
-  stream it); ZIP64 (4 GiB) as everywhere.
+  stream it); ZIP64 (4 GiB) as everywhere. *(Done in commit 31d,
+  docs/LARGE-FILES.md: the package streams to disk, ZIP64 where needed,
+  and the verifier reads it from disk.)*
 
 ### 29i — the SIEM feed
 

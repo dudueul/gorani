@@ -40,12 +40,12 @@
 import { statements, type RegistryIdentity, type Signer, type Trust } from "./identity.ts";
 import { places } from "./places.ts";
 import { openPlacedText, openWith, unwrapPlacedKey, type VaultPrivateKey } from "./vault-crypto.ts";
-import { openChunked } from "./chunked-file.ts";
-import { checkContentHash, openContentHash, sha256Hex, type ContentHashRecord, type HashCheck } from "./content-hash.ts";
+import { openChunked, openChunkedStream } from "./chunked-file.ts";
+import { checkContentHash, openContentHash, sha256Hex, sha256Stream, type ContentHashRecord, type HashCheck } from "./content-hash.ts";
 import { checkIntake, type IntakeRecord } from "./intake.ts";
 import { verifyChain, type CustodyChain } from "./custody.ts";
-import { isSampleType, zipEncrypted } from "./samples.ts";
-import { zipEntries, type ZipEntry } from "./zip.ts";
+import { isSampleType, SAMPLE_PASSWORD } from "./samples.ts";
+import { ZipStream, type ZipSink } from "./zip.ts";
 import type { Approval } from "./approvals.ts";
 import { checkCheckpointStamp, checkVersionStamp, stampImprint, trustedTsas, type StampCheck, type TrustedTsas, type TsaCert, type VersionStamp } from "./timestamp.ts";
 
@@ -57,6 +57,8 @@ export interface ExportSource {
 	put?<T>(path: string, body: unknown): Promise<T>;
 	/** A version's sealed bytes and the headers that open it (`GET …/files/<id>?version=n`). */
 	object(path: string): Promise<{ body: Uint8Array; ck: string; chunk: number | null; version: number; hash: string | null }>;
+	/** (D12, 31d) The same as a stream — `size` is the sealed length; absent → `object` is used. */
+	objectStream?(path: string): Promise<{ body: ReadableStream<Uint8Array>; size: number; ck: string; chunk: number | null; version: number; hash: string | null }>;
 }
 
 export interface VersionReport {
@@ -95,7 +97,14 @@ interface FileRow {
  * check each signed record. `onVersion` receives the plaintext (the export
  * stores it; re-verification drops it).
  */
-async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, caseId: string, tsas: TrustedTsas, onVersion: (file: FileRow & { name: string }, v: VersionReport, plain: Uint8Array) => Promise<void> | void): Promise<FileReport[]> {
+/**
+ * A version's plaintext, pushed through `write` as it decrypts (D12, 31d):
+ * each version streams ONCE — into the export's zip, or nowhere (a
+ * re-verification) — and is hashed on the way.
+ */
+type Pump = (write: (plain: Uint8Array) => Promise<void>) => Promise<void>;
+
+async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, caseId: string, tsas: TrustedTsas, onVersion: (file: FileRow & { name: string }, at: { version: number; path: string; packed: VersionReport["packed"]; sizeHint: number }, pump: Pump) => Promise<void> | void): Promise<FileReport[]> {
 	const base = `/api/v1/cases/${caseId}`;
 	const area = `case:${caseId}`;
 	const rows: FileRow[] = [];
@@ -130,21 +139,47 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 					const t = await openPlacedText(store, places.fileType(area, row.id, n), it.v2).catch(() => null);
 					if (t === null || isSampleType(t)) sample = true; // the careful side, as the viewer
 				}
-				const obj = await source.object(`${base}/files/${row.id}?version=${n}`);
+				// Streamed where the source can (the browser, the tests' fetch): a
+				// 255 GB image is decrypted frame by frame, never held (D12).
+				const objectPath = `${base}/files/${row.id}?version=${n}`;
+				const streamed = source.objectStream ? await source.objectStream(objectPath) : null;
+				const whole = streamed ? null : await source.object(objectPath);
+				const obj = (streamed ?? whole)!;
+				if (obj.version !== n) throw new Error(`asked for version ${n} of ${name}, the server answered with ${obj.version}`);
 				const key = await unwrapPlacedKey(store, places.fileKey(area, row.id, obj.version), obj.ck);
-				const plain = obj.chunk ? await openChunked(key, obj.body, obj.chunk) : await openWith(key, obj.body);
-				const sha256 = await sha256Hex(plain);
-				const check = await checkContentHash(store, trust, area, row.id, obj.version, obj.hash, { sha256, size: plain.length });
+				const h = await sha256Stream();
+				let plainSize = 0;
+				let pumped = false;
+				const pump: Pump = async (write) => {
+					if (pumped) throw new Error("a version streams once");
+					pumped = true;
+					const feed = async (p: Uint8Array) => {
+						h.update(p);
+						plainSize += p.length;
+						await write(p);
+					};
+					if (streamed && obj.chunk) await openChunkedStream(key, streamed.body, obj.chunk, streamed.size, feed);
+					else {
+						const bytes = streamed ? new Uint8Array(await new Response(streamed.body).arrayBuffer()) : whole!.body;
+						await feed(obj.chunk ? await openChunked(key, bytes, obj.chunk) : await openWith(key, bytes));
+					}
+				};
 				const safe = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_") || row.id;
 				const hashRecord = await openContentHash(store, area, row.id, obj.version, obj.hash);
 				const s = stamps.get(obj.version);
 				const stampCheck = await checkVersionStamp(hashRecord, s, tsas);
+				const path = `evidence/${row.id}/v${obj.version}/${safe}${sample ? ".zip" : ""}`;
+				const packed: VersionReport["packed"] = sample ? "zip-infected" : "plain";
+				await onVersion({ ...row, name }, { version: obj.version, path, packed, sizeHint: streamed ? streamed.size : whole!.body.length }, pump);
+				if (!pumped) await pump(async () => {});
+				const sha256 = h.hex();
+				const check = await checkContentHash(store, trust, area, row.id, obj.version, obj.hash, { sha256, size: plainSize });
 				const v: VersionReport = {
 					version: obj.version,
-					size: plain.length,
+					size: plainSize,
 					sha256,
-					path: `evidence/${row.id}/v${obj.version}/${safe}${sample ? ".zip" : ""}`,
-					packed: sample ? "zip-infected" : "plain",
+					path,
+					packed,
 					hashRecord,
 					hashCheck: check.status,
 					stamp: s?.token && s.imprint ? { imprint: s.imprint, token: s.token, at: s.at } : null,
@@ -152,7 +187,6 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 					stampNote: s?.status === "no-imprint" ? "no-imprint" : stampCheck.status === "invalid" || stampCheck.status === "absent" ? stampCheck.why : "",
 				};
 				versions.push(v);
-				await onVersion({ ...row, name }, v, plain);
 			}
 			if (page.next === null) break;
 			after = page.next;
@@ -185,13 +219,16 @@ export async function reverifyCase(source: ExportSource, store: VaultPrivateKey,
 	const problems: string[] = [];
 	const { trusted } = await tsasOf(source, trust);
 	const missing: { file: string; version: number; signature: string }[] = [];
-	await walk(source, store, trust, caseId, trusted, (f, v) => {
-		checked++;
-		if (v.hashCheck !== "verified") problems.push(`${f.name} v${v.version}: ${v.hashCheck}`);
-		const sp = stampProblem(v);
-		if (sp) problems.push(`${f.name} v${v.version}: ${sp}`);
-		if (v.stampNote === "no-imprint" && v.hashCheck === "verified" && v.hashRecord) missing.push({ file: f.id, version: v.version, signature: v.hashRecord.signature });
-	});
+	const files = await walk(source, store, trust, caseId, trusted, () => {});
+	for (const f of files) {
+		for (const v of f.versions) {
+			checked++;
+			if (v.hashCheck !== "verified") problems.push(`${f.name} v${v.version}: ${v.hashCheck}`);
+			const sp = stampProblem(v);
+			if (sp) problems.push(`${f.name} v${v.version}: ${sp}`);
+			if (v.stampNote === "no-imprint" && v.hashCheck === "verified" && v.hashRecord) missing.push({ file: f.id, version: v.version, signature: v.hashRecord.signature });
+		}
+	}
 	for (const m of missing) {
 		if (!source.put) break;
 		try {
@@ -206,24 +243,48 @@ export async function reverifyCase(source: ExportSource, store: VaultPrivateKey,
 }
 
 export interface ExportResult {
+	/** The package, when no sink was given (tests, small cases); empty when it streamed. */
 	parts: Uint8Array[];
 	manifest: Record<string, unknown>;
 	digest: string;
 	problems: string[];
 }
 
-/** Build the signed package for an approved, unconsumed `case.export`. */
-export async function buildExport(source: ExportSource, signer: Signer, trust: Trust, store: VaultPrivateKey, caseId: string, approvalId: string): Promise<ExportResult> {
+/**
+ * Build the signed package for an approved, unconsumed `case.export`.
+ *
+ * Streamed (D12, 31d): with a `sink`, the zip goes out as it is made — each
+ * version decrypted once, straight into its entry (a sample into its own
+ * "infected" zip inside), hashed on the way — and the manifest, which
+ * needs every hash, is written LAST (a zip's order is its central
+ * directory's, not its bytes'). Without one, the parts are collected and
+ * returned. `forceZip64` writes every ZIP64 field (how a test proves them).
+ */
+export async function buildExport(source: ExportSource, signer: Signer, trust: Trust, store: VaultPrivateKey, caseId: string, approvalId: string, { sink, forceZip64 = false }: { sink?: ZipSink; forceZip64?: boolean } = {}): Promise<ExportResult> {
 	const started = await source.post<{ exportId: string; exporter: string; approval: Approval }>(`/api/v1/cases/${caseId}/export`, { approval: approvalId });
-	const entries: ZipEntry[] = [];
+	const collected: Uint8Array[] = [];
+	const zip = new ZipStream(sink ?? (async (b) => void collected.push(b)), { forceZip64 });
 	const problems: string[] = [];
 	const tsa = await tsasOf(source, trust);
-	const files = await walk(source, store, trust, caseId, tsa.trusted, (f, v, plain) => {
-		entries.push({ name: v.path, data: v.packed === "zip-infected" ? concat(zipEncrypted(f.name, plain)) : plain });
-		if (v.hashCheck !== "verified") problems.push(`${f.name} v${v.version}: content ${v.hashCheck}`);
-		const sp = stampProblem(v);
-		if (sp) problems.push(`${f.name} v${v.version}: ${sp}`);
+	const files = await walk(source, store, trust, caseId, tsa.trusted, async (f, at, pump) => {
+		if (at.packed === "zip-infected") {
+			// A sample leaves only zipped under "infected" — a zip inside the package's entry.
+			await zip.add(at.path, async (writeOuter) => {
+				const inner = new ZipStream(writeOuter, { forceZip64 });
+				await inner.add(f.name.replace(/[\\/]/g, "_") || "sample", pump, { password: SAMPLE_PASSWORD, size: at.sizeHint });
+				await inner.finish();
+			}, { size: at.sizeHint + 512 + 2 * f.name.length });
+		} else {
+			await zip.add(at.path, pump, { size: at.sizeHint });
+		}
 	});
+	for (const f of files) {
+		for (const v of f.versions) {
+			if (v.hashCheck !== "verified") problems.push(`${f.name} v${v.version}: content ${v.hashCheck}`);
+			const sp = stampProblem(v);
+			if (sp) problems.push(`${f.name} v${v.version}: ${sp}`);
+		}
+	}
 	for (const f of files) {
 		if (f.intakeCheck !== "verified" && f.intakeCheck !== "none") problems.push(`${f.name}: intake ${f.intakeCheck}`);
 		if (f.custody && !f.custody.ok) problems.push(`${f.name}: custody chain does not verify`);
@@ -276,13 +337,11 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 	const digest = await sha256Hex(manifestBytes);
 	const signature = await signer.sign(statements.exportManifest(caseId, started.exportId, digest));
 	const sig = { statement: "gorani-export-v1 ‖ case ‖ export id ‖ SHA-256(manifest.json), each length-prefixed (u32 big-endian)", case: caseId, exportId: started.exportId, exporter: signer.member, keyId: signer.keyId, digest, signature, algorithm: "ECDSA P-256 / SHA-256, IEEE P1363 (r ‖ s), base64" };
-	const pkg: ZipEntry[] = [
-		{ name: "manifest.json", data: manifestBytes },
-		{ name: "manifest.sig.json", data: new TextEncoder().encode(JSON.stringify(sig, null, 2)) },
-		{ name: "VERIFY.txt", data: new TextEncoder().encode(verifyText(caseId, started.exportId, signer, digest)) },
-		...entries,
-	];
-	return { parts: zipEntries(pkg), manifest, digest, problems };
+	await zip.addBytes("manifest.json", manifestBytes);
+	await zip.addBytes("manifest.sig.json", new TextEncoder().encode(JSON.stringify(sig, null, 2)));
+	await zip.addBytes("VERIFY.txt", new TextEncoder().encode(verifyText(caseId, started.exportId, signer, digest)));
+	await zip.finish();
+	return { parts: collected, manifest, digest, problems };
 }
 
 function verifyText(caseId: string, exportId: string, signer: Signer, digest: string): string {

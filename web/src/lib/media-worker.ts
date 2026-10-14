@@ -81,6 +81,53 @@ export async function registerDownload(worker: ServiceWorker, msg: { url: string
 	return { done };
 }
 
+/**
+ * A download this page writes as it goes (31d — the export package): the
+ * media worker answers the browser's download with whatever `write` hands
+ * it, one chunk per ask. `write` waits for the ask, so the producer runs
+ * exactly as fast as the disk takes it. Navigate to `url` (not
+ * <a download> — Chromium sends those past the worker) BEFORE writing.
+ */
+export async function pipeToDownload(worker: ServiceWorker, { url, name, mime = "application/octet-stream" }: { url: string; name: string; mime?: string }): Promise<{ write(bytes: Uint8Array): Promise<void>; close(): Promise<void>; fail(e: unknown): void }> {
+	const ack = new MessageChannel();
+	const pipe = new MessageChannel();
+	const acked = new Promise<void>((resolve, reject) => {
+		const t = setTimeout(() => reject(new Error("the media worker did not answer")), 5000);
+		ack.port1.onmessage = () => (clearTimeout(t), resolve());
+	});
+	let asks = 0;
+	let cancelled = false;
+	let wake: (() => void) | null = null;
+	pipe.port1.onmessage = (e) => {
+		if (e.data?.cancel) cancelled = true;
+		else if (e.data?.pull) asks++;
+		const w = wake;
+		wake = null;
+		w?.();
+	};
+	const nextAsk = async () => {
+		while (asks === 0 && !cancelled) await new Promise<void>((r) => (wake = r));
+		if (cancelled) throw new Error("the download was cancelled");
+		asks--;
+	};
+	worker.postMessage({ type: "pipe", url, name, mime }, [ack.port2, pipe.port2]);
+	await acked;
+	return {
+		async write(bytes) {
+			await nextAsk();
+			const copy = bytes.slice();
+			pipe.port1.postMessage({ chunk: copy.buffer }, [copy.buffer]);
+		},
+		async close() {
+			await nextAsk();
+			pipe.port1.postMessage({ done: true });
+		},
+		fail(e) {
+			pipe.port1.postMessage({ error: e instanceof Error ? e.message : String(e) });
+		},
+	};
+}
+
 export async function forgetMedia(url?: string): Promise<void> {
 	if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
 	try {

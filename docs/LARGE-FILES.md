@@ -41,7 +41,7 @@ desktop shells agree on every file's frames.
 |---|---|
 | 31a *(landed)* | **Adaptive chunks, streamed parts, streamed browser uploads.** `chunkFor` in both languages; the Worker refuses sizes over 255 GiB and chunks over 64 MiB, and pipes each part's body to the backend (S3: `UNSIGNED-PAYLOAD` with the length fixed; R2: the binding's stream) — no copy in the isolate. The browser hashes the file in one streamed pass (the hash is signed before any byte leaves), then seals and uploads slice by slice, retrying a failed part (three tries, backoff). |
 | 31b *(landed)* | **Resumable uploads.** The in-flight upload — its id, object key, chunk, the sealed fields (name, type, key, signed hash, intake), the parts done — is kept in the browser (IndexedDB; every field already sealed). After a dropped connection or a closed tab, choosing the same file again (name, size, modified time, and the same SHA-256) continues from the first missing part. The server keeps an unfinished upload for the housekeeping window, then aborts it. |
-| 31c *(downloads landed; the export is 31d)* | **Streaming downloads and export.** A download larger than the tab can hold streams through the media service worker (`/media/<id>?download`), decrypting frame by frame to the browser's own download. The export package streams too (File System Access where the browser has it, the service worker otherwise), with ZIP64 for entries and archives over 4 GiB; `tools/verify-export.mjs` reads ZIP64 and hashes entries from disk, never holding one whole. |
+| 31c *(landed: downloads in 31c, the export in 31d)* | **Streaming downloads and export.** A download larger than the tab can hold streams through the media service worker (`/media/<id>?download`), decrypting frame by frame to the browser's own download. The export package streams too (File System Access where the browser has it, the service worker otherwise), with ZIP64 for entries and archives over 4 GiB; `tools/verify-export.mjs` reads ZIP64 and hashes entries from disk, never holding one whole. |
 
 Not in D12 (recorded here so nobody assumes otherwise):
 
@@ -127,6 +127,33 @@ Not in D12 (recorded here so nobody assumes otherwise):
 - Samples still download zipped in the tab (up to 2 GiB; larger ones go
   through the export), and a file too large for the tab with no worker is
   refused with the reason rather than tried.
+
+## 31d as built (the export)
+
+- `web/src/vault/zip.ts › ZipStream`: entries streamed in, each followed
+  by a data descriptor (bit 3: CRC and sizes after the data); ZIP64 extras
+  and end records wherever a size, an offset or the count needs them —
+  or everywhere, with `forceZip64`, which is how the tests prove the
+  ZIP64 paths without writing 4 GiB. A ZipCrypto entry under bit 3 checks
+  its password against the DOS time's high byte (the CRC is not known
+  yet), the convention Info-ZIP and Python read. A zip inside a zip is a
+  ZipStream whose sink is the outer entry's `write`.
+- `export.ts`: the walk streams each version ONCE through a pump — into
+  its entry (a sample's into its own "infected" zip, inside) or nowhere
+  (re-verification) — hashing it on the way; the source's `objectStream`
+  hands it the response body, decrypted frame by frame. The manifest,
+  which needs every hash, is written last. With a `sink` nothing is
+  collected; without one (the tests, a browser with no service worker)
+  the parts come back as before.
+- The browser: `pipeToDownload` (media-worker.ts) registers a pipe with
+  the media worker, the page navigates to it, and the worker asks the
+  page for one chunk each time the browser's download wants more —
+  the export runs exactly as fast as the disk takes it.
+- `tools/verify-export.mjs` reads the package from disk with positional
+  reads — ZIP64 end records and extras, sizes from the central directory
+  (data descriptors), a sample's zip opened in place through a window
+  onto the outer file — hashing every entry a slice at a time and
+  checking its CRC. Nothing is held whole but the manifest.
 
 ## Why these choices
 

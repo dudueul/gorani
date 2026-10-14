@@ -38,6 +38,9 @@ const registrations = new Map(); // pathname → { memberId, fileId, version, ke
 // (D12, 31c) One-use downloads: /media/dl/<random> → { …, name, port } — the
 // port carries the plaintext's SHA-256 back to the page when it is done.
 const downloads = new Map();
+// (31d) Downloads the PAGE produces as they go (the export package): the
+// worker pulls each chunk over the port as the browser's download asks.
+const pipes = new Map();
 
 self.addEventListener("install", () => self.skipWaiting());
 // Claim the open app page right away: a page loaded before the worker
@@ -76,12 +79,17 @@ self.addEventListener("message", (event) => {
 		});
 		event.ports?.[0]?.postMessage({ ok: true });
 	}
+	if (msg.type === "pipe" && msg.url && event.ports?.[1]) {
+		pipes.set(new URL(msg.url, self.location.origin).pathname, { name: String(msg.name ?? "download"), type: String(msg.mime ?? "application/octet-stream"), port: event.ports[1] });
+		event.ports[0]?.postMessage({ ok: true });
+	}
 	if (msg.type === "media-forget" && msg.url) {
 		registrations.delete(new URL(msg.url, self.location.origin).pathname);
 	}
 	if (msg.type === "media-forget-all") {
 		registrations.clear();
 		downloads.clear(); // locking ends a download not yet started, too
+		pipes.clear();
 	}
 });
 
@@ -94,7 +102,13 @@ self.addEventListener("fetch", (event) => {
 	// A download (D12, 31c): used once — the path is forgotten as it is served.
 	if (url.pathname.startsWith("/media/dl/")) {
 		const dl = downloads.get(url.pathname);
+		const pipe = pipes.get(url.pathname);
 		downloads.delete(url.pathname);
+		pipes.delete(url.pathname);
+		if (pipe && event.request.method === "GET") {
+			event.respondWith(servePipe(pipe));
+			return;
+		}
 		if (!dl || event.request.method !== "GET") {
 			event.respondWith(new Response("not available", { status: 404, headers: { "Cache-Control": "no-store" } }));
 			return;
@@ -194,5 +208,40 @@ function serveDownload(dl) {
 			"Cache-Control": "no-store",
 			"X-Content-Type-Options": "nosniff",
 		},
+	});
+}
+
+/**
+ * A download the page writes as it goes (31d — the export package): each
+ * time the browser's download wants more, the worker asks the page for one
+ * chunk over the port; the page's producer waits for that ask, so nothing
+ * is made faster than the disk takes it, and nothing is buffered here.
+ */
+function servePipe(pipe) {
+	let answer = null;
+	pipe.port.onmessage = (e) => {
+		const a = answer;
+		answer = null;
+		a?.(e.data ?? {});
+	};
+	const body = new ReadableStream(
+		{
+			pull: (controller) =>
+				new Promise((resolve) => {
+					answer = (msg) => {
+						if (msg.error) controller.error(new Error(String(msg.error)));
+						else if (msg.done) controller.close();
+						else controller.enqueue(new Uint8Array(msg.chunk));
+						resolve();
+					};
+					pipe.port.postMessage({ pull: true });
+				}),
+			cancel: () => pipe.port.postMessage({ cancel: true }),
+		},
+		{ highWaterMark: 0 },
+	);
+	return new Response(body, {
+		status: 200,
+		headers: { "Content-Type": pipe.type, "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(pipe.name)}`, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
 	});
 }

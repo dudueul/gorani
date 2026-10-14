@@ -246,6 +246,38 @@ try {
 			assert.deepEqual(await page.evaluate(() => window.__dl.done), { ok: true, sha256, size: plain.length }, "the plaintext's hash, back to the page");
 			assert.equal(await page.evaluate(async () => (await fetch(window.__dl.url)).status), 404, "a download URL is used once");
 			await assertNoViolations(page, "streamed download");
+
+			// The other direction (31d): a download the PAGE produces as it goes
+			// (the export package) — the worker asks for each chunk over its
+			// port as the browser's download wants more, and passes it on.
+			const pieces = [Buffer.from("PK — a package, "), Buffer.alloc(3 * 1024 * 1024, 7), Buffer.from(" written as it was made")];
+			const [piped] = await Promise.all([
+				page.waitForEvent("download"),
+				page.evaluate(async (chunks) => {
+					const url = `/media/dl/e2e-pipe-${Math.random().toString(36).slice(2)}`;
+					const ack = new MessageChannel();
+					const pipe = new MessageChannel();
+					const acked = new Promise((r) => (ack.port1.onmessage = r));
+					navigator.serviceWorker.controller.postMessage({ type: "pipe", url, name: "case-export.zip", mime: "application/zip" }, [ack.port2, pipe.port2]);
+					await acked;
+					const queue = [...chunks.map((c) => Uint8Array.from(atob(c), (x) => x.charCodeAt(0))), null];
+					pipe.port1.onmessage = (e) => {
+						if (!e.data?.pull) return;
+						const next = queue.shift();
+						if (next) pipe.port1.postMessage({ chunk: next.buffer }, [next.buffer]);
+						else pipe.port1.postMessage({ done: true });
+					};
+					const a = document.createElement("a");
+					a.href = url;
+					document.body.append(a);
+					a.click();
+					a.remove();
+				}, pieces.map((p) => p.toString("base64"))),
+			]);
+			assert.equal(piped.suggestedFilename(), "case-export.zip");
+			const pipedBytes = await (await import("node:fs/promises")).readFile(await piped.path());
+			assert.ok(pipedBytes.equals(Buffer.concat(pieces)), `the page's chunks, in order, on disk (${pipedBytes.length} bytes)`);
+			await assertNoViolations(page, "piped download");
 		}
 
 		// ── Lock means locked (docs/SECURITY-REVIEW.md › O2) ───────────

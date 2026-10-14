@@ -11,11 +11,12 @@
  * add a decoder to trust and buy little on images that are already
  * compressed or encrypted.
  *
- * The honest limits: no ZIP64 — every entry and the whole archive stay
- * under 4 GiB (refused above, with a message); one disk; no data
+ * `zipEntries` writes whole buffers: no ZIP64 — every entry and the whole
+ * archive stay under 4 GiB (refused above, with a message); no data
  * descriptors (sizes and CRCs are known before writing, so each local
  * header is complete — which is also what lets ZipCrypto's check byte be
- * the CRC's high byte).
+ * the CRC's high byte). `ZipStream` (D12) writes what never fits in
+ * memory: data descriptors and ZIP64, streamed.
  */
 
 // ── CRC-32 (IEEE 802.3, the zip one) ──────────────────────────────────
@@ -172,4 +173,214 @@ export function zipEntries(entries: ZipEntry[], { random = (n: number) => global
 	ev.setUint32(12, cdSize, true);
 	ev.setUint32(16, offset, true); // where the directory starts
 	return [...parts, ...central, end];
+}
+
+// ── The streaming writer (D12, docs/LARGE-FILES.md › 31d) ─────────────
+
+/** Where a streamed zip's bytes go, in order; awaited, so the reader sets the pace. */
+export type ZipSink = (bytes: Uint8Array) => Promise<void>;
+
+/** An entry's content, written through `write` as it is produced. */
+export type ZipProducer = (write: (bytes: Uint8Array) => Promise<void>) => Promise<void>;
+
+const U32 = 0xffffffff;
+
+/**
+ * A zip written as it goes — for archives that never fit in memory (a
+ * case export of 255 GB images). Each entry's bytes stream through once;
+ * its CRC and sizes follow it in a **data descriptor** (general-purpose
+ * bit 3), and **ZIP64** fields appear wherever a size, an offset or the
+ * entry count needs them (or always, with `forceZip64` — how the tests
+ * prove the ZIP64 paths without writing 4 GiB).
+ *
+ * With bit 3, ZipCrypto's check byte is the high byte of the DOS time
+ * (the CRC is not known when the encryption header is written) — the
+ * convention Info-ZIP and Python's zipfile read.
+ *
+ * Nesting is composition: a ZipStream whose sink is an outer entry's
+ * `write` is a zip inside a zip (a sample's "infected" zip in an export).
+ */
+export class ZipStream {
+	private offset = 0;
+	private central: Uint8Array[] = [];
+	private count = 0;
+	private names = new Set<string>();
+	private finished = false;
+	private readonly enc = new TextEncoder();
+
+	private readonly sink: ZipSink;
+	private readonly opts: { forceZip64?: boolean; random?: (n: number) => Uint8Array };
+
+	// (Fields assigned by hand, not as parameter properties: Node runs this
+	// module with types stripped, and parameter properties are not types.)
+	constructor(sink: ZipSink, opts: { forceZip64?: boolean; random?: (n: number) => Uint8Array } = {}) {
+		this.sink = sink;
+		this.opts = opts;
+	}
+
+	private async emit(bytes: Uint8Array): Promise<void> {
+		this.offset += bytes.length;
+		await this.sink(bytes);
+	}
+
+	/**
+	 * Add one stored entry. `size` (the plaintext's, when known) decides
+	 * whether the local header announces ZIP64; unknown is treated as large.
+	 * Returns the entry's CRC-32 and size, as written.
+	 */
+	async add(name: string, produce: ZipProducer, { password, modified = new Date(), size }: { password?: string; modified?: Date; size?: number } = {}): Promise<{ crc: number; size: number }> {
+		if (this.finished) throw new Error("the zip is already finished");
+		const clean = name.replace(/\\/g, "/").replace(/^\/+/, "");
+		if (!clean || clean.split("/").some((s) => s === ".." || s === "")) throw new Error(`a zip entry needs a plain relative name: “${name}”`);
+		if (this.names.has(clean)) throw new Error(`two zip entries are named “${clean}”`);
+		this.names.add(clean);
+		const nameBytes = this.enc.encode(clean);
+		const { time, date } = dosTime(modified);
+		const encrypted = password !== undefined;
+		const zip64 = this.opts.forceZip64 === true || size === undefined || size + (encrypted ? 12 : 0) >= U32;
+		const flags = 0x0800 | 0x0008 | (encrypted ? 0x0001 : 0); // UTF-8 · data descriptor · encrypted
+		const localAt = this.offset;
+
+		// The local header: CRC and sizes zero (they follow the data); with
+		// ZIP64, 0xFFFFFFFF and a ZIP64 extra holding zeros for both sizes.
+		const extra = zip64 ? new Uint8Array(20) : new Uint8Array(0);
+		if (zip64) {
+			const xv = new DataView(extra.buffer);
+			xv.setUint16(0, 0x0001, true);
+			xv.setUint16(2, 16, true);
+		}
+		const local = new Uint8Array(30 + nameBytes.length + extra.length);
+		const lv = new DataView(local.buffer);
+		lv.setUint32(0, 0x04034b50, true);
+		lv.setUint16(4, zip64 ? 45 : 20, true);
+		lv.setUint16(6, flags, true);
+		lv.setUint16(8, 0, true); // stored
+		lv.setUint16(10, time, true);
+		lv.setUint16(12, date, true);
+		lv.setUint32(14, 0, true);
+		lv.setUint32(18, zip64 ? U32 : 0, true);
+		lv.setUint32(22, zip64 ? U32 : 0, true);
+		lv.setUint16(26, nameBytes.length, true);
+		lv.setUint16(28, extra.length, true);
+		local.set(nameBytes, 30);
+		local.set(extra, 30 + nameBytes.length);
+		await this.emit(local);
+
+		// The data: CRC over the PLAINTEXT, sizes counted as it passes.
+		let crc = 0xffffffff;
+		let plainSize = 0;
+		let cipher: ZipCrypto | null = null;
+		if (encrypted) {
+			cipher = new ZipCrypto(this.enc.encode(password));
+			const head = new Uint8Array(12);
+			head.set((this.opts.random ?? ((n: number) => globalThis.crypto.getRandomValues(new Uint8Array(n))))(11).subarray(0, 11));
+			head[11] = (time >>> 8) & 0xff; // bit 3: the check byte is the time's high byte
+			cipher.encrypt(head);
+			await this.emit(head);
+		}
+		await produce(async (bytes) => {
+			for (const b of bytes) crc = crcStep(crc, b);
+			plainSize += bytes.length;
+			if (cipher) {
+				const out = bytes.slice();
+				cipher.encrypt(out);
+				await this.emit(out);
+			} else {
+				await this.emit(bytes);
+			}
+		});
+		crc = (crc ^ 0xffffffff) >>> 0;
+		const stored = plainSize + (encrypted ? 12 : 0);
+		if (!zip64 && stored >= U32) throw new Error(`“${clean}” grew past what its header announced (4 GiB without ZIP64)`);
+
+		// The data descriptor: what the local header could not say.
+		const dd = new Uint8Array(zip64 ? 24 : 16);
+		const dv = new DataView(dd.buffer);
+		dv.setUint32(0, 0x08074b50, true);
+		dv.setUint32(4, crc, true);
+		if (zip64) {
+			dv.setBigUint64(8, BigInt(stored), true);
+			dv.setBigUint64(16, BigInt(plainSize), true);
+		} else {
+			dv.setUint32(8, stored, true);
+			dv.setUint32(12, plainSize, true);
+		}
+		await this.emit(dd);
+
+		// Its central directory entry, with ZIP64 fields for whatever overflows.
+		const big = (n: number) => this.opts.forceZip64 === true || n >= U32;
+		const fields: number[] = [];
+		if (big(plainSize)) fields.push(plainSize);
+		if (big(stored)) fields.push(stored);
+		if (big(localAt)) fields.push(localAt);
+		const cx = fields.length ? new Uint8Array(4 + 8 * fields.length) : new Uint8Array(0);
+		if (fields.length) {
+			const xv = new DataView(cx.buffer);
+			xv.setUint16(0, 0x0001, true);
+			xv.setUint16(2, 8 * fields.length, true);
+			fields.forEach((v, i) => xv.setBigUint64(4 + 8 * i, BigInt(v), true));
+		}
+		const cd = new Uint8Array(46 + nameBytes.length + cx.length);
+		const cv = new DataView(cd.buffer);
+		cv.setUint32(0, 0x02014b50, true);
+		cv.setUint16(4, 45, true);
+		cv.setUint16(6, fields.length || zip64 ? 45 : 20, true);
+		cv.setUint16(8, flags, true);
+		cv.setUint16(12, time, true);
+		cv.setUint16(14, date, true);
+		cv.setUint32(16, crc, true);
+		cv.setUint32(20, big(stored) ? U32 : stored, true);
+		cv.setUint32(24, big(plainSize) ? U32 : plainSize, true);
+		cv.setUint16(28, nameBytes.length, true);
+		cv.setUint16(30, cx.length, true);
+		cv.setUint32(42, big(localAt) ? U32 : localAt, true);
+		cd.set(nameBytes, 46);
+		cd.set(cx, 46 + nameBytes.length);
+		this.central.push(cd);
+		this.count++;
+		return { crc, size: plainSize };
+	}
+
+	/** A whole buffer as an entry. */
+	addBytes(name: string, data: Uint8Array, opts: { password?: string; modified?: Date } = {}): Promise<{ crc: number; size: number }> {
+		return this.add(name, (write) => write(data), { ...opts, size: data.length });
+	}
+
+	/** The central directory and its end records (ZIP64 when anything overflows). */
+	async finish(): Promise<void> {
+		if (this.finished) return;
+		this.finished = true;
+		const cdAt = this.offset;
+		for (const c of this.central) await this.emit(c);
+		const cdSize = this.offset - cdAt;
+		const zip64 = this.opts.forceZip64 === true || this.count > 0xffff || cdAt >= U32 || cdSize >= U32;
+		if (zip64) {
+			const eocd64At = this.offset;
+			const r = new Uint8Array(56);
+			const rv = new DataView(r.buffer);
+			rv.setUint32(0, 0x06064b50, true);
+			rv.setBigUint64(4, 44n, true); // the record's size after this field
+			rv.setUint16(12, 45, true);
+			rv.setUint16(14, 45, true);
+			rv.setBigUint64(24, BigInt(this.count), true);
+			rv.setBigUint64(32, BigInt(this.count), true);
+			rv.setBigUint64(40, BigInt(cdSize), true);
+			rv.setBigUint64(48, BigInt(cdAt), true);
+			await this.emit(r);
+			const loc = new Uint8Array(20);
+			const lv = new DataView(loc.buffer);
+			lv.setUint32(0, 0x07064b50, true);
+			lv.setBigUint64(8, BigInt(eocd64At), true);
+			lv.setUint32(16, 1, true);
+			await this.emit(loc);
+		}
+		const end = new Uint8Array(22);
+		const ev = new DataView(end.buffer);
+		ev.setUint32(0, 0x06054b50, true);
+		ev.setUint16(8, zip64 ? 0xffff : this.count, true);
+		ev.setUint16(10, zip64 ? 0xffff : this.count, true);
+		ev.setUint32(12, zip64 ? U32 : cdSize, true);
+		ev.setUint32(16, zip64 ? U32 : cdAt, true);
+		await this.emit(end);
+	}
 }

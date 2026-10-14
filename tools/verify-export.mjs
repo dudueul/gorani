@@ -33,43 +33,108 @@
  */
 
 import { createHash, createPublicKey, verify as verifySig, X509Certificate } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { fstatSync, openSync, readSync } from "node:fs";
 
 // ── the zip (stored entries; ZipCrypto for samples) ──────────────────
+// Read from DISK, a range at a time (D12, 31d): a package of 255 GB images
+// is never in memory. ZIP64 end records and extras, data descriptors
+// (sizes from the central directory), and a zip nested inside an entry —
+// a sample's — read in place through a window onto the outer file.
 
-function readZip(buf) {
-	let eocd = -1;
-	for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 65535); i--) {
-		if (buf.readUInt32LE(i) === 0x06054b50) {
-			eocd = i;
+/** Positional reads over a file. */
+function disk(path) {
+	const fd = openSync(path, "r");
+	const size = fstatSync(fd).size;
+	return {
+		size,
+		read(at, len) {
+			const b = Buffer.alloc(len);
+			let n = 0;
+			while (n < len) {
+				const r = readSync(fd, b, n, len - n, at + n);
+				if (!r) break;
+				n += r;
+			}
+			return b.subarray(0, n);
+		},
+	};
+}
+
+/** A window [base, base + size) onto another source — a nested zip's bytes. */
+const windowOf = (src, base, size) => ({ size, read: (at, len) => src.read(base + at, Math.max(0, Math.min(len, size - at))) });
+
+const U32 = 0xffffffff;
+
+function readZip(src) {
+	const tailLen = Math.min(src.size, 65535 + 22);
+	const tail = src.read(src.size - tailLen, tailLen);
+	let e = -1;
+	for (let i = tail.length - 22; i >= 0; i--) {
+		if (tail.readUInt32LE(i) === 0x06054b50) {
+			e = i;
 			break;
 		}
 	}
-	if (eocd < 0) throw new Error("not a zip (no end-of-central-directory record)");
-	const count = buf.readUInt16LE(eocd + 10);
-	let at = buf.readUInt32LE(eocd + 16);
+	if (e < 0) throw new Error("not a zip (no end-of-central-directory record)");
+	let count = tail.readUInt16LE(e + 10);
+	let cdSize = tail.readUInt32LE(e + 12);
+	let cdAt = tail.readUInt32LE(e + 16);
+	const eocdAt = src.size - tailLen + e;
+	if (eocdAt >= 20) {
+		const loc = src.read(eocdAt - 20, 20);
+		if (loc.readUInt32LE(0) === 0x07064b50) {
+			const rec = src.read(Number(loc.readBigUInt64LE(8)), 56);
+			if (rec.readUInt32LE(0) !== 0x06064b50) throw new Error("a ZIP64 locator pointing at no ZIP64 record");
+			count = Number(rec.readBigUInt64LE(32));
+			cdSize = Number(rec.readBigUInt64LE(40));
+			cdAt = Number(rec.readBigUInt64LE(48));
+		}
+	}
+	const cd = src.read(cdAt, cdSize);
 	const entries = new Map();
+	let at = 0;
 	for (let n = 0; n < count; n++) {
-		if (buf.readUInt32LE(at) !== 0x02014b50) throw new Error("a broken central directory");
-		const flags = buf.readUInt16LE(at + 8);
-		const method = buf.readUInt16LE(at + 10);
-		const crc = buf.readUInt32LE(at + 16);
-		const csize = buf.readUInt32LE(at + 20);
-		const usize = buf.readUInt32LE(at + 24);
-		const nlen = buf.readUInt16LE(at + 28);
-		const xlen = buf.readUInt16LE(at + 30);
-		const clen = buf.readUInt16LE(at + 32);
-		const local = buf.readUInt32LE(at + 42);
-		const name = buf.subarray(at + 46, at + 46 + nlen).toString("utf8");
+		if (cd.readUInt32LE(at) !== 0x02014b50) throw new Error("a broken central directory");
+		const flags = cd.readUInt16LE(at + 8);
+		const method = cd.readUInt16LE(at + 10);
+		const time = cd.readUInt16LE(at + 12);
+		const crc = cd.readUInt32LE(at + 16);
+		let csize = cd.readUInt32LE(at + 20);
+		let usize = cd.readUInt32LE(at + 24);
+		const nlen = cd.readUInt16LE(at + 28);
+		const xlen = cd.readUInt16LE(at + 30);
+		const clen = cd.readUInt16LE(at + 32);
+		let local = cd.readUInt32LE(at + 42);
+		const name = cd.subarray(at + 46, at + 46 + nlen).toString("utf8");
+		// ZIP64 extra (0x0001): 8-byte values for the fields set to 0xFFFFFFFF, in this order.
+		for (let x = at + 46 + nlen; x < at + 46 + nlen + xlen; ) {
+			const id = cd.readUInt16LE(x);
+			const len = cd.readUInt16LE(x + 2);
+			if (id === 0x0001) {
+				let f = x + 4;
+				if (usize === U32) (usize = Number(cd.readBigUInt64LE(f)), (f += 8));
+				if (csize === U32) (csize = Number(cd.readBigUInt64LE(f)), (f += 8));
+				if (local === U32) local = Number(cd.readBigUInt64LE(f));
+			}
+			x += 4 + len;
+		}
 		if (method !== 0) throw new Error(`${name}: compression method ${method} — gorani packages are stored`);
-		const lnlen = buf.readUInt16LE(local + 26);
-		const lxlen = buf.readUInt16LE(local + 28);
-		const start = local + 30 + lnlen + lxlen;
-		entries.set(name, { flags, crc, usize, data: buf.subarray(start, start + csize) });
+		const lh = src.read(local, 30);
+		if (lh.readUInt32LE(0) !== 0x04034b50) throw new Error(`${name}: no local header where the directory says`);
+		const dataAt = local + 30 + lh.readUInt16LE(26) + lh.readUInt16LE(28);
+		entries.set(name, { name, flags, time, crc, csize, usize, dataAt, src });
 		at += 46 + nlen + xlen + clen;
 	}
 	return entries;
 }
+
+/** An entry's bytes, a slice at a time (8 MiB). */
+function* slices(entry, from = 0) {
+	const STEP = 8 * 1024 * 1024;
+	for (let at = from; at < entry.csize; at += STEP) yield entry.src.read(entry.dataAt + at, Math.min(STEP, entry.csize - at));
+}
+/** A small entry, whole (the manifest, its signature). */
+const bytesOf = (entry) => entry.src.read(entry.dataAt, entry.csize);
 
 const CRC = new Uint32Array(256).map((_, n) => {
 	let c = n;
@@ -77,33 +142,49 @@ const CRC = new Uint32Array(256).map((_, n) => {
 	return c >>> 0;
 });
 const crcStep = (c, b) => (CRC[(c ^ b) & 0xff] ^ (c >>> 8)) >>> 0;
-const crc32 = (buf) => {
-	let c = 0xffffffff;
-	for (const b of buf) c = crcStep(c, b);
-	return (c ^ 0xffffffff) >>> 0;
-};
 
-/** Decrypt a ZipCrypto entry (APPNOTE 6.1) and check its CRC. */
-function unzipCrypto(entry, password) {
-	let k0 = 0x12345678, k1 = 0x23456789, k2 = 0x34567890;
-	const update = (b) => {
-		k0 = crcStep(k0, b);
-		k1 = (k1 + (k0 & 0xff)) >>> 0;
-		k1 = (Math.imul(k1, 134775813) + 1) >>> 0;
-		k2 = crcStep(k2, k1 >>> 24);
-	};
-	for (const b of Buffer.from(password, "utf8")) update(b);
-	const out = Buffer.alloc(entry.data.length);
-	for (let i = 0; i < entry.data.length; i++) {
-		const t = (k2 | 2) & 0xffff;
-		const p = entry.data[i] ^ (((t * (t ^ 1)) >>> 8) & 0xff);
-		out[i] = p;
-		update(p);
+/**
+ * Hash an entry as it is read — decrypting a ZipCrypto one (APPNOTE 6.1)
+ * with `password` — and check its CRC. With a data descriptor (bit 3) the
+ * password's check byte is the DOS time's high byte, else the CRC's.
+ */
+function hashEntry(entry, password) {
+	const h = createHash("sha256");
+	let crc = 0xffffffff;
+	let size = 0;
+	let dec = null;
+	if (password !== undefined) {
+		if (!(entry.flags & 1)) throw new Error("the sample's entry is not encrypted");
+		let k0 = 0x12345678, k1 = 0x23456789, k2 = 0x34567890;
+		const update = (b) => {
+			k0 = crcStep(k0, b);
+			k1 = (k1 + (k0 & 0xff)) >>> 0;
+			k1 = (Math.imul(k1, 134775813) + 1) >>> 0;
+			k2 = crcStep(k2, k1 >>> 24);
+		};
+		for (const b of Buffer.from(password, "utf8")) update(b);
+		dec = (buf) => {
+			const out = Buffer.alloc(buf.length);
+			for (let i = 0; i < buf.length; i++) {
+				const t = (k2 | 2) & 0xffff;
+				const p = buf[i] ^ (((t * (t ^ 1)) >>> 8) & 0xff);
+				out[i] = p;
+				update(p);
+			}
+			return out;
+		};
+		const head = dec(entry.src.read(entry.dataAt, 12));
+		const check = entry.flags & 8 ? (entry.time >>> 8) & 0xff : entry.crc >>> 24;
+		if (head[11] !== check) throw new Error("wrong password");
 	}
-	if (out[11] !== entry.crc >>> 24) throw new Error("wrong password");
-	const plain = out.subarray(12);
-	if (crc32(plain) !== entry.crc) throw new Error("CRC mismatch");
-	return plain;
+	for (const raw of slices(entry, dec ? 12 : 0)) {
+		const plain = dec ? dec(raw) : raw;
+		h.update(plain);
+		for (const b of plain) crc = crcStep(crc, b);
+		size += plain.length;
+	}
+	if (((crc ^ 0xffffffff) >>> 0) !== entry.crc) throw new Error("CRC mismatch");
+	return { sha256: h.digest("hex"), size };
 }
 
 // ── statements and signatures ────────────────────────────────────────
@@ -250,9 +331,11 @@ const results = [];
 const notes = [];
 const check = (ok, what) => results.push({ ok: !!ok, what });
 
-const zip = readZip(readFileSync(path));
-const manifestBytes = zip.get("manifest.json")?.data;
-const sig = JSON.parse(zip.get("manifest.sig.json")?.data.toString("utf8") ?? "null");
+const zip = readZip(disk(path));
+const manifestEntry = zip.get("manifest.json");
+const sigEntry = zip.get("manifest.sig.json");
+const manifestBytes = manifestEntry ? bytesOf(manifestEntry) : null;
+const sig = sigEntry ? JSON.parse(bytesOf(sigEntry).toString("utf8")) : null;
 if (!manifestBytes || !sig) {
 	console.error("✘ manifest.json or manifest.sig.json is missing — not a gorani export package");
 	process.exit(1);
@@ -311,13 +394,14 @@ for (const f of m.files) {
 		const entry = zip.get(v.path);
 		if (!entry) check(false, `${f.name} v${v.version}: ${v.path} is in the package`);
 		else {
-			let plain = null;
+			// Hashed as it is read from disk; a sample's zip is opened in place.
+			let got = null;
 			try {
-				plain = v.packed === "zip-infected" ? unzipCrypto([...readZip(entry.data).values()][0], "infected") : entry.data;
+				got = v.packed === "zip-infected" ? hashEntry([...readZip(windowOf(entry.src, entry.dataAt, entry.csize)).values()][0], "infected") : hashEntry(entry);
 			} catch (e) {
-				check(false, `${f.name} v${v.version}: the sample zip opens (${e.message})`);
+				check(false, `${f.name} v${v.version}: ${v.packed === "zip-infected" ? "the sample zip opens" : "the entry reads"} (${e.message})`);
 			}
-			if (plain) check(plain.length === v.size && sha256hex(plain) === v.sha256, `${f.name} v${v.version}: ${v.size} bytes, SHA-256 ${v.sha256.slice(0, 16)}…`);
+			if (got) check(got.size === v.size && got.sha256 === v.sha256, `${f.name} v${v.version}: ${v.size} bytes, SHA-256 ${v.sha256.slice(0, 16)}…`);
 		}
 		const r = v.hashRecord;
 		check(r && r.sha256 === v.sha256 && r.size === v.size && signedBy(r.signer, r.keyId, stmt("gorani-content-hash-v1", area, f.id, String(v.version), r.sha256, String(r.size)), r.signature), `${f.name} v${v.version}: signed by its uploader${r ? ` (${r.signer})` : " — no record"}`);

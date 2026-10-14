@@ -52,6 +52,12 @@ const sourceAs = (who) => ({
 		if (!r.ok) throw new Error(`${r.status} ${path}`);
 		return { body: new Uint8Array(await r.arrayBuffer()), ck: r.headers.get("x-gorani-ck"), chunk: Number(r.headers.get("x-gorani-chunk")) || null, version: Number(r.headers.get("x-gorani-version")), hash: r.headers.get("x-gorani-hash") };
 	},
+	// (D12, 31d) The streamed read the browser makes: the export decrypts as it goes.
+	async objectStream(path) {
+		const r = await fetch(`${dev.base}${path}`, { headers: { "x-gorani-dev-email": who.email } });
+		if (!r.ok) throw new Error(`${r.status} ${path}`);
+		return { body: r.body, size: Number(r.headers.get("content-length")), ck: r.headers.get("x-gorani-ck"), chunk: Number(r.headers.get("x-gorani-chunk")) || null, version: Number(r.headers.get("x-gorani-version")), hash: r.headers.get("x-gorani-hash") };
+	},
 });
 async function upload(who, kase, name, type, text, extra = {}) {
 	const plain = enc.encode(text);
@@ -134,6 +140,22 @@ try {
 	// (c) an audit line rewritten: the chain itself says so, signature aside.
 	const bad3 = repack({ ...m, audit: { ...m.audit, lines: m.audit.lines.map((l, i) => (i === 0 ? { ...l, actor: "nobody@team.test" } : l)) } });
 	assert.match(bad3.out, /✘ the audit trail/);
+
+	// ── 3b. Streamed, and ZIP64 throughout (D12, 31d) ─────────────────
+	// A second approved export, written through a sink as it is made and
+	// with every ZIP64 field forced: the standalone tool reads it from disk
+	// — ZIP64 end records, data descriptors, the sample's nested zip with
+	// its data-descriptor check byte — and every check still passes.
+	const again = await requestApproval(callAs(ana), ana.signer, "ir-export", "case.export");
+	await approveRequest(callAs(lu), lu.signer, await trustOf(dev, lu), again);
+	const streamedParts = [];
+	const streamed = await buildExport(sourceAs(ana), ana.signer, anaTrust, ev.sealer.priv, "ir-export", again.id, { sink: async (b) => void streamedParts.push(b.slice()), forceZip64: true });
+	assert.deepEqual(streamed.parts, [], "with a sink, nothing is collected — it all went out");
+	const z64 = concat(streamedParts);
+	assert.equal(z64.readUInt32LE(z64.length - 42), 0x07064b50, "a ZIP64 end locator");
+	const good64 = verifyTool(z64);
+	assert.equal(good64.status, 0, good64.out);
+	assert.match(good64.out, /✔ dropper\.exe v1: \d+ bytes/, "the sample, opened in place with its data-descriptor check byte");
 
 	// ── 4. Re-verification ────────────────────────────────────────────
 	const before = (await api(dev.base, "GET", `${ev.base}/reverify`, { email: bo.email })).json;

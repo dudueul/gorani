@@ -58,6 +58,8 @@ import {
 	type UnlockMethod,
 } from "./vault-crypto.ts";
 import { toBase64, fromBase64 } from "../lib/encoding.ts";
+import { openSealedText } from "./vault-crypto.ts";
+import { checkRecordMatches } from "./records.ts";
 
 const toB64 = (b: Uint8Array) => toBase64(b);
 
@@ -91,6 +93,8 @@ export interface SealingKey {
 	publicKey: JsonWebKey;
 	pqPublicKey?: string;
 	privateKeySealed: string;
+	/** The record's MAC under its owner's root-derived key (records.ts). */
+	mac?: string;
 }
 
 // ── vault creation ──────────────────────────────────────────────────
@@ -166,7 +170,7 @@ export async function sealMasterToParent(master: NewMaster, parentRootPublic: Se
 
 /** Open a parent's copy of the master with that parent's root private key. */
 export async function openMaster(parentRoot: VaultPrivateKey, masterSealed: string): Promise<VaultPrivateKey> {
-	return importVaultKey(fromBase64(await openText(parentRoot, masterSealed)));
+	return importVaultKey(fromBase64(await openSealedText(parentRoot, masterSealed)));
 }
 
 // ── store keys (files, family area) ────────────────────────────────
@@ -205,7 +209,13 @@ export async function sealStoreKeyToMaster(store: NewStoreKey, master: NewMaster
 
 /** Open a store key's private bundle from a member's own settings (their root opens it). */
 export async function openStoreKey(memberRoot: VaultPrivateKey, key: SealingKey): Promise<VaultPrivateKey> {
-	return importVaultKey(fromBase64(await openText(memberRoot, key.privateKeySealed)));
+	// Sealed text only (an unsealed "private key" from the server is refused),
+	// and the opened key must BE the record's key — the same public halves
+	// and id (docs/SECURITY-REVIEW.md › O3; records.ts). The MAC check that
+	// pins the record to its owner happens in the session.
+	const opened = await importVaultKey(fromBase64(await openSealedText(memberRoot, key.privateKeySealed)));
+	await checkRecordMatches(opened, key);
+	return opened;
 }
 
 /**
@@ -215,7 +225,7 @@ export async function openStoreKey(memberRoot: VaultPrivateKey, key: SealingKey)
  */
 export async function openChildStoreKey(parentRoot: VaultPrivateKey, masterSealed: string, guardian: GuardianForChild): Promise<VaultPrivateKey> {
 	const master = await openMaster(parentRoot, masterSealed);
-	return importVaultKey(fromBase64(await openText(master, guardian.storeSealed)));
+	return importVaultKey(fromBase64(await openSealedText(master, guardian.storeSealed)));
 }
 
 /**

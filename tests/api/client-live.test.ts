@@ -12,6 +12,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { suiteDev, api } from "../api/_dev.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { deriveRecordKey, macRecord } from "../../web/src/vault/records.ts";
+import { importVaultKey } from "../../web/src/vault/vault-crypto.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const BIN = path.join(ROOT, "target/debug/gorani-sync");
@@ -57,6 +59,10 @@ try {
 	const kidVault = await createChildVault();
 	const filesStore = await createStoreKey();
 	const own = await sealStoreKeyToMember(filesStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
+	// Authenticated as the setup screen does it (records.ts): the CLI refuses
+	// a files-store record without a MAC under this root (commit 24, O3).
+	const recordKey = await deriveRecordKey(await importVaultKey(kidVault.rootBundle.slice()));
+	own.mac = await macRecord(recordKey, "files", own);
 	const guardian = await sealStoreKeyToMaster(filesStore, master);
 	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian } } });
 	assert.equal(saved.status, 200);
@@ -119,7 +125,21 @@ try {
 	const stored = new Uint8Array(await raw.arrayBuffer());
 	assert.equal(new TextDecoder().decode(stored.subarray(0, 4)), "GV02", "the stored object is GV02-sealed");
 
-	console.log("ok  live:client — enrol, push, ls, pull, round trip, zero-trust");
+	// ── 6. The server swaps the files store (O3) — the binary refuses ───
+	// The attack: a fresh key pair, its private half sealed to Jinu's root
+	// (sealing needs only the PUBLIC key), dropped into the settings row with
+	// the old MAC. Before commit 24 the CLI would have opened it and sealed
+	// the next push to the attacker. Now: refused, nothing sealed.
+	const attacker = await createStoreKey();
+	const forged = { ...(await sealStoreKeyToMember(attacker, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey })), mac: own.mac };
+	const swap = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: forged }, guardian } } });
+	assert.equal(swap.status, 200, "(the server stores what it is given — the client is the judge)");
+	fs.writeFileSync(localFile, "this must never be sealed to the attacker");
+	const refused = await sync(["push", "--file", localFile, "--name", "secret.txt", "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	assert.notEqual(refused.status, 0, "push with a swapped store record is refused");
+	assert.match(refused.out, /failed authentication/, `the refusal names the reason: ${refused.out}`);
+
+	console.log("ok  live:client — enrol, push, ls, pull, round trip, zero-trust, a swapped store record refused");
 } finally {
 	await dev.close();
 }

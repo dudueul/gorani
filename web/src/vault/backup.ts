@@ -14,6 +14,7 @@
 
 import { generateHybridKey, importVaultKey, openText, importContentKey, type VaultPrivateKey } from "./vault-crypto.ts";
 import { toBase64, fromBase64 } from "../lib/encoding.ts";
+import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
 export interface BackupKeyFile {
 	type: "gorani-backup-key";
@@ -31,13 +32,16 @@ export async function createBackupKey(): Promise<{ keyFile: BackupKeyFile; publi
 	return { keyFile, publicPut: { keyId: root.keyId, publicKey: root.publicKey, pqPublicKey: root.pqPublicKey } };
 }
 
+/** Save the key file. Its blob URL is the most secret handle the app ever
+ * mints (the backup's private bundle), so it goes through the tracker like
+ * every decrypted byte — a lock in the next five seconds revokes it too. */
 export function downloadKeyFile(keyFile: BackupKeyFile): void {
-	const url = URL.createObjectURL(new Blob([JSON.stringify(keyFile, null, "\t")], { type: "application/json" }));
+	const url = blobURL(new Blob([JSON.stringify(keyFile, null, "\t")], { type: "application/octet-stream" }));
 	const a = document.createElement("a");
 	a.href = url;
 	a.download = `gorani-backup-key-${keyFile.keyId}.json`;
 	a.click();
-	setTimeout(() => URL.revokeObjectURL(url), 5000);
+	setTimeout(() => revokeBlobURL(url), 5000);
 }
 
 // ── the GB1 reader (mirrors crates/formats/src/backup.rs) ───────────

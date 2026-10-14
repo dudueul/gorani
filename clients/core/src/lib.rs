@@ -61,10 +61,25 @@ pub struct DeviceProfile {
 	pub member: String,
 	pub device_id: String,
 	pub token: String,
+	/// Cloudflare Access service-token pair (docs/PRODUCTION.md › 2.5) —
+	/// sent as `CF-Access-Client-Id/Secret` on every request.
 	#[serde(default)]
 	pub access_id: Option<String>,
-	#[serde(default)]
+	#[serde(default, rename = "accessClientSecret")]
 	pub access_secret: Option<String>,
+	/// The device secret (hex) — the input to this computer's KEK. It must
+	/// NEVER leave the machine: the server holds the wrapped root copy and
+	/// its salt, so server + device secret = the root.
+	///
+	/// Security review, commit 23: the dev CLI stored this in the
+	/// `access_secret` slot, and the API client sends that slot as
+	/// `CF-Access-Client-Secret` — so with an Access id configured, every
+	/// request handed the server (and Access, and any log of either) the
+	/// one secret the device design keeps on the device. Old profiles named
+	/// the field `accessSecret` and always meant the device secret by it;
+	/// the alias reads them into the right slot.
+	#[serde(default, alias = "accessSecret")]
+	pub device_secret: Option<String>,
 	/// Dev-mode identity (wrangler dev only; production uses Access).
 	#[serde(default)]
 	pub dev_email: Option<String>,
@@ -79,22 +94,58 @@ pub struct Session {
 }
 
 impl Session {
-	/// The files store's private key, opened from the root.
+	/// The files store's private key, opened from the root — and only once the
+	/// record has proven it belongs to this member (docs/SECURITY-REVIEW.md ›
+	/// O3). Every name, type and content key this client seals goes to the
+	/// files store's public half; a record swapped by the server would hand
+	/// all of it to whoever minted the swap. So, before anything is opened:
+	///
+	/// 1. the record's MAC must verify under this root's record key — the
+	///    CLI never pins (it does not write settings), so a record without a
+	///    MAC is refused: the web app pins on first open;
+	/// 2. the opened private key must reproduce the record's public halves
+	///    and key id.
 	pub fn files_store(&self) -> Result<gorani_formats::formats::VaultPrivateKey, Error> {
+		use gorani_formats::formats::{self, VaultPrivateKey, VaultPublicKey};
+		use gorani_formats::records::{record_key, verify_record, StoreRecord};
 		let key = self.settings.stores.get("files").ok_or(Error::Open("no files store key"))?;
-		let root = gorani_formats::formats::VaultPrivateKey::from_bytes(&self.root).map_err(|_| Error::Open("root bundle"))?;
-		// private_key_sealed is GV* TEXT sealed to the root; opening yields the
-		// store bundle's bytes (base64), which import into a private key.
-		let bundle_b64 = gorani_formats::formats::open_text(&root, &key.private_key_sealed).map_err(|_| Error::Open("store key"))?;
+		let root = VaultPrivateKey::from_bytes(&self.root).map_err(|_| Error::Open("root bundle"))?;
+		let record_pub = VaultPublicKey::from_jwk(&key.public_key.x, &key.public_key.y, key.pq_public_key.as_deref()).map_err(|_| Error::Format("bad store JWK"))?;
+		let VaultPublicKey::Hybrid { ec, kem } = &record_pub else { return Err(Error::Open("the files store record is not a hybrid key")) };
+		let ec_raw = formats::raw_public_bytes(ec);
+		let mac = key.mac.as_deref().ok_or(Error::Open("the files store record is not authenticated (open the vault once in the web app to pin it)"))?;
+		let rk = record_key(&root).map_err(|_| Error::Open("record key"))?;
+		let rec = StoreRecord { name: "files", key_id: &key.key_id, ec_public: &ec_raw, kem_public: kem, private_key_sealed: &key.private_key_sealed };
+		if !verify_record(&rk, &rec, mac) {
+			return Err(Error::Open("the files store record failed authentication — it was changed by someone without this vault's root; nothing was opened or sealed"));
+		}
+		// Sealed text only (an unsealed "private key" is refused), then the
+		// consistency check: the opened key IS the record's key.
+		if !formats::is_sealed_text(&key.private_key_sealed) {
+			return Err(Error::Open("the files store private key is not sealed"));
+		}
+		let bundle_b64 = formats::open_text(&root, &key.private_key_sealed).map_err(|_| Error::Open("store key"))?;
 		let bytes = decode(&bundle_b64)?;
-		gorani_formats::formats::VaultPrivateKey::from_bytes(bytes.as_slice()).map_err(|_| Error::Open("store bundle"))
+		let store = VaultPrivateKey::from_bytes(bytes.as_slice()).map_err(|_| Error::Open("store bundle"))?;
+		if formats::key_id(&formats::public_of(&store)) != key.key_id || formats::key_id(&record_pub) != key.key_id {
+			return Err(Error::Open("the files store record does not match its private key"));
+		}
+		Ok(store)
+	}
+
+	/// The files store's public half — derived from the VERIFIED private key,
+	/// never read off the record. Sealing is the attack path (O3): a client
+	/// that seals to whatever public key the settings row names hands every
+	/// upload to whoever wrote that row. This used to read the record's JWK
+	/// directly, so `push` sealed to a swapped record without ever running
+	/// the checks in `files_store` — found by api:client-live's swap step.
+	pub fn files_public(&self) -> Result<gorani_formats::formats::VaultPublicKey, Error> {
+		Ok(gorani_formats::formats::public_of(&self.files_store()?))
 	}
 
 	/// Seal text to the files store's public half (names, types).
 	pub fn seal_for_files(&self, text: &str) -> Result<String, Error> {
-		let key = self.settings.stores.get("files").ok_or(Error::Open("no files store key"))?;
-		let pub_key = gorani_formats::formats::VaultPublicKey::from_jwk(&key.public_key.x, &key.public_key.y, key.pq_public_key.as_deref()).map_err(|_| Error::Format("bad store JWK"))?;
-		Ok(gorani_formats::formats::seal_text(&pub_key, text))
+		Ok(gorani_formats::formats::seal_text(&self.files_public()?, text))
 	}
 }
 

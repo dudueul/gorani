@@ -17,6 +17,7 @@ import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, importVaultKey, openText, sealWith, openWith, sealText, generateHybridKey, wrapContentKey, unwrapContentKey } from "../../web/src/vault/vault-crypto.ts";
 import { createChildVault, createParentsMaster, createStoreKey, openStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 import { toBase64, fromBase64 } from "../../web/src/lib/encoding.ts";
+import { resealStore } from "../../web/src/vault/rotation.ts";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -154,16 +155,18 @@ try {
 	const newOwn = await sealStoreKeyToMember(newStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
 	const newGuardian = await sealStoreKeyToMaster(newStore, master);
 	const newStorePublic = { ec: newStore.publicKey, kem: newStore.pqPublicKey };
-	// The client opens the old wrap (with the root it holds) and re-seals the
-	// key to the new store key — the raw key stays in the client the whole time.
+	// The client walks every sealed value (rotation.ts — commit 24 made it
+	// every version, folder, tag and secret, not just living versions; the
+	// full proof is api:rotation) — the raw keys stay in the client.
 	const rootPriv = await importVaultKey(kidVault.rootBundle);
 	const storePriv = await openStoreKey(rootPriv, settings.stores.files);
-	const openedCkRaw = fromBase64(await openText(storePriv, ckSealed));
-	const newCkSealed = await wrapContentKey(newStorePublic, openedCkRaw);
-	openedCkRaw.fill(0);
-	const newName = await sealText(newStorePublic, "trashme.txt");
-	const reseal = await api(dev.base, "PUT", "/api/v1/members/jinu/files/reseal", { email: "jinu@family.test", body: { keys: { [f.id]: { ck: newCkSealed, name: newName } } } });
-	assert.equal(reseal.status, 200, JSON.stringify(reseal.json));
+	const call = async (method, path, body) => {
+		const r = await api(dev.base, method, path, { email: "jinu@family.test", body });
+		assert.ok(r.status < 300, `${method} ${path}: ${r.status} ${r.text.slice(0, 200)}`);
+		return r.json;
+	};
+	const walked = await resealStore(call, "jinu", storePriv, await importVaultKey(newStore.bundle), newStorePublic);
+	assert.ok(walked.resealed.version >= 1 && walked.resealed.file >= 1, JSON.stringify(walked));
 	// Settings updated to the new store key…
 	const updatedSettings = { ...settings, stores: { files: newOwn }, guardian: newGuardian };
 	const save2 = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: updatedSettings } });

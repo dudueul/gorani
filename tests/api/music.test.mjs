@@ -40,13 +40,16 @@ try {
 	assert.equal(saved.status, 200);
 	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
 
-	// A GV02-prefixed body passes the sealed-shape check; the bytes are
-	// opaque to this test (the unit suite owns the crypto proofs).
-	const audio = new Uint8Array([...enc.encode("GV02"), ...enc.encode("fake audio bytes")]);
+	// A GV02-SHAPED body passes the sealed-shape check: magic ‖ nonce (12) ‖
+	// payload ‖ tag (16), with `size` = the payload length (the worker checks
+	// sealed − 32 since commit 23). The bytes are opaque to this test (the
+	// unit suite owns the crypto proofs).
+	const payload = enc.encode("fake audio bytes");
+	const audio = new Uint8Array([...enc.encode("GV02"), ...new Uint8Array(12), ...payload, ...new Uint8Array(16)]);
 
 	// ── 1. An upload WITH sealed metadata lands in the feed ────────────
 	const meta = { title: "Gorani Anthem", artist: "The Family", album: "Sealed Sounds", track: 7 };
-	const up = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "anthem.flac"), type: await sealText(storePublic, "audio/flac"), size: String(audio.length), mmeta: await sealText(storePublic, JSON.stringify(meta)) }, audio);
+	const up = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "anthem.flac"), type: await sealText(storePublic, "audio/flac"), size: String(payload.length), mmeta: await sealText(storePublic, JSON.stringify(meta)) }, audio);
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const tracks1 = (await feed()).tracks;
 	assert.equal(tracks1.length, 1);
@@ -55,18 +58,18 @@ try {
 	assert.ok(tracks1[0].blobSealed.startsWith("GV03:"), "the blob rides sealed");
 
 	// ── 2. An upload WITHOUT metadata stays out of the feed ────────────
-	const up2 = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "notes.txt"), type: await sealText(storePublic, "text/plain"), size: String(audio.length) }, audio);
+	const up2 = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "notes.txt"), type: await sealText(storePublic, "text/plain"), size: String(payload.length) }, audio);
 	assert.equal(up2.status, 200);
 	assert.equal((await feed()).tracks.length, 1, "text uploads carry no metadata");
 
 	// ── 3. An UNSEALED blob is refused like every other sealed text ────
-	const bad = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "song.mp3"), type: await sealText(storePublic, "audio/mpeg"), size: String(audio.length), mmeta: JSON.stringify(meta) }, audio);
+	const bad = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "song.mp3"), type: await sealText(storePublic, "audio/mpeg"), size: String(payload.length), mmeta: JSON.stringify(meta) }, audio);
 	assert.equal(bad.status, 400, "unsealed metadata refused before storage");
 	assert.equal((await feed()).tracks.length, 1);
 
 	// ── 4. A new version carries the new blob (the pointer moves) ──────
 	const meta2 = { ...meta, title: "Gorani Anthem (remaster)" };
-	const v2 = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "anthem.flac"), type: await sealText(storePublic, "audio/flac"), size: String(audio.length), base_version: "1", mmeta: await sealText(storePublic, JSON.stringify(meta2)) }, audio, "jinu@family.test", `/files/${up.json.id}/versions`);
+	const v2 = await upload({ ck: "GV03:WRAPPED", name: await sealText(storePublic, "anthem.flac"), type: await sealText(storePublic, "audio/flac"), size: String(payload.length), base_version: "1", mmeta: await sealText(storePublic, JSON.stringify(meta2)) }, audio, "jinu@family.test", `/files/${up.json.id}/versions`);
 	assert.equal(v2.status, 200, JSON.stringify(v2.json));
 	const tracks4 = (await feed()).tracks;
 	assert.equal(tracks4.length, 1, "one living version, one blob");

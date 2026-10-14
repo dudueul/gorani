@@ -79,9 +79,12 @@ try {
 	// ── 3. Over the threshold: the size gate bypasses ───────────────────
 	// 7 MB against the dev gate of 6 MB — sealed like any upload (the bytes
 	// must start with the GV02 magic or the sealed-shape check refuses them).
-	const big = new Uint8Array(await sealWith(await importContentKey(newContentKey()), new Uint8Array(7 * 1024 * 1024)));
+	const bigPlainLength = 7 * 1024 * 1024;
+	const big = new Uint8Array(await sealWith(await importContentKey(newContentKey()), new Uint8Array(bigPlainLength)));
 	const ck2 = newContentKey();
-	const bigUp = await uploadWhole({ ck: await wrapContentKey(storePublic, ck2), name: await sealText(storePublic, "big.bin"), type: await sealText(storePublic, "application/octet-stream"), size: String(big.length) }, big);
+	// `size` is the PLAINTEXT length — the worker checks it against the sealed
+	// bytes (sealed − 32) since commit 23; this used to send the sealed length.
+	const bigUp = await uploadWhole({ ck: await wrapContentKey(storePublic, ck2), name: await sealText(storePublic, "big.bin"), type: await sealText(storePublic, "application/octet-stream"), size: String(bigPlainLength) }, big);
 	assert.equal(bigUp.status, 200, JSON.stringify(bigUp.json));
 	const b1 = await get(bigUp.json.id);
 	assert.equal(b1.status, 200);

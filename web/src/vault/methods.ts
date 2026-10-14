@@ -41,7 +41,8 @@ export interface VaultSettings {
 	publicKey: JsonWebKey;
 	pqPublicKey: string;
 	methods: UnlockMethod[];
-	stores: Record<string, { keyId: string; publicKey: JsonWebKey; pqPublicKey?: string; privateKeySealed: string }>;
+	/** Store keys; each record's `mac` pins it to this member (records.ts). */
+	stores: Record<string, { keyId: string; publicKey: JsonWebKey; pqPublicKey?: string; privateKeySealed: string; mac?: string }>;
 	guardian?: { masterKeyId: string; masterPublicKey: { ec: JsonWebKey; kem: string }; storeSealed: string };
 	/** Parents only: their sealed copy of the family master (family.ts). */
 	masterSealed?: string;

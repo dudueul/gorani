@@ -16,6 +16,8 @@ import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { createVaultBundle, confirmKeyBytes, addPasswordMethod, addRecoveryMethod, type VaultSettings } from "../vault/methods.ts";
 import { createStoreKey, sealStoreKeyToMember } from "../vault/family.ts";
+import { importVaultKey } from "../vault/vault-crypto.ts";
+import { deriveRecordKey, macRecord } from "../vault/records.ts";
 import { api } from "../lib/api.ts";
 import { passwordProblem } from "../vault/vault-crypto.ts";
 
@@ -96,6 +98,10 @@ export class GoraniSetup extends LitElement {
 			// sealed per member there; docs/FAMILY.md.)
 			const filesStore = await createStoreKey();
 			bundle.settings.stores.files = await sealStoreKeyToMember(filesStore, { ec: bundle.settings.publicKey, kem: bundle.settings.pqPublicKey });
+			// …authenticated from birth: the record's MAC under the new root's
+			// record key (records.ts — a swapped record is refused on open).
+			const root = await importVaultKey(bundle.rootBundle);
+			bundle.settings.stores.files.mac = await macRecord(await deriveRecordKey(root), "files", bundle.settings.stores.files);
 			const res = await api.put<{ keyId: string }>(`/api/v1/members/${this.memberId}/vault`, { settings: bundle.settings });
 			if (res.keyId !== bundle.keyId) throw new Error("the server did not keep the settings it was given");
 			this.recoveryCode = bundle.recoveryCode;

@@ -20,6 +20,7 @@ import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { kindOf, type FileKind } from "./icons.ts";
+import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
 
@@ -396,7 +397,7 @@ export class FilesModel {
 	 * are skipped honestly rather than failing the library.
 	 */
 	async musicLibrary(): Promise<(AudioMeta & { id: string; version: number; size: number })[]> {
-		const feed = await this.bridge.apiGet<{ tracks: { id: string; version: number; blobSealed: string; size: number }[] }>("/files/music");
+		const feed = await this.bridge.apiGet<{ tracks: { id: string; version: number; blobSealed: string; size: number }[] }>(`/api/v1/members/${this.memberId}/files/music`);
 		const priv = await this.bridge.storePrivate();
 		const out: (AudioMeta & { id: string; version: number; size: number })[] = [];
 		for (const t of feed.tracks) {
@@ -440,24 +441,31 @@ export class FilesModel {
 
 	// ── download ────────────────────────────────────────────────────────
 
-	/** Open a file's current version and hand the bytes to a download. */
+	/** Open a file's current version and hand the bytes to ONE download.
+	 *
+	 * (Commit 24: the sink used to start a browser download per decrypted
+	 * frame — a 100 MB file arrived as thirteen 8 MiB pieces. The frames are
+	 * collected and saved as one Blob; a Blob of parts is not a copy.) */
 	async download(id: string, name: string): Promise<void> {
-		await this.openBytes(id, undefined, async (plain) => {
-			// The save itself is browser-only (the Node test collects bytes).
-			if (typeof document === "undefined") return;
-			const url = URL.createObjectURL(new Blob([plain as BlobPart]));
+		const parts: Uint8Array[] = [];
+		await this.openBytes(id, undefined, (plain) => {
+			parts.push(plain);
+		});
+		// The save itself is browser-only (the Node test collects bytes).
+		if (typeof document !== "undefined") {
+			const url = blobURL(new Blob(parts as BlobPart[], { type: "application/octet-stream" }));
 			const a = document.createElement("a");
 			a.href = url;
 			a.download = name;
 			a.click();
-			setTimeout(() => URL.revokeObjectURL(url), 5000);
-		});
+			setTimeout(() => revokeBlobURL(url), 5000);
+		}
 		this.bridge.toast(`Downloaded “${name}”`);
 	}
 
 	/** Open + decrypt; chunked objects stream frame by frame (never whole). */
 	async openBytes(id: string, version: number | undefined, sink: (plain: Uint8Array) => Promise<void> | void): Promise<void> {
-		const keys = await this.bridge.apiGet<{ keys: Record<string, { key: string; chunk: number | null }> }>(`/api/v1/members/${this.memberId}/files/keys`);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) throw new Error("the file's key was not found");
 		const chunk = meta.chunk;
@@ -476,7 +484,7 @@ export class FilesModel {
 		const s = this.state.get();
 		const row = s.files.find((f) => f.id === id) ?? s.trashFiles.find((f) => f.id === id);
 		if (!row) return null;
-		const keys = await this.bridge.apiGet<{ keys: Record<string, { key: string; chunk: number | null; type: string | null }> }>(`/api/v1/members/${this.memberId}/files/keys`);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; type: string | null }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const priv = await this.bridge.storePrivate();
@@ -503,7 +511,7 @@ export class FilesModel {
 	 * unavailable — the viewer falls back to the decrypted blob. */
 	async mediaHandle(id: string): Promise<{ url: string } | null> {
 		if (typeof navigator === "undefined" || !navigator.serviceWorker) return null;
-		const keys = await this.bridge.apiGet<{ keys: Record<string, { key: string; chunk: number | null }> }>(`/api/v1/members/${this.memberId}/files/keys`);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const s = this.state.get();
@@ -599,9 +607,19 @@ export class FilesModel {
 
 	private cursor = 0;
 
+	/** The wrapped content key (+ chunk/type/version) of ONE file's living
+	 * version. The route is `POST …/files/keys { ids }` — a POST because the
+	 * ids ride in the body (a batch can be hundreds long), and so that a key
+	 * request is never a cacheable, prefetchable, history-logged GET URL.
+	 * Asking for exactly the file being opened keeps the view's key material
+	 * minimal (docs/ENCRYPTION.md: the listing never carries keys). */
+	private keysFor<T>(id: string): Promise<T> {
+		return this.bridge.apiSend<T>("POST", `/api/v1/members/${this.memberId}/files/keys`, { ids: [id] });
+	}
+
 	/** Info for the Get Info / details pane: everything readable, opened. */
 	async info(id: string): Promise<{ name: string; kind: FileKind; size: number; version: number; createdAt: string; updatedAt: string; mime: string | null } | null> {
-		const keys = await this.bridge.apiGet<{ keys: Record<string, { key: string; version: number; type: string | null; size: number }> }>(`/api/v1/members/${this.memberId}/files/keys`);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; version: number; type: string | null; size: number }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const priv = await this.bridge.storePrivate();

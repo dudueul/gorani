@@ -24,7 +24,6 @@ use base64::Engine;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::Deserialize;
-use sha2::Digest;
 use worker::*;
 
 /// Who the request is. More claims exist; these are the ones gorani acts on.
@@ -150,8 +149,11 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 	let kid = t.header.get("kid").and_then(|k| k.as_str()).unwrap_or("").to_string();
 	let keys = fetch_jwks(env).await?;
 	let jwk = keys.iter().find(|k| k.kid == kid).ok_or_else(|| Error::RustError("unknown token key".into()))?;
-	if jwk.kty != "EC" || jwk.crv != "P-256" {
-		return Err(Error::RustError("token key is not P-256".into()));
+	// The key must be what the header claimed: P-256, and — when the JWKS
+	// names an algorithm — ES256. (alg confusion is the classic JWT bug: a
+	// verifier that lets the token pick its own algorithm.)
+	if jwk.kty != "EC" || jwk.crv != "P-256" || jwk.alg.as_deref().is_some_and(|a| a != "ES256") {
+		return Err(Error::RustError("token key is not an ES256 P-256 key".into()));
 	}
 	let x = URL_SAFE_NO_PAD.decode(jwk.x.trim_end_matches('=')).map_err(|_| Error::RustError("bad key x".into()))?;
 	let y = URL_SAFE_NO_PAD.decode(jwk.y.trim_end_matches('=')).map_err(|_| Error::RustError("bad key y".into()))?;
@@ -188,6 +190,21 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 /// (it becomes a DO instance name and part of URLs).
 pub fn valid_member_id(id: &str) -> bool {
 	(2..=32).contains(&id.len()) && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') && !id.starts_with('-') && !id.ends_with('-')
+}
+
+/// An id that becomes a segment of an S3 object key or a DO route: file ids,
+/// upload ids, device ids, folder ids. 1–64 characters of `[A-Za-z0-9_-]`
+/// — the alphabet of the uuids and base64url ids the clients mint.
+///
+/// Why this exists (security review, commit 23): ids from the URL or the
+/// body used to flow straight into keys like `files/<member>/<file>/v-…`
+/// and were written to S3 *before* the DO checked anything. The S3 signer
+/// keeps `.` unencoded (SigV4 requires it), so an id of `..` produced a
+/// path the HTTP stack may normalise — today that only breaks the
+/// signature, but "the signature happened to fail" is not a control. The
+/// rule here is the allow-list, applied at the edge, before any write.
+pub fn valid_object_id(id: &str) -> bool {
+	(1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// SHA-256 hex (token hashes in the registry's audit lines).

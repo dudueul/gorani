@@ -19,8 +19,11 @@
  * surgery, no DRM: the family's device decrypted it, the server saw only
  * ciphertext.
  *
- * The key lives in this worker's memory only while the page keeps it
- * registered; closing the tab drops it.
+ * The keys live in this worker's memory until the page forgets them: the
+ * viewer sends `media-forget` when it closes, and LOCKING sends
+ * `media-forget-all` (web/src/ui/shell.ts). Before commit 24 nothing ever
+ * sent either — a "locked" app left every played file's content key here,
+ * and any same-origin tab could stream `/media/<id>` as plaintext.
  */
 
 import { framesForRange, frameAad, splitFrame, resolveRange } from "/gorani-media-lib.js";
@@ -44,6 +47,7 @@ self.addEventListener("message", (event) => {
 	if (msg.type === "media-forget" && msg.url) {
 		registrations.delete(new URL(msg.url, self.location.origin).pathname);
 	}
+	if (msg.type === "media-forget-all") registrations.clear();
 });
 
 const encoder = new TextEncoder();

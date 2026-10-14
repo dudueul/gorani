@@ -176,6 +176,12 @@ fn ecdh(secret: &SecretKey, public: &PublicKey) -> Zeroizing<[u8; 32]> {
 
 /// The raw uncompressed P-256 public key (65 bytes: `04 ‖ X ‖ Y`), the wire
 /// shape every format carries. `pub(crate)`: unlock's key generation uses it.
+/// A P-256 public key as its uncompressed point (0x04 ‖ x ‖ y) — the form
+/// key ids and authenticated store records hash (records.rs).
+pub fn raw_public_bytes(pk: &PublicKey) -> [u8; EPH_LEN] {
+	raw_public(pk)
+}
+
 pub(crate) fn raw_public(pk: &PublicKey) -> [u8; EPH_LEN] {
 	let mut out = [0u8; EPH_LEN];
 	out.copy_from_slice(pk.to_encoded_point(false).as_bytes());

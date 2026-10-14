@@ -20,7 +20,7 @@
 
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
-use worker::{Request, Response, Result};
+use worker::{Response, Result};
 
 use crate::auth;
 use crate::family::json_error;
@@ -109,6 +109,27 @@ impl GoraniMemberDO {
 	/// Prove the device token, or refuse with the reasons a client acts on:
 	/// 403 revoked, 410 wipe requested.
 	async fn device_auth(&self, id: &str, token_header: Option<String>) -> std::result::Result<DeviceRow, Response> {
+		let row = self.device_token_ok(id, token_header).await?;
+		if row.revoked_at.is_some() {
+			return Err(json_error_raw(403, "revoked"));
+		}
+		if row.wipe_at.is_some() {
+			return Err(json_error_raw(410, "wipe"));
+		}
+		Ok(row)
+	}
+
+	/// The token half alone: the device exists and the caller holds ITS
+	/// token (404 / 401 / 403 otherwise) — whatever state it is in.
+	///
+	/// Split out in the security review (commit 23). The wiped/leave reports
+	/// must work for a device that is already revoked or told to wipe, so
+	/// they used to call [`Self::device_auth`] and carry on after ANY 403 —
+	/// including "wrong device token". The device routes skip the member
+	/// scope (the token is their authority), so any Access identity that
+	/// knew a device id could revoke anyone's computer with a garbage token.
+	/// Now: state may be anything; the token may not.
+	async fn device_token_ok(&self, id: &str, token_header: Option<String>) -> std::result::Result<DeviceRow, Response> {
 		let Some(token) = token_header else { return Err(json_error_raw(401, "missing device token")) };
 		let rows: Vec<DeviceRow> = match self
 			.sql
@@ -121,14 +142,10 @@ impl GoraniMemberDO {
 			Err(e) => return Err(json_error_raw(500, &e.to_string())),
 		};
 		let Some(row) = rows.into_iter().next() else { return Err(json_error_raw(404, "no such device")) };
+		// (A plain comparison is fine here: both sides are SHA-256 digests of a
+		// 256-bit random token, so timing reveals nothing usable.)
 		if auth::sha256_hex(token.as_bytes()) != row.token_hash {
 			return Err(json_error_raw(403, "wrong device token"));
-		}
-		if row.revoked_at.is_some() {
-			return Err(json_error_raw(403, "revoked"));
-		}
-		if row.wipe_at.is_some() {
-			return Err(json_error_raw(410, "wipe"));
 		}
 		Ok(row)
 	}
@@ -184,28 +201,42 @@ impl GoraniMemberDO {
 	}
 
 	/// The device wiped itself (after a 410): its enrolment is over.
+	/// Revoked or wipe-flagged devices may still report — with their token.
 	pub(crate) async fn device_wiped(&self, actor: &str, id: &str, token_header: Option<String>) -> Result<Response> {
-		if let Err(resp) = self.device_auth(id, token_header).await {
-			// Revoked devices may still report their wipe; 404 may not.
-			if resp.status_code() == 404 {
-				return Ok(resp);
-			}
+		if let Err(resp) = self.device_token_ok(id, token_header).await {
+			return Ok(resp);
 		}
-		self.sql.exec("UPDATE devices SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1", Some(vec![id.into()]))?;
+		self.revoke_copy(id)?;
 		self.audit(actor, "device.wiped", id, None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
 	}
 
 	/// The device left (uninstalled): revoke its copy.
 	pub(crate) async fn device_leave(&self, actor: &str, id: &str, token_header: Option<String>) -> Result<Response> {
-		if let Err(resp) = self.device_auth(id, token_header).await {
-			if resp.status_code() == 404 {
-				return Ok(resp);
-			}
+		if let Err(resp) = self.device_token_ok(id, token_header).await {
+			return Ok(resp);
 		}
-		self.sql.exec("UPDATE devices SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1", Some(vec![id.into()]))?;
+		self.revoke_copy(id)?;
 		self.audit(actor, "device.leave", id, None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	/// Revoke a device AND delete its wrapped root copy. Returns how many
+	/// rows changed (0 = unknown or already revoked).
+	///
+	/// "Revoking deletes the copy" was the design (docs/DESKTOP.md) but the
+	/// code only stamped `revoked_at`, keeping `wrapped` + `salt` in the row
+	/// forever — so a later DB leak plus the stolen computer's TPM secret
+	/// would still open the root. Blanking them is crypto-shredding of that
+	/// one copy (the columns are NOT NULL, hence '' rather than NULL).
+	fn revoke_copy(&self, id: &str) -> Result<usize> {
+		Ok(self
+			.sql
+			.exec(
+				"UPDATE devices SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')), wrapped = '', salt = '' WHERE id = ?1 AND wrapped != ''",
+				Some(vec![id.into()]),
+			)?
+			.rows_written())
 	}
 
 	/// The member's list (Settings › Devices).
@@ -232,7 +263,7 @@ impl GoraniMemberDO {
 	/// Revoke (Settings › Devices, or the member themselves): the wrapped
 	/// copy is deleted — the computer can never unlock again.
 	pub(crate) async fn device_revoke(&self, actor: &str, id: &str) -> Result<Response> {
-		let n = self.sql.exec("UPDATE devices SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND revoked_at IS NULL", Some(vec![id.into()]))?.rows_written();
+		let n = self.revoke_copy(id)?;
 		if n == 0 {
 			return json_error(404, "no such device");
 		}
@@ -252,6 +283,11 @@ impl GoraniMemberDO {
 	/// checked the confirm phrase and the destroy secret before calling.
 	pub(crate) async fn vault_destroy(&self, actor: &str) -> Result<Response> {
 		self.sql.exec("DELETE FROM vault WHERE k = 'settings'", None)?;
+		// Every enrolled computer holds a wrapped copy of the same root here.
+		// Leaving them would make "destroyed" a lie: a device that kept its
+		// secret could ask for its copy back once settings were re-created.
+		// (commit 23 — the settings row was the only thing deleted before)
+		self.sql.exec("UPDATE devices SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')), wrapped = '', salt = ''", None)?;
 		self.audit(actor, "vault.destroy", "settings", None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "destroyed": true }))?)
 	}

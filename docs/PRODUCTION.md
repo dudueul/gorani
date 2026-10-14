@@ -17,10 +17,21 @@ simulator so both branches stay tested.
    manager): `https://minio.example.com`. It must be publicly reachable —
    the Worker signs requests to it over HTTPS.
 2. Create a bucket `gorani`, policy **private** (no anonymous access).
-3. Create a dedicated access key scoped to that bucket.
+3. Create a dedicated access key scoped to that bucket — and to the
+   object actions the worker uses (Get/Put/DeleteObject,
+   AbortMultipartUpload, ListBucket); never bucket-admin rights.
+4. Add a lifecycle rule: abort incomplete multipart uploads after 2 days
+   (the worker's housekeeping sweeps its own, this catches the rest).
+5. Prove it: `GORANI_LIVE_S3=1 S3_ENDPOINT=… S3_REGION=… S3_BUCKET=…
+   S3_ACCESS_KEY_ID=… S3_SECRET_KEY=… node tests/api/s3-live.test.mjs`
+   against a dedicated test bucket — it checks that anonymous reads are
+   refused before it writes anything. More: docs/SECURITY-REVIEW.md ›
+   Operational controls.
 
 `wrangler.jsonc` vars: `S3_ENDPOINT`, `S3_REGION` (any string MinIO
-accepts, e.g. `us-east-1`), `S3_BUCKET`. Secrets (`wrangler secret put`):
+accepts, e.g. `us-east-1`), `S3_BUCKET`. The endpoint must be `https://`
+— the worker refuses anything else outside `wrangler dev` (the signatures
+use UNSIGNED-PAYLOAD, so body integrity is TLS's job). Secrets (`wrangler secret put`):
 `S3_ACCESS_KEY_ID`, `S3_SECRET_KEY`. The worker signs SigV4 with path-style
 addressing (`https://endpoint/bucket/key`) — verified against golden
 vectors in `crates/s3`.
@@ -98,8 +109,11 @@ then create each vault from the UI (commit ⑨'s setup screen).
    every member: the deployment-default housekeeping (trash, journal,
    audit, dead shares) and backup-manifest pruning (the newest 7 `.gbak`
    runs survive; older rows and their S3 objects go). The audit trail
-   records each pass under the actor `cron`. 4. Keep the key file offline.
-   Losing it loses the backups, not the vault.
+   records each pass under the actor `cron`. The retention knobs
+   (`trashDays`, `auditKeep`, …) are deployment defaults: the HTTP route
+   honours them only on the dev server, so no member can shorten their own
+   audit trail.
+4. Keep the key file offline. Losing it loses the backups, not the vault.
 
 ## 5. Growth
 

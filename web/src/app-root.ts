@@ -21,7 +21,6 @@ import { store } from "./lib/store.ts";
 import { api, type FamilyState, type Member } from "./lib/api.ts";
 import type { VaultSettings } from "./vault/methods.ts";
 import type { VaultSession } from "./vault/session.ts";
-import { watchAutoLock } from "./vault/session.ts";
 import "./ui/unlock.ts";
 import "./ui/setup.ts";
 import "./ui/shell.ts";

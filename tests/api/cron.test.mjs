@@ -47,7 +47,10 @@ try {
 	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
-	const up = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "diary.txt"), type: await sealText(storePublic, "text/plain"), size: "30" }, await sealWith(key, enc.encode("the cron tends the museum")));
+	// (size: the plaintext's real length — commit 23's size-honesty rule; this
+	// used to declare "30" for a 25-byte diary.)
+	const diary = enc.encode("the cron tends the museum");
+	const up = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "diary.txt"), type: await sealText(storePublic, "text/plain"), size: String(diary.length) }, await sealWith(key, diary));
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const backup = await generateHybridKey();
 	const put = await api(dev.base, "PUT", "/api/v1/members/jinu/backup-key", { email: "jinu@family.test", body: { keyId: backup.keyId, publicKey: backup.publicKey, pqPublicKey: backup.pqPublicKey } });

@@ -54,25 +54,73 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-	// Liveness for the deploy and for tests. The S3 line says whether the
-	// storage backend is *configured* — never what is in it, and never a key.
+	// Liveness for the deploy and for tests. This route is PUBLIC (the Access
+	// bypass in docs/PRODUCTION.md), so it says only whether storage is
+	// configured — one bit. It used to name the bucket and echo the config
+	// error ("missing S3_SECRET_KEY…"): reconnaissance for free, and the
+	// kind of detail that belongs in observability logs, not on the open
+	// internet (security review, commit 23).
 	match (req.method(), req.path().as_str()) {
 		(Method::Get, "/api/healthz") => {
-			let s3 = s3::config(&env);
-			Response::from_json(&serde_json::json!({
-				"ok": true,
-				"service": "gorani",
-				"s3": match &s3 {
-					Ok(cfg) => serde_json::json!({ "configured": true, "bucket": cfg.bucket }),
-					Err(e) => serde_json::json!({ "configured": false, "error": e.to_string() }),
-				},
-			}))
+			let configured = env.bucket("R2BUCKET").is_ok() || s3::config(&env).is_ok();
+			harden(Response::from_json(&serde_json::json!({ "ok": true, "service": "gorani", "storage": { "configured": configured } }))?)
 		}
 		// /api/v1 is authenticated+routed in routes.rs; /s/* is the PUBLIC
 		// share surface (the link's fragment secret is the credential).
-		(_, p) if p.starts_with("/api/v1/") || p.starts_with("/s/") => routes::route(req, env).await,
+		(_, p) if p.starts_with("/api/v1/") || p.starts_with("/s/") => match routes::route(req, env).await {
+			Ok(resp) => harden(resp),
+			// An unexpected fault (a storage outage, a malformed body the
+			// route did not anticipate): logged in full for the operator,
+			// answered generically to the caller — internal messages (object
+			// keys, endpoints, SQL) are reconnaissance — and hardened like any
+			// other response. Expected refusals never come this way: routes
+			// answer those themselves with honest 4xx statuses.
+			Err(e) => {
+				console_log!("gorani: unhandled error: {e}");
+				harden(Response::from_json(&serde_json::json!({ "error": "internal error" }))?.with_status(500))
+			}
+		},
 		// The asset layer handles static files and the SPA fallback; the
 		// Worker only ever sees what `run_worker_first` names.
 		_ => Response::error("Not Found", 404),
 	}
+}
+
+/// The CSP for everything the Worker itself answers: JSON, ciphertext
+/// streams, error pages. None of it is meant to render, so the policy allows
+/// nothing at all — if a browser is ever tricked into displaying an API
+/// response as a document, it can run no script, load nothing, and cannot be
+/// framed. (The share page overrides this with its own, routes.rs.)
+const API_CSP: &str = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+/// Security headers on every Worker response (docs/SECURITY-REVIEW.md › O1).
+///
+/// Static assets get theirs from `web/public/_headers` (the platform serves
+/// them without running this code); everything routed here passes through
+/// this one function, so no route can forget a header. A header a route set
+/// on purpose (the share page's own CSP, a download's Cache-Control) wins:
+/// only absent headers are filled in.
+///
+/// The headers are COPIED and re-attached: responses relayed from a Durable
+/// Object or the cache carry immutable header lists, and setting on those
+/// throws (worker::Headers::clone makes a fresh, mutable list).
+fn harden(resp: Response) -> Result<Response> {
+	let headers = resp.headers().clone();
+	let fill = |name: &str, value: &str| -> Result<()> {
+		if headers.get(name)?.is_none() {
+			headers.set(name, value)?;
+		}
+		Ok(())
+	};
+	fill("Content-Security-Policy", API_CSP)?;
+	fill("X-Content-Type-Options", "nosniff")?;
+	fill("Referrer-Policy", "no-referrer")?;
+	fill("Cross-Origin-Resource-Policy", "same-origin")?;
+	fill("Strict-Transport-Security", "max-age=63072000; includeSubDomains")?;
+	// API answers are per-user and often secret-adjacent (wrapped keys ride
+	// in x-gorani-ck): never stored by a browser or a shared proxy cache.
+	// (The Worker's OWN edge cache, cache.rs, works below this layer and is
+	// unaffected — it stores ciphertext under its own keys.)
+	fill("Cache-Control", "no-store")?;
+	Ok(resp.with_headers(headers))
 }

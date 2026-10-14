@@ -33,6 +33,9 @@ assert.equal(pickViewerMode("doc", "text/plain", 10), "text");
 
 // Render mimes never let stored content run as the app.
 assert.equal(renderMime("image", null, "pic.svg"), "image/png", "SVG never runs");
+assert.equal(renderMime("image", "image/svg+xml", "pic"), "image/png", "a stored SVG mime never reaches a blob URL either (commit 23)");
+assert.equal(renderMime("image", "text/html", "x.png"), "image/png", "the extension wins only inside the raster list");
+assert.equal(renderMime("image", "image/webp", "noext"), "image/webp", "a raster stored mime is kept");
 assert.equal(renderMime("image", null, "pic.jpg"), "image/jpeg");
 assert.equal(renderMime("video", null, "v.mkv"), "video/mp4");
 assert.equal(renderMime("text", "text/plain", "n"), "text/plain");

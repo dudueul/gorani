@@ -214,7 +214,7 @@ export async function rewrapContentKey(oldPrivateKey: VaultPrivateKey, newPublic
 
 /** Recover a content key with a store private key. */
 export async function unwrapContentKey(storePrivateKey: VaultPrivateKey, sealedKey: string): Promise<CryptoKey> {
-	return importContentKey(fromBase64(await openText(storePrivateKey, sealedKey)));
+	return importContentKey(fromBase64(await openSealedText(storePrivateKey, sealedKey)));
 }
 
 /** Seal bytes to a public key. Anyone with the public key can seal; only the private key opens. A hybrid key seals GV3. */
@@ -258,10 +258,23 @@ export function isSealedText(value: string | null | undefined): boolean {
 	return typeof value === "string" && (value.startsWith(SEALED_TEXT_PREFIX) || value.startsWith(SEALED_TEXT_PREFIX_V2) || value.startsWith(SEALED_TEXT_PREFIX_V3));
 }
 
+/**
+ * Open sealed text. A value WITHOUT a sealed prefix passes through as-is —
+ * convenient for display fields, and a hazard for key material: a server
+ * could hand over an unsealed "private key" and it would be used. Key
+ * material therefore goes through `openSealedText` (commit 24,
+ * docs/SECURITY-REVIEW.md › O3).
+ */
 export async function openText(privateKey: VaultPrivateKey, value: string): Promise<string> {
 	const prefix = value.startsWith(SEALED_TEXT_PREFIX) ? SEALED_TEXT_PREFIX : value.startsWith(SEALED_TEXT_PREFIX_V3) ? SEALED_TEXT_PREFIX_V3 : null;
 	if (!prefix) return value;
 	return new TextDecoder().decode(await open(privateKey, fromBase64(value.slice(prefix.length))));
+}
+
+/** Open sealed text, refusing anything that is not sealed (for key material). */
+export async function openSealedText(privateKey: VaultPrivateKey, value: string): Promise<string> {
+	if (!value.startsWith(SEALED_TEXT_PREFIX) && !value.startsWith(SEALED_TEXT_PREFIX_V3)) throw new Error("expected sealed key material, got plain text");
+	return openText(privateKey, value);
 }
 
 // ── v3: hybrid post-quantum sealing ─────────────────────────────────
@@ -318,7 +331,14 @@ async function sealV3(pub: HybridPublicKey, plaintext: Uint8Array): Promise<Uint
 }
 
 /** The ML-KEM-768 public key inside its secret key (FIPS 203: dk = dk_PKE (1152) | ek (1184) | H(ek) | z). */
-const kemPublicOf = (secretKey: Uint8Array) => secretKey.subarray(1152, 1152 + 1184);
+/** The ML-KEM-768 public key embedded in a FIPS 203 decapsulation key (bytes 1152‥2336). */
+export const kemPublicOf = (secretKey: Uint8Array) => secretKey.subarray(1152, 1152 + 1184);
+
+/** A hybrid key's id: "pq" + 14 chars of base64(SHA-256(P-256 raw ‖ ML-KEM public)[..12]), +/= removed. */
+export async function hybridKeyId(ecRaw: Uint8Array, kemPub: Uint8Array): Promise<string> {
+	const digest = new Uint8Array(await subtle().digest("SHA-256", concat(ecRaw, kemPub) as BufferSource));
+	return "pq" + toBase64(digest.slice(0, 12)).replace(/[+/=]/g, "").slice(0, 14);
+}
 
 async function openV3(privateKey: VaultPrivateKey, sealed: Uint8Array): Promise<Uint8Array> {
 	if (!isHybridPrivate(privateKey)) throw new Error("This object is sealed post-quantum: it needs the hybrid key");
@@ -352,9 +372,8 @@ export async function generateHybridKey(): Promise<{ keyId: string; publicKey: J
 	const bundle = concat(BUNDLE_MAGIC, len, pkcs8, seed, ecRaw);
 	pkcs8.fill(0);
 	seed.fill(0);
-	const digest = new Uint8Array(await subtle().digest("SHA-256", concat(ecRaw, kemPub) as BufferSource));
 	return {
-		keyId: "pq" + toBase64(digest.slice(0, 12)).replace(/[+/=]/g, "").slice(0, 14),
+		keyId: await hybridKeyId(ecRaw, kemPub),
 		publicKey: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
 		pqPublicKey: toBase64(kemPub),
 		bundle,

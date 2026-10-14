@@ -61,11 +61,16 @@ and its order matters:
    rotateFamilyStoreKey`): a fresh store pair, its private sealed to every
    REMAINING member's root. The departing member's root opens none of the
    new copies.
-2. **Re-wrap the family area's content keys** — unwrap each with the old
-   store private half, wrap to the new public half, store via
-   `files/reseal` (the same client-driven walk as a child-store rotation;
-   no file is re-encrypted). After this, their old store key unwraps
-   nothing — not even bytes already stored.
+2. **Re-seal everything the old key sealed** — `rotation.ts ›
+   resealStore` walks `files/sealed` kind by kind (every VERSION's content
+   key and type, file and folder names, music tags, share names, the files
+   secrets), opens each value with the old store private half, seals it to
+   the new public half and stores it via `files/reseal`. No file is
+   re-encrypted; the walk is idempotent and resumable. Then prove it:
+   `opensAnything(oldKey)` must be 0 (`tests/api/rotation.test.mjs` does
+   exactly this). After this, their old store key unwraps nothing — not
+   even bytes already stored. (Before commit 24 the walk reached living
+   versions and file names only — docs/SECURITY-REVIEW.md › O5.)
 3. **Update each remaining member's settings**: the new family key copy
    replaces the old (`stores.family`, sealed to their root — a parent can
    act for any member).

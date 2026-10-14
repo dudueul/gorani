@@ -28,6 +28,8 @@ import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
+import { renderMime } from "../viewer/mode.ts";
+import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import "../viewer/viewer.ts";
 import "./share-dialog.ts";
 
@@ -116,11 +118,12 @@ export class GoraniFinder extends LitElement {
 	private async quickLookOn(id: string): Promise<void> {
 		const row = this.s().files.find((f) => f.id === id) ?? this.s().trashFiles.find((f) => f.id === id);
 		if (!row) return;
+		revokeBlobURL(this.quickLook?.url); // the previous preview's handle
 		this.quickLook = { id, name: row.name, kind: row.kind };
 		try {
 			const p = await this.model.preview(id, 512 * 1024);
 			if (p && this.quickLook?.id === id) {
-				if (row.kind === "image") this.quickLook.url = URL.createObjectURL(new Blob([p.bytes as BlobPart], { type: p.mime }));
+				if (row.kind === "image") this.quickLook.url = blobURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
 				else if (row.kind === "text" || row.kind === "code" || row.kind === "pdf") this.quickLook.text = new TextDecoder().decode(p.bytes.subarray(0, 16384));
 				this.quickLook.meta = { size: row.size, version: row.version, updatedAt: row.updatedAt };
 			}
@@ -442,7 +445,7 @@ export class GoraniFinder extends LitElement {
 			</div>
 		`;
 		return html`
-			<div class="grid grid-cols-[repeat(auto-fill,minmax(118px,1fr))] gap-2 p-4" style="content-visibility: auto">
+			<div class="grid grid-cols-[repeat(auto-fill,minmax(118px,1fr))] gap-2 p-4 [content-visibility:auto]">
 				${folders.map((f) => cell("folder", f.id, f.name, "folder"))}
 				${files.map((f) => cell("file", f.id, f.name, f.kind))}
 				${!folders.length && !files.length ? html`<p class="col-span-full py-16 text-center text-sm text-neutral-500">This folder is empty</p>` : nothing}
@@ -480,7 +483,7 @@ export class GoraniFinder extends LitElement {
 				<button class="text-left hover:text-neutral-200" @click=${() => this.model.sortBy("type")}>Kind${sortArrow("type")}</button>
 				<button class="text-right hover:text-neutral-200" @click=${() => this.model.sortBy("modified")}>Date Modified${sortArrow("modified")}</button>
 			</div>
-			<div class="p-2" style="content-visibility: auto">
+			<div class="p-2 [content-visibility:auto]">
 				${folders.map((f) => item("folder", f.id, f.name, "folder", null))}
 				${files.map((f) => item("file", f.id, f.name, f.kind, f.size))}
 			</div>

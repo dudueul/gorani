@@ -22,51 +22,95 @@ use crate::auth::{self, Identity};
 use crate::family::json_error;
 use crate::s3;
 
-/// Which member an email belongs to (the registry's answer).
+/// Who is calling (the registry's answer for the Access email), plus what
+/// the registry says about the member the URL addresses.
 struct Actor {
+	/// The caller's member id — the upload paths record it as the owner.
 	id: String,
 	role: String,
+	/// The Access email, forwarded to the DOs as the audit actor.
 	email: String,
+	target_exists: bool,
+	target_active: bool,
 }
 
 /// Resolve the caller's registry row, then enforce the member scope:
-/// themselves, or any member if they are a parent.
-async fn member_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<String, Response> {
-	let actor = match actor_of(env, &identity.email).await {
+/// themselves, or any member if they are a parent. The ORDER of the checks
+/// is the lesson (security review, commit 23):
+///
+/// 1. **Shape** — the id becomes a DO instance name (`member:<id>`) and the
+///    first segment of every object key (`files/<id>/…`), so it is held to
+///    the registry's own id rule before anything else happens.
+/// 2. **Identity** — the caller must be an active member.
+/// 3. **Existence** — the addressed member must be in the registry. Before
+///    this check, a parent's request for `members/<anything>/…` created a
+///    fresh, empty Durable Object on first touch (a DO exists the moment it
+///    is addressed): unbounded state, holding data for a member nobody can
+///    see in the registry.
+/// 4. **Scope** — a child acts only for themselves, and only while active;
+///    a parent for anyone, deactivated members included (offboarding: a
+///    parent may still need to export or purge a former member's area).
+///
+/// It returns the whole Actor so no caller resolves the caller twice — the
+/// upload paths used to make a second registry round trip just to learn
+/// the owner's id.
+async fn member_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<Actor, Response> {
+	if !auth::valid_member_id(id) {
+		return Err(json_error_raw(400, "member id: 2–32 chars of a–z, 0–9, dashes"));
+	}
+	let actor = match actor_of(env, &identity.email, Some(id)).await {
 		Ok(Some(a)) => a,
-		Ok(None) => return Err(json_error_raw(403, &format!("not a family member: {}", identity.email))),
+		// (No echo of the email: error bodies end up in logs and screenshots.)
+		Ok(None) => return Err(json_error_raw(403, "not a family member")),
 		Err(e) => return Err(json_error_raw(500, &e.to_string())),
 	};
-	if actor.id == id || actor.role == "parent" {
-		Ok(actor.email)
+	if !actor.target_exists {
+		return Err(json_error_raw(404, "no such member"));
+	}
+	let allowed = actor.role == "parent" || (actor.id == id && actor.target_active);
+	if allowed {
+		Ok(actor)
 	} else {
 		Err(json_error_raw(403, "children act only for themselves"))
 	}
 }
 
-/// The acting uploader's member id (strict ownership attribution).
-async fn actor_id_of(env: &Env, email: &str) -> Option<String> {
-	actor_of(env, email).await.ok().flatten().map(|a| a.id)
-}
-
-async fn actor_of(env: &Env, email: &str) -> Result<Option<Actor>> {
+/// One registry round trip: the caller's row and (with `target`) whether
+/// the addressed member exists and is active.
+async fn actor_of(env: &Env, email: &str, target: Option<&str>) -> Result<Option<Actor>> {
 	let namespace = env.durable_object("FAMILY")?;
 	let stub = namespace.id_from_name("family")?.get_stub()?;
-	let mut headers = Headers::new();
+	let headers = Headers::new();
 	headers.set("x-gorani-actor", email)?;
+	if let Some(t) = target {
+		headers.set("x-gorani-target", t)?;
+	}
 	let request = Request::new_with_init("https://do.internal/actor", &RequestInit { method: Method::Get, headers, ..Default::default() })?;
-	let resp = stub.fetch_with_request(request).await?;
-	let mut resp = resp;
+	let mut resp = stub.fetch_with_request(request).await?;
 	let v: serde_json::Value = resp.json().await?;
 	if v.is_null() {
-		Ok(None)
-	} else {
-		Ok(Some(Actor {
-			id: v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-			role: v.get("role").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-			email: email.to_string(),
-		}))
+		return Ok(None);
 	}
+	let flag = |k: &str| v.get("target").and_then(|t| t.get(k)).and_then(|b| b.as_bool()).unwrap_or(false);
+	Ok(Some(Actor {
+		id: v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+		role: v.get("role").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+		email: email.to_string(),
+		target_exists: flag("exists"),
+		target_active: flag("active"),
+	}))
+}
+
+/// Does the registry know this member? (The device routes skip the member
+/// scope — the device token is their authority — but they still must not
+/// conjure a DO for a member that does not exist.)
+async fn member_exists(env: &Env, id: &str) -> Result<bool> {
+	let namespace = env.durable_object("FAMILY")?;
+	let stub = namespace.id_from_name("family")?.get_stub()?;
+	let request = Request::new_with_init(&format!("https://do.internal/member-exists/{id}"), &RequestInit { method: Method::Get, ..Default::default() })?;
+	let mut resp = stub.fetch_with_request(request).await?;
+	let v: serde_json::Value = resp.json().await?;
+	Ok(v.get("exists").and_then(|b| b.as_bool()).unwrap_or(false))
 }
 
 /// A JSON error as a plain Response (for the `Err(Response)` channel).
@@ -90,6 +134,15 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 	let method = req.method().to_string();
 	let rest = &path["/api/v1/".len()..];
 	let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+	// One allow-list for every path segment (security review, commit 23).
+	// Segments become DO paths (`files/<id>`), S3 key parts
+	// (`files/<member>/<file>/…`) and audit targets; route words, uuids,
+	// base64url share ids, hex stamps and part numbers all fit
+	// `[A-Za-z0-9_-]{1,64}`. Anything else — dots, percent-escapes, unicode —
+	// is refused here, once, instead of being trusted by forty handlers.
+	if let Some(bad) = segments.iter().find(|s| !auth::valid_object_id(s)) {
+		return json_error(400, &format!("bad path segment ({} chars) — ids are [A-Za-z0-9_-]", bad.len()));
+	}
 
 	match (method.as_str(), segments.as_slice()) {
 		// ── The family registry (GoraniFamilyDO) ────────────────────────
@@ -142,6 +195,9 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await
 		}
+		// The rotation walk's input: every value sealed to the files store
+		// key, by kind, paged (files_store.rs › sealed_page).
+		("GET", ["members", id, "files", "sealed"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/sealed", &req, actor)).await,
 		("PUT", ["members", id, "files", "reseal"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "files/reseal", Some(body), actor)).await
@@ -205,7 +261,7 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 					} else if !confirm {
 						json_error(403, "confirm with ?confirm=DESTROY VAULT KEY")
 					} else {
-						forward_member(&env, id, "DELETE", "vault", None, &actor).await
+						forward_member(&env, id, "DELETE", "vault", None, &actor.email).await
 					}
 				}
 				Err(resp) => Ok(resp),
@@ -245,7 +301,7 @@ where
 	Fut: std::future::Future<Output = Result<Response>>,
 {
 	match member_ctx(env, identity, id).await {
-		Ok(actor) => f(actor).await,
+		Ok(actor) => f(actor.email).await,
 		Err(resp) => Ok(resp),
 	}
 }
@@ -256,13 +312,18 @@ where
 /// touch member B), and in production the perimeter is an Access service
 /// token, not a member email.
 async fn device_call(env: &Env, _identity: &Identity, member_id: &str, device: &str, what: &str, mut req: Request) -> Result<Response> {
+	// The token decides — but only for a member the registry has (otherwise
+	// any Access identity could conjure `member:<anything>` DOs here).
+	if !auth::valid_member_id(member_id) || !member_exists(env, member_id).await? {
+		return json_error(404, "no such member");
+	}
 	let token = req.headers().get("x-gorani-device-token")?;
 	let body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
 	// The device token is forwarded as a header — the DO authenticates the
 	// device with it (its hash lives in exactly one member's DO).
 	let namespace = env.durable_object("MEMBER")?;
 	let stub = namespace.id_from_name(&format!("member:{member_id}"))?.get_stub()?;
-	let mut headers = Headers::new();
+	let headers = Headers::new();
 	headers.set("x-gorani-actor", "device")?;
 	headers.set("Content-Type", "application/json")?;
 	let Some(token) = token else { return json_error(401, "the device token header is required") };
@@ -284,13 +345,17 @@ async fn device_call(env: &Env, _identity: &Identity, member_id: &str, device: &
 async fn forward_family(env: &Env, actor: &str, method: &str, path: impl Into<String>, body: Option<serde_json::Value>) -> Result<Response> {
 	let namespace = env.durable_object("FAMILY")?;
 	let stub = namespace.id_from_name("family")?.get_stub()?;
-	do_request(&stub, method, path, body, Some(actor)).await
+	do_request(&stub, method, path, body, Some(actor), None).await
 }
 
 async fn forward_member(env: &Env, member_id: &str, method: &str, path: impl Into<String>, body: Option<serde_json::Value>, actor: impl Into<String>) -> Result<Response> {
 	let namespace = env.durable_object("MEMBER")?;
 	let stub = namespace.id_from_name(&format!("member:{member_id}"))?.get_stub()?;
-	do_request(&stub, method, path, body, Some(actor.into().as_str())).await
+	// The member DO is told whose database it is (`x-gorani-member`): a DO
+	// cannot read its own instance name, and code that needs it (the restore
+	// minting `files/<member>/…` keys) used to guess from the ACTOR — wrong
+	// whenever a parent acts for a child.
+	do_request(&stub, method, path, body, Some(actor.into().as_str()), Some(member_id)).await
 }
 
 /// Same, but carrying the caller's query string through (list/changes/match/meta).
@@ -301,10 +366,13 @@ async fn forward_member_qs(env: &Env, member_id: &str, method: &str, path: impl 
 	forward_member(env, member_id, method, &full, None, actor.into().as_str()).await
 }
 
-async fn do_request(stub: &Stub, method: &str, path: impl Into<String>, body: Option<serde_json::Value>, actor: Option<&str>) -> Result<Response> {
-	let mut headers = Headers::new();
+async fn do_request(stub: &Stub, method: &str, path: impl Into<String>, body: Option<serde_json::Value>, actor: Option<&str>, member: Option<&str>) -> Result<Response> {
+	let headers = Headers::new();
 	if let Some(a) = actor {
 		headers.set("x-gorani-actor", a)?;
+	}
+	if let Some(m) = member {
+		headers.set("x-gorani-member", m)?;
 	}
 	if body.is_some() {
 		headers.set("Content-Type", "application/json")?;
@@ -356,14 +424,29 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	Ok(UploadForm { fields, file })
 }
 
+/// GV02's fixed overhead: magic (4) ‖ nonce (12) ‖ … ‖ tag (16).
+const GV02_OVERHEAD: u64 = 32;
+
 /// The sealed-shape checks every upload must pass before anything is stored:
-/// bytes start with the GV02 magic, names and types are sealed text. This is
-/// the zero-trust boundary in code — the Worker refuses anything else, with
-/// a 400, not a 500 (a refusal is an expectation, not a fault).
-fn check_sealed(file: &Option<Vec<u8>>, name: &Option<String>, type_sealed: &Option<String>) -> Result<(), String> {
+/// bytes start with the GV02 magic, the declared plaintext size is honest,
+/// names and types are sealed text. This is the zero-trust boundary in
+/// code — the Worker refuses anything else, with a 400, not a 500 (a
+/// refusal is an expectation, not a fault).
+///
+/// The size rule (security review, commit 23) was drawn in
+/// ARCHITECTURE-DEEP.md's upload diagram ("size honest") but never
+/// written: the DO stored whatever `size` the form claimed. Sizes are the
+/// one readable number per file — quotas, the duplicate check
+/// (`files/match`) and the listings all trust it — so it must equal what
+/// the bytes say: sealed length − 32.
+fn check_sealed(file: &Option<Vec<u8>>, declared_size: Option<&String>, name: &Option<String>, type_sealed: &Option<String>) -> Result<(), String> {
 	let bytes = file.as_ref().ok_or("missing file")?;
-	if bytes.len() < 4 || &bytes[..4] != gorani_formats::formats::MAGIC_V2 {
+	if bytes.len() < GV02_OVERHEAD as usize || &bytes[..4] != gorani_formats::formats::MAGIC_V2 {
 		return Err("content must be sealed (GV02) bytes".into());
+	}
+	let size: Option<u64> = declared_size.and_then(|s| s.parse().ok());
+	if size != Some(bytes.len() as u64 - GV02_OVERHEAD) {
+		return Err("size must be the plaintext length (the sealed bytes minus 32)".into());
 	}
 	if let Some(n) = name {
 		if !gorani_formats::formats::is_sealed_text(n) {
@@ -386,7 +469,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 	let form = form_of(&mut req).await?;
 	let name = form.fields.get("name").cloned();
 	let type_sealed = form.fields.get("type").cloned();
-	if let Err(msg) = check_sealed(&form.file, &name, &type_sealed) {
+	if let Err(msg) = check_sealed(&form.file, form.fields.get("size"), &name, &type_sealed) {
 		return json_error(400, &msg);
 	}
 	let file_id = crate::files_store::uuid();
@@ -404,9 +487,9 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"mmeta": form.fields.get("mmeta"),
 		"objectKey": object_key,
 		"bytesSealed": true,
-		"owner": actor_id_of(&env, &identity.email).await.unwrap_or_else(|| member_id.to_string()),
+		"owner": actor.id,
 	});
-	let resp = forward_member(&env, member_id, "POST", "files/put", Some(body), &actor).await?;
+	let resp = forward_member(&env, member_id, "POST", "files/put", Some(body), &actor.email).await?;
 	if resp.status_code() >= 400 {
 		// The DO refused the record — do not leave the object orphaned.
 		let _ = s3::delete(&env, &object_key).await;
@@ -422,9 +505,11 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 	let form = form_of(&mut req).await?;
 	let name = form.fields.get("name").cloned();
 	let type_sealed = form.fields.get("type").cloned();
-	if let Err(msg) = check_sealed(&form.file, &name, &type_sealed) {
+	if let Err(msg) = check_sealed(&form.file, form.fields.get("size"), &name, &type_sealed) {
 		return json_error(400, &msg);
 	}
+	// (`file_id` is a path segment — the router's allow-list already held it
+	// to [A-Za-z0-9_-] before this key is built.)
 	let version_id = crate::files_store::uuid();
 	let object_key = format!("files/{member_id}/{file_id}/v-{version_id}");
 	s3::put(&env, &object_key, form.file.clone().unwrap_or_default()).await?;
@@ -439,7 +524,7 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 		"mmeta": form.fields.get("mmeta"),
 		"objectKey": object_key,
 	});
-	let resp = forward_member(&env, member_id, "POST", "files/versions", Some(body), &actor).await?;
+	let resp = forward_member(&env, member_id, "POST", "files/versions", Some(body), &actor.email).await?;
 	if resp.status_code() >= 400 {
 		let _ = s3::delete(&env, &object_key).await;
 	}
@@ -464,13 +549,20 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 	if chunk < MIN_PART {
 		return json_error(400, &format!("chunk {chunk} is below the backend's minimum part size of {MIN_PART} bytes (every part but the last must be at least that)"));
 	}
-	let parts = ((size + chunk - 1) / chunk).max(1);
+	// (div_ceil, not `(size + chunk - 1) / chunk`: a hostile `size` near
+	// u64::MAX would wrap the sum in a release build.)
+	let parts = size.div_ceil(chunk).max(1);
 	if parts > 10_000 {
 		return json_error(400, "this plan needs more than 10 000 parts (the backends' limit) — raise the chunk size");
 	}
-	let file_id = body.get("fileId").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(crate::files_store::uuid);
+	// A body-supplied file id becomes a key segment: same allow-list as paths.
+	let requested = body.get("fileId").and_then(|v| v.as_str());
+	if requested.is_some_and(|f| !auth::valid_object_id(f)) {
+		return json_error(400, "fileId must be an id ([A-Za-z0-9_-], ≤ 64)");
+	}
+	let file_id = requested.map(str::to_string).unwrap_or_else(crate::files_store::uuid);
 	let object_key = format!("files/{member_id}/{file_id}/u-{}", crate::files_store::uuid());
-	let started = forward_member(&env, member_id, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key, "fileId": body.get("fileId") })), &actor).await?;
+	let started = forward_member(&env, member_id, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key, "fileId": body.get("fileId") })), &actor.email).await?;
 	if started.status_code() >= 400 {
 		return Ok(started);
 	}
@@ -478,7 +570,7 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 	let started_body: serde_json::Value = started.json().await?;
 	let upload_id: String = started_body.get("uploadId").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| Error::RustError("no uploadId".into()))?;
 	let s3_upload_id = s3::multipart_init(&env, &object_key).await?;
-	forward_member(&env, member_id, "PUT", format!("uploads/{upload_id}/s3"), Some(serde_json::json!({ "s3UploadId": s3_upload_id })), &actor).await?;
+	forward_member(&env, member_id, "PUT", format!("uploads/{upload_id}/s3"), Some(serde_json::json!({ "s3UploadId": s3_upload_id })), &actor.email).await?;
 	Ok(Response::from_json(&serde_json::json!({ "uploadId": upload_id, "key": object_key, "parts": parts }))?)
 }
 
@@ -491,10 +583,16 @@ async fn upload_part(mut req: Request, env: Env, identity: &Identity, member_id:
 		Ok(m) => m,
 		Err(resp) => return Ok(resp),
 	};
+	let Some(n) = part_number(part) else { return json_error(400, "part numbers are 1–10000") };
 	let bytes = req.bytes().await?;
-	let n: u32 = part.parse().map_err(|_| Error::RustError("bad part number".into()))?;
 	let etag = s3::multipart_part(&env, &meta.object_key, &meta.s3_upload_id, n, bytes.to_vec()).await?;
 	Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
+}
+
+/// S3's part-number range (1-based, at most 10 000). Parsed before the body
+/// is read, so a bad number costs nothing.
+fn part_number(raw: &str) -> Option<u32> {
+	raw.parse::<u32>().ok().filter(|n| (1..=10_000).contains(n))
 }
 
 async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member_id: &str, upload_id: &str) -> Result<Response> {
@@ -518,16 +616,24 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 				.collect()
 		})
 		.unwrap_or_default();
-	s3::multipart_complete(&env, &meta.object_key, &meta.s3_upload_id, &parts).await?;
-	// The completed object must add up: size + frames × 28 bytes (GC01).
 	let size: u64 = form.fields.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
 	let chunk: u64 = form.fields.get("chunk").and_then(|s| s.parse().ok()).unwrap_or(0);
-	if let Some(head) = s3::head(&env, &meta.object_key).await? {
-		let expected = gorani_formats::chunked::sealed_size(size, chunk.max(1));
-		if head.size != expected {
-			let _ = s3::multipart_abort(&env, &meta.object_key, &meta.s3_upload_id).await;
-			return json_error(400, "the upload does not add up to its declared size");
-		}
+	if chunk == 0 {
+		return json_error(400, "chunk is required (the GC01 frame size the parts were sealed with)");
+	}
+	s3::multipart_complete(&env, &meta.object_key, &meta.s3_upload_id, &parts).await?;
+	// The completed object must add up: size + frames × 28 bytes (GC01).
+	//
+	// Fail CLOSED (security review, commit 23): this used to be
+	// `if let Some(head) = …` — a HEAD that found nothing skipped the check
+	// and the row was recorded anyway. And once a multipart upload is
+	// complete there is nothing left to abort: a refused object must be
+	// DELETED, or it lingers in the bucket with no row pointing at it.
+	let expected = gorani_formats::chunked::sealed_size(size, chunk);
+	let actual = s3::head(&env, &meta.object_key).await?.map(|h| h.size);
+	if actual != Some(expected) {
+		let _ = s3::delete(&env, &meta.object_key).await;
+		return json_error(400, "the upload does not add up to its declared size");
 	}
 	let body = serde_json::json!({
 		"ck": form.fields.get("ck"),
@@ -535,7 +641,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"type": form.fields.get("type"),
 		"size": size,
 		"chunkSize": chunk,
-		"owner": actor_id_of(&env, &identity.email).await.unwrap_or_else(|| member_id.to_string()), // (acting uploader attribution below)
+		"owner": actor.id, // the acting uploader (strict ownership, files_store.rs)
 		"folderId": form.fields.get("folder_id"),
 		"baseVersion": form.fields.get("base_version").and_then(|s| s.parse::<u64>().ok()),
 		"tag": form.fields.get("tag"),
@@ -547,10 +653,11 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		// checks above passed.
 		"bytesSealed": true,
 	});
-	let resp = forward_member(&env, member_id, "POST", format!("uploads/{upload_id}/complete"), Some(body), &actor).await?;
+	let resp = forward_member(&env, member_id, "POST", format!("uploads/{upload_id}/complete"), Some(body), &actor.email).await?;
 	if resp.status_code() >= 400 {
-		// Refused (a 409 conflict, say) — abort the parts so nothing lingers.
-		let _ = s3::multipart_abort(&env, &meta.object_key, &meta.s3_upload_id).await;
+		// Refused (a 409 conflict, say). The upload is already complete, so
+		// the object itself goes — nothing lingers without a row.
+		let _ = s3::delete(&env, &meta.object_key).await;
 	}
 	Ok(resp)
 }
@@ -567,7 +674,7 @@ async fn upload_abort(env: &Env, identity: &Identity, member_id: &str, upload_id
 	if meta.s3_upload_id != "pending" {
 		let _ = s3::multipart_abort(&env, &meta.object_key, &meta.s3_upload_id).await;
 	}
-	forward_member(&env, member_id, "DELETE", format!("uploads/{upload_id}"), None, &actor).await
+	forward_member(&env, member_id, "DELETE", format!("uploads/{upload_id}"), None, &actor.email).await
 }
 
 struct UploadMeta {
@@ -607,19 +714,7 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 		Err(e) => return json_error(500, &e.to_string()),
 	};
 	let object_key = meta.get("objectKey").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-	let range: Option<(u64, u64)> = req
-		.headers()
-		.get("Range")?
-		.and_then(|r| {
-			let r = r.trim().strip_prefix("bytes=")?;
-			let mut it = r.split('-');
-			let start: u64 = it.next()?.parse().ok()?;
-			let end: u64 = it.next()?.parse().ok()?;
-			if end < start {
-				return None;
-			}
-			Some((start, end - start + 1))
-		});
+	let range = parse_range(&req.headers().get("Range")?.unwrap_or_default());
 	// The cache keys CHUNKED media by its frame span (docs/PRODUCTION.md ›
 	// Object caching): the media worker requests whole frames, so the span
 	// is the same bytes on every play — the deterministic half of the
@@ -643,7 +738,7 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 	if status != 200 && status != 206 {
 		return Response::error("Not Found", 404);
 	}
-	let mut headers = Headers::new();
+	let headers = Headers::new();
 	headers.set("Content-Type", "application/octet-stream")?;
 	headers.set("Accept-Ranges", "bytes")?;
 	if let Some(ck) = meta.get("ck").and_then(|x| x.as_str()) {
@@ -702,7 +797,7 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 	let do_call = |path: String, body: Option<serde_json::Value>| {
 		let stub = &stub;
 		async move {
-			let mut headers = Headers::new();
+			let headers = Headers::new();
 			headers.set("Content-Type", "application/json")?;
 			let request = Request::new_with_init(
 				&format!("https://do.internal/{path}"),
@@ -718,15 +813,35 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 	};
 	match segs.get(2) {
 		None => {
-			// Serve the self-contained recipient page. s.html lives outside
-			// /s/* (the asset server owns it), so this self-fetch cannot loop.
-			let origin = { let url = req.url()?; format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()) };
-			let page = Fetch::Url(Url::parse(&format!("{origin}/s.html")).map_err(|_| Error::RustError("page missing".into()))?).send().await?;
-			let mut page = page;
+			// Serve the recipient page from the ASSETS binding (wrangler.jsonc ›
+			// assets.binding) — an in-process read of the built s.html.
+			//
+			// Commit 24: this used to `fetch("<own origin>/s.html")` over the
+			// network. A Worker's subrequest to its own hostname is refused
+			// (workers.dev, wrangler dev's loopback) or loops back through the
+			// Worker, so /s/f/<id> answered a bare 500 and the share page was
+			// never served — the api suites only ever called /meta, /claim and
+			// /data, and the e2e never opened a link. The binding is the
+			// platform's own door to the static files.
+			let mut page = env.assets("ASSETS")?.fetch("https://assets.internal/s.html", None).await?;
+			if page.status_code() != 200 {
+				return http_text(500, "the share page is missing from this deployment").await;
+			}
 			let body = page.bytes().await?;
-			let mut headers = Headers::new();
+			let headers = Headers::new();
 			headers.set("Content-Type", "text/html; charset=utf-8")?;
 			headers.set("Cache-Control", "no-store")?;
+			// The page holds the link secret (in the fragment) while it runs:
+			// never framed by another site, never leaking its URL in a Referer,
+			// never MIME-sniffed — and since commit 24 a full script policy:
+			// its code is /s.js + the vendored Argon2id (WebAssembly, hence
+			// 'wasm-unsafe-eval'), nothing inline, and Trusted Types with NO
+			// policy at all ('none'): the page writes the DOM only through
+			// textContent/classList, so no string can ever become markup.
+			// Kept in step with the /s.html rule in web/public/_headers.
+			headers.set("Content-Security-Policy", SHARE_PAGE_CSP)?;
+			headers.set("Referrer-Policy", "no-referrer")?;
+			headers.set("X-Content-Type-Options", "nosniff")?;
 			Ok(Response::from_bytes(body)?.with_headers(headers))
 		}
 		Some(&"meta") => {
@@ -755,9 +870,9 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 			let object = v.get("objectKey").and_then(|x| x.as_str()).unwrap_or_default().to_string();
 			let range_header = req.headers().get("Range")?.unwrap_or_default();
 			let range = parse_range(&range_header);
-			let mut s3_resp = s3::fetch_stream(&env, "GET", &object, range, &[], None).await?;
+			let s3_resp = s3::fetch_stream(&env, "GET", &object, range, &[], None).await?;
 			let mut s3_resp = s3_resp;
-			let mut headers = Headers::new();
+			let headers = Headers::new();
 			headers.set("Content-Type", "application/octet-stream")?;
 			headers.set("Accept-Ranges", "bytes")?;
 			if let Some(len) = s3_resp.headers().get("Content-Length")? {
@@ -775,47 +890,86 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 }
 
 
-/// Range header → (start, end) for the S3 fetch (the plaintext is sealed
-/// ciphertext; the recipient's ranges pass through verbatim).
+/// `Range: bytes=a-b` → `(offset, length)` — the shape `s3::fetch_stream`
+/// and the cache take. One parser for every route.
+///
+/// (Security review, commit 23: there used to be two parsers. The file
+/// route's returned `(start, length)`; the public share route's returned
+/// `(start, END)` into the same `(offset, length)` slot — so `bytes=2-9`
+/// on a share link fetched bytes 2..=10 and `bytes=0-N` one byte short.
+/// The share test only checked `bytes=0-…` and the 206 status, which is
+/// why it survived. Two copies of a parser are two chances to be wrong.)
+///
+/// Only the closed form `a-b` is honoured; suffix (`-n`) and open (`a-`)
+/// ranges and multi-range lists fall back to a whole read — correct, if
+/// less efficient, and the media worker always sends `a-b`.
 fn parse_range(header: &str) -> Option<(u64, u64)> {
 	let r = header.trim().strip_prefix("bytes=")?;
-	let mut it = r.split('-');
-	let start: u64 = it.next()?.parse().ok()?;
-	let end: u64 = it.next()?.parse().ok()?;
-	if end < start {
-		return None;
-	}
-	Some((start, end))
+	let (a, b) = r.split_once('-')?;
+	let start: u64 = a.parse().ok()?;
+	let end: u64 = b.parse().ok()?;
+	(end >= start).then(|| (start, end - start + 1))
 }
 
 async fn http_text(status: u16, text: &str) -> Result<Response> {
-	let mut h = Headers::new();
+	let h = Headers::new();
 	h.set("Content-Type", "text/plain; charset=utf-8")?;
 	let mut r = Response::from_bytes(text.as_bytes().to_vec())?;
 	r = r.with_status(status).with_headers(h);
 	Ok(r)
 }
 
+/// The share recipient page's CSP (also in web/public/_headers › /s.html).
+const SHARE_PAGE_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
+
 // ── Share plumbing (the Worker's half; the DO owns rows) ───────────────────
 
 const SHARE_CHUNK: u64 = 8 * 1024 * 1024; // GC1 frames, one per part
 
+/// Create a share. The ORDER is the security property (review, commit 23):
+///
+/// 1. validate the client-minted id (it becomes `shares/<id>` — ONE object
+///    namespace for the whole deployment, not per member);
+/// 2. **claim** the id in the registry's share index — write-once, so a
+///    second claim (another member's, or a replay of our own) is a 409
+///    before any S3 call happens;
+/// 3. only then open the multipart upload and write the member's row;
+///    if either fails, the claim is released so the id is not burned.
+///
+/// The old order was multipart → row → index `INSERT OR REPLACE`: a member
+/// who had seen someone's link could mint a share with the same id,
+/// re-point the public route to their own DO, and complete an upload over
+/// the original sealed copy.
 async fn share_create(env: &Env, member_id: &str, actor: String, mut body: serde_json::Value) -> Result<Response> {
+	let Some(id) = body.get("id").and_then(|v| v.as_str()).map(str::to_string) else { return json_error(400, "id required") };
+	// (The same shape rule the member DO and s.html apply: 22+ base64url.)
+	if !(22..=64).contains(&id.len()) || !auth::valid_object_id(&id) {
+		return json_error(400, "share id shape");
+	}
 	let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
 	let frames = gorani_formats::chunked::frame_count(size, SHARE_CHUNK);
-	let object_key = format!("shares/{}", body.get("id").and_then(|v| v.as_str()).unwrap_or_default());
-	let s3_upload_id = s3::multipart_init(env, &object_key).await?;
+	let claim = forward_family(env, "internal", "POST", "shares-index", Some(serde_json::json!({ "id": id, "memberId": member_id }))).await?;
+	if claim.status_code() >= 400 {
+		return Ok(claim);
+	}
+	let object_key = format!("shares/{id}");
+	let release = || async {
+		let _ = do_request(&env.durable_object("FAMILY")?.id_from_name("family")?.get_stub()?, "DELETE", format!("shares-index/{id}"), None, Some("internal"), Some(member_id)).await;
+		Ok::<(), Error>(())
+	};
+	let s3_upload_id = match s3::multipart_init(env, &object_key).await {
+		Ok(u) => u,
+		Err(e) => {
+			release().await?;
+			return Err(e);
+		}
+	};
 	body["s3UploadId"] = serde_json::json!(s3_upload_id);
 	let resp = forward_member(env, member_id, "POST", "files/shares", Some(body), actor).await?;
 	if resp.status_code() >= 400 {
 		let _ = s3::multipart_abort(env, &object_key, &s3_upload_id).await;
+		release().await?;
 		return Ok(resp);
-	}
-	// The public /s/f/:id routes resolve the owner through the registry's
-	// share index (the share id alone must find its member DO).
-	let index = forward_family(env, "internal", "POST", "shares-index", Some(serde_json::json!({ "id": object_key.trim_start_matches("shares/"), "memberId": member_id }))).await?;
-	if index.status_code() >= 400 {
-		return Ok(index);
 	}
 	Response::from_json(&serde_json::json!({ "parts": frames }))
 }
@@ -829,8 +983,8 @@ async fn share_part(mut req: Request, env: Env, identity: &Identity, member_id: 
 		Ok(m) => m,
 		Err(resp) => return Ok(resp),
 	};
+	let Some(n) = part_number(part) else { return json_error(400, "part numbers are 1–10000") };
 	let bytes = req.bytes().await?;
-	let n: u32 = part.parse().map_err(|_| Error::RustError("bad part number".into()))?;
 	let etag = s3::multipart_part(&env, &meta.object_key, &meta.s3_upload_id, n, bytes.to_vec()).await?;
 	Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
 }
@@ -850,8 +1004,16 @@ async fn share_complete(mut req: Request, env: Env, identity: &Identity, member_
 		.and_then(|p| serde_json::from_value(p.clone()).ok())
 		.unwrap_or_default();
 	s3::multipart_complete(&env, &meta.object_key, &meta.s3_upload_id, &parts).await?;
-	let size = body.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
-	forward_member(&env, member_id, "POST", &format!("shares/{share}/complete"), Some(serde_json::json!({ "size": size })), &actor).await
+	// The same "must add up" rule as file uploads (review, commit 23): the
+	// share was marked ready with whatever size the body claimed, and the
+	// recipient's page trusts that size to know where the final frame is.
+	let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+	let actual = s3::head(&env, &meta.object_key).await?.map(|h| h.size);
+	if actual != Some(gorani_formats::chunked::sealed_size(size, SHARE_CHUNK)) {
+		let _ = s3::delete(&env, &meta.object_key).await;
+		return json_error(400, "the share copy does not add up to its declared size");
+	}
+	forward_member(&env, member_id, "POST", &format!("shares/{share}/complete"), Some(serde_json::json!({ "size": size })), &actor.email).await
 }
 
 async fn share_revoke(env: &Env, identity: &Identity, member_id: &str, share: &str) -> Result<Response> {
@@ -863,7 +1025,7 @@ async fn share_revoke(env: &Env, identity: &Identity, member_id: &str, share: &s
 		Ok(m) => m,
 		Err(resp) => return Ok(resp),
 	};
-	let resp = forward_member(&env, member_id, "DELETE", &format!("shares/{share}"), None, &actor).await?;
+	let resp = forward_member(&env, member_id, "DELETE", &format!("shares/{share}"), None, &actor.email).await?;
 	if resp.status_code() < 400 {
 		let _ = s3::delete(env, &meta.object_key).await;
 	}
@@ -900,39 +1062,67 @@ async fn backup_download(env: &Env, identity: &Identity, member_id: &str, stamp:
 	if !stamp.chars().all(|c| c.is_ascii_hexdigit()) {
 		return json_error(400, "bad backup stamp");
 	}
-	let resp = forward_member(env, member_id, "GET", &format!("backups/{stamp}"), None, "internal").await;
-	match resp {
-		Ok(r) if r.status_code() >= 400 => Ok(r),
-		Ok(_) => {
-			let bytes = crate::s3::get(env, &format!("backups/{stamp}.gbak")).await?;
-			match bytes {
-				Some(b) => {
-					let mut headers = Headers::new();
-					headers.set("Content-Type", "application/octet-stream")?;
-					headers.set("Content-Disposition", &format!("attachment; filename=\"gorani-{stamp}.gbak\""))?;
-					Ok(Response::from_bytes(b)?.with_headers(headers))
-				}
-				None => json_error(404, "backup object missing"),
-			}
-		}
-		Err(e) => json_error(500, &e.to_string()),
+	// The DO answers from its manifest only (is this stamp ours?); the
+	// bytes STREAM from storage straight to the caller. Before commit 23 the
+	// DO downloaded the whole .gbak into memory, the router threw that copy
+	// away and downloaded it again into memory — two full buffers of the
+	// largest object in the system, inside a 128 MB isolate — and the read
+	// also landed in the edge cache, where a pruned backup outlived its
+	// retention by the cache's 30-day TTL.
+	let manifest = forward_member(env, member_id, "GET", &format!("backups/{stamp}"), None, "internal").await?;
+	if manifest.status_code() >= 400 {
+		return Ok(manifest);
 	}
+	let mut origin = s3::stream_uncached(env, &format!("backups/{stamp}.gbak")).await?;
+	if origin.status_code() != 200 {
+		return json_error(404, "backup object missing");
+	}
+	let headers = Headers::new();
+	headers.set("Content-Type", "application/octet-stream")?;
+	headers.set("Content-Disposition", &format!("attachment; filename=\"gorani-{stamp}.gbak\""))?;
+	headers.set("Cache-Control", "no-store")?;
+	if let Some(len) = origin.headers().get("Content-Length")? {
+		headers.set("Content-Length", &len)?;
+	}
+	Ok(Response::from_stream(origin.stream()?)?.with_headers(headers))
 }
 
 /// Fill a restored version's object: the client PUTs the SEALED bytes it
-/// decrypted from the backup; the key must be a member-scoped files key.
+/// decrypted from the backup, to a key the restore call minted.
+///
+/// Three gates, each closing a hole the review found (commit 23):
+///
+/// 1. **Shape** — exactly `files/<this member>/<file id>/r-<id>`. The old
+///    check was `starts_with("files/<member>/")`, which admitted every LIVE
+///    object (`…/v-<uuid>`): a member — or any parent — could overwrite a
+///    file's bytes in place, bypassing versions and the Trash, and (the
+///    object keys being version-unique by design) the edge cache would go
+///    on serving the old bytes while storage held new ones.
+/// 2. **Minted** — the member DO must hold a version row pointing at this
+///    exact key, i.e. the restore really created it.
+/// 3. **Write-once** — an object that already exists is never replaced.
 async fn backup_object_fill(mut req: Request, env: Env, identity: &Identity, member_id: &str) -> Result<Response> {
-	match member_ctx(&env, identity, member_id).await {
-		Ok(_) => {}
-		Err(resp) => return Ok(resp),
+	if let Err(resp) = member_ctx(&env, identity, member_id).await {
+		return Ok(resp);
 	}
 	let url = req.url()?;
 	let raw = crate::files_store::urlquery(url.query().unwrap_or("")).get("k").cloned().unwrap_or_default();
-	let key = raw.replace("%2F", "/").replace("%20", " "); // (the client percent-encodes the path separators)
-	if !key.starts_with(&format!("files/{member_id}/")) || key.contains("..") {
-		return json_error(400, "object key must be a member files key");
+	// (encodeURIComponent of a key in our alphabet only ever escapes '/'.)
+	let key = raw.replace("%2F", "/").replace("%2f", "/");
+	let parts: Vec<&str> = key.split('/').collect();
+	let minted_shape = matches!(parts.as_slice(), ["files", m, file, obj]
+		if *m == member_id && auth::valid_object_id(file) && obj.strip_prefix("r-").is_some_and(auth::valid_object_id));
+	if !minted_shape {
+		return json_error(403, "only objects a restore minted (files/<member>/<file>/r-…) can be filled");
+	}
+	let known = forward_member(&env, member_id, "GET", format!("restore-target/{}/{}", parts[2], parts[3]), None, "internal").await?;
+	if known.status_code() != 200 {
+		return json_error(403, "no restored version points at that key");
+	}
+	if s3::head(&env, &key).await?.is_some() {
+		return json_error(409, "that restored object is already filled (write-once)");
 	}
 	let bytes = req.bytes().await?;
-	crate::s3::put(&env, &key, bytes.to_vec()).await?;
+	s3::put(&env, &key, bytes.to_vec()).await?;
 	Response::from_json(&serde_json::json!({ "ok": true }))
 }

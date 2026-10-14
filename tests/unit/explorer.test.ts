@@ -57,11 +57,11 @@ const server = {
 			};
 		}
 		if (p.endsWith("/files/secrets")) return { sealed: secretsSealed };
-		if (p.endsWith("/files/keys")) {
-			const out: Record<string, unknown> = {};
-			for (const [id, v] of versions) out[id] = { key: v.ck, chunk: v.chunk, type: v.type, version: rows.get(id)?.version ?? 1, size: rows.get(id)?.size ?? 0 };
-			return { keys: out };
-		}
+		// (No GET /files/keys here on purpose: the real worker routes a GET of
+		// that path to "download the file whose id is `keys`" → 404. This fake
+		// once answered the GET, and the app shipped calling it — a mock of the
+		// tested layer that agreed with the bug. The fake mirrors the real
+		// contract now: POST with { ids }, see send() below.)
 		if (p.endsWith("/files/match")) {
 			const size = url.searchParams.get("size");
 			return { files: [...rows.values()].filter((r) => String(r.size) === size && !r.trashedWith).map((r) => ({ id: r.id, tag: tags.get(r.id) ?? null })) };
@@ -74,6 +74,17 @@ const server = {
 	},
 	send(method: string, path: string, body?: { settings?: unknown; sealed?: string; ids?: string[]; files?: string[]; folders?: string[]; name?: string; parentId?: string | null; folderId?: string | null }): unknown {
 		const p = new URL(path, "http://x").pathname;
+		if (p.endsWith("/files/keys")) {
+			// The real contract (worker/src/routes.rs): POST, ids in the body,
+			// only the asked-for ids answered.
+			assert.equal(method, "POST", "files/keys is a POST route");
+			const out: Record<string, unknown> = {};
+			for (const id of body?.ids ?? []) {
+				const v = versions.get(id);
+				if (v) out[id] = { key: v.ck, chunk: v.chunk, type: v.type, version: rows.get(id)?.version ?? 1, size: rows.get(id)?.size ?? 0 };
+			}
+			return { keys: out };
+		}
 		if (p.endsWith("/files/secrets") && method === "PUT") {
 			secretsSealed = body!.sealed as string;
 			return { ok: true };

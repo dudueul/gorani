@@ -3,7 +3,7 @@
 // project; see NOTICE.
 
 //! The S3 transport: gorani-s3's signatures (pure, tested) driven through
-//! the Workers runtime's fetch. Six object operations and multipart — the
+//! the Workers runtime's fetch. Five object operations and multipart — the
 //! entire surface the file store needs; anything fancier belongs in an SDK,
 //! not in a security-sensitive worker.
 //!
@@ -16,16 +16,15 @@
 //! sidecars, backup segments); the bucket is private and its keys are
 //! Worker secrets. Nothing here inspects content beyond sizes and statuses.
 
-use gorani_s3::{complete_multipart_body, sign_request, xml_unescape, xml_val, S3Config, SignedRequest};
+use gorani_s3::{complete_multipart_body, sign_request, xml_val, S3Config, SignedRequest};
 use worker::*;
 
 use crate::cache;
 
-/// A HEAD result: size and etag (the store keeps etags for upload parts).
+/// A HEAD result: the size (what the "must add up" checks compare).
 #[derive(Debug, Clone)]
 pub struct HeadInfo {
 	pub size: u64,
-	pub etag: String,
 }
 
 /// The R2 binding name (wrangler.jsonc › `r2_buckets`). **Storage priority**:
@@ -53,8 +52,20 @@ pub fn config(env: &Env) -> Result<S3Config> {
 	let secret = |name: &str| -> Result<String> {
 		env.secret(name).map(|v| v.to_string()).or_else(|_| var(name))
 	};
+	let endpoint = var("S3_ENDPOINT")?.trim_end_matches('/').to_string();
+	// TLS is part of the signing contract, not an option (security review,
+	// commit 23). The signer uses UNSIGNED-PAYLOAD — the body is NOT covered
+	// by the signature, only by the transport — so over plain http anyone
+	// on the path could swap ciphertext in flight, and would see every
+	// object key and access-key id. `wrangler dev` against the local stub
+	// (GORANI_DEV=1, never set in production — auth.rs) is the one place a
+	// plain-http endpoint is allowed.
+	let dev = env.var("GORANI_DEV").map(|v| v.to_string() == "1").unwrap_or(false);
+	if !endpoint.starts_with("https://") && !(dev && endpoint.starts_with("http://")) {
+		return Err(Error::RustError("S3_ENDPOINT must be an https:// URL".into()));
+	}
 	Ok(S3Config {
-		endpoint: var("S3_ENDPOINT")?.trim_end_matches('/').to_string(),
+		endpoint,
 		region: var("S3_REGION")?,
 		bucket: var("S3_BUCKET")?,
 		access_key: secret("S3_ACCESS_KEY_ID")?,
@@ -102,30 +113,13 @@ async fn fetch_signed(cfg: &S3Config, method: &str, object_key: &str, query_pair
 
 // ── Object operations ───────────────────────────────────────────────
 
-/// Full GET; None on 404. Whole-object entries are cached like the
-/// streaming reads — the caller asked for bytes anyway, so the cached copy
-/// costs one clone at put time.
+/// Full GET into memory; None on 404. **Uncached on purpose** (commit 23):
+/// its only caller is the backup job, which reads EVERY object of a member
+/// once — caching that walk filled the edge with the whole vault and cost
+/// a full extra copy of each object in worker memory (the clone handed to
+/// `cache.put`). Interactive reads go through [`fetch_stream`], which is
+/// the path the cache was designed for.
 pub async fn get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
-	let cache = Cache::default();
-	let url = cache::url(key, None);
-	if let Some(mut hit) = cache.get(&cache::request_of(&url, None)?, false).await? {
-		// (cache-served headers are immutable — the bytes path has no
-		// response headers of its own to mark anyway)
-		return Ok(Some(hit.bytes().await?));
-	}
-	let bytes = origin_get(env, key).await?;
-	if let Some(b) = &bytes {
-		if (b.len() as u64) <= cache::max_bytes(env) {
-			let mut entry = Response::from_bytes(b.clone())?;
-			entry.headers_mut().set("Cache-Control", &format!("public, max-age={}, immutable", cache::max_age(env)))?;
-			entry.headers_mut().set("Content-Type", "application/octet-stream")?;
-			let _ = cache.put(&url, entry).await;
-		}
-	}
-	Ok(bytes)
-}
-
-async fn origin_get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
 	if let Some(bucket) = r2_bucket(env).await? {
 		return match bucket.get(key).execute().await? {
 			Some(o) => match o.body() {
@@ -142,27 +136,6 @@ async fn origin_get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
 		404 => Ok(None),
 		s => Err(Error::RustError(format!("S3 get {key}: HTTP {s}"))),
 	}
-}
-
-/// Ranged read — S3 answers 206; a server may answer 200 when the range
-/// covers the whole object, which is equally fine for a full read.
-pub async fn read_range(env: &Env, key: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
-	if let Some(bucket) = r2_bucket(env).await? {
-		return match bucket.get(key).range(Range::OffsetWithLength { offset, length }).execute().await? {
-			Some(o) => match o.body() {
-				Some(b) => b.bytes().await,
-				None => Err(Error::RustError(format!("R2 range read {key}: no body"))),
-			},
-			None => Err(Error::RustError(format!("R2 range read {key}: missing"))),
-		};
-	}
-	let cfg = config(env)?;
-	let mut resp = fetch_signed(&cfg, "GET", key, &[], Some((offset, length)), None, None).await?;
-	let status = resp.status_code();
-	if status != 206 && status != 200 {
-		return Err(Error::RustError(format!("S3 range read {key}: HTTP {status}")));
-	}
-	resp.bytes().await
 }
 
 /// Full GET as a **streamable** Response (the file route pipes the body
@@ -220,6 +193,14 @@ pub async fn fetch_stream(env: &Env, method: &str, key: &str, range: Option<(u64
 	}
 }
 
+/// A whole-object read that streams and never touches the edge cache — for
+/// objects whose lifetime the cache must not extend (backups: pruned after
+/// seven runs, they would otherwise live on at the edge for the TTL).
+/// A 404 comes back as a 404 response.
+pub async fn stream_uncached(env: &Env, key: &str) -> Result<Response> {
+	origin_stream(env, key, None, &[]).await
+}
+
 /// The uncached origin read: the R2 binding when bound, the signed S3
 /// transport otherwise.
 async fn origin_stream(env: &Env, key: &str, range: Option<(u64, u64)>, query_pairs: &[(String, String)]) -> Result<Response> {
@@ -256,15 +237,12 @@ async fn origin_stream(env: &Env, key: &str, range: Option<(u64, u64)>, query_pa
 /// Size + etag via HEAD. None on 404.
 pub async fn head(env: &Env, key: &str) -> Result<Option<HeadInfo>> {
 	if let Some(bucket) = r2_bucket(env).await? {
-		return Ok(bucket.head(key).await?.map(|o| HeadInfo { size: o.size(), etag: o.etag() }));
+		return Ok(bucket.head(key).await?.map(|o| HeadInfo { size: o.size() }));
 	}
 	let cfg = config(env)?;
 	let resp = fetch_signed(&cfg, "HEAD", key, &[], None, None, None).await?;
 	match resp.status_code() {
-		200 => Ok(Some(HeadInfo {
-			size: resp.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
-			etag: resp.headers().get("ETag")?.unwrap_or_default(),
-		})),
+		200 => Ok(Some(HeadInfo { size: resp.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) })),
 		404 => Ok(None),
 		s => Err(Error::RustError(format!("S3 head {key}: HTTP {s}"))),
 	}
@@ -353,8 +331,11 @@ pub async fn multipart_complete(env: &Env, key: &str, upload_id: &str, parts: &[
 	let mut resp = fetch_signed(&cfg, "POST", key, &q, None, Some(complete_multipart_body(parts)), Some("application/xml")).await?;
 	let status = resp.status_code();
 	let text = resp.text().await?;
-	if status != 200 {
-		return Err(Error::RustError(format!("S3 multipart complete: HTTP {status} {text}")));
+	// S3's documented trap: CompleteMultipartUpload can answer **200 with an
+	// `<Error>` body** (the status is sent before the server finishes
+	// assembling). A 200 alone is not success.
+	if status != 200 || xml_val(&text, "Code").is_some() {
+		return Err(Error::RustError(format!("S3 multipart complete: HTTP {status} {}", xml_val(&text, "Code").unwrap_or_default())));
 	}
 	Ok(())
 }
@@ -373,54 +354,4 @@ pub async fn multipart_abort(env: &Env, key: &str, upload_id: &str) -> Result<()
 		204 | 404 => Ok(()),
 		s => Err(Error::RustError(format!("S3 multipart abort: HTTP {s}"))),
 	}
-}
-
-// ── Listing (the daily housekeeping: expired shares, stale uploads) ──
-
-/// One listed object: key and size.
-#[derive(Debug, Clone)]
-pub struct Listed {
-	pub key: String,
-	pub size: u64,
-}
-
-/// ListObjectsV2 under a prefix, one page (up to `max_keys`, ≤ 1000).
-/// Returns the objects and the continuation token, if any. Keys come back
-/// XML-escaped and percent-relevant; they are unescaped here and the caller
-/// treats them as the exact stored keys.
-pub async fn list_page(env: &Env, prefix: &str, continuation: Option<&str>, max_keys: u32) -> Result<(Vec<Listed>, Option<String>)> {
-	if let Some(bucket) = r2_bucket(env).await? {
-		let mut list = bucket.list().prefix(prefix.to_string()).limit(max_keys);
-		if let Some(c) = continuation {
-			list = list.cursor(c.to_string());
-		}
-		let page = list.execute().await?;
-		let objects = page.objects().into_iter().map(|o| Listed { key: o.key(), size: o.size() }).collect();
-		return Ok((objects, if page.truncated() { page.cursor() } else { None }));
-	}
-	let cfg = config(env)?;
-	let mut q = vec![
-		("list-type".to_string(), "2".to_string()),
-		("max-keys".to_string(), max_keys.to_string()),
-		("prefix".to_string(), prefix.to_string()),
-	];
-	if let Some(c) = continuation {
-		q.push(("continuation-token".to_string(), c.to_string()));
-	}
-	let mut resp = fetch_signed(&cfg, "GET", "", &q, None, None, None).await?;
-	let status = resp.status_code();
-	let body = resp.text().await?;
-	if status != 200 {
-		return Err(Error::RustError(format!("S3 list: HTTP {status} {body}")));
-	}
-	let keys: Vec<String> = gorani_s3::xml_vals(&body, "Key").into_iter().map(|k| xml_unescape(&k)).collect();
-	let sizes: Vec<String> = gorani_s3::xml_vals(&body, "Size");
-	let objects = keys
-		.into_iter()
-		.enumerate()
-		.map(|(i, key)| Listed { key, size: sizes.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) })
-		.collect();
-	let truncated = xml_val(&body, "IsTruncated").as_deref() == Some("true");
-	let next = if truncated { xml_val(&body, "NextContinuationToken") } else { None };
-	Ok((objects, next))
 }

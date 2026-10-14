@@ -104,8 +104,31 @@ impl GoraniFamilyDO {
 		let path = req.path().trim_start_matches('/').to_string();
 		let actor = req.headers().get("x-gorani-actor")?.unwrap_or_default();
 		match (req.method().to_string().as_str(), path.as_str()) {
-			("GET", "state") => self.state().await,
-			("GET", "actor") => self.actor(&actor).await,
+			// The registry lists every member's Access emails and the last 100
+			// audit lines. Authentication (Access) only proves *someone* signed
+			// in; the registry is for members. Before the first member exists
+			// there is nothing to protect and the bootstrap screen needs the
+			// (empty) answer, so an empty registry stays readable.
+			("GET", "state") => {
+				if self.active_count()? > 0 && self.actor_row(&actor)?.is_none() {
+					return json_error(403, "not a family member");
+				}
+				self.state().await
+			}
+			("GET", "actor") => {
+				let target = req.headers().get("x-gorani-target")?;
+				self.actor(&actor, target.as_deref()).await
+			}
+			// The system's own view (the nightly cron): active member ids only.
+			// Internal — routes.rs maps no public path here.
+			("GET", "member-ids") => {
+				let rows: Vec<IdRow> = self.sql.exec("SELECT id FROM members WHERE active = 1 ORDER BY id", None)?.to_array()?;
+				Ok(Response::from_json(&serde_json::json!({ "ids": rows.into_iter().map(|r| r.id).collect::<Vec<_>>() }))?)
+			}
+			("GET", id) if id.starts_with("member-exists/") => {
+				let exists = self.member_row(&id["member-exists/".len()..])?.is_some();
+				Ok(Response::from_json(&serde_json::json!({ "exists": exists }))?)
+			}
 			("POST", "members") => {
 				let body = req.json::<NewMember>().await?;
 				self.create_member(&actor, body).await
@@ -125,6 +148,10 @@ impl GoraniFamilyDO {
 				let body = req.json::<ShareIndexPut>().await?;
 				self.share_index_put(body).await
 			}
+			("DELETE", id) if id.starts_with("shares-index/") => {
+				let member = req.headers().get("x-gorani-member")?.unwrap_or_default();
+				self.share_index_release(&id["shares-index/".len()..], &member).await
+			}
 			("GET", id) if id.starts_with("share-owner/") => self.share_owner(&id["share-owner/".len()..]).await,
 			_ => Response::error("Not Found", 404),
 		}
@@ -133,19 +160,55 @@ impl GoraniFamilyDO {
 	/// Which member (if any) an Access email belongs to, and its role — the
 	/// Worker resolves every member-scoped request through this. A child may
 	/// act only for themselves; a parent for anyone (routes.rs enforces).
-	async fn actor(&self, email: &str) -> Result<Response> {
+	///
+	/// With `x-gorani-target`, the same answer also says whether the member
+	/// being *addressed* exists and is active — so the route can refuse a
+	/// URL naming a member the registry never had (which would otherwise
+	/// conjure an empty `member:<id>` Durable Object on first touch) in the
+	/// same round trip, not a second one.
+	async fn actor(&self, email: &str, target: Option<&str>) -> Result<Response> {
+		let Some(row) = self.actor_row(email)? else { return Ok(Response::from_json(&serde_json::Value::Null)?) };
+		let mut out = serde_json::json!({ "id": row.id, "role": row.role });
+		if let Some(t) = target {
+			out["target"] = match self.member_row(t)? {
+				Some(m) => serde_json::json!({ "exists": true, "active": m.active != 0 }),
+				None => serde_json::json!({ "exists": false, "active": false }),
+			};
+		}
+		Ok(Response::from_json(&out)?)
+	}
+
+	/// The active member row an Access email maps to (emails compare
+	/// case-insensitively, as Access issues them).
+	fn actor_row(&self, email: &str) -> Result<Option<EmailRoleRow>> {
 		if email.is_empty() {
-			return Ok(Response::from_json(&serde_json::Value::Null)?);
+			return Ok(None);
 		}
 		let rows: Vec<EmailRoleRow> = self.sql.exec("SELECT id, role, emails FROM members WHERE active = 1", None)?.to_array()?;
-		for r in rows {
-			if let Ok(list) = serde_json::from_str::<Vec<String>>(&r.emails) {
-				if list.iter().any(|e| e.eq_ignore_ascii_case(email)) {
-					return Ok(Response::from_json(&serde_json::json!({ "id": r.id, "role": r.role }))?);
-				}
+		Ok(rows.into_iter().find(|r| serde_json::from_str::<Vec<String>>(&r.emails).map(|list| list.iter().any(|e| e.eq_ignore_ascii_case(email))).unwrap_or(false)))
+	}
+
+	fn member_row(&self, id: &str) -> Result<Option<ActiveRow>> {
+		Ok(self.sql.exec("SELECT active FROM members WHERE id = ?1", Some(vec![id.into()]))?.to_array::<ActiveRow>()?.into_iter().next())
+	}
+
+	fn active_count(&self) -> Result<i64> {
+		Ok(self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE active = 1", None)?.one::<Count>()?.n)
+	}
+
+	/// An email may map to exactly one member. Two rows sharing an email
+	/// would make "who is this caller?" depend on row order — a parent's
+	/// identity resolving to a child's row, or worse, the reverse. `except`
+	/// is the member being edited (its own emails don't conflict with it).
+	fn email_taken(&self, emails: &[String], except: Option<&str>) -> Result<Option<String>> {
+		let rows: Vec<EmailRoleRow> = self.sql.exec("SELECT id, role, emails FROM members", None)?.to_array()?;
+		for r in rows.iter().filter(|r| Some(r.id.as_str()) != except) {
+			let list: Vec<String> = serde_json::from_str(&r.emails).unwrap_or_default();
+			if let Some(e) = emails.iter().find(|e| list.iter().any(|x| x.eq_ignore_ascii_case(e))) {
+				return Ok(Some(e.clone()));
 			}
 		}
-		Ok(Response::from_json(&serde_json::Value::Null)?)
+		Ok(None)
 	}
 
 	async fn state(&self) -> Result<Response> {
@@ -182,6 +245,9 @@ impl GoraniFamilyDO {
 		if has_members && !self.is_parent(actor).await? {
 			return json_error(403, "only a parent may add members");
 		}
+		if let Some(e) = self.email_taken(&body.emails, None)? {
+			return json_error(409, &format!("{e} already belongs to another member"));
+		}
 		let emails = serde_json::to_string(&body.emails).unwrap_or_else(|_| "[]".into());
 		if let Err(e) = self.sql.exec(
 			"INSERT INTO members (id, name, role, emails, active, created_at) VALUES (?1, ?2, ?3, ?4, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
@@ -197,6 +263,14 @@ impl GoraniFamilyDO {
 		if !self.is_parent(actor).await? {
 			return json_error(403, "only a parent may change members");
 		}
+		if self.member_row(id)?.is_none() {
+			return json_error(404, "no such member");
+		}
+		if let Some(emails) = &body.emails {
+			if let Some(e) = self.email_taken(emails, Some(id))? {
+				return json_error(409, &format!("{e} already belongs to another member"));
+			}
+		}
 		if let Some(name) = &body.name {
 			self.sql.exec("UPDATE members SET name = ?1 WHERE id = ?2", Some(vec![name.clone().into(), id.into()]))?;
 		}
@@ -211,7 +285,9 @@ impl GoraniFamilyDO {
 		if !self.is_parent(actor).await? {
 			return json_error(403, "only a parent may deactivate members");
 		}
-		let row = self.sql.exec("SELECT role FROM members WHERE id = ?1", Some(vec![id.into()]))?.one::<RoleRow>()?;
+		let Some(row) = self.sql.exec("SELECT role FROM members WHERE id = ?1", Some(vec![id.into()]))?.to_array::<RoleRow>()?.into_iter().next() else {
+			return json_error(404, "no such member");
+		};
 		if row.role == "parent" {
 			let parents = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE role = 'parent' AND active = 1", None)?.one::<Count>()?.n;
 			if parents <= 1 {
@@ -247,16 +323,35 @@ impl GoraniFamilyDO {
 		self.state().await
 	}
 
-	/// Index a share id → its owner member (called by the route at create
-	/// time; the public /s/f/:id routes resolve through this).
+	/// Claim a share id for its owner member — the FIRST step of creating a
+	/// share (routes.rs › share_create), before any S3 call. The public
+	/// /s/f/:id routes resolve the owner through this index.
+	///
+	/// Write-once on purpose (security review, commit 23). This used to be
+	/// `INSERT OR REPLACE`, and share ids are chosen by the client: any
+	/// member who had seen a link (the id is in its URL) could create a
+	/// share with the same id, re-point the public link to their own DO,
+	/// and — because the copy object is `shares/<id>`, one namespace for the
+	/// whole deployment — complete a multipart upload over the original
+	/// owner's sealed copy. A 409 here stops both at the door.
 	async fn share_index_put(&self, body: ShareIndexPut) -> Result<Response> {
-		self.sql
+		let inserted = self
+			.sql
 			.exec(
-				"INSERT OR REPLACE INTO share_index (id, member_id) VALUES (?1, ?2)",
+				"INSERT INTO share_index (id, member_id) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
 				Some(vec![body.id.into(), body.member_id.into()]),
-			)
-			.map(|_| ())
-			.map_err(Error::from)?;
+			)?
+			.rows_written();
+		if inserted == 0 {
+			return json_error(409, "that share id is taken");
+		}
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	/// Undo a claim whose share never came to exist (the S3 init or the
+	/// member DO refused). Only the claiming member's row is removed.
+	async fn share_index_release(&self, id: &str, member: &str) -> Result<Response> {
+		self.sql.exec("DELETE FROM share_index WHERE id = ?1 AND member_id = ?2", Some(vec![id.into(), member.into()]))?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
 	}
 
@@ -336,6 +431,14 @@ struct ShareIndexPut {
 #[derive(serde::Deserialize)]
 struct OwnerRow {
 	member_id: String,
+}
+#[derive(serde::Deserialize)]
+struct IdRow {
+	id: String,
+}
+#[derive(serde::Deserialize)]
+struct ActiveRow {
+	active: i64,
 }
 #[derive(serde::Deserialize)]
 struct EmailRoleRow {

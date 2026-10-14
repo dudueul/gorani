@@ -1,0 +1,15 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The share recipient page's stylesheet (web/s.html). Same Tailwind build
+   and palette as the app; a separate entry so the public page never loads
+   the app's code. */
+
+@import "tailwindcss";
+
+@theme {
+	--color-accent: oklch(0.72 0.17 145); /* gorani green — as in global.css */
+}
+
+body {
+	font-family: system-ui, sans-serif;
+}

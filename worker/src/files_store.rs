@@ -18,7 +18,6 @@
 
 use rand_core::{OsRng, RngCore};
 use base64::Engine;
-use serde::Deserialize;
 use worker::{Error, Request, Response, Result};
 
 use crate::family::json_error;
@@ -39,27 +38,6 @@ pub(crate) fn bind(v: Option<String>) -> worker::SqlStorageValue {
 		Some(s) => worker::SqlStorageValue::String(s),
 		None => worker::SqlStorageValue::Null,
 	}
-}
-
-/// A file row as lists return it (no keys — keys come in batches, docs/APPS.md).
-#[derive(serde::Serialize)]
-struct FileListRow {
-	id: String,
-	folder: Option<String>,
-	name: String,
-	size: i64,
-	version: i64,
-	created_at: String,
-	updated_at: String,
-}
-
-#[derive(serde::Serialize)]
-struct FolderListRow {
-	id: String,
-	parent: Option<String>,
-	name: String,
-	created_at: String,
-	updated_at: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -406,6 +384,18 @@ impl GoraniMemberDO {
 		}
 	}
 
+	/// Does a version row point at `files/<member>/<file>/<obj>`? The
+	/// restore fill (routes.rs › backup_object_fill) writes only to keys a
+	/// restore minted — this is how it asks.
+	pub(crate) async fn restore_target(&self, member: &str, file_id: &str, obj: &str) -> Result<Response> {
+		let key = format!("files/{member}/{file_id}/{obj}");
+		let n = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE file_id = ?1 AND object_key = ?2", Some(vec![file_id.into(), key.into()]))?.one::<TotalCount>()?.n;
+		if n == 0 {
+			return json_error(404, "no such restore target");
+		}
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
 	/// The object of a version, for the Worker to stream from S3 with its
 	/// wrapped key in a header.
 	async fn file_object(&self, file_id: &str, version: Option<i64>) -> Result<Option<ObjectRow>> {
@@ -596,7 +586,13 @@ impl GoraniMemberDO {
 	/// Create a share row. The route has already opened the S3 multipart
 	/// upload for the sealed copy (object `shares/<id>`) and hands its id in.
 	pub(crate) async fn share_create(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
-		self.vault_gate().await?;
+		// (Commit 23: this line was `self.vault_gate().await?;` — the `?` only
+		// propagates a SQL *error*; the refusal message in the Ok(Some(..))
+		// was dropped on the floor, so a paused or absent vault could still
+		// mint share links. A gate whose answer nobody reads is not a gate.)
+		if let Some(msg) = self.vault_gate().await? {
+			return json_error(400, &msg);
+		}
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let id = get("id").ok_or_else(|| worker::Error::RustError("missing id".into()))?;
 		if !(22..=64).contains(&id.len()) || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
@@ -892,40 +888,93 @@ impl GoraniMemberDO {
 		Ok(Response::from_json(&serde_json::json!({ "files": n_files, "folders": n_folders }))?)
 	}
 
-	/// Rotation, client-driven (docs/VAULT.md: rotate = re-wrap small keys,
-	/// never re-encrypt content). The client opened every content key under
-	/// the old store key and sealed it to the new one; names and types are
-	/// re-sealed the same way and sent along. This route stores the results —
-	/// and is idempotent: a row is either under the old key or the new one,
-	/// and doing it twice does no harm.
+	/// Everything in this member's database that is sealed to the files STORE
+	/// key, one kind at a time, paged by SQLite rowid — the input of a store
+	/// rotation (docs/FAMILY.md › Removing a member, docs/SECURITY-REVIEW.md
+	/// › O5). `GET files/sealed?kind=<kind>&after=<rowid>&limit=<n>`.
+	///
+	/// | kind | rows | sealed values |
+	/// |---|---|---|
+	/// | `version` | file_versions | content key, type |
+	/// | `file` | files | name |
+	/// | `folder` | file_folders | name |
+	/// | `music` | music_meta | tag blob |
+	/// | `share` | shares | the owner's copy of the name |
+	/// | `secrets` | files_secrets | fingerprint + index keys |
+	///
+	/// Before commit 24 the rotation walk could reach only each file's LIVING
+	/// version (via `files/keys`) and file names — so a departed member's old
+	/// key still opened every older version, every folder name, the music
+	/// tags and the secrets. A rotation that misses rows is not a rotation.
+	pub(crate) async fn sealed_page(&self, req: Request) -> Result<Response> {
+		let url = req.url()?;
+		let q = urlquery(url.query().unwrap_or(""));
+		let after = q.get("after").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+		let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
+		let Some(kind) = q.get("kind").map(String::as_str) else { return json_error(400, "kind required") };
+		let sql = match kind {
+			"version" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, content_key AS v1, type_sealed AS v2 FROM file_versions WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"file" => "SELECT rowid AS row, id AS a, NULL AS b, name_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"folder" => "SELECT rowid AS row, id AS a, NULL AS b, name_sealed AS v1, NULL AS v2 FROM file_folders WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"music" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, blob_sealed AS v1, NULL AS v2 FROM music_meta WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"share" => "SELECT rowid AS row, id AS a, NULL AS b, name_sealed AS v1, NULL AS v2 FROM shares WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"secrets" => "SELECT rowid AS row, NULL AS a, NULL AS b, v AS v1, NULL AS v2 FROM files_secrets WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			_ => return json_error(400, "kind: version | file | folder | music | share | secrets"),
+		};
+		let rows: Vec<SealedRow> = self.sql.exec(sql, Some(vec![after.into(), limit.into()]))?.to_array()?;
+		let next = (rows.len() as i64 == limit).then(|| rows.last().map(|r| r.row)).flatten();
+		Ok(Response::from_json(&serde_json::json!({
+			"kind": kind,
+			"items": rows.into_iter().map(|r| serde_json::json!({ "row": r.row, "a": r.a, "b": r.b, "v1": r.v1, "v2": r.v2 })).collect::<Vec<_>>(),
+			"next": next,
+		}))?)
+	}
+
+	/// Store the results of a rotation walk: `PUT files/reseal { items: [{
+	/// kind, row, v1, v2? }] }` — each row's sealed value(s), re-sealed by
+	/// the CLIENT to the new store key (the server never sees a key; it
+	/// checks that every value is sealed text and writes it to exactly the
+	/// row named). Idempotent: the client re-seals only what still opens
+	/// under the OLD key, so running the walk twice does no harm.
+	///
+	/// (Clean break, docs/DECISIONS.md › D13: the old `{ keys: { fileId:
+	/// { ck, name, type } } }` form re-wrapped living versions only, and is
+	/// refused.)
 	pub(crate) async fn files_reseal(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
-		let Some(entries) = body.get("keys").and_then(|k| k.as_object()) else { return json_error(400, "keys required") };
-		let mut updated = 0;
-		for (id, v) in entries {
-			let ck = v.get("ck").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-			let name = v.get("name").and_then(|x| x.as_str()).map(str::to_string);
-			let r#type = v.get("type").and_then(|x| x.as_str()).map(str::to_string);
-			if !gorani_formats::formats::is_sealed_text(&ck) || name.as_ref().is_some_and(|n| !gorani_formats::formats::is_sealed_text(n)) || r#type.as_ref().is_some_and(|t| !gorani_formats::formats::is_sealed_text(t)) {
+		if body.get("keys").is_some() {
+			return json_error(400, "the current-version-only reseal form is gone (commit 24): send { items: [{ kind, row, v1, v2? }] } from a files/sealed walk");
+		}
+		let Some(items) = body.get("items").and_then(|k| k.as_array()) else { return json_error(400, "items required") };
+		if items.len() > 1000 {
+			return json_error(400, "at most 1000 items per call");
+		}
+		// Validate everything first: a batch is applied whole or not at all.
+		let mut plan: Vec<(&'static str, i64, String, Option<String>)> = Vec::with_capacity(items.len());
+		for it in items {
+			let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or_default();
+			let Some(row) = it.get("row").and_then(|v| v.as_i64()) else { return json_error(400, "each item needs its row") };
+			let Some(v1) = it.get("v1").and_then(|v| v.as_str()).map(str::to_string) else { return json_error(400, "each item needs v1") };
+			let v2 = it.get("v2").and_then(|v| v.as_str()).map(str::to_string);
+			if !gorani_formats::formats::is_sealed_text(&v1) || v2.as_ref().is_some_and(|t| !gorani_formats::formats::is_sealed_text(t)) {
 				return json_error(400, "reseal values must be sealed text");
 			}
-			let n = self
-				.sql
-				.exec(
-					"SELECT COUNT(*) AS n FROM file_versions WHERE file_id = ?1 AND version = (SELECT version FROM files WHERE id = ?1)",
-					Some(vec![id.clone().into()]),
-				)?
-				.one::<TotalCount>()?
-				.n;
-			self.sql.exec(
-				"UPDATE file_versions SET content_key = ?1, type_sealed = COALESCE(?2, type_sealed) WHERE file_id = ?3 AND version = (SELECT version FROM files WHERE id = ?3)",
-				Some(vec![ck.into(), bind(r#type), id.clone().into()]),
-			)?;
-			if let Some(nm) = &name {
-				self.sql.exec("UPDATE files SET name_sealed = ?1 WHERE id = ?2", Some(vec![nm.clone().into(), id.clone().into()]))?;
-			}
-			updated += n;
+			let sql: &'static str = match kind {
+				"version" => "UPDATE file_versions SET content_key = ?1, type_sealed = COALESCE(?2, type_sealed) WHERE rowid = ?3",
+				"file" => "UPDATE files SET name_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				"folder" => "UPDATE file_folders SET name_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				"music" => "UPDATE music_meta SET blob_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				"share" => "UPDATE shares SET name_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				"secrets" => "UPDATE files_secrets SET v = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				_ => return json_error(400, "kind: version | file | folder | music | share | secrets"),
+			};
+			plan.push((sql, row, v1, v2));
 		}
-		self.audit(actor, "files.reseal", &format!("{updated} versions"), None, None).await?;
+		let mut updated = 0usize;
+		for (sql, row, v1, v2) in plan {
+			self.sql.exec(sql, Some(vec![v1.into(), bind(v2), row.into()]))?;
+			updated += 1;
+		}
+		self.audit(actor, "files.reseal", &format!("{updated} sealed values"), None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "updated": updated }))?)
 	}
 
@@ -962,6 +1011,14 @@ impl GoraniMemberDO {
 	}
 }
 
+#[derive(serde::Deserialize)]
+struct SealedRow {
+	row: i64,
+	a: Option<String>,
+	b: Option<String>,
+	v1: Option<String>,
+	v2: Option<String>,
+}
 #[derive(serde::Deserialize)]
 struct CurrentVersion {
 	version: i64,

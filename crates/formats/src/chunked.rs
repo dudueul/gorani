@@ -32,7 +32,6 @@ use zeroize::Zeroizing;
 use crate::Error;
 
 pub const MAGIC: &[u8; 4] = b"GC01";
-const TAG_LEN: usize = 16;
 pub const FRAME_OVERHEAD: u64 = 28;
 /// Plain bytes per frame (and per uploaded part, which S3 wants at least 5 MiB and uniform).
 pub const DEFAULT_CHUNK: u64 = 8 * 1024 * 1024;
@@ -59,21 +58,6 @@ pub fn seal_chunk(key: &[u8; 32], plain: &[u8], i: u64, last: bool) -> Vec<u8> {
 	OsRng.fill_bytes(&mut nonce);
 	let ct = Aes256Gcm::new_from_slice(key).expect("32-byte key").encrypt(&Nonce::from(nonce), Payload { msg: plain, aad: &aad(i, last) }).expect("AES-GCM");
 	[nonce.as_slice(), &ct].concat()
-}
-
-/// Open one frame from its parts (nonce + body + AAD already assembled) —
-/// what the client's streaming path uses after fetching a ciphertext span.
-pub fn open_chunk_frame(key: &[u8; 32], nonce: &[u8], body: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
-	if body.len() < TAG_LEN {
-		return Err(Error::Format("a chunk is too short"));
-	}
-	let mut iv = [0u8; 12];
-	iv.copy_from_slice(&nonce[..12]);
-	Aes256Gcm::new_from_slice(key)
-		.expect("32-byte key")
-		.decrypt(&Nonce::from(iv), Payload { msg: &body[..body.len() - TAG_LEN], aad })
-		.map(Zeroizing::new)
-		.map_err(|_| Error::Open("a chunk: wrong key, or the file was altered, reordered or cut short"))
 }
 
 pub fn open_chunk(key: &[u8; 32], frame: &[u8], i: u64, last: bool) -> Result<Zeroizing<Vec<u8>>, Error> {
@@ -128,6 +112,8 @@ pub fn open_span(key: &[u8; 32], bytes: &[u8], span: FrameSpan, size: u64, chunk
 pub fn open_chunked(key: &[u8; 32], sealed: &[u8], chunk: u64) -> Result<Zeroizing<Vec<u8>>, Error> {
 	let frame = chunk + FRAME_OVERHEAD;
 	let n = (sealed.len() as u64).div_ceil(frame).max(1);
-	let size = sealed.len() as u64 - n * FRAME_OVERHEAD;
+	// checked: attacker-sized input shorter than its frames' overhead must be
+	// an error, not an arithmetic panic (an abort, in the worker's profile).
+	let size = (sealed.len() as u64).checked_sub(n * FRAME_OVERHEAD).ok_or(Error::Format("the file was cut short"))?;
 	open_span(key, sealed, FrameSpan { first: 0, last: n - 1, start: 0, end: sealed.len() as u64 }, size, chunk)
 }

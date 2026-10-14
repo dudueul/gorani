@@ -38,6 +38,7 @@ use worker::{durable_object, DurableObject, Env, Error, Request, Response, Resul
 
 use crate::family::json_error;
 use crate::devices::EnrolBody;
+use crate::files_store::urlquery;
 
 pub const MIGRATIONS: &[&str] = &[
 	// Vault settings: one row. The JSON carries public halves, unlock methods
@@ -260,16 +261,15 @@ impl DurableObject for GoraniMemberDO {
 
 // The files operations live beside the core (worker/src/files_store.rs) —
 // same DO, another `impl` block, one module per concern.
-pub(crate) fn now_iso() -> String {
-	// The DO's SQL clock is the single source of time in this database.
-	"strftime".to_string()
-}
 
 impl GoraniMemberDO {
 
 	async fn dispatch(&self, mut req: Request) -> Result<Response> {
 		let path = req.path().trim_start_matches('/').to_string();
 		let actor = req.headers().get("x-gorani-actor")?.unwrap_or_default();
+		// Whose database this is (routes.rs › forward_member sets it; a DO
+		// cannot read its own instance name).
+		let member = req.headers().get("x-gorani-member")?.unwrap_or_default();
 		match (req.method().to_string().as_str(), path.as_str()) {
 			("GET", "vault") => self.get_vault().await,
 			("PUT", "vault") => {
@@ -361,7 +361,7 @@ impl GoraniMemberDO {
 			("GET", id) if id.starts_with("backups/") => self.backup_object(&id["backups/".len()..]).await,
 			("POST", "backup/restore") => {
 				let body = req.json::<serde_json::Value>().await?;
-				self.backup_restore(&actor, body).await
+				self.backup_restore(&actor, &member, body).await
 			}
 			("POST", "housekeeping") => {
 				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
@@ -372,18 +372,23 @@ impl GoraniMemberDO {
 				self.cron_pass(&actor, body).await
 			}
 			("GET", "music/feed") => self.music_feed().await,
+			("GET", "files/sealed") => self.sealed_page(req).await,
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.files_reseal(&actor, body).await
 			}
 			("GET", id) if id.starts_with("files-object/") => {
-				let rest = &id["files-object/".len()..];
-				let (file_id, version) = match rest.split_once('?') {
-					Some((f, qs)) => (f, urlquery(qs).get("version").and_then(|x| x.parse::<i64>().ok())),
-					None => (rest, None),
-				};
-				self.file_object_route(file_id, version).await
+				// The version rides in the QUERY. `req.path()` never contains
+				// one, so the old `split_once('?')` on the path never matched
+				// and `?version=n` downloads silently served the CURRENT
+				// version (commit 23).
+				let version = req.url()?.query().map(urlquery).and_then(|q| q.get("version").and_then(|x| x.parse::<i64>().ok()));
+				self.file_object_route(&id["files-object/".len()..], version).await
 			}
+			("GET", id) if id.starts_with("restore-target/") => match id["restore-target/".len()..].split_once('/') {
+				Some((file_id, obj)) => self.restore_target(&member, file_id, obj).await,
+				None => json_error(400, "restore-target/<file>/<object>"),
+			},
 			// ── Files (implemented in worker/src/files_store.rs) ──
 			("POST", "files/put") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -513,11 +518,21 @@ impl GoraniMemberDO {
 	/// age/count, trashed items purge after their window (their sealed
 	/// objects go from S3 too), dead share copies are removed. Every knob is
 	/// a parameter so tests can force the clocks.
+	///
+	/// **Who may turn the knobs** (security review, commit 23): only the dev
+	/// server. The route is member-scoped, so before this change any member
+	/// could POST `{ auditKeep: 1, journalDays: 0 }` and erase their own
+	/// audit trail and restore history — the person being audited holding
+	/// the eraser. In production the body is ignored and the deployment
+	/// defaults apply; the tests (GORANI_DEV=1) still force their clocks.
 	pub(crate) async fn housekeeping(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
-		let trash_days = body.get("trashDays").and_then(|v| v.as_i64()).unwrap_or(30).max(0);
-		let journal_days = body.get("journalDays").and_then(|v| v.as_i64()).unwrap_or(180).max(0);
-		let audit_keep = body.get("auditKeep").and_then(|v| v.as_i64()).unwrap_or(500).max(1);
-		let share_days = body.get("shareDays").and_then(|v| v.as_i64()).unwrap_or(1).max(0);
+		let dev = self.env.var("GORANI_DEV").map(|v| v.to_string() == "1").unwrap_or(false);
+		let knob = |k: &str, default: i64| if dev { body.get(k).and_then(|v| v.as_i64()).unwrap_or(default) } else { default };
+		let trash_days = knob("trashDays", 30).max(0);
+		let journal_days = knob("journalDays", 180).max(0);
+		let audit_keep = knob("auditKeep", 500).max(1);
+		let share_days = knob("shareDays", 1).max(0);
+		let upload_days = knob("uploadDays", 2).max(0);
 
 		// 1. Trash purge: sealed objects leave S3, rows leave (triggers
 		// journal the purge).
@@ -539,6 +554,14 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
+		// The purged files' dependent rows go too. `files` has no foreign keys
+		// (SQLite DOs run without them), so `DELETE FROM files` used to leave
+		// every version row — wrapped content key, object key — plus music
+		// blobs and contributor rows behind forever: unbounded growth, and
+		// key material outliving the file it belonged to.
+		self.sql.exec("DELETE FROM file_versions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		self.sql.exec("DELETE FROM music_meta WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		self.sql.exec("DELETE FROM file_contributors WHERE file_id NOT IN (SELECT id FROM files)", None)?;
 		let n_folders_purged = self
 			.sql
 			.exec(
@@ -555,8 +578,28 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.to_array()?;
+		let mut stale_multipart: Vec<(String, String)> = Vec::new();
 		for r in &dead_shares {
 			purged_objects.push(r.object_key.clone());
+			// A share that never completed holds an open multipart upload:
+			// its parts are billed storage until someone aborts it.
+			if let Some(u) = r.s3_upload_id.as_ref().filter(|u| !u.is_empty()) {
+				stale_multipart.push((r.object_key.clone(), u.clone()));
+			}
+		}
+
+		// 2b. Uploads that never completed (a closed tab, a crashed client).
+		// The bookkeeping row is the only pointer to the multipart upload; the
+		// docs promised this sweep, the code never had it (commit 23).
+		let stale_uploads: Vec<StaleUpload> = self
+			.sql
+			.exec(&format!("SELECT id, object_key, s3_upload_id FROM uploads WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{upload_days} days')"), None)?
+			.to_array()?;
+		for u in &stale_uploads {
+			if u.s3_upload_id != "pending" {
+				stale_multipart.push((u.object_key.clone(), u.s3_upload_id.clone()));
+			}
+			self.sql.exec("DELETE FROM uploads WHERE id = ?1", Some(vec![u.id.clone().into()]))?;
 		}
 		let n_shares_purged = self
 			.sql
@@ -582,6 +625,9 @@ impl GoraniMemberDO {
 			)?
 			.rows_written();
 
+		for (key, upload) in &stale_multipart {
+			let _ = crate::s3::multipart_abort(&self.env, key, upload).await;
+		}
 		for key in &purged_objects {
 			let _ = crate::s3::delete(&self.env, key).await;
 		}
@@ -591,6 +637,7 @@ impl GoraniMemberDO {
 		Ok(Response::from_json(&serde_json::json!({
 			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged,
 			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": purged_objects.len(),
+			"uploadsAborted": stale_uploads.len(),
 		}))?)
 	}
 
@@ -652,6 +699,12 @@ struct ObjRow {
 	object_key: String,
 }
 #[derive(serde::Deserialize)]
+struct StaleUpload {
+	id: String,
+	object_key: String,
+	s3_upload_id: String,
+}
+#[derive(serde::Deserialize)]
 struct ShareObjRow {
 	object_key: String,
 	s3_upload_id: Option<String>,
@@ -674,15 +727,4 @@ struct AuditPut {
 	target: String,
 	#[serde(default)]
 	details_sealed: Option<String>,
-}
-
-/// A tiny query-string reader for the few DO routes that take one (the
-/// Worker forwards the caller's query verbatim).
-fn urlquery(qs: &str) -> std::collections::BTreeMap<String, String> {
-	qs.split('&')
-		.filter_map(|pair| {
-			let (k, v) = pair.split_once('=')?;
-			Some((k.to_string(), v.to_string()))
-		})
-		.collect()
 }

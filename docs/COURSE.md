@@ -42,6 +42,9 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 21 | Removing a member | docs/FAMILY.md › Removing a member (19) | The family-area rotation and why its order matters |
 | 22 | The music library | web/src/vault/music-meta.ts (21) | Tags parsed by whoever holds the plaintext; one sealed feed |
 | 23 | The product surface, watched | tests/e2e/app.test.mjs (20) | The SPA in a real browser — where four silent bugs were caught |
+| 24 | Reviewing your own system | docs/SECURITY-REVIEW.md + tests/api/security.test.mjs (23) | Reading code against its own documents; write-once ownership indexes; fail-closed checks; why a fake server must enforce the real contract |
+| 25 | A CSP that is actually delivered | web/public/_headers, web/src/lib/trusted-types.ts, tests/e2e (24) | Who serves which bytes (assets vs. Worker); Trusted Types and a default policy; finding sinks by making them fail; watching for violations in the e2e |
+| 26 | Lock means locked | web/src/vault/session.ts, web/src/lib/blob-urls.ts, tests/unit/lock.test.ts (24) | A lock as a state, not a flush; ordering (delete the hold, then notify); decisions as pure functions; fake clocks in a browser test |
 
 Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at

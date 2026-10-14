@@ -31,14 +31,20 @@ export function r2Twin() {
 	return "wrangler.r2.jsonc";
 }
 
-export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist" } = {}) {
+/**
+ * `s3` (optional): a REAL S3-compatible target `{ endpoint, region, bucket,
+ * accessKeyId, secretKey }` instead of the in-memory stub — the live suite
+ * (tests/api/s3-live.test.mjs) uses it. The credentials go only into the
+ * gitignored .dev.vars, exactly where `wrangler dev` reads secrets from.
+ */
+export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3 } = {}) {
 	if (!fs.existsSync(path.join(ROOT, "web/dist/index.html"))) {
 		const b = spawnSync("npm", ["--prefix", "web", "run", "build"], { cwd: ROOT, encoding: "utf8" });
 		if (b.status !== 0) throw new Error(`web build failed:\n${b.stdout}\n${b.stderr}`);
 	}
-	// The S3 stub, before anything fetches it.
+	// The S3 stub, before anything fetches it (not needed against a real bucket).
 	const { startS3Stub } = await import("../lib/s3stub.mjs");
-	const stub = await startS3Stub();
+	const stub = s3 ? { close: async () => {}, address: null } : await startS3Stub();
 	// Dev vars: auth bypassed with a header, storage endpoints as placeholders
 	// (the registry routes never touch S3; file-route suites replace these).
 	// The S3 endpoint uses the machine's LAN IP, not loopback: `wrangler dev`
@@ -46,13 +52,23 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 	const lan = Object.values(os.networkInterfaces())
 		.flatMap((xs) => xs ?? [])
 		.find((x) => x && !x.internal && x.family === "IPv4")?.address;
-	const s3endpoint = lan ? `http://${lan}:${stub.address.port}` : `http://127.0.0.1:${stub.address.port}`;
+	const s3endpoint = s3 ? s3.endpoint : lan ? `http://${lan}:${stub.address.port}` : `http://127.0.0.1:${stub.address.port}`;
 	fs.writeFileSync(
 		path.join(ROOT, ".dev.vars"),
 		// CACHE_MAX_OBJECT_MB=6: the cache suite exercises the size boundary
 		// with whole-file/span pairs a few MB big instead of 256MB uploads
 		// (the media span gate must fit a 5MiB GC01 frame).
-		["GORANI_DEV=1", `S3_ENDPOINT=${s3endpoint}`, "S3_REGION=us-east-1", "S3_BUCKET=gorani-test", "S3_ACCESS_KEY_ID=test", "S3_SECRET_KEY=test", "CACHE_MAX_OBJECT_MB=6", "VAULT_DESTROY_ENABLED=1", ""].join("\n"),
+		[
+			"GORANI_DEV=1",
+			`S3_ENDPOINT=${s3endpoint}`,
+			`S3_REGION=${s3?.region ?? "us-east-1"}`,
+			`S3_BUCKET=${s3?.bucket ?? "gorani-test"}`,
+			`S3_ACCESS_KEY_ID=${s3?.accessKeyId ?? "test"}`,
+			`S3_SECRET_KEY=${s3?.secretKey ?? "test"}`,
+			"CACHE_MAX_OBJECT_MB=6",
+			"VAULT_DESTROY_ENABLED=1",
+			"",
+		].join("\n"),
 	);
 	const out = fs.openSync(path.join(ROOT, "tests/output/wrangler-dev.log"), "w");
 	// Fresh SQLite state per run: a private persist directory (created before

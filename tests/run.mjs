@@ -62,7 +62,7 @@ if (wantKind("api")) {
 		// live-S3 suite pointed at a real bucket, the restart suite that stops
 		// and starts its own) don't get the runner's stub-configured one — it
 		// would sit unused.
-		const ownServer = f.startsWith("r2.") || f.startsWith("s3-live.") || f.startsWith("restart.") || f.startsWith("bootstrap.") || f.startsWith("objectlock.");
+		const ownServer = f.startsWith("r2.") || f.startsWith("s3-live.") || f.startsWith("restart.") || f.startsWith("bootstrap.") || f.startsWith("objectlock.") || f.startsWith("siem.") || f.startsWith("timestamps.");
 		const dev = ownServer ? null : await suiteDev();
 		try {
 			// Async spawn on purpose: the parent owns the S3 stub's event

@@ -72,7 +72,27 @@
 		// retention nobody can shorten. Off, nothing is locked — and evidence
 		// opened meanwhile is locked the moment it is turned on.
 		"OBJECT_LOCK": "off",
-		"EVIDENCE_RETAIN_DAYS": "2557"
+		"EVIDENCE_RETAIN_DAYS": "2557",
+
+		// ── The SIEM feed (docs/CUSTODY.md › Stage 7, 29i) ─────────────────
+		// Empty: no feed. Set, every chained audit line is POSTed there by
+		// its trail's own Durable Object (an alarm — no request waits on the
+		// SIEM), retried with backoff until a 2xx. "ndjson" (Elastic, a data
+		// collection endpoint, any log shipper) or "splunk-hec" (the URL is
+		// then …/services/collector). The token is a SECRET:
+		// `wrangler secret put SIEM_TOKEN`.
+		"SIEM_URL": "",
+		"SIEM_FORMAT": "ndjson",
+
+		// ── Trusted timestamps (docs/CUSTODY.md › Stage 7, 29j) ────────────
+		// An RFC 3161 authority's HTTP endpoint (e.g. a commercial TSA, or
+		// your own). Empty: nothing is stamped. Set, every evidence version
+		// and every audit checkpoint gets a third party's signed "seen at" —
+		// which readers count only once a LEAD certified the authority's key
+		// (Team › People › Timestamp authority). An account's credential, if
+		// it wants one, is a secret: `wrangler secret put TSA_AUTHORIZATION`
+		// (sent verbatim as the Authorization header, e.g. "Basic …").
+		"TSA_URL": ""
 	},
 
 	// ── Storage priority: Cloudflare R2 ──────────────────────────────────

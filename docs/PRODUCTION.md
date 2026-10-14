@@ -205,6 +205,68 @@ it until someone does. The lock protects versions, not the current
 pointer; `tests/api/s3-live.test.mjs` with `GORANI_LIVE_S3_LOCK=1` proves
 the version part against the real server.
 
+**Re-verification** (commit 29h): a client re-hashes an evidence case's
+files against their signatures ("Re-verify now" in Team › Cases); the
+nightly pass logs every evidence case not re-verified for `REVERIFY_DAYS`
+(a `wrangler.jsonc` var, default 30). **Exports** need a two-person
+approval and are checked by the recipient with `tools/verify-export.mjs`
+(Node only) — hand it to them with the package.
+
+### The SIEM feed (commit 29i, D5.4)
+
+Set `SIEM_URL` (and `SIEM_FORMAT`) in `wrangler.jsonc` and the token as a
+secret — `wrangler secret put SIEM_TOKEN` — and every audit line is POSTed
+there as it is chained:
+
+- **Elastic / OpenSearch / a log shipper** (Vector, Fluent Bit, Logstash's
+  `http` input): `SIEM_FORMAT = "ndjson"`, one event per line,
+  `Authorization: Bearer <token>`.
+- **Splunk**: `SIEM_FORMAT = "splunk-hec"`, `SIEM_URL =
+  "https://<host>:8088/services/collector"`, a HEC token;
+  sourcetype `gorani:audit`, source `gorani:<area>`.
+- **Microsoft Sentinel**: a Logs Ingestion data collection endpoint needs
+  an Entra token, not a static one — put a shipper in front (ndjson in,
+  the DCR API out).
+
+What arrives: `@timestamp`, `actor`, `action`, `target`, the readable
+`details`, `sealed` (whether the line had sealed details — never their
+value), and `gorani { area, seq, hash }`. Delivery is at least once:
+dedupe on `(gorani.area, gorani.seq)`, and alert on a gap in `seq` — the
+chain has none, so a gap means lines were lost on the way or dropped by
+retention. A collector that is down loses nothing: each trail retries with
+backoff (up to an hour), and the nightly pass logs every area still
+behind (`<area>: SIEM: … not yet delivered`). The first deploy with
+`SIEM_URL` set sends every trail from the start of its retained chain.
+
+### Trusted timestamps (commit 29j, D5.5)
+
+Set `TSA_URL` in `wrangler.jsonc` to an RFC 3161 authority's HTTP
+endpoint — a commercial TSA (DigiCert, Sectigo, GlobalSign — some are free
+for low volume, others want an account: `wrangler secret put
+TSA_AUTHORIZATION` with the header value they give you), a national
+qualified TSA if your evidence must meet eIDAS, or your own (`openssl ts`
+behind a small HTTP server is what the test suite uses). The Worker must
+be able to reach it. Each evidence version costs one request, each audit
+trail one a night.
+
+Then, once: a lead opens Team › People › Timestamp authority, presses
+"Read the authority's certificate", **compares the certificate SHA-256
+with the one the authority publishes on its own site**, and certifies.
+Until a lead does, stamps are stored but every reader reports them
+"uncertified". When the authority rotates its key, certify the new one
+(keep the old certification — tokens it signed stay valid); if a key is
+compromised, Withdraw it.
+
+Evidence uploaded before `TSA_URL` was set (or before commit 29j) is
+stamped when someone with write access re-verifies the case (Team ›
+Cases › Re-verify now): the stamp then dates the signature as of that day.
+The nightly pass logs `evidence version(s) … still without a trusted
+timestamp` while a TSA is failing; the alarm keeps retrying (backoff up to
+an hour). By hand, a token checks with OpenSSL: save it (base64 → DER) and
+`openssl ts -verify -in token.der -token_in -digest <imprint> -CAfile
+tsa.pem` — the imprint is SHA-256 of the version's `hashRecord.signature`
+(base64-decoded) or of the checkpoint's bytes.
+
 ### Upgrading across commit 29 (the audit trails)
 
 `wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration

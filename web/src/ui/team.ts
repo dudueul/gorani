@@ -24,7 +24,11 @@ import { fingerprint, pin, certify, buildTrust, type RegistryIdentity } from "..
 import { newCase, openCaseKey, openCaseTitle, rotateCase, sealCaseGrant, type CaseKind, type CasePermission, type CaseRow, type MemberRoot } from "../vault/cases.ts";
 import { approveCeremony, combineCeremony, newCeremony, recoverCaseGrant, recoverMemberStore, setupRecovery, type Ceremony, type RecoveryRecord } from "../vault/recovery.ts";
 import type { TeamCall, TeamContext } from "../vault/team.ts";
-import { approveRequest, requestApproval, verifyApproval, type Approval, type ApprovalCheck } from "../vault/approvals.ts";
+import { approveRequest, requestApproval, verifyApproval, type Approval, type ApprovalCheck, type TwoPersonAction } from "../vault/approvals.ts";
+import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
+import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
+import { devIdentityHeaders } from "../lib/api.ts";
+import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
 type Tab = "people" | "cases" | "recovery";
 
@@ -50,6 +54,12 @@ export class GoraniTeam extends LitElement {
 	@state() private ceremonies: Ceremony[] = [];
 	/** Each case's two-person requests (commit 29f), with this member's own check of their signatures. */
 	@state() private approvals: Record<string, (Approval & { check: ApprovalCheck })[]> = {};
+	/** Evidence cases' last re-verification (commit 29h). */
+	@state() private reverified: Record<string, { last: { at: string; checked: number; failed: number; by: string } | null; overdue: boolean; days: number }> = {};
+	/** The timestamp authority (commit 29j): the leads' certifications, those THIS member's trust accepts, and a lead's probe. */
+	@state() private tsa: { configured: boolean; certs: TsaCert[] } | null = null;
+	@state() private tsaTrusted: TrustedTsas = new Map();
+	@state() private tsaProbe: TsaIdentity | null = null;
 	/** Ephemeral keys of the ceremonies THIS tab coordinates (memory only). */
 	private ephemerals = new Map<string, VaultPrivateKey>();
 	private caseKeys = new Map<string, VaultPrivateKey>();
@@ -94,6 +104,8 @@ export class GoraniTeam extends LitElement {
 		// Externals do not see the registry (stage 2): names fall back to ids.
 		this.members = (await quiet(() => this.call<{ members: Member[] }>("GET", "/api/v1/family"), { members: [] as Member[] })).members;
 		this.team = { ...this.team, identities: this.identities, trust: await buildTrust(this.team.memberId, this.session.root, this.team.settings.identity!, this.identities) };
+		this.tsa = await quiet(() => this.call<{ configured: boolean; certs: TsaCert[] }>("GET", "/api/v1/family/tsa"), null);
+		this.tsaTrusted = await trustedTsas(this.team.trust, this.tsa?.certs ?? []);
 		const cases = (await quiet(() => this.call<{ cases: CaseRow[] }>("GET", "/api/v1/cases"), { cases: [] })).cases;
 		this.cases = await Promise.all(cases.map(async (c) => ({ ...c, title: c.grant ? await quiet(async () => openCaseTitle(await this.caseKey(c), c), null) : null })));
 		// The two-person requests, each checked HERE against this member's
@@ -101,9 +113,16 @@ export class GoraniTeam extends LitElement {
 		const approvals: typeof this.approvals = {};
 		for (const c of cases) {
 			const list = (await quiet(() => this.call<{ approvals: Approval[] }>("GET", `/api/v1/cases/${c.id}/approvals`), { approvals: [] })).approvals;
-			approvals[c.id] = await Promise.all(list.filter((a) => a.status === "pending").map(async (a) => ({ ...a, check: await verifyApproval(this.team.trust, a) })));
+			// Pending requests, and approved exports not yet spent (commit 29h).
+			approvals[c.id] = await Promise.all(list.filter((a) => a.status === "pending" || (a.action === "case.export" && a.status === "approved" && !a.consumedAt)).map(async (a) => ({ ...a, check: await verifyApproval(this.team.trust, a) })));
 		}
 		this.approvals = approvals;
+		const reverified: typeof this.reverified = {};
+		for (const c of cases.filter((x) => x.grant && x.kind === "evidence")) {
+			const r = await quiet(() => this.call<(typeof this.reverified)[string]>("GET", `/api/v1/cases/${c.id}/reverify`), null);
+			if (r) reverified[c.id] = r;
+		}
+		this.reverified = reverified;
 		if (this.member.role !== "external") this.recovery = await quiet(() => this.call("GET", "/api/v1/recovery"), null);
 		if (this.isLead || this.member.role === "auditor") this.ceremonies = (await quiet(() => this.call<{ ceremonies: Ceremony[] }>("GET", "/api/v1/recovery/ceremonies"), { ceremonies: [] })).ceremonies;
 	}
@@ -183,6 +202,63 @@ export class GoraniTeam extends LitElement {
 						`;
 					})}
 				</ul>
+			</section>
+			${this.renderTsa()}
+		`;
+	}
+
+	/**
+	 * The timestamp authority (commit 29j, timestamp.ts): which TSA keys the
+	 * leads certified, and whether THIS member's trust accepts each. A lead
+	 * reads the TSA's certificate from a probe token, compares its
+	 * fingerprint with the one the TSA publishes, and only then certifies.
+	 */
+	private renderTsa() {
+		if (!this.tsa) return nothing;
+		const bySpki = new Map<string, TsaCert[]>();
+		for (const c of this.tsa.certs) bySpki.set(c.spki, [...(bySpki.get(c.spki) ?? []), c]);
+		const p = this.tsaProbe;
+		return html`
+			<section class="rounded-xl border border-neutral-800 p-3" data-test="tsa">
+				<h3 class="font-medium">Timestamp authority</h3>
+				<p class="mt-1 text-xs text-neutral-400">${this.tsa.configured
+					? "Evidence versions and audit checkpoints are stamped by a third party (RFC 3161). A stamp counts when a lead you trust certified the authority's key."
+					: "No timestamp authority is configured (TSA_URL): evidence is dated by the audit trail alone."}</p>
+				<ul class="mt-2 divide-y divide-neutral-800">
+					${[...bySpki].map(([spki, certs]) => {
+						const counts = this.tsaTrusted.has(spki);
+						return html`<li class="flex flex-wrap items-center gap-2 py-2 text-xs" data-test="tsa-${spki.slice(0, 16)}">
+							<span class="w-48 truncate">${certs[0]!.name}</span>
+							<code class="font-mono text-neutral-400">key ${spki.slice(0, 16)}…</code>
+							<span class=${counts ? "text-emerald-400" : "text-amber-400"}>certified by ${certs.map((c) => this.nameOf(c.by)).join(", ")}${counts ? "" : " — none of them someone you verified"}</span>
+							${this.isLead ? html`<button class="${button} ml-auto" ?disabled=${this.busy} @click=${() => this.act("Withdrawing the authority", async () => {
+								await this.call("DELETE", `/api/v1/family/tsa/${spki}`);
+								return `${certs[0]!.name}'s key no longer counts: its tokens now read as uncertified.`;
+							})}>Withdraw</button>` : nothing}
+						</li>`;
+					})}
+				</ul>
+				${this.isLead && this.tsa.configured
+					? p
+						? html`<div class="mt-2 rounded-lg border border-neutral-700 p-2 text-xs" data-test="tsa-probe">
+								<p><span class="text-neutral-400">Authority:</span> ${p.name}</p>
+								<p><span class="text-neutral-400">Certificate SHA-256:</span> <code class="break-all font-mono text-accent">${p.certFingerprint}</code></p>
+								<p><span class="text-neutral-400">Valid:</span> ${p.notBefore.slice(0, 10)} – ${p.notAfter.slice(0, 10)}</p>
+								<p class="mt-1 text-neutral-400">Compare the fingerprint with the one the authority publishes — on its own site, not this page — before you certify.</p>
+								<div class="mt-2 flex gap-2">
+									<button class=${primary} ?disabled=${this.busy} data-test="tsa-certify" @click=${() => this.act("Certifying the authority", async () => {
+										this.tsa = await certifyTsa(this.call, this.team.signer, { spki: p.spki, name: p.name });
+										this.tsaProbe = null;
+										return `You certified ${p.name}'s key: stamps it signs now count for everyone who trusts you.`;
+									})}>I compared — certify</button>
+									<button class=${button} @click=${() => (this.tsaProbe = null)}>Cancel</button>
+								</div>
+							</div>`
+						: html`<button class="${button} mt-2" ?disabled=${this.busy} data-test="tsa-read" @click=${() => this.act("Asking the authority", async () => {
+								const probe = await this.call<{ token: string }>("POST", "/api/v1/family/tsa/probe");
+								this.tsaProbe = await tsaIdentityOf(probe.token);
+							})}>Read the authority's certificate</button>`
+					: nothing}
 			</section>
 		`;
 	}
@@ -293,7 +369,7 @@ export class GoraniTeam extends LitElement {
 	private twoPerson(c: CaseRow, manage: boolean) {
 		const may = (manage || this.isLead) && !c.closed;
 		const pending = this.approvals[c.id] ?? [];
-		const ask = (action: "case.close" | "hold.release", label: string) => html`<button class=${button} ?disabled=${this.busy || pending.some((a) => a.action === action)} data-test="ask-${action}-${c.id}" @click=${() => this.act(label, async () => {
+		const ask = (action: TwoPersonAction, label: string) => html`<button class=${button} ?disabled=${this.busy || pending.some((a) => a.action === action)} data-test="ask-${action}-${c.id}" @click=${() => this.act(label, async () => {
 			await requestApproval(this.call, this.team.signer, c.id, action);
 			return `Asked: ${action} on ${c.id}. A second lead must agree — they see it here.`;
 		})}>${label}</button>`;
@@ -307,14 +383,23 @@ export class GoraniTeam extends LitElement {
 								return `${c.id} is under a legal hold. Lifting it takes two leads.`;
 							})}>Place a legal hold</button>`}
 					${c.kind === "evidence" ? ask("case.close", "Ask to close") : nothing}
+					${c.grant ? ask("case.export", "Ask to export") : nothing}
 				</div>`
 				: nothing}
+			${c.grant && c.kind === "evidence" ? this.reverifyRow(c) : nothing}
 			${pending.length
 				? html`<ul class="mt-2 space-y-1 text-xs">${pending.map((a) => html`
 					<li class="flex flex-wrap items-center gap-2 rounded-lg bg-neutral-900 px-2 py-1" data-test="approval-${a.id}">
 						<span><b>${a.action}</b> asked by ${this.nameOf(a.requestedBy)} · ${a.requestedAt.slice(0, 16).replace("T", " ")}</span>
 						<span class=${a.check.request ? "text-emerald-400" : "text-red-400"}>${a.check.request ? "signature verified" : "signature does NOT verify — do not agree"}</span>
-						${this.isLead && a.requestedBy !== this.team.memberId && a.check.request
+						${a.status === "approved" && a.action === "case.export" && (a.requestedBy === this.team.memberId || a.approvedBy === this.team.memberId) && c.grant
+							? html`<button class=${primary} ?disabled=${this.busy} data-test="export-${a.id}" @click=${() => this.act(`Exporting ${c.id}`, async () => {
+									const built = await buildExport(this.source(), this.team.signer, this.team.trust, await this.caseKey(c), c.id, a.id);
+									this.save(built.parts, `${c.id}-export-${a.id.slice(0, 8)}.zip`);
+									return built.problems.length ? `Exported ${c.id} — with ${built.problems.length} problem(s) recorded in the manifest: ${built.problems.join("; ")}` : `Exported ${c.id}: every record verified. Check it with tools/verify-export.mjs; give the recipient your fingerprint out of band.`;
+								})}>Export now</button>`
+							: nothing}
+						${a.status === "pending" && this.isLead && a.requestedBy !== this.team.memberId && a.check.request
 							? html`<button class=${primary} ?disabled=${this.busy} data-test="approve-${a.id}" @click=${() => window.confirm(`Agree to ${a.action} on ${c.id}, asked by ${this.nameOf(a.requestedBy)}? It runs at once.`) && this.act(`Agreeing to ${a.action}`, async () => {
 									const done = await approveRequest(this.call, this.team.signer, this.team.trust, a);
 									return `${done.executed} on ${c.id}: done, with your signature and ${this.nameOf(a.requestedBy)}'s.`;
@@ -328,6 +413,43 @@ export class GoraniTeam extends LitElement {
 					</li>`)}</ul>`
 				: nothing}
 		`;
+	}
+
+	/** Re-verification (commit 29h): the last run, and a button to run one now. */
+	private reverifyRow(c: CaseRow) {
+		const r = this.reverified[c.id];
+		const last = r?.last;
+		return html`<div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+			<span class=${r?.overdue ? "text-amber-400" : "text-neutral-400"} data-test="reverify-${c.id}">${last ? `re-verified ${last.at.slice(0, 10)} by ${this.nameOf(last.by)}: ${last.checked} checked, ${last.failed} failed` : "never re-verified"}${r?.overdue ? ` — overdue (every ${r.days} days)` : ""}</span>
+			<button class=${button} ?disabled=${this.busy} data-test="reverify-now-${c.id}" @click=${() => this.act(`Re-verifying ${c.id}`, async () => {
+				const done = await reverifyCase(this.source(), await this.caseKey(c), this.team.trust, c.id);
+				const stamps = done.stampsRequested ? ` ${done.stampsRequested} older version(s) sent for a timestamp.` : "";
+				return done.failed ? `${c.id}: ${done.failed} of ${done.checked} versions do NOT verify — ${done.problems.join("; ")}${stamps}` : `${c.id}: all ${done.checked} versions re-hashed and verified against their signatures.${stamps}`;
+			})}>Re-verify now</button>
+		</div>`;
+	}
+
+	/** The API as the export and re-verification read it (this tab's fetches). */
+	private source(): ExportSource {
+		return {
+			get: (path) => this.call("GET", path),
+			post: (path, body) => this.call("POST", path, body),
+			put: (path, body) => this.call("PUT", path, body),
+			object: async (path) => {
+				const r = await fetch(path, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web-export" } });
+				if (!r.ok) throw new Error(`download failed: ${r.status}`);
+				return { body: new Uint8Array(await r.arrayBuffer()), ck: r.headers.get("x-gorani-ck") ?? "", chunk: Number(r.headers.get("x-gorani-chunk")) || null, version: Number(r.headers.get("x-gorani-version")), hash: r.headers.get("x-gorani-hash") };
+			},
+		};
+	}
+
+	private save(parts: Uint8Array[], name: string): void {
+		const url = blobURL(new Blob(parts as BlobPart[], { type: "application/zip" }));
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = name;
+		a.click();
+		setTimeout(() => revokeBlobURL(url), 5000);
 	}
 
 	// ── Recovery ──────────────────────────────────────────────────────

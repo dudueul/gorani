@@ -27,7 +27,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 *(landed: 29f `api:approvals`, 29g `api:custody`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
-| 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
+| 7 *(landed: 29h `api:export`, 29i `api:siem`, 29j `api:timestamps`)* | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
 ## Stage 1 — the audit, tamper-evident
 
@@ -396,3 +396,185 @@ custody, per evidence file:   custodian = the uploader, then each accepted trans
   evidence case gets an automatic intake naming its source; "Custody…" in
   both explorers shows the chain as this client verified it and offers
   the one action open to the member (accept, or hand over).
+
+## Stage 7 — export, re-verification, the SIEM, trusted time (D5.8 / D5.4 / D5.5), the design
+
+Three commits: **29h** the signed export package and re-verification;
+**29i** the SIEM feed; **29j** RFC 3161 timestamps.
+
+### 29h — the signed export, and re-verifying what is kept
+
+```text
+two leads   case.export approval (stage 6's rule: one asks, a second agrees)
+exporter    POST /cases/<id>/export { approval }  → the registry consumes it, once; audited
+            the exporter's browser: every file, every version — decrypted, re-hashed, each
+            signature, intake record and custody chain checked; the whole audit trail
+            manifest.json = { case, approval (both signatures), files, versions, hashes,
+                              records, custody, audit lines, the signers' public keys }
+            manifest.sig  = sign(stmt("gorani-export-v1", case, export id, SHA-256(manifest.json)))
+            package.zip   = manifest.json, manifest.sig, evidence/<file>/v<n>/<name>, VERIFY.txt
+anyone      tools/verify-export.mjs package.zip — Node only, no gorani code, no network
+```
+
+- **Plaintext, on purpose**: a package is for someone OUTSIDE the vault
+  (counsel, an insurer, a court). It carries the evidence decrypted, with
+  every hash a recipient can recompute with `sha256sum`, and every
+  signature verifiable with the public keys it names. Samples stay zipped
+  under "infected" inside it (stage 5).
+- **Why the export needs two people**: an export is the moment evidence
+  leaves the system's controls. The server cannot stop a grantee from
+  downloading files one by one — but only an approved, consumed export
+  produces a package bearing two leads' signatures.
+- **What the recipient decides**: whether the exporter's key is who it
+  claims — the manifest names the fingerprint, compared out of band. The
+  verifier reports every check; it trusts nothing it was not shown.
+- **Re-verification** (D5.8's second half): "Re-verify the case" re-hashes
+  every stored version against its signed hash, client-side, and records
+  the result in the case's audit (`case.reverify`, counts only). The
+  nightly pass flags evidence cases whose last re-verification is older
+  than `REVERIFY_DAYS` (default 30) — the server cannot re-hash (it has no
+  key), but it can notice nobody did.
+
+#### 29h as built
+
+- The registry: `case.export` joins the two-person actions (approved like
+  the others; nothing runs at approval); `POST /cases/<id>/export
+  { approval }` spends it — once, within a week, run by one of the two
+  people who agreed — and audits `case.export` (migration v7:
+  `approvals.consumed_at/by`).
+- `web/src/vault/export.ts › buildExport`: walks every file and version
+  (decrypt, SHA-256, `checkContentHash`), every intake record and custody
+  chain, the whole audit trail (`GET …/audit/lines?after=` — new: oldest
+  first, a page at a time, with the chain's base), the identities named;
+  writes `manifest.json` (problems recorded, never hidden), signs it,
+  zips it with the evidence (`web/src/vault/zip.ts` — stored, now
+  multi-entry; samples nested under "infected") and `VERIFY.txt`.
+- `tools/verify-export.mjs` — a second implementation in plain Node: its
+  own zip reader and ZipCrypto, its own statement encoding, ECDSA through
+  `node:crypto`; reports every check and exits non-zero on any failure.
+- `reverifyCase` walks the same way and `POST …/reverify { checked,
+  failed }`; the store keeps the last run (`vault › reverified`) and the
+  audit line; `GET …/reverify` says whether one is overdue
+  (`REVERIFY_DAYS`, default 30), and the nightly pass logs every overdue
+  evidence store.
+- The Team panel: "Ask to export", "Export now" on an approved export for
+  the two people, "Re-verify now" with the last run's result per evidence
+  case.
+- Not yet: a package is built in memory (D12's large-file work will
+  stream it); ZIP64 (4 GiB) as everywhere.
+
+### 29i — the SIEM feed
+
+- Every line the audit DOs chain (stage 1) is also queued for the SIEM
+  when `SIEM_URL` is set; the queue drains after each append and in the
+  nightly pass, oldest first, with the chain's own hash on every event (a
+  SIEM can check continuity), retried until acknowledged.
+- Formats: `ndjson` (one JSON object per line — Elastic, Sentinel's data
+  collection endpoints, any log shipper) and `splunk-hec` (`{ "event": … }`
+  per line, `Authorization: Splunk <token>`). `SIEM_TOKEN` is a secret.
+- Sealed details never leave (they are sealed); readable fields do —
+  the same fields the audit view shows.
+
+#### 29i as built
+
+- The trail is the queue. Each audit DO keeps a cursor (`meta ›
+  siem_cursor`, never below the chain's base) naming the last line the
+  collector acknowledged; nothing is copied into a second table that could
+  disagree with the first.
+- Delivery is the DO's own **alarm**: an append arms it (1 s) unless one is
+  set, so a burst of lines goes in one batch and a failing collector's
+  backoff (1 s doubling to an hour, `meta › siem_backoff`) is never cut
+  short by new lines. Each run sends up to 20 batches of 500 lines, oldest
+  first, and re-arms at once while lines remain. The cursor moves only on
+  a 2xx, and only forward — the alarm and the nightly pass may both be
+  sending (a DO takes other events while it awaits a fetch), so a line can
+  arrive twice, never zero times. The `gorani.seq` on every event is how
+  the SIEM drops the second.
+- The nightly pass (`cron.rs`) also drains every area and the registry,
+  and reports an area whose lines are still undelivered as a failure, like
+  a lock or a delete.
+- An event: `@timestamp`, `gorani { area, seq, hash }`, `actor`, `action`,
+  `target`, `details`, and `sealed` (true when the line had sealed
+  details — their value never leaves). `splunk-hec` wraps each in `{ time,
+  host: "gorani", source: "gorani:<area>", sourcetype: "gorani:audit",
+  event }` with `Authorization: Splunk <token>`; `ndjson` sends
+  `Authorization: Bearer <token>` when a token is set.
+- The trail's area is learned from the append (`ship` names it) or from
+  the nightly pass, so trails whose lines predate 29i are delivered with
+  their names too — from the base of the chain, the whole retained trail.
+- Not yet: no per-area opt-out, and no SIEM-side checker for the hash
+  chain (a SIEM rule over `gorani.seq` gaps is the cheap version; the
+  checkpoints in the bucket remain the proof).
+
+### 29j — RFC 3161 timestamps
+
+- **What is stamped**: SHA-256 of each evidence version's SEALED hash
+  record and of each daily audit checkpoint — never the content hash
+  itself (a timestamp authority would learn the evidence's fingerprint).
+  The stamp proves the signed record existed at that time; the record
+  proves what it was.
+- The Worker asks `TSA_URL` (an RFC 3161 TimeStampReq over HTTP) after the
+  version is recorded, like the lock pass: retried until it lands, the
+  token stored beside the version.
+- Verification is the client's and the export's: parse the token
+  (CMS SignedData), check the message imprint, the TSA's signature, and
+  its certificate against a pinned TSA certificate.
+
+#### 29j as built
+
+- **One change from the design: a version's imprint is SHA-256 of the
+  uploader's SIGNATURE, not of the sealed record.** A stamp over the
+  sealed record proves "this ciphertext existed" — and nobody outside the
+  case can tie a ciphertext to what it says, so an export's recipient
+  would have had to take the exporter's word for the link. The signature
+  is in the open in an export (`hashRecord.signature`): hash it, compare
+  the token's imprint, verify the signature names the content hash —
+  every step checkable with no key. To a TSA it is 64 random-looking
+  bytes: it learns nothing about the evidence. The client computes the
+  imprint (`content-hash.ts › signContentHashStamped`) and sends it as the
+  upload's `stamp` field; the store cannot check it (the record is
+  sealed), and a wrong one buys a stamp that verifies nothing, reported as
+  such — the same failure mode as a wrong hash record.
+- `worker/src/tsa.rs`: the TimeStampReq (SHA-256, an 8-byte nonce,
+  `certReq`), and the reply's check — status granted, the token over the
+  imprint asked about, the nonce echoed (no replayed or crossed reply).
+  It verifies NO signature: that is the reader's job, never the server's.
+  Unit-tested against a reply from OpenSSL's own TSA.
+- `worker/src/stamps.rs` (migration v15: `file_versions.stamp_imprint,
+  stamp_token, stamped_at`): evidence versions are stamped by the member
+  DO's ALARM — the upload never waits on a third party; up to 20 a run,
+  the first failure ends the run and backs off (1 s doubling to an hour);
+  the nightly pass tries too and reports what is pending. `GET
+  …/files/<id>/stamps` lists every version's token; `PUT` sets the imprint
+  of a version recorded without one — only then, never a replacement —
+  and re-verification (`export.ts › reverifyCase`) sends it.
+- Audit checkpoints: the nightly pass stamps SHA-256 of the checkpoint's
+  exact bytes and writes the token beside it (`<date>.tsr`, locked like
+  the checkpoint under Object Lock). `…/audit/verify` returns each
+  checkpoint's body and token. The checkpoint names the chain's head, so
+  its token dates every line up to it.
+- Which TSA counts — `family/tsa_certs.rs` (registry migration v8): a lead
+  probes the TSA (`POST /family/tsa/probe` — a token over a random
+  imprint, its certificate inside), compares the certificate's SHA-256
+  fingerprint with the one the authority publishes, and signs
+  `stmt("gorani-tsa-v1", SHA-256(SPKI), name)`. Readers count a key when
+  a certification of it verifies under an identity THEY trust. The KEY is
+  pinned, not a certificate chain to a root: a renewed certificate on the
+  same key needs nothing; a new key, a new certification, the old one
+  kept so old tokens still verify. Any lead withdraws a key (taking trust
+  away is protective); its tokens then read "uncertified".
+- `web/src/vault/timestamp.ts`: the reader's check — imprint,
+  messageDigest, the ESS signing-certificate binding, the timestamping
+  EKU, genTime within the certificate's validity, the signature (RSA
+  PKCS#1 v1.5 or ECDSA, WebCrypto), and the key's certification. Each
+  failure is named; only `verified` means "a TSA the team chose saw this
+  by then". The file explorer's "Verify signature" adds the stamp's line;
+  Team › People shows the authority and, for a lead, the certify flow.
+- The export carries every version's token and imprint, the checkpoints'
+  bodies and tokens, and `tsa.certs`; `tools/verify-export.mjs` checks
+  them with its own DER walk and Node's X.509 parser — a third reader —
+  and prints the TSA certificate's fingerprint to compare out of band
+  (`--tsa <spki>` trusts a key the package does not certify).
+- Not yet: no CRL/OCSP check of the TSA's certificate (a revoked TSA key
+  is the team's call — withdraw it); RSA-PSS tokens are reported
+  unsupported; working (non-evidence) stores are not stamped.

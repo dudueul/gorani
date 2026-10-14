@@ -28,6 +28,7 @@ use crate::auth;
 
 mod approvals;
 mod recovery;
+mod tsa_certs;
 
 /// APPEND-ONLY: a statement's index is its identity in the schema ledger
 /// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
@@ -175,6 +176,21 @@ pub const MIGRATIONS: &[&str] = &[
 	)",
 	"ALTER TABLE cases ADD COLUMN hold_at TEXT",
 	"ALTER TABLE cases ADD COLUMN hold_by TEXT",
+	// Migration v7 (commit 29h, docs/CUSTODY.md › Stage 7): an approved
+	// case.export is CONSUMED by the export it allowed — once.
+	"ALTER TABLE approvals ADD COLUMN consumed_at TEXT",
+	"ALTER TABLE approvals ADD COLUMN consumed_by TEXT",
+	// Migration v8 (commit 29j, family/tsa_certs.rs): leads' signed word on
+	// which timestamp authority keys count — SHA-256 of each key's SPKI.
+	"CREATE TABLE IF NOT EXISTS tsa_certs (
+		spki TEXT NOT NULL,
+		by_member TEXT NOT NULL,
+		name TEXT NOT NULL,
+		key_id TEXT NOT NULL,
+		signature TEXT NOT NULL,
+		at TEXT NOT NULL,
+		PRIMARY KEY (spki, by_member)
+	)",
 ];
 
 /// The four roles (docs/CASES.md). (The family's parent/child were accepted
@@ -361,6 +377,10 @@ impl GoraniFamilyDO {
 			("POST", id) if id.starts_with("case-close/") => self.case_close(&actor, &id["case-close/".len()..]).await,
 			// ── The two-person rule and the legal hold (commit 29f, family/approvals.rs) ──
 			("POST", id) if id.starts_with("case-hold/") => self.case_hold(&actor, &id["case-hold/".len()..]).await,
+			("POST", id) if id.starts_with("case-export/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.case_export(&actor, &id["case-export/".len()..], body).await
+			}
 			("GET", id) if id.starts_with("case-approvals/") => self.approvals_list(&actor, &id["case-approvals/".len()..]).await,
 			("POST", id) if id.starts_with("case-approvals/") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -377,6 +397,13 @@ impl GoraniFamilyDO {
 				Some((case, approval)) => self.approval_cancel(&actor, case, approval).await,
 				None => json_error(400, "case-approvals/<case>/<approval>"),
 			},
+			// ── The timestamp authority (commit 29j, family/tsa_certs.rs) ──
+			("GET", "tsa") => self.tsa_get(&actor).await,
+			("PUT", "tsa") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.tsa_certify(&actor, body).await
+			}
+			("DELETE", id) if id.starts_with("tsa/") => self.tsa_withdraw(&actor, &id["tsa/".len()..]).await,
 			// ── Identities (commit 27, docs/CASES.md › Member identity keys) ──
 			("GET", "identities") => self.identities(&actor).await,
 			("PUT", "identity") => {

@@ -30,7 +30,8 @@ import { kindOf, type FileKind } from "./icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
 import type { Signer, Trust } from "../../vault/identity.ts";
-import { checkContentHash, describeHashCheck, sha256Stream, signContentHash, type HashCheck } from "../../vault/content-hash.ts";
+import { checkContentHash, describeHashCheck, openContentHash, sha256Stream, signContentHashStamped, type HashCheck } from "../../vault/content-hash.ts";
+import { checkVersionStamp, describeStamp, trustedTsas, type StampCheck, type TsaCert, type VersionStamp } from "../../vault/timestamp.ts";
 import { SAMPLE_PASSWORD, isSampleType, originalType, sampleType, zipEncrypted } from "../../vault/samples.ts";
 import { signIntake, type IntakeFields } from "../../vault/intake.ts";
 import { acceptCustody, offerCustody, verifyChain, type CustodyCall, type CustodyChain } from "../../vault/custody.ts";
@@ -464,11 +465,14 @@ export class FilesModel {
 		// member's identity is open; an evidence case refuses an upload
 		// without one, so there the missing identity is said plainly.
 		const me = this.bridge.identity?.() ?? null;
-		const hash = me ? await signContentHash(me.signer, priv, this.memberId, id, 1, sha256, plain.length) : undefined;
+		// With it, the imprint the deployment's timestamp authority stamps
+		// (commit 29j, timestamp.ts) — SHA-256 of the signature, nothing more.
+		const signed = me ? await signContentHashStamped(me.signer, priv, this.memberId, id, 1, sha256, plain.length) : undefined;
+		const hash = signed?.sealed;
 		// …and, in an evidence case, its intake record, sealed into this
 		// file's place and signed the same way (commit 29g, intake.ts).
 		const intake = me && intakeFields ? await signIntake(me.signer, priv, this.memberId, id, intakeFields) : undefined;
-		const extra = { ...(mmeta ? { mmeta } : {}), ...(hash ? { hash } : {}), ...(intake ? { intake } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}) };
+		const extra = { ...(mmeta ? { mmeta } : {}), ...(signed ? { hash: signed.sealed, stamp: signed.stamp } : {}), ...(intake ? { intake } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}) };
 		try {
 			if (plain.length > 48 * 1024 * 1024) {
 				const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
@@ -662,13 +666,32 @@ export class FilesModel {
 	 * byte — the claim is about all of them.
 	 */
 	async verify(id: string, version?: number): Promise<HashCheck> {
+		return (await this.verifyServed(id, version)).check;
+	}
+
+	private async verifyServed(id: string, version?: number): Promise<{ check: HashCheck; served: { version: number; hash: string | null } }> {
 		const h = await sha256Stream();
 		let size = 0;
 		const served = await this.openBytes(id, version, (plain) => {
 			h.update(plain);
 			size += plain.length;
 		});
-		return this.checkHash(id, served, { sha256: h.hex(), size });
+		return { check: await this.checkHash(id, served, { sha256: h.hex(), size }), served };
+	}
+
+	/**
+	 * The served version's trusted timestamp (commit 29j), checked HERE: the
+	 * token against its signature's imprint, and the TSA's key against the
+	 * leads' certifications THIS member's trust accepts.
+	 */
+	async stamp(id: string, served: { version: number; hash: string | null }): Promise<StampCheck> {
+		const me = this.bridge.identity?.() ?? null;
+		const [stamps, tsa] = await Promise.all([
+			this.bridge.apiGet<{ versions: VersionStamp[] }>(`${areaPath(this.memberId)}/files/${id}/stamps`),
+			this.bridge.apiGet<{ certs: TsaCert[] }>("/api/v1/family/tsa").catch(() => ({ certs: [] as TsaCert[] })),
+		]);
+		const record = await openContentHash(await this.bridge.storePrivate(), this.memberId, id, served.version, served.hash);
+		return checkVersionStamp(record, stamps.versions.find((v) => v.version === served.version), await trustedTsas(me?.trust ?? null, tsa.certs));
 	}
 
 	// ── custody (commit 29g, docs/CUSTODY.md › stage 6) ─────────────────
@@ -709,8 +732,11 @@ export class FilesModel {
 	async verifyAndReport(id: string): Promise<HashCheck | null> {
 		const name = this.names.get(id) ?? id;
 		try {
-			const check = await this.verify(id);
-			this.bridge.toast(`“${name}”: ${describeHashCheck(check)}`);
+			const { check, served } = await this.verifyServed(id);
+			// And when it was signed, by a third party — where the deployment stamps.
+			const stamp = check.status === "unsigned" ? null : await this.stamp(id, served).catch(() => null);
+			const when = stamp && !(stamp.status === "absent" && /no timestamp authority/.test(stamp.why)) ? ` · ${describeStamp(stamp)}` : "";
+			this.bridge.toast(`“${name}”: ${describeHashCheck(check)}${when}`);
 			return check;
 		} catch (e) {
 			this.bridge.toast(`“${name}”: could not verify — ${e instanceof Error ? e.message : String(e)}`);

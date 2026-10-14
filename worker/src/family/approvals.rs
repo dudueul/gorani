@@ -29,9 +29,10 @@ use worker::{Response, Result};
 
 use super::{is_signature, json_error, Count, GoraniFamilyDO};
 
-/// What the two-person rule covers today. (`case.export` joins with the
-/// signed export, stage 7.)
-const ACTIONS: [&str; 2] = ["case.close", "hold.release"];
+/// What the two-person rule covers. `case.export` (commit 29h) is approved
+/// like the others but runs later: the export it allows CONSUMES it, once
+/// (`case_export`).
+const ACTIONS: [&str; 3] = ["case.close", "hold.release", "case.export"];
 /// A request nobody approved in a week is stale: ask again.
 const APPROVAL_DAYS: i64 = 7;
 
@@ -46,6 +47,10 @@ struct ApprovalRow {
 	approved_at: Option<String>,
 	approve_signature: Option<String>,
 	cancelled_at: Option<String>,
+	#[serde(default)]
+	consumed_at: Option<String>,
+	#[serde(default)]
+	consumed_by: Option<String>,
 	/// 1 when the request is older than APPROVAL_DAYS (computed by SQLite).
 	expired: i64,
 }
@@ -64,7 +69,7 @@ impl ApprovalRow {
 			"id": self.id, "case": case, "action": self.action, "status": self.status(),
 			"requestedBy": self.requested_by, "requestedAt": self.requested_at, "requestSignature": self.request_signature,
 			"approvedBy": self.approved_by, "approvedAt": self.approved_at, "approveSignature": self.approve_signature,
-			"cancelledAt": self.cancelled_at,
+			"cancelledAt": self.cancelled_at, "consumedAt": self.consumed_at, "consumedBy": self.consumed_by,
 		})
 	}
 }
@@ -80,7 +85,7 @@ impl GoraniFamilyDO {
 		Ok(self
 			.sql
 			.exec(
-				&format!("SELECT id, action, requested_by, requested_at, request_signature, approved_by, approved_at, approve_signature, cancelled_at, (requested_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{APPROVAL_DAYS} days')) AS expired FROM approvals WHERE case_id = ?1 AND id = ?2"),
+				&format!("SELECT id, action, requested_by, requested_at, request_signature, approved_by, approved_at, approve_signature, cancelled_at, consumed_at, consumed_by, (requested_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{APPROVAL_DAYS} days')) AS expired FROM approvals WHERE case_id = ?1 AND id = ?2"),
 				Some(vec![case.into(), id.into()]),
 			)?
 			.to_array::<ApprovalRow>()?
@@ -96,6 +101,8 @@ impl GoraniFamilyDO {
 			"case.close" if c.closed_at.is_some() => Err("the case is already closed"),
 			"case.close" if c.kind != "evidence" => Err("a working case closes with one manager — POST /api/v1/cases/<id>/close"),
 			"hold.release" if c.hold_at.is_none() => Err("the case is not on hold"),
+			// (case.export: any case, open or closed — exporting what was
+			// kept is exactly what a closed evidence case is for.)
 			_ => Ok(()),
 		})
 	}
@@ -109,7 +116,7 @@ impl GoraniFamilyDO {
 		}
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let Some(id) = get("id").filter(|i| valid_approval_id(i)) else { return json_error(400, "id: 22–64 of [A-Za-z0-9_-], chosen by the client (it is signed)") };
-		let Some(action) = get("action").filter(|a| ACTIONS.contains(&a.as_str())) else { return json_error(400, "action: case.close or hold.release") };
+		let Some(action) = get("action").filter(|a| ACTIONS.contains(&a.as_str())) else { return json_error(400, "action: case.close, hold.release or case.export") };
 		let Some(signature) = get("signature").filter(|s| is_signature(s)) else { return json_error(400, "signature: the requester's, over the request statement") };
 		if let Err(why) = self.action_ready(case, &action)? {
 			return json_error(409, why);
@@ -149,7 +156,7 @@ impl GoraniFamilyDO {
 		let rows: Vec<ApprovalRow> = self
 			.sql
 			.exec(
-				&format!("SELECT id, action, requested_by, requested_at, request_signature, approved_by, approved_at, approve_signature, cancelled_at, (requested_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{APPROVAL_DAYS} days')) AS expired FROM approvals WHERE case_id = ?1 ORDER BY requested_at DESC"),
+				&format!("SELECT id, action, requested_by, requested_at, request_signature, approved_by, approved_at, approve_signature, cancelled_at, consumed_at, consumed_by, (requested_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{APPROVAL_DAYS} days')) AS expired FROM approvals WHERE case_id = ?1 ORDER BY requested_at DESC"),
 				Some(vec![case.into()]),
 			)?
 			.to_array()?;
@@ -188,6 +195,8 @@ impl GoraniFamilyDO {
 			"hold.release" => {
 				self.sql.exec("UPDATE cases SET hold_at = NULL, hold_by = NULL WHERE id = ?1", Some(vec![case.into()]))?;
 			}
+			// Approved now, run later: the export consumes it (case_export).
+			"case.export" => {}
 			_ => return json_error(400, "unknown action"),
 		}
 		self.sql.exec(
@@ -214,6 +223,44 @@ impl GoraniFamilyDO {
 		self.sql.exec("UPDATE approvals SET cancelled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND case_id = ?2", Some(vec![id.into(), case.into()]))?;
 		self.audit(actor, "approval.cancel", case, Some(&serde_json::json!({ "id": id, "action": row.action }))).await?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	/// `POST case-export/<case> { approval }` — one of the two people who
+	/// agreed runs the export, and the approval is spent: a second package
+	/// needs a second approval. Within 7 days of the approval. The registry
+	/// records it (`case.export`); the package itself is built in the
+	/// exporter's browser (web/src/vault/export.ts), which holds the key.
+	pub(super) async fn case_export(&self, actor: &str, case: &str, body: serde_json::Value) -> Result<Response> {
+		let Some(me) = self.member_by_email(actor)? else { return json_error(403, "not a team member") };
+		let Some(id) = body.get("approval").and_then(|v| v.as_str()) else { return json_error(400, "approval: the id of an approved case.export") };
+		let Some(row) = self.approval_row(case, id)? else { return json_error(404, "no such approval") };
+		if row.action != "case.export" {
+			return json_error(409, "that approval is not for an export");
+		}
+		if row.approved_at.is_none() {
+			return json_error(409, "the export is not approved yet — a second lead must agree");
+		}
+		if row.consumed_at.is_some() {
+			return json_error(409, "this approval was used by an earlier export — each package needs its own");
+		}
+		if me.id != row.requested_by && Some(&me.id) != row.approved_by.as_ref() {
+			return json_error(403, "one of the two people who agreed runs the export");
+		}
+		let fresh = self
+			.sql
+			.exec(&format!("SELECT COUNT(*) AS n FROM approvals WHERE id = ?1 AND approved_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-{APPROVAL_DAYS} days')"), Some(vec![id.into()]))?
+			.one::<Count>()?
+			.n;
+		if fresh == 0 {
+			return json_error(409, "the approval is older than a week — ask again");
+		}
+		self.sql.exec(
+			"UPDATE approvals SET consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), consumed_by = ?1 WHERE id = ?2 AND case_id = ?3 AND consumed_at IS NULL",
+			Some(vec![me.id.clone().into(), id.into(), case.into()]),
+		)?;
+		self.audit(actor, "case.export", case, Some(&serde_json::json!({ "approval": id, "exporter": me.id, "requestedBy": row.requested_by, "approvedBy": row.approved_by }))).await?;
+		let done = self.approval_row(case, id)?.ok_or_else(|| worker::Error::RustError("approval vanished".into()))?;
+		Ok(Response::from_json(&serde_json::json!({ "exportId": id, "case": case, "exporter": me.id, "approval": done.json(case) }))?)
 	}
 
 	/// `POST case-hold/<case>` — a manager of the case, or a lead, places a

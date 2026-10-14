@@ -297,6 +297,14 @@ pub const MIGRATIONS: &[&str] = &[
 		cancelled_at TEXT,
 		PRIMARY KEY (file_id, seq)
 	)",
+	// Migration v15 (commit 29j, docs/CUSTODY.md › Stage 7, D5.5): an RFC
+	// 3161 timestamp per evidence version. The imprint is the client's
+	// (SHA-256 of the uploader's signature, which the store cannot open);
+	// the token is the TSA's, stored as it came (base64 DER), with the time
+	// it states — readable, because a token is a public proof.
+	"ALTER TABLE file_versions ADD COLUMN stamp_imprint TEXT",
+	"ALTER TABLE file_versions ADD COLUMN stamp_token TEXT",
+	"ALTER TABLE file_versions ADD COLUMN stamped_at TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -313,6 +321,8 @@ pub const MIGRATIONS: &[&str] = &[
 pub struct GoraniMemberDO {
 	pub(crate) sql: worker::SqlStorage,
 	pub(crate) env: Env,
+	/// (commit 29j) The alarm that stamps evidence versions (stamps.rs).
+	pub(crate) state: State,
 	/// A failed migration, kept instead of panicking (schema.rs): every
 	/// request is answered with it until a fixed deploy migrates cleanly.
 	schema: std::result::Result<(), String>,
@@ -324,7 +334,16 @@ impl DurableObject for GoraniMemberDO {
 		// Ledgered (commit 25): the constructor runs on EVERY wake-up, and
 		// re-running an ADD COLUMN panicked the second one (schema.rs).
 		let schema = crate::schema::migrate(&sql, MIGRATIONS);
-		Self { sql, env, schema }
+		Self { sql, env, schema, state }
+	}
+
+	/// The only alarm this DO sets: trusted timestamps for evidence versions
+	/// (commit 29j, stamps.rs), off every request's path.
+	async fn alarm(&self) -> Result<Response> {
+		if self.schema.is_ok() {
+			self.stamp_alarm().await?;
+		}
+		Response::ok("")
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
@@ -383,6 +402,50 @@ impl GoraniMemberDO {
 		let v = serde_json::to_string(&settings).map_err(|_| Error::RustError("bad settings JSON".into()))?;
 		self.sql.exec("INSERT INTO vault (k, v) VALUES ('settings', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", Some(vec![v.into()]))?;
 		self.audit(actor, if hold { "case.hold" } else { "case.hold.release" }, "settings", None, None).await
+	}
+}
+
+// ── Re-verification (commit 29h, docs/CUSTODY.md › Stage 7, D5.8) ───────
+
+impl GoraniMemberDO {
+	/// A client re-hashed this store's evidence: record WHO, WHEN and the
+	/// counts (the store cannot check them — it has no key; the audit line
+	/// is the record that someone did, and what they found).
+	async fn reverify_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let n = |k: &str| body.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+		let (checked, failed) = (n("checked"), n("failed"));
+		let member = body.get("member").and_then(|v| v.as_str()).unwrap_or_default();
+		self.sql.exec(
+			"INSERT INTO vault (k, v) VALUES ('reverified', json_object('by', ?1, 'checked', ?2, 'failed', ?3, 'at', strftime('%Y-%m-%dT%H:%M:%fZ','now'))) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+			Some(vec![member.into(), (checked as i64).into(), (failed as i64).into()]),
+		)?;
+		self.audit(actor, "case.reverify", "evidence", None, Some(&format!("checked:{checked},failed:{failed}"))).await?;
+		Ok(Response::from_json(&self.reverify_state().await?)?)
+	}
+
+	/// The last re-verification, and whether one is owed: an evidence store
+	/// with files, never re-verified or last re-verified more than
+	/// REVERIFY_DAYS (default 30) ago.
+	pub(crate) async fn reverify_state(&self) -> Result<serde_json::Value> {
+		let days: i64 = self.env.var("REVERIFY_DAYS").ok().and_then(|v| v.to_string().parse().ok()).unwrap_or(30).max(1);
+		let last: Option<serde_json::Value> = self
+			.sql
+			.exec("SELECT v FROM vault WHERE k = 'reverified'", None)?
+			.to_array::<KvRow>()?
+			.into_iter()
+			.next()
+			.and_then(|r| serde_json::from_str(&r.v).ok());
+		let evidence = self.is_evidence().await?;
+		let files = self.sql.exec("SELECT COUNT(*) AS n FROM files", None)?.one::<crate::files_store::TotalCount>()?.n;
+		#[derive(serde::Deserialize)]
+		struct Old {
+			old: i64,
+		}
+		let stale = match last.as_ref().and_then(|l| l.get("at")).and_then(|a| a.as_str()) {
+			Some(at) => self.sql.exec(&format!("SELECT (?1 < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{days} days')) AS old"), Some(vec![at.into()]))?.one::<Old>()?.old != 0,
+			None => true,
+		};
+		Ok(serde_json::json!({ "last": last, "days": days, "overdue": evidence && files > 0 && stale }))
 	}
 }
 
@@ -507,6 +570,12 @@ impl GoraniMemberDO {
 			// Custody (commit 29g, custody.rs). The Worker names the acting
 			// member in the body (`member`), from its own check of the caller.
 			("GET", id) if id.starts_with("custody/") => self.custody_get(&id["custody/".len()..]).await,
+			// Timestamps (commit 29j, stamps.rs).
+			("GET", id) if id.starts_with("stamps/") => self.stamps_get(&id["stamps/".len()..]).await,
+			("PUT", id) if id.starts_with("stamps/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.stamps_put(&actor, &id["stamps/".len()..], body).await
+			}
 			("POST", id) if id.starts_with("custody/") => {
 				let body = req.json::<serde_json::Value>().await?;
 				match id["custody/".len()..].split('/').collect::<Vec<_>>().as_slice() {
@@ -518,6 +587,11 @@ impl GoraniMemberDO {
 					}
 					_ => json_error(404, "custody/<file>[/<seq>/accept|cancel]"),
 				}
+			}
+			("GET", "reverify") => Response::from_json(&self.reverify_state().await?),
+			("POST", "reverify") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.reverify_put(&actor, body).await
 			}
 			("PUT", "case-hold") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -1046,9 +1120,21 @@ impl GoraniMemberDO {
 		// Evidence still without its write-once retention: a failure the pass
 		// reports (503), like a delete storage refused — never silence.
 		let locks = self.lock_pass().await?;
-		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending},locksFailed:{},locksPending:{}", locks.failed, locks.pending))).await?;
-		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending });
-		if failed > 0 || locks.failed > 0 {
+		// Evidence versions still without their timestamp (commit 29j): the
+		// alarm retries on its own; tonight's pass tries too, and says so.
+		let stamps = self.stamp_pass().await?;
+		if stamps.pending > 0 {
+			worker::console_error!("gorani: {} evidence version(s) in {} still without a trusted timestamp (TSA_URL)", stamps.pending, self.area(None).unwrap_or_default());
+		}
+		// Evidence nobody re-verified lately (commit 29h): the server cannot
+		// re-hash (it has no key) — it can notice nobody did, and say so.
+		let reverify = self.reverify_state().await?;
+		if reverify.get("overdue").and_then(|o| o.as_bool()) == Some(true) {
+			worker::console_error!("gorani: evidence store {} not re-verified for {} days or more (REVERIFY_DAYS) — a client must re-hash it", self.area(None).unwrap_or_default(), reverify["days"]);
+		}
+		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending},locksFailed:{},locksPending:{},stampsFailed:{},stampsPending:{}", locks.failed, locks.pending, stamps.failed, stamps.pending))).await?;
+		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending, "stamped": stamps.stamped, "stampsFailed": stamps.failed, "stampsPending": stamps.pending, "reverify": reverify });
+		if failed > 0 || locks.failed > 0 || stamps.failed > 0 {
 			return Ok(Response::from_json(&body)?.with_status(503));
 		}
 		Ok(Response::from_json(&body)?)

@@ -34,6 +34,7 @@
  * intake    "gorani-intake-v1"   ‖ area ‖ file ‖ source ‖ collector ‖ method ‖ collected-at ‖ notes   (intake.ts)
  * offer     "gorani-custody-offer-v1"  ‖ area ‖ file ‖ seq ‖ from ‖ to ‖ SHA-256(reason)          (custody.ts)
  * accept    "gorani-custody-accept-v1" ‖ area ‖ file ‖ seq ‖ from ‖ to
+ * export    "gorani-export-v1"   ‖ case ‖ export id ‖ SHA-256(manifest.json)   (the exporter; export.ts)
  * ```
  *
  * Digests are FULL SHA-256 of the public halves (ec raw ‖ ML-KEM public):
@@ -92,6 +93,9 @@ export const statements = {
 	intake: (area: string, file: string, source: string, collector: string, method: string, collectedAt: string, notes: string) => stmt("gorani-intake-v1", area, file, source, collector, method, collectedAt, notes),
 	custodyOffer: (area: string, file: string, seq: number, from: string, to: string, reasonDigest: string) => stmt("gorani-custody-offer-v1", area, file, String(seq), from, to, reasonDigest),
 	custodyAccept: (area: string, file: string, seq: number, from: string, to: string) => stmt("gorani-custody-accept-v1", area, file, String(seq), from, to),
+	exportManifest: (caseId: string, exportId: string, manifestDigest: string) => stmt("gorani-export-v1", caseId, exportId, manifestDigest),
+	// The team's timestamp authority (commit 29j, timestamp.ts): a lead's word that this key is it.
+	tsa: (spki: string, name: string) => stmt("gorani-tsa-v1", spki, name),
 };
 
 // ── ids, digests, fingerprints ────────────────────────────────────────

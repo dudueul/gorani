@@ -24,7 +24,7 @@
 import { statements, type Signer, type Trust } from "./identity.ts";
 import { newItemId } from "./places.ts";
 
-export type TwoPersonAction = "case.close" | "hold.release";
+export type TwoPersonAction = "case.close" | "hold.release" | "case.export";
 
 export interface Approval {
 	id: string;
@@ -37,6 +37,9 @@ export interface Approval {
 	approvedBy: string | null;
 	approvedAt: string | null;
 	approveSignature: string | null;
+	/** An approved case.export is spent by the export it allowed (commit 29h). */
+	consumedAt?: string | null;
+	consumedBy?: string | null;
 }
 
 /** A JSON call against the API (the shell's, or a test's). */

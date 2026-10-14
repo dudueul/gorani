@@ -214,6 +214,28 @@ async fn audit_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Res
 
 /// One registry round trip: the caller's row and (with `target`) whether
 /// the addressed member exists and is active.
+/// `POST /family/tsa/probe` (commit 29j): a lead asks the deployment's TSA
+/// for a token over a random imprint and gets it back whole, certificate
+/// included — what their client shows (subject, key fingerprint) before
+/// they certify that key. Nothing is stored: the token dates nothing.
+async fn tsa_probe(env: &Env, email: &str) -> Result<Response> {
+	match actor_of(env, email, None).await? {
+		Some(a) if a.role == "lead" => {}
+		Some(_) => return json_error(403, "only a lead certifies the timestamp authority"),
+		None => return json_error(403, "not a team member"),
+	}
+	let mut imprint = [0u8; 32];
+	getrandom::getrandom(&mut imprint).map_err(|e| Error::RustError(format!("no randomness: {e}")))?;
+	match crate::tsa::stamp(env, &imprint).await {
+		Ok(Some(s)) => {
+			use base64::Engine;
+			Response::from_json(&serde_json::json!({ "imprint": hex::encode(imprint), "token": base64::engine::general_purpose::STANDARD.encode(&s.token), "at": s.at }))
+		}
+		Ok(None) => json_error(409, "no timestamp authority is configured (TSA_URL)"),
+		Err(e) => json_error(502, &format!("the timestamp authority: {e}")),
+	}
+}
+
 async fn actor_of(env: &Env, email: &str, target: Option<&str>) -> Result<Option<Actor>> {
 	let namespace = env.durable_object("FAMILY")?;
 	let stub = namespace.id_from_name("family")?.get_stub()?;
@@ -337,6 +359,11 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 			}
 			return Response::from_json(&answer);
 		}
+		// The export (commit 29h): consumes an approved case.export, once.
+		("POST", [case, "export"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			return forward_family(&env, &identity.email, "POST", format!("case-export/{case}"), Some(body)).await;
+		}
 		("POST", [case, "hold"]) => {
 			let placed = forward_family(&env, &identity.email, "POST", format!("case-hold/{case}"), Some(serde_json::json!({}))).await?;
 			if placed.status_code() != 200 {
@@ -376,7 +403,9 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 	Some(match (method, content) {
 		(_, ["files", "shares", ..]) => return None,
-		("GET", ["audit"] | ["reads"] | ["audit", "verify"]) => None,
+		("GET", ["audit"] | ["reads"] | ["audit", "verify"] | ["audit", "lines"]) => None,
+		// Re-verifying is reading every file — and saying so (commit 29h).
+		("GET" | "POST", ["reverify"]) => Some(Need::Read),
 		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
@@ -468,6 +497,16 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			Some(a) if a.role == "lead" || a.role == "auditor" => Response::from_json(&crate::audit::verify_area(&env, "registry").await?),
 			_ => json_error(403, "the registry's audit is verified by leads and auditors"),
 		},
+		// ── The timestamp authority (commit 29j, family/tsa_certs.rs) ──
+		("GET", ["family", "tsa"]) => forward_family(&env, &identity.email, "GET", "tsa", None).await,
+		("PUT", ["family", "tsa"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "tsa", Some(body)).await
+		}
+		("DELETE", ["family", "tsa", spki]) => forward_family(&env, &identity.email, "DELETE", format!("tsa/{spki}"), None).await,
+		// A lead's client needs the TSA's certificate to show its fingerprint
+		// before certifying it: a token over a random imprint carries it.
+		("POST", ["family", "tsa", "probe"]) => tsa_probe(&env, &identity.email).await,
 		("GET", ["family", "identities"]) => forward_family(&env, &identity.email, "GET", "identities", None).await,
 		("PUT", ["family", "identity"]) => {
 			let body = req.json::<serde_json::Value>().await?;
@@ -528,6 +567,31 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			Ok(actor) => forward_member(&env, id, "GET", "audit", None, actor.email).await,
 			Err(resp) => Ok(resp),
 		},
+		// The whole chained trail, oldest first, a page at a time (commit
+		// 29h — what an export carries). The audit's audience, as above.
+		("GET", ["members", id, "audit", "lines"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(actor) => {
+				// Ship what is still in the outbox first, so the pages are whole.
+				let _ = forward_member(&env, id, "GET", "audit", None, actor.email).await?;
+				let q = crate::files_store::urlquery(req.url()?.query().unwrap_or(""));
+				let after = q.get("after").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0).max(0);
+				let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
+				Response::from_json(&crate::audit::page(&env, id, after, limit).await?)
+			}
+			Err(resp) => Ok(resp),
+		},
+		// Re-verification (commit 29h): a client re-hashed the store's
+		// evidence and reports the counts; the store records them.
+		("GET", ["members", id, "reverify"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "reverify", None, actor)).await,
+		("POST", ["members", id, "reverify"]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			let mut body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+			body["member"] = serde_json::json!(actor.id);
+			forward_member(&env, id, "POST", "reverify", Some(body), &actor.email).await
+		}
 		// A member's root PUBLIC halves — what a case manager seals a grant
 		// to (commit 26). Until stage 4's fingerprints, this is the server's
 		// word for whose key it is: the trust-on-first-use gap of O3, now
@@ -567,6 +631,20 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			let mut body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
 			body["member"] = serde_json::json!(actor.id);
 			forward_member(&env, id, "POST", &path, Some(body), &actor.email).await
+		}
+		// ── Trusted timestamps (commit 29j, stamps.rs) ── every version's
+		// token, for the reader to check; an imprint for a version without one.
+		("GET", ["members", id, "files", file, "stamps"]) => {
+			let path = format!("stamps/{file}");
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", path, None, actor)).await
+		}
+		("PUT", ["members", id, "files", file, "stamps"]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			let body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+			forward_member(&env, id, "PUT", &format!("stamps/{file}"), Some(body), &actor.email).await
 		}
 		("GET", ["members", id, "files", "music"]) => {
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "music/feed", None, actor)).await
@@ -853,8 +931,9 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	// ask for each by name (the upload contract is fixed anyway).
 	// (`hash`: the uploader's signed content hash, sealed — commit 29d.
 	// `sample`: "1" uploads a malware sample — commit 29e. `intake`: an
-	// evidence file's sealed, signed intake record — commit 29g.)
-	const KNOWN: [&str; 15] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake"];
+	// evidence file's sealed, signed intake record — commit 29g. `stamp`:
+	// the timestamp imprint, SHA-256 of the hash record's signature — 29j.)
+	const KNOWN: [&str; 16] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake", "stamp"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -935,6 +1014,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
+		"stamp": form.fields.get("stamp"),
 		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
 		"intake": form.fields.get("intake"),
 		"objectKey": object_key,
@@ -975,6 +1055,7 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
+		"stamp": form.fields.get("stamp"),
 		"objectKey": object_key,
 	});
 	let resp = forward_member(&env, member_id, "POST", "files/versions", Some(body), &actor.email).await?;
@@ -1106,6 +1187,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
+		"stamp": form.fields.get("stamp"),
 		// (A new file only: a version of a sample is a sample already.)
 		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
 		"intake": form.fields.get("intake"),

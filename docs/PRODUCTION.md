@@ -144,9 +144,9 @@ memory.
    enrolled computer moves to the TPM with `gorani-sync protect`.
    `gorani-sync devices` shows what protects each computer (the client's
    word, recorded by the server — not attested), and `gorani-sync revoke
-   --device <id>` deletes a lost one's copy from any other. *(The web app
-   has no devices screen yet: until it has, revocation is this command or
-   the API.)*
+   --device <id>` deletes a lost one's copy from any other — as does the
+   web app's Team › Devices tab (commit 35), which flags a computer whose
+   secret sits in a file.
 
 ## 3. Deploy
 

@@ -419,10 +419,32 @@ try {
 		});
 		const ids = (await api(dev.base, "GET", "/api/v1/family/identities", { email: "mom@family.test" })).json.identities;
 		assert.equal(ids.filter((e) => e.member === "mom").length, 1, "mom's identity is registered, once");
+		// Two of mom's computers (commit 34): one whose device secret the TPM
+		// and the login keyring hold, one whose secret sits in a file.
+		const vaultRow = (await api(dev.base, "GET", "/api/v1/members/mom/vault", { email: "mom@family.test" })).json;
+		const rootKeyId = (vaultRow.settings ?? vaultRow).keyId;
+		const enrolDevice = async (name, protection) => {
+			const r = await api(dev.base, "POST", "/api/v1/members/mom/devices", { email: "mom@family.test", body: { name, platform: "linux", keyId: rootKeyId, wrapped: "GW01:e2e-placeholder", salt: "c2FsdHNhbHRzYWx0c2FsdA==", protection } });
+			assert.equal(r.status, 200, r.text);
+			return r.json.deviceId;
+		};
+		const desk = await enrolDevice("mom's desktop", "tpm+keyring");
+		const oldLaptop = await enrolDevice("old laptop", "file");
 		await teamButton.click();
 		const fp = (await page.locator('[data-test="my-fingerprint"]').textContent())?.trim() ?? "";
 		assert.match(fp, /^([0-9A-F]{4} ){7}[0-9A-F]{4}$/, "the fingerprint people read to each other");
 		assert.equal(fp.replace(/ /g, ""), ids.find((e) => e.member === "mom").keyId.slice(0, 32).toUpperCase(), "…is the registered identity's");
+		// The Devices tab: what protects each computer, and revoking a lost one.
+		await page.getByRole("button", { name: "Devices" }).click();
+		const deskProtection = page.locator(`[data-test="device-protection-${desk}"]`);
+		await deskProtection.waitFor({ timeout: 30_000 });
+		assert.equal((await deskProtection.textContent()).trim(), "Protected by the TPM + the login keyring");
+		assert.match(await page.locator(`[data-test="device-protection-${oldLaptop}"]`).textContent(), /⚠ Protected by a file/, "a file-held secret is flagged");
+		page.once("dialog", (d) => void d.accept());
+		await page.locator(`[data-test="device-revoke-${oldLaptop}"]`).click();
+		await page.locator(`[data-test="device-revoked-${oldLaptop}"]`).waitFor({ timeout: 30_000 });
+		const devicesAfter = (await api(dev.base, "GET", "/api/v1/members/mom/devices", { email: "mom@family.test" })).json;
+		assert.deepEqual([devicesAfter.find((d) => d.id === oldLaptop)?.revoked, devicesAfter.find((d) => d.id === desk)?.revoked], [true, false], "the lost laptop is revoked from the web app; the desktop is not");
 
 		await page.getByRole("button", { name: "Cases" }).click();
 		await page.locator('[data-test="case-id"]').fill("ir-e2e");
@@ -513,7 +535,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel (with Devices: protection shown, a lost laptop revoked) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

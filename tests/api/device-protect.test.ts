@@ -21,7 +21,7 @@
  *      server took the new copy is finished by the next one; replaced
  *      keyring parts are forgotten;
  *   5. `devices` lists every computer's protection, and a lost one is
- *      revoked from another (the web app has no devices screen yet).
+ *      revoked from another (the web app's Team › Devices does the same — e2e:app).
  *
  * Skipped without the binaries, swtpm, tpm2-tools, secret-tool,
  * gnome-keyring or dbus-daemon (apt: swtpm tpm2-tools libsecret-tools

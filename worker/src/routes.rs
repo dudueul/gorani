@@ -347,7 +347,7 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 	Some(match (method, content) {
 		(_, ["files", "shares", ..]) => return None,
-		("GET", ["audit"] | ["reads"]) => None,
+		("GET", ["audit"] | ["reads"] | ["audit", "verify"]) => None,
 		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
@@ -413,6 +413,10 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			forward_family(&env, &identity.email, "POST", format!("members/{id}/deactivate"), Some(serde_json::json!({}))).await
 		}
 		// ── Identities (commit 27, docs/CASES.md › Member identity keys) ──
+		("GET", ["family", "audit", "verify"]) => match actor_of(&env, &identity.email, None).await? {
+			Some(a) if a.role == "lead" || a.role == "auditor" => Response::from_json(&crate::audit::verify_area(&env, "registry").await?),
+			_ => json_error(403, "the registry's audit is verified by leads and auditors"),
+		},
 		("GET", ["family", "identities"]) => forward_family(&env, &identity.email, "GET", "identities", None).await,
 		("PUT", ["family", "identity"]) => {
 			let body = req.json::<serde_json::Value>().await?;
@@ -461,6 +465,12 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 				let body = req.json::<serde_json::Value>().await?;
 				forward_member(&env, id, "PUT", "vault", Some(body), actor.email).await
 			}
+			Err(resp) => Ok(resp),
+		},
+		// The trail verified (commit 29): the chain recomputed, every
+		// checkpoint the bucket holds compared — the same audience as the audit.
+		("GET", ["members", id, "audit", "verify"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(_) => Response::from_json(&crate::audit::verify_area(&env, id).await?),
 			Err(resp) => Ok(resp),
 		},
 		("GET", ["members", id, "audit"]) => match audit_ctx(&env, &identity, id).await {

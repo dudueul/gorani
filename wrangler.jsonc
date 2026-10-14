@@ -86,11 +86,15 @@
 	"durable_objects": {
 		"bindings": [
 			{ "name": "FAMILY", "class_name": "GoraniFamilyDO" },
-			{ "name": "MEMBER", "class_name": "GoraniMemberDO" }
+			{ "name": "MEMBER", "class_name": "GoraniMemberDO" },
+			// Commit 29 (docs/CUSTODY.md › Stage 1): one audit trail per area,
+			// hash-chained, outside the area's own database.
+			{ "name": "AUDIT", "class_name": "GoraniAuditDO" }
 		]
 	},
 	"migrations": [
-		{ "tag": "v1", "new_sqlite_classes": ["GoraniFamilyDO", "GoraniMemberDO"] }
+		{ "tag": "v1", "new_sqlite_classes": ["GoraniFamilyDO", "GoraniMemberDO"] },
+		{ "tag": "v2", "new_sqlite_classes": ["GoraniAuditDO"] }
 	],
 
 	// Rate limits (commit 25, docs/SECURITY-REVIEW.md › O13) — the Workers

@@ -258,6 +258,70 @@ pub async fn delete(env: &Env, key: &str) -> Result<()> {
 	}
 }
 
+/// Keys under a prefix (ListObjectsV2; R2's list), at most `max` — for
+/// small listings only: the audit checkpoints of one area (audit.rs). The
+/// verification reads the bucket's own word on which checkpoints exist,
+/// not the database it is checking.
+pub async fn list(env: &Env, prefix: &str, max: usize) -> Result<Vec<String>> {
+	let mut out: Vec<String> = Vec::new();
+	if let Some(bucket) = r2_bucket(env).await? {
+		let mut cursor: Option<String> = None;
+		loop {
+			let mut b = bucket.list().prefix(prefix.to_string());
+			if let Some(c) = cursor.take() {
+				b = b.cursor(c);
+			}
+			let objects = b.execute().await?;
+			out.extend(objects.objects().into_iter().map(|o| o.key()));
+			if !objects.truncated() || out.len() >= max {
+				break;
+			}
+			cursor = objects.cursor();
+			if cursor.is_none() {
+				break;
+			}
+		}
+		out.truncate(max);
+		return Ok(out);
+	}
+	let cfg = config(env)?;
+	let mut token: Option<String> = None;
+	loop {
+		let mut q = vec![("list-type".to_string(), "2".to_string()), ("prefix".to_string(), prefix.to_string())];
+		if let Some(t) = &token {
+			q.push(("continuation-token".to_string(), t.clone()));
+		}
+		let mut resp = fetch_signed(&cfg, "GET", "", &q, None, None, None).await?;
+		if resp.status_code() != 200 {
+			return Err(Error::RustError(format!("S3 list {prefix}: HTTP {}", resp.status_code())));
+		}
+		let xml = resp.text().await?;
+		out.extend(xml_tags(&xml, "Key"));
+		let truncated = xml_tags(&xml, "IsTruncated").first().is_some_and(|t| t == "true");
+		token = xml_tags(&xml, "NextContinuationToken").into_iter().next();
+		if !truncated || token.is_none() || out.len() >= max {
+			break;
+		}
+	}
+	out.truncate(max);
+	Ok(out)
+}
+
+/// The text of every `<tag>…</tag>` in a small XML answer. (Our keys hold
+/// only `[A-Za-z0-9_./:-]`, so no entity ever needs decoding.)
+fn xml_tags(xml: &str, tag: &str) -> Vec<String> {
+	let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+	let mut out = Vec::new();
+	let mut rest = xml;
+	while let Some(i) = rest.find(&open) {
+		let after = &rest[i + open.len()..];
+		let Some(j) = after.find(&close) else { break };
+		out.push(after[..j].to_string());
+		rest = &after[j + close.len()..];
+	}
+	out
+}
+
 // ── Multipart upload (GC01 frames: one frame per part) ──────────────
 
 /// Initiate: returns the S3 UploadId.

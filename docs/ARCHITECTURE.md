@@ -22,7 +22,9 @@ devices are the only places a key exists unwrapped.
 |---|---|---|
 | Web SPA (web/) | Lit 3 + TypeScript + Tailwind v4, static assets | Yes — your own content, in your browser, after you unlock |
 | Worker (worker/) | Rust → wasm32 (workers-rs) | **Never** |
-| Member database | Durable Object `GoraniMemberDO`, SQLite | Structure only (sizes, times, folder shape, ids) |
+| Area databases | Durable Object `GoraniMemberDO`, SQLite — one per member (`member:<id>`) and per case (`case:<id>`) | Structure only (sizes, times, folder shape, ids) |
+| Team registry | Durable Object `GoraniFamilyDO` — members, cases and grants, identities, recovery (docs/CASES.md) | Structure, public keys and sealed copies — opens nothing |
+| Audit trails | Durable Object `GoraniAuditDO` — one hash-chained trail per area and the registry (`audit:<area>`), checkpointed daily to the bucket (docs/CUSTODY.md) | Structure only — sealed details stay sealed |
 | Object storage | Any S3-compatible bucket via SigV4 | **Never** |
 | Native clients (clients/) | Rust (Windows cfapi / Linux FUSE / macOS FileProvider) | Yes — on your device, after its own unlock |
 

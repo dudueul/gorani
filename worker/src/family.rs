@@ -192,18 +192,20 @@ struct FamilyState {
 #[durable_object]
 pub struct GoraniFamilyDO {
 	sql: worker::SqlStorage,
+	/// For the registry's audit trail (audit.rs › `audit:registry`).
+	env: Env,
 	/// A failed migration, kept instead of panicking (schema.rs).
 	schema: std::result::Result<(), String>,
 }
 
 impl DurableObject for GoraniFamilyDO {
-	fn new(state: State, _env: Env) -> Self {
+	fn new(state: State, env: Env) -> Self {
 		let sql = state.storage().sql();
 		// The same ledger as the member stores (schema.rs). This list has no
 		// ADD COLUMN yet — which is why the registry survived restarts while
 		// every member store hung — but the next one would have broken it too.
 		let schema = crate::schema::migrate(&sql, MIGRATIONS);
-		Self { sql, schema }
+		Self { sql, env, schema }
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
@@ -212,12 +214,36 @@ impl DurableObject for GoraniFamilyDO {
 		}
 		// Errors become JSON with their message: an opaque 500 helps nobody,
 		// least of all the tests that must tell refusals from faults.
-		match self.dispatch(req).await {
+		let out = match self.dispatch(req).await {
 			Ok(r) => Ok(r),
 			Err(e) => json_error(500, &e.to_string()),
+		};
+		// The registry's audit lines go to its chained trail like an area's
+		// (member.rs › the audit outbox); best effort, the outbox keeps them.
+		if let Err(e) = self.ship_audit().await {
+			worker::console_error!("gorani: registry audit ship failed (kept in the outbox): {e}");
 		}
+		out
 	}
 
+}
+
+impl GoraniFamilyDO {
+	async fn ship_audit(&self) -> Result<()> {
+		loop {
+			let rows: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details FROM audit ORDER BY id LIMIT 500", None)?.to_array()?;
+			if rows.is_empty() {
+				return Ok(());
+			}
+			let n = rows.len();
+			let lines: Vec<crate::audit::LineIn> = rows.into_iter().map(|a| crate::audit::LineIn { id: a.id, at: a.at, actor: a.actor, action: a.action, target: a.target, details: a.details, details_sealed: None }).collect();
+			let acked = crate::audit::ship(&self.env, "registry", &lines).await?;
+			self.sql.exec("DELETE FROM audit WHERE id <= ?1", Some(vec![acked.into()]))?;
+			if n < 500 {
+				return Ok(());
+			}
+		}
+	}
 }
 
 impl GoraniFamilyDO {
@@ -416,7 +442,16 @@ impl GoraniFamilyDO {
 
 	async fn state(&self) -> Result<Response> {
 		let members: Vec<MemberRow> = self.sql.exec("SELECT id, name, role, emails, active, created_at, expires_at FROM members ORDER BY created_at, id", None)?.to_array()?;
-		let audit: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details FROM audit ORDER BY id DESC LIMIT 100", None)?.to_array()?;
+		// The newest lines: not yet shipped (listed first), then the chain's.
+		let _ = self.ship_audit().await;
+		let pending: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details FROM audit ORDER BY id DESC LIMIT 100", None)?.to_array()?;
+		let mut audit: Vec<serde_json::Value> = pending.into_iter().map(|a| serde_json::json!({ "id": null, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "details": a.details, "pending": true })).collect();
+		audit.extend(crate::audit::lines(&self.env, "registry", 100).await.unwrap_or_default().into_iter().map(|mut l| {
+			if let Some(o) = l.as_object_mut() {
+				o.remove("detailsSealed");
+			}
+			l
+		}));
 		Ok(Response::from_json(&FamilyState {
 			members: members
 				.into_iter()
@@ -428,10 +463,7 @@ impl GoraniFamilyDO {
 					})
 				})
 				.collect(),
-			audit: audit
-				.into_iter()
-				.map(|a| serde_json::json!({ "id": a.id, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "details": a.details }))
-				.collect(),
+			audit,
 		})?)
 	}
 

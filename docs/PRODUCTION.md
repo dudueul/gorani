@@ -126,6 +126,21 @@ A store whose migration fails answers every request with a 500 naming the
 failed statement (it does not hang) — look for `member store schema:` in
 the Worker's logs.
 
+### Upgrading across commit 29 (the audit trails)
+
+`wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration
+tag `v2` (`GoraniAuditDO`); a deploy applies both. Existing audit lines
+ship from each area's outbox to its new trail on the area's next request
+(or the nightly pass) — nothing is lost; the chain starts at the first
+line shipped. From the first nightly pass on, the bucket holds
+`audit-checkpoints/<members|cases|registry>/…/<date>.json`: put those
+under Object Lock (docs/CUSTODY.md › stage 3) or at least a bucket policy
+that denies `DeleteObject` and overwrites to the Worker's key — the
+checkpoints are what makes a rewritten trail detectable, and only if the
+same credential cannot rewrite both. Verify any trail with
+`GET /api/v1/members/<id>/audit/verify` (or `/cases/<id>/…`,
+`/family/audit/verify`).
+
 ## 4. Backups
 
 > **Upgrading across commit 25:** backups written before it are GB1 and

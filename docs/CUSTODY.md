@@ -21,7 +21,7 @@ rendered, delivered zipped under the industry's "infected" password).
 
 | Stage | Decision | What |
 |---|---|---|
-| 1 | D7 + D5.3 | the audit leaves the area database: an outbox ships each line to a per-area **audit Durable Object** that hash-chains it, keeps it 7 years with no line cap, and checkpoints daily to object storage; `…/audit/verify` |
+| 1 *(landed: commit 29, `api:audit`)* | D7 + D5.3 | the audit leaves the area database: an outbox ships each line to a per-area **audit Durable Object** that hash-chains it, keeps it 7 years with no line cap, and checkpoints daily to object storage; `…/audit/verify` |
 | 2 | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
 | 3 | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
 | 4 | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
@@ -61,3 +61,21 @@ area DO (member:<id>, case:<id>, the registry)
 - **Retention**: 7 years. Pruning older lines moves the chain's BASE
   (the hash of the last pruned line is kept), so the remaining chain still
   verifies.
+
+### Stage 1 as built
+
+- `worker/src/audit.rs` — `GoraniAuditDO`, the `canonical`/`link` pair (a
+  Rust unit test; `api:audit` recomputes the chain in JavaScript from the
+  API's lines, so the spelling is pinned across languages), checkpoints,
+  verification, the 7-year prune. `s3::list` reads the bucket's own word on
+  which checkpoints exist.
+- The outbox: `member.rs` and `family.rs` ship after every request (the
+  area's name is remembered from the Worker's `x-gorani-member`, since not
+  every caller sends it — a device token's routes, the cron's knock); a
+  read lists what is still pending first, marked `"pending": true`.
+- The housekeeping knob `auditKeep` is gone (ignored): the area database no
+  longer prunes its audit — it would delete lines before they were chained.
+- `GET …/audit/verify` for each area's audit audience; the registry's for
+  leads and auditors. Statuses per checkpoint: `ok`, `mismatch` (the chain
+  and the bucket disagree), `missing` (the bucket names lines the chain no
+  longer has), `pruned` (older than the retention).

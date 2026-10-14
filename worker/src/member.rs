@@ -298,14 +298,66 @@ impl DurableObject for GoraniMemberDO {
 		if let Err(e) = &self.schema {
 			return json_error(500, &format!("member store schema: {e}"));
 		}
+		// Which area this database is (the Worker names it in
+		// `x-gorani-member`; remembered, because not every caller does — a
+		// device's token routes, the cron's knock).
+		let named = req.headers().get("x-gorani-member").ok().flatten();
 		// Errors become JSON with their message: an opaque 500 helps nobody,
 		// least of all the tests that must tell refusals from faults.
-		match self.dispatch(req).await {
+		let out = match self.dispatch(req).await {
 			Ok(r) => Ok(r),
 			Err(e) => json_error(500, &e.to_string()),
+		};
+		// Ship this request's audit lines (and any a failed ship left) to the
+		// area's chained trail. Best effort: the outbox keeps what did not
+		// go, and the next request — or tonight's cron — sends it.
+		if let Some(area) = self.area(named.as_deref()) {
+			if let Err(e) = self.ship_audit(&area).await {
+				worker::console_error!("gorani: audit ship for {area} failed (kept in the outbox): {e}");
+			}
 		}
+		out
 	}
 
+}
+
+// ── The audit outbox (commit 29, docs/CUSTODY.md › Stage 1) ─────────────
+//
+// `audit()` writes into the local `audit` table in the same database, in
+// the same request, as the action it records — the line exists if the
+// action did. That table is now an OUTBOX: lines leave for the area's
+// chained trail (audit.rs) and are deleted only once acknowledged.
+
+impl GoraniMemberDO {
+	/// The area's name, from this request's header (and remembered), or the
+	/// one remembered before.
+	fn area(&self, named: Option<&str>) -> Option<String> {
+		#[derive(serde::Deserialize)]
+		struct V {
+			v: String,
+		}
+		if let Some(a) = named.filter(|a| crate::area::valid_area(a)) {
+			let _ = self.sql.exec("INSERT INTO vault (k, v) VALUES ('area', ?1) ON CONFLICT(k) DO NOTHING", Some(vec![a.into()]));
+			return Some(a.to_string());
+		}
+		self.sql.exec("SELECT v FROM vault WHERE k = 'area'", None).ok()?.to_array::<V>().ok()?.into_iter().next().map(|r| r.v)
+	}
+
+	pub(crate) async fn ship_audit(&self, area: &str) -> Result<()> {
+		loop {
+			let rows: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed, details FROM audit ORDER BY id LIMIT 500", None)?.to_array()?;
+			if rows.is_empty() {
+				return Ok(());
+			}
+			let n = rows.len();
+			let lines: Vec<crate::audit::LineIn> = rows.into_iter().map(|a| crate::audit::LineIn { id: a.id, at: a.at, actor: a.actor, action: a.action, target: a.target, details: a.details, details_sealed: a.details_sealed }).collect();
+			let acked = crate::audit::ship(&self.env, area, &lines).await?;
+			self.sql.exec("DELETE FROM audit WHERE id <= ?1", Some(vec![acked.into()]))?;
+			if n < 500 {
+				return Ok(());
+			}
+		}
+	}
 }
 
 // The files operations live beside the core (worker/src/files_store.rs) —
@@ -332,11 +384,11 @@ impl GoraniMemberDO {
 				let body = req.json::<VaultPut>().await?;
 				self.vault_reroot(&actor, body).await
 			}
-			("GET", "audit") => self.get_audit().await,
+			("GET", "audit") => self.get_audit(Some(&member).filter(|m| !m.is_empty()).map(|m| m.as_str())).await,
 			("POST", "audit") => {
 				let body = req.json::<AuditPut>().await?;
 				self.audit(&actor, &body.action, &body.target, body.details_sealed.as_deref(), None).await?;
-				self.get_audit().await
+				self.get_audit(Some(&member).filter(|m| !m.is_empty()).map(|m| m.as_str())).await
 			}
 			("GET", "stats") => self.stats().await,
 			// ── Devices (worker/src/devices.rs) ──
@@ -554,21 +606,25 @@ impl GoraniMemberDO {
 		self.get_vault().await
 	}
 
-	async fn get_audit(&self) -> Result<Response> {
+	/// The newest lines: the chained trail's, after any not yet shipped
+	/// (those are listed first, with `"pending": true` — the outbox).
+	async fn get_audit(&self, area: Option<&str>) -> Result<Response> {
+		if let Some(a) = self.area(area) {
+			let _ = self.ship_audit(&a).await; // best effort; what stays is listed below
+			let pending: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed, details FROM audit ORDER BY id DESC LIMIT 200", None)?.to_array()?;
+			let mut out: Vec<serde_json::Value> = pending
+				.into_iter()
+				.map(|a| serde_json::json!({ "id": null, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "detailsSealed": a.details_sealed, "details": a.details, "pending": true }))
+				.collect();
+			out.extend(crate::audit::lines(&self.env, &a, 200).await?);
+			return Ok(Response::from_json(&out)?);
+		}
+		// An area that was never named has never shipped: its outbox is all.
 		// (`details` was missing from this SELECT until commit 25: every
 		// readable detail — retention outcomes, device names, backup counts —
 		// was written and then listed as null. Found by api:cron's O10 block.)
 		let rows: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed, details FROM audit ORDER BY id DESC LIMIT 200", None)?.to_array()?;
-		let lines: Vec<serde_json::Value> = rows
-			.into_iter()
-			.map(|a| {
-				serde_json::json!({
-					"id": a.id, "at": a.at, "actor": a.actor, "action": a.action,
-					"target": a.target, "detailsSealed": a.details_sealed, "details": a.details,
-				})
-			})
-			.collect();
-		Ok(Response::from_json(&lines)?)
+		Ok(Response::from_json(&rows.into_iter().map(|a| serde_json::json!({ "id": a.id, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "detailsSealed": a.details_sealed, "details": a.details })).collect::<Vec<_>>())?)
 	}
 
 	pub(crate) async fn audit(&self, actor: &str, action: &str, target: &str, details_sealed: Option<&str>, details: Option<&str>) -> Result<()> {
@@ -612,7 +668,6 @@ impl GoraniMemberDO {
 		let knob = |k: &str, default: i64| if dev { body.get(k).and_then(|v| v.as_i64()).unwrap_or(default) } else { default };
 		let trash_days = knob("trashDays", 30).max(0);
 		let journal_days = knob("journalDays", 180).max(0);
-		let audit_keep = knob("auditKeep", 500).max(1);
 		let share_days = knob("shareDays", 1).max(0);
 		let upload_days = knob("uploadDays", 2).max(0);
 
@@ -711,13 +766,11 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
-		let audit_pruned = self
-			.sql
-			.exec(
-				&format!("DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT {audit_keep})"),
-				None,
-			)?
-			.rows_written();
+		// (The audit is no longer pruned here: since commit 29 it lives in the
+		// area's chained trail, kept 7 years with no line cap (D7) — the local
+		// table is only the outbox, and its lines leave when acknowledged.
+		// Pruning it here would delete lines before they were chained.)
+		let audit_pruned = 0;
 		// The read log keeps as long as the change journal (O14).
 		self.sql.exec(&format!("DELETE FROM read_log WHERE last_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{journal_days} days')"), None)?;
 		// Share download tokens: expired, or of a share that is gone (O12).

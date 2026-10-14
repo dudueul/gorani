@@ -134,6 +134,19 @@ memory.
    no email, so the Worker — which takes identity from the email — refused
    every desktop request. A service token identifies a machine, not a
    member.)*
+6. **Where each computer keeps its device secret** (commit 34): the secret
+   that opens the server's copy of the root lives in the TPM and/or the
+   user's login keyring, never in the profile file. On Linux install
+   `tpm2-tools` and `libsecret-tools` (`secret-tool`), and add each user
+   to the `tss` group so they may use `/dev/tpmrm0`; `gorani-sync setup`
+   then picks `tpm+keyring` by itself. A computer with neither is refused
+   unless the person types `--protect file` (dev and CI) — and an already
+   enrolled computer moves to the TPM with `gorani-sync protect`.
+   `gorani-sync devices` shows what protects each computer (the client's
+   word, recorded by the server — not attested), and `gorani-sync revoke
+   --device <id>` deletes a lost one's copy from any other. *(The web app
+   has no devices screen yet: until it has, revocation is this command or
+   the API.)*
 
 ## 3. Deploy
 

@@ -51,17 +51,68 @@ safety   base_version on a version upload (409 names the current version); mass-
 ## Security model
 
 ```text
-device secret = TPM signature behind Windows Hello ‖ Secure Enclave agreement ‖ keyring+TPM pair (Linux)
+device secret = what this machine's security chip (and its user's login) produces — never stored in the clear
 KEK           = HKDF-SHA256(device secret, salt, "gorani-device-v1")
 device copy   = GW01(KEK, root private key)     ← stored on the SERVER, released only to that device's token
 ```
 
-Neither half is enough alone: the server's copy needs the computer's TPM
+Neither half is enough alone: the server's copy needs the computer's chip
 and its owner; the computer holds nothing it could open without asking.
 Revoking deletes the copy — the computer never unlocks again. The screen
 lock drops the root from memory (nothing is opened, sealed or pulled while
 locked). Linux additionally keeps its local cache encrypted at rest (GL1:
-64 KiB sealed blocks, position-bound).
+64 KiB sealed blocks, position-bound) — once it has one (see 33d's limits).
+
+**The machine key never leaves the chip.** Each platform keeps a key that
+was created inside its security hardware and cannot be exported; what the
+client stores is a blob or a handle only that chip can use, and the device
+secret is the result of asking the chip to use it:
+
+| Platform | The machine's key | The device secret | Presence | Status |
+|---|---|---|---|---|
+| Linux | the TPM 2.0 storage key (owner hierarchy, re-derived from the chip's seed) | a part SEALED to that key (`tpm2_create`/`tpm2_unseal`) and a part in the login keyring (Secret Service), combined by HKDF | the login (the keyring opens at sign-in) | **built — commit 34** |
+| Windows | a TPM-backed RSA key behind Windows Hello (`KeyCredentialManager`, Microsoft Platform Crypto Provider) | SHA-256 of Hello's signature over a fixed challenge — RSA PKCS#1 v1.5 is deterministic, so the same key gives the same secret (an ECDSA signature would not) | the Hello PIN, face or fingerprint, at every unlock | designed; needs Windows to build and test |
+| macOS | a Secure Enclave P-256 key (`kSecAttrTokenIDSecureEnclave`, access control `.userPresence`) | ECDH between the enclave key and a stored peer public key (`SecKeyCopyKeyExchangeResult`) | Touch ID or the login password | designed; needs macOS to build and test |
+
+**The honest limit, on every platform** — the browser's too: while the
+vault is open, the root is in the client's memory, and code running as the
+user can ask the chip exactly as the client does. What the hardware buys:
+a copy of the disk, a backup or the profile file opens nothing; unlocking
+needs this machine (and, where the platform asks for it, the person); a
+revoked device's chip opens nothing because the server's copy is gone.
+
+### Commit 34 as built (Linux, and the CLI everywhere)
+
+- `clients/core/src/devicekey.rs`: the device secret is made of **parts**,
+  each held by a protector — `tpm` (sealed by the chip, the profile keeps
+  the sealed blobs), `keyring` (the profile keeps a random reference), or
+  `file` (the part in the clear, dev and CI only, never chosen silently).
+  `secret = HKDF(salt "gorani-device-parts-v1", part₁ ‖ part₂…, kinds)`.
+  Through `tpm2-tools` and `secret-tool` as subprocesses (the clevis way:
+  no C library linked in); secrets cross pipes only, never argv or a file.
+- `gorani-sync setup --protect auto|tpm|keyring|tpm+keyring|file` — `auto`
+  takes everything the machine has, and refuses (pointing at `--protect
+  file`) when it has nothing. The server records the label.
+- `gorani-sync protect` moves an enrolled computer's secret to new
+  protectors without enrolling again: the server's copy is re-wrapped,
+  the old secret opens nothing, replaced keyring parts are forgotten. The
+  new protectors are written down as *pending* before the server moves,
+  so a run that dies in between still opens whichever copy the server
+  holds, and the next run finishes it.
+- `gorani-sync devices` lists every computer and what protects it;
+  `gorani-sync revoke --device <id>` deletes a lost one's copy from any
+  other. **Found on the way:** the web app has no devices screen — this
+  document said "revoke … from the web app", and until now there was no
+  way to revoke a lost laptop but the raw API.
+- Not yet: a TPM PIN (an authorization value the chip's lockout would
+  protect) or sealing to the boot state (a PCR policy); attestation of the
+  protection label (the server records the client's word).
+- `api:device-protect` runs it against a real software TPM (swtpm) and a
+  real GNOME Keyring on a private D-Bus session: no secret in the profile;
+  another TPM cannot load the blob; another login's keyring has no part;
+  a machine with neither is refused; `protect` moves an in-file secret,
+  finishes a run that died mid-way, forgets replaced parts; a revoked
+  computer never unlocks again.
 
 ## Whose device
 

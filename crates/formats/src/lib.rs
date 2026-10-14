@@ -40,6 +40,7 @@
 pub mod backup;
 pub mod chunked;
 pub mod formats;
+pub mod records;
 pub mod unlock;
 
 /// The crate's errors: a shape problem (`Format`), a key or corruption

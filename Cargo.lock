@@ -435,6 +435,7 @@ dependencies = [
  "argon2",
  "base64",
  "hkdf",
+ "hmac",
  "ml-kem",
  "p256",
  "rand_core",

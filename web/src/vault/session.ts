@@ -41,6 +41,7 @@
  */
 
 import { importVaultKey, deriveIndexKey, type VaultPrivateKey } from "./vault-crypto.ts";
+import { deriveRecordKey, macRecord, verifyRecord } from "./records.ts";
 import { openStoreKey as openSealedStoreKey } from "./family.ts";
 import { toBase64, fromBase64 } from "../lib/encoding.ts";
 import type { VaultSettings } from "./methods.ts";
@@ -69,6 +70,11 @@ export interface VaultSession {
 	lock(): Promise<void>;
 	/** Subscribe to this session's lock; returns the unsubscribe. */
 	onLock(listener: () => void): () => void;
+	/**
+	 * Settings with newly pinned store records (trust on first use), or null
+	 * if nothing was pinned since the last call. The shell persists them.
+	 */
+	takePinned(): VaultSettings | null;
 }
 
 /** A session from an opened root bundle: import non-extractable, wire stores. */
@@ -77,6 +83,8 @@ export async function openSession(memberId: string, settings: VaultSettings, bun
 	bundle.fill(0); // the bytes are gone the instant the key exists
 	const cache = new Map<string, OpenedStoreKey>();
 	const listeners = new Set<() => void>();
+	const recordKey = deriveRecordKey(root);
+	let pinned = false;
 	let locked = false;
 	let locking: Promise<void> | null = null;
 	const session: VaultSession = {
@@ -94,7 +102,19 @@ export async function openSession(memberId: string, settings: VaultSettings, bun
 			if (cached) return cached;
 			const key = settings.stores[name];
 			if (!key) throw new Error(`no store key named ${name}`);
+			// Authenticity first (docs/SECURITY-REVIEW.md › O3, records.ts):
+			// a record carrying a MAC must verify under THIS root's record key,
+			// or it was not made or pinned by us — refuse, loudly. A record
+			// without one (sealed to us by someone else) is pinned now, after
+			// the consistency check inside openSealedStoreKey passes.
+			if (key.mac && !(await verifyRecord(await recordKey, name, key))) {
+				throw new Error(`the "${name}" store key record failed authentication — it was changed by someone without this vault's root (the server?). Nothing was opened or sealed with it.`);
+			}
 			const privateKey = await openSealedStoreKey(root, key);
+			if (!key.mac) {
+				key.mac = await macRecord(await recordKey, name, key);
+				pinned = true;
+			}
 			const opened: OpenedStoreKey = { name, privateKey, publicKey: key.publicKey, pqPublicKey: key.pqPublicKey, keyId: key.keyId };
 			cache.set(name, opened);
 			return opened;
@@ -119,6 +139,11 @@ export async function openSession(memberId: string, settings: VaultSettings, bun
 		onLock(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
+		},
+		takePinned() {
+			if (!pinned) return null;
+			pinned = false;
+			return settings;
 		},
 	};
 	return session;

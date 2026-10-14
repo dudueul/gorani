@@ -10,7 +10,7 @@
 
 import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import type { Member } from "../lib/api.ts";
+import { api, type Member } from "../lib/api.ts";
 import { watchAutoLock, AUTO_LOCK, type VaultSession } from "../vault/session.ts";
 import { revokeAllBlobURLs } from "../lib/blob-urls.ts";
 import { FilesModel } from "./files/model.ts";
@@ -113,8 +113,24 @@ export class GoraniShell extends LitElement {
 				toast: (m) => this.toast(m),
 			}), this.member.id, this.index ?? undefined);
 			window.__goraniMember = this.member.id;
-			void this.model.open();
+			void this.model.open().then(() => this.persistPinned());
 			void this.requestUpdate();
+		}
+	}
+
+	/**
+	 * Store records opened for the first time get pinned by the session (a
+	 * MAC under this root's record key — docs/SECURITY-REVIEW.md › O3); save
+	 * them so the NEXT unlock, on any device, verifies instead of trusting.
+	 * Best effort: a failed save just means the pin happens again next time.
+	 */
+	private async persistPinned(): Promise<void> {
+		const settings = this.session.takePinned();
+		if (!settings || this.session.locked) return;
+		try {
+			await api.put(`/api/v1/members/${this.member.id}/vault`, { settings });
+		} catch (e) {
+			console.warn("could not save the pinned store records:", e);
 		}
 	}
 

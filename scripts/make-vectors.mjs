@@ -10,6 +10,9 @@
  * guarantee the whole vault rests on.
  *
  * Run: node scripts/make-vectors.mjs
+ *      node scripts/make-vectors.mjs --only-record   (add/refresh the store-record
+ *        vector inside the EXISTING file, keyed to its hybrid root — so a new
+ *        vector does not churn every other one)
  */
 
 import fs from "node:fs";
@@ -30,10 +33,35 @@ import {
 	makePasskeyMethod,
 	makeDeviceCopy,
 } from "../web/src/vault/vault-crypto.ts";
-import { toBase64 } from "../web/src/lib/encoding.ts";
+import { toBase64, fromBase64 } from "../web/src/lib/encoding.ts";
+import { importVaultKey } from "../web/src/vault/vault-crypto.ts";
+import { createStoreKey, sealStoreKeyToMember } from "../web/src/vault/family.ts";
+import { deriveRecordKey, macRecord } from "../web/src/vault/records.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const out = path.join(root, "crates/formats/tests/vectors.json");
+
+/**
+ * The authenticated store-record vector (commit 24, web/src/vault/records.ts):
+ * a store key sealed to the hybrid ROOT, and its MAC under that root's record
+ * key. Rust must verify the MAC from the same bytes — the length-prefixed
+ * encoding, the ECDH-with-itself + ML-KEM-secret derivation, HKDF, HMAC.
+ */
+async function recordVector(rootBundle, rootPublic) {
+	const store = await createStoreKey();
+	const record = await sealStoreKeyToMember(store, rootPublic);
+	const mac = await macRecord(await deriveRecordKey(await importVaultKey(rootBundle.slice())), "files", record);
+	return { name: "files", keyId: record.keyId, x: record.publicKey.x, y: record.publicKey.y, kem: record.pqPublicKey, privateKeySealed: record.privateKeySealed, mac };
+}
+
+if (process.argv.includes("--only-record")) {
+	const vectors = JSON.parse(fs.readFileSync(out, "utf8"));
+	const h = vectors.hybrid;
+	vectors.record = await recordVector(fromBase64(h.bundle), { ec: { kty: "EC", crv: "P-256", x: h.x, y: h.y }, kem: h.kem });
+	fs.writeFileSync(out, JSON.stringify(vectors, null, "\t") + "\n");
+	console.log(`record vector written into ${path.relative(root, out)}`);
+	process.exit(0);
+}
 
 // ── a P-256 key (the plain path, GV01) ───────────────────────────────
 const p256 = await generateMemberKey();
@@ -105,6 +133,8 @@ const vectors = {
 	vectors.unlock = { root: "hybrid", password, recoveryCode: recovery.code, recovery: recovery.method, passkeyPrf: toBase64(prf), passkey };
 	vectors.device = { secret: toBase64(deviceSecret), wrapped: device.wrapped, salt: device.salt };
 }
+
+vectors.record = await recordVector(hybrid.bundle, hybridPublic);
 
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, JSON.stringify(vectors, null, "\t") + "\n");

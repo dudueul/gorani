@@ -6,7 +6,7 @@
 //! lives in the platform shells, which own WebAuthn), the root bundle is
 //! unwrapped and held in `Zeroizing` for the command's lifetime.
 
-use gorani_formats::unlock::{self, Secret, UnlockMethod};
+use gorani_formats::unlock::{Secret, UnlockMethod};
 use zeroize::Zeroizing;
 
 use crate::{api, decode, DeviceProfile, Error, Session};

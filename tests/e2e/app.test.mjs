@@ -112,6 +112,10 @@ try {
 		await page.getByRole("button", { name: "Unlock" }).click();
 		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
 		assert.ok(await page.evaluate(() => isSecureContext && !!crypto.subtle), "the app runs in a secure context with WebCrypto");
+		// The setup screen authenticated the files-store record from birth
+		// (records.ts, O3): a MAC under the new root's record key.
+		const soraVault = await api(dev.base, "GET", "/api/v1/members/sora/vault", { email: "sora@family.test" });
+		assert.match(soraVault.json.stores.files.mac ?? "", /^[A-Za-z0-9+/]{43}=$/, "the store record carries its MAC from setup");
 		// Icons are SVG elements now (they used to render as escaped text).
 		assert.ok(await page.locator("gorani-win11 svg").count() > 0, "file-type icons render as SVG, not as markup text");
 		await assertNoViolations(page, "setup → unlock");
@@ -149,6 +153,11 @@ try {
 		// name in-browser — the whole round trip with no test-side crypto.
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "hello.txt", mimeType: "text/plain", buffer: Buffer.from("uploaded from the real browser") });
 		await page.locator("text=hello.txt").first().waitFor({ timeout: 60_000 });
+		// Jinu's record was seeded by this test WITHOUT a MAC (as a record
+		// sealed to a member by someone else arrives): the first open pinned
+		// it, and the shell saved the pin (trust on first use, O3).
+		const jinuVault = await api(dev.base, "GET", "/api/v1/members/jinu/vault", { email: "jinu@family.test" });
+		assert.match(jinuVault.json.stores.files.mac ?? "", /^[A-Za-z0-9+/]{43}=$/, "the first open pinned the record and saved it");
 		// …and OPEN it: the viewer fetches the content key (POST files/keys —
 		// the app used to send a GET there, so no file could ever be opened)
 		// and decrypts in the page.

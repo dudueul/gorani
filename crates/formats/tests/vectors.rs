@@ -148,3 +148,48 @@ fn opens_what_the_browser_sealed_and_seals_what_it_opens() {
 		std::fs::write(out_path, serde_json::to_string_pretty(&out).unwrap()).unwrap();
 	}
 }
+/// The authenticated store record (commit 24, docs/SECURITY-REVIEW.md › O3):
+/// the browser computed the MAC (web/src/vault/records.ts); Rust derives the
+/// same record key from the same root bundle and verifies the same bytes —
+/// and refuses each field changed. Two implementations, one MAC.
+#[test]
+fn store_record_mac_from_typescript() {
+	use gorani_formats::records::{record_key, record_mac, verify_record, StoreRecord};
+	let v = vectors();
+	let root = VaultPrivateKey::from_bytes(&b(&v["hybrid"]["bundle"])).unwrap();
+	let key = record_key(&root).unwrap();
+	let r = &v["record"];
+	let ec = {
+		use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+		let mut p = vec![0x04u8];
+		p.extend(URL_SAFE_NO_PAD.decode(s(&r["x"])).unwrap());
+		p.extend(URL_SAFE_NO_PAD.decode(s(&r["y"])).unwrap());
+		p
+	};
+	let kem = b(&r["kem"]);
+	let rec = StoreRecord { name: s(&r["name"]), key_id: s(&r["keyId"]), ec_public: &ec, kem_public: &kem, private_key_sealed: s(&r["privateKeySealed"]) };
+	let mac = s(&r["mac"]);
+	assert!(verify_record(&key, &rec, mac), "Rust verifies the browser's MAC");
+	assert_eq!(record_mac(&key, &rec), mac, "…and computes the identical MAC");
+
+	// Each field is bound.
+	assert!(!verify_record(&key, &StoreRecord { name: "family", ..rec_copy(&rec) }, mac), "name bound");
+	assert!(!verify_record(&key, &StoreRecord { key_id: "pqAAAAAAAAAAAAAA", ..rec_copy(&rec) }, mac), "key id bound");
+	let mut other_ec = ec.clone();
+	other_ec[10] ^= 1;
+	assert!(!verify_record(&key, &StoreRecord { ec_public: &other_ec, ..rec_copy(&rec) }, mac), "P-256 public bound");
+	let mut other_kem = kem.clone();
+	other_kem[0] ^= 1;
+	assert!(!verify_record(&key, &StoreRecord { kem_public: &other_kem, ..rec_copy(&rec) }, mac), "ML-KEM public bound");
+	assert!(!verify_record(&key, &StoreRecord { private_key_sealed: "GV03:AAAA", ..rec_copy(&rec) }, mac), "sealed private bound");
+	assert!(!verify_record(&key, &rec, "not base64!"), "a malformed MAC is a failure, not a panic");
+
+	// A P-256-only root cannot authenticate records at all (the record key
+	// mixes in the ML-KEM secret — breaking P-256 alone must not forge it).
+	let p256 = VaultPrivateKey::from_bytes(&b(&v["p256"]["pkcs8"])).unwrap();
+	assert!(record_key(&p256).is_err(), "records need a hybrid root");
+}
+
+fn rec_copy<'a>(r: &gorani_formats::records::StoreRecord<'a>) -> gorani_formats::records::StoreRecord<'a> {
+	gorani_formats::records::StoreRecord { name: r.name, key_id: r.key_id, ec_public: r.ec_public, kem_public: r.kem_public, private_key_sealed: r.private_key_sealed }
+}

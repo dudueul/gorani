@@ -80,7 +80,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("enrolled device {} for root {} (member {})", profile.device_id, sess.settings.key_id, profile.member);
 		}
 		Some("ls") => {
-			let (profile, sess) = unlocked(&flag, &req_flag)?;
+			let (profile, sess) = unlocked(&flag)?;
 			let client = api::Client::new(profile);
 			let (cursor, changes) = client.changes(0)?;
 			println!("cursor {cursor}, {} changes", changes.len());
@@ -96,7 +96,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			}
 		}
 		Some("pull") => {
-			let (profile, sess) = unlocked(&flag, &req_flag)?;
+			let (profile, sess) = unlocked(&flag)?;
 			let id = req_flag("id")?;
 			let out = flag("out").unwrap_or_else(|| format!("./{id}"));
 			let client = api::Client::new(profile);
@@ -129,7 +129,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pulled {id} → {out}");
 		}
 		Some("push") => {
-			let (profile, sess) = unlocked(&flag, &req_flag)?;
+			let (profile, sess) = unlocked(&flag)?;
 			let path = req_flag("file")?;
 			let name = flag("name").unwrap_or_else(|| std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
 			let bytes = std::fs::read(&path)?;
@@ -139,7 +139,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let ck = gorani_formats::formats::new_content_key();
 			let key = gorani_formats::formats::import_content_key(&ck);
 			let sealed = gorani_formats::formats::seal_with(&key, &bytes);
-			let ck_wrapped = gorani_formats::formats::wrap_content_key(&files_public(&sess)?, &ck);
+			let ck_wrapped = gorani_formats::formats::wrap_content_key(&sess.files_public()?, &ck);
 			let fields = api::UploadFields {
 				form: vec![
 					("ck".into(), ck_wrapped),
@@ -159,7 +159,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 	Ok(())
 }
 
-fn unlocked(flag: &dyn Fn(&str) -> Option<String>, req_flag: &dyn Fn(&str) -> Result<String, Error>) -> Result<(DeviceProfile, Session), Error> {
+fn unlocked(flag: &dyn Fn(&str) -> Option<String>) -> Result<(DeviceProfile, Session), Error> {
 	let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
 	let mut profile = session::load_profile(&path)?;
 	if let Some(e) = flag("dev-email") {
@@ -171,11 +171,6 @@ fn unlocked(flag: &dyn Fn(&str) -> Option<String>, req_flag: &dyn Fn(&str) -> Re
 }
 
 
-
-fn files_public(sess: &Session) -> Result<gorani_formats::formats::VaultPublicKey, Error> {
-	let key = sess.settings.stores.get("files").ok_or(Error::Open("no files store key"))?;
-	gorani_formats::formats::VaultPublicKey::from_jwk(&key.public_key.x, &key.public_key.y, key.pq_public_key.as_deref()).map_err(|_| Error::Format("bad store JWK"))
-}
 
 /// Open a sealed name with the root (the settings' store key is opened from
 /// the root; for the feed, the names are sealed to the store key too).

@@ -32,6 +32,10 @@ pub struct StoreKey {
 	#[serde(default)]
 	pub pq_public_key: Option<String>,
 	pub private_key_sealed: String,
+	/// The record's MAC under the member's root-derived record key
+	/// (gorani_formats::records — docs/SECURITY-REVIEW.md › O3).
+	#[serde(default)]
+	pub mac: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -157,7 +161,6 @@ impl Client {
 			ureq::Error::Status(code, resp) => Error::Http(code, resp.into_string().unwrap_or_default()),
 			other => Error::Config(other.to_string()),
 		})?;
-		let mut res = res;
 		let mut out = Vec::new();
 		res.into_reader().read_to_end(&mut out)?;
 		Ok(out)

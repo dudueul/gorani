@@ -15,7 +15,9 @@
 //! only while a command runs (`Zeroizing` everywhere, dropped at exit).
 
 pub mod api;
+pub mod area;
 pub mod cases;
+pub mod engine;
 pub mod identity;
 pub mod session;
 pub mod transfer;
@@ -195,4 +197,15 @@ pub fn decode(s: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
 		.decode(s)
 		.map(Zeroizing::new)
 		.map_err(|_| Error::Format("bad base64"))
+}
+
+/// A fresh file or folder id, chosen before sealing (128 random bits,
+/// base64url — the Worker's id allow-list). The twin of `places.ts ›
+/// newItemId`: the name, type and key are sealed into places that NAME the
+/// id, so it must exist first.
+pub fn new_item_id() -> String {
+	use base64::Engine;
+	let mut b = [0u8; 16];
+	rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }

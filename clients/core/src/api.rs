@@ -214,7 +214,9 @@ impl Client {
 		Ok((device_id, token))
 	}
 
-	pub fn unlock(&self, device_id: &str, token: &str) -> Result<(String, String, VaultSettings), Error> {
+	/// This computer's wrapped root copy and its salt (only to this
+	/// device's token), with the vault settings: `(keyId, wrapped, salt, settings)`.
+	pub fn unlock(&self, device_id: &str, token: &str) -> Result<(String, String, String, VaultSettings), Error> {
 		let res = self
 			.req("POST", &self.url(&format!("/devices/{device_id}/unlock")))
 			.set("x-gorani-device-token", token)
@@ -227,6 +229,7 @@ impl Client {
 		Ok((
 			v["keyId"].as_str().unwrap_or_default().to_string(),
 			v["wrapped"].as_str().unwrap_or_default().to_string(),
+			v["salt"].as_str().unwrap_or_default().to_string(),
 			serde_json::from_value(v["settings"].clone()).map_err(|e| Error::Config(format!("settings: {e}")))?,
 		))
 	}
@@ -236,6 +239,48 @@ impl Client {
 	pub fn changes(&self, since: u64) -> Result<(u64, Vec<Value>), Error> {
 		let v = self.area_json("GET", &format!("/files/changes?since={since}&limit=1000"), None)?;
 		Ok((v["cursor"].as_u64().unwrap_or(since), v["changes"].as_array().cloned().unwrap_or_default()))
+	}
+
+	/// One page of the change feed: `(cursor, more, changes)`. The feed is
+	/// the "something changed" signal; `list` is the state (the journal is
+	/// pruned after its retention, so it cannot rebuild a tree from 0).
+	pub fn changes_page(&self, since: u64, limit: u32) -> Result<(u64, bool, Vec<Value>), Error> {
+		let v = self.area_json("GET", &format!("/files/changes?since={since}&limit={limit}"), None)?;
+		Ok((v["cursor"].as_u64().unwrap_or(since), v["more"].as_bool().unwrap_or(false), v["changes"].as_array().cloned().unwrap_or_default()))
+	}
+
+	/// One page of every living file, with every folder (`files/list?folder=all`).
+	pub fn list(&self, offset: u64, limit: u32) -> Result<Value, Error> {
+		self.area_json("GET", &format!("/files/list?folder=all&offset={offset}&limit={limit}"), None)
+	}
+
+	/// A whole new version after `base_version` (in `fields`): 409 when the
+	/// file moved on since — the caller decides what to do with its bytes.
+	pub fn upload_version(&self, id: &str, fields: &UploadFields, sealed: &[u8]) -> Result<Value, Error> {
+		self.post_form(&format!("/files/{id}/versions"), fields, Some(sealed))
+	}
+
+	/// Rename (a sealed name) and/or move (`folderId`, null = the top).
+	pub fn patch_file(&self, id: &str, body: Value) -> Result<Value, Error> {
+		self.area_json("PATCH", &format!("/files/{id}"), Some(body))
+	}
+
+	/// To the Trash (an evidence case refuses: evidence is not deleted).
+	pub fn trash_file(&self, id: &str) -> Result<Value, Error> {
+		self.area_json("DELETE", &format!("/files/{id}"), None)
+	}
+
+	/// A folder whose id the client chose (its name is sealed into a place naming it).
+	pub fn create_folder(&self, id: &str, name_sealed: &str, parent: Option<&str>) -> Result<Value, Error> {
+		self.area_json("POST", "/files/folders", Some(json!({ "id": id, "name": name_sealed, "parentId": parent })))
+	}
+
+	pub fn patch_folder(&self, id: &str, body: Value) -> Result<Value, Error> {
+		self.area_json("PATCH", &format!("/files/folders/{id}"), Some(body))
+	}
+
+	pub fn trash_folder(&self, id: &str) -> Result<Value, Error> {
+		self.area_json("DELETE", &format!("/files/folders/{id}"), None)
 	}
 
 	pub fn keys(&self, ids: &[String]) -> Result<Value, Error> {

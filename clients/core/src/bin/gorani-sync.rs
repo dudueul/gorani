@@ -17,8 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
+use gorani_client_core::area::{self, open_area, open_team, Area};
 use gorani_client_core::cases::{self, CaseRow, HashCheck, IntakeFields};
-use gorani_client_core::identity::{self, RegistryIdentity, Signer, Trust};
 use gorani_client_core::{api, session, transfer, DeviceProfile, Error, Session};
 use gorani_formats::formats::VaultPrivateKey;
 use gorani_formats::placed::{self, Place};
@@ -58,65 +58,6 @@ fn read_secret(prompt: &str) -> String {
 		Some(p) => p.trim().to_string(),
 		None => read_line(prompt),
 	}
-}
-
-/// Where a command works (commit 33c): the member's own area, or a case
-/// they are granted — the store key that seals and opens there, and the
-/// member's identity and trust when their vault has one (always in a case:
-/// the case key opens only through a trusted signature).
-struct Area {
-	/// `<member>` or `case:<id>` — the GV04 `store` of every place.
-	name: String,
-	key: VaultPrivateKey,
-	case: Option<CaseRow>,
-	team: Option<(Signer, Trust)>,
-}
-
-impl Area {
-	fn is_evidence(&self) -> bool {
-		self.case.as_ref().is_some_and(CaseRow::is_evidence)
-	}
-
-	/// Open text sealed into a place of this area; None when it does not
-	/// open there (moved, minted, or another store's).
-	fn open(&self, place: &Place, sealed: &str) -> Option<String> {
-		placed::open_placed_text(&self.key, place, sealed).ok().map(|s| s.to_string())
-	}
-
-	fn seal(&self, place: &Place, text: &str) -> Result<String, Error> {
-		placed::seal_placed_text(&self.key, place, text).map_err(|_| Error::Open("the area's store key"))
-	}
-}
-
-/// The member's identity and trust (identity.rs): the record from their
-/// settings (MAC'd by the root), the registry's identities. None when the
-/// vault has no identity yet — the web app makes one on first open.
-fn open_team(client: &api::Client, sess: &Session, member: &str) -> Result<Option<(Signer, Trust)>, Error> {
-	let Some(rec) = &sess.settings.identity else { return Ok(None) };
-	let root = VaultPrivateKey::from_bytes(&sess.root).map_err(|_| Error::Open("root bundle"))?;
-	let signer = identity::open_identity(member, &root, rec)?;
-	let registry: Vec<RegistryIdentity> = serde_json::from_value(client.team_get("family/identities")?["identities"].clone()).map_err(|e| Error::Config(format!("identities: {e}")))?;
-	let trust = identity::build_trust(member, &root, rec, &registry)?;
-	Ok(Some((signer, trust)))
-}
-
-fn granted_cases(client: &api::Client) -> Result<Vec<CaseRow>, Error> {
-	serde_json::from_value(client.team_get("cases")?["cases"].clone()).map_err(|e| Error::Config(format!("cases: {e}")))
-}
-
-/// Open the area a command names: `--case <id>`, or the member's own.
-fn open_area(client: &api::Client, sess: &Session, member: &str, case: Option<&str>) -> Result<Area, Error> {
-	let team = open_team(client, sess, member)?;
-	let Some(case_id) = case else {
-		return Ok(Area { name: member.into(), key: sess.files_store()?, case: None, team });
-	};
-	let Some((signer, trust)) = team else {
-		return Err(Error::Config("your vault has no identity yet — open it once in the web app (Team), where it is made and your lead's fingerprint compared; a case key opens only through a signature you can check".into()));
-	};
-	let c = granted_cases(client)?.into_iter().find(|c| c.id == case_id).ok_or_else(|| Error::Config(format!("no case {case_id} is listed for you")))?;
-	let root = VaultPrivateKey::from_bytes(&sess.root).map_err(|_| Error::Open("root bundle"))?;
-	let key = cases::open_case_key(&root, &c, &trust)?;
-	Ok(Area { name: c.area(), key, case: Some(c), team: Some((signer, trust)) })
 }
 
 fn run(args: &[String]) -> Result<(), Error> {
@@ -179,7 +120,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 				return Err(Error::Config("your vault has no identity yet — open it once in the web app (Team)".into()));
 			};
 			let root = VaultPrivateKey::from_bytes(&sess.root).map_err(|_| Error::Open("root bundle"))?;
-			let listed = granted_cases(&client)?;
+			let listed = area::listed_cases(&client)?;
 			let mine: Vec<&CaseRow> = listed.iter().filter(|c| c.grant.is_some()).collect();
 			println!("{} case(s) granted to you", mine.len());
 			for c in mine {
@@ -219,7 +160,10 @@ fn run(args: &[String]) -> Result<(), Error> {
 				let kind = c["kind"].as_str().unwrap_or("");
 				// Each name opens only in the place its row names (O6): a name
 				// the server moved here, or minted, prints as unverified.
-				if let Some(file) = c["data"].get("file") {
+				if kind == "version.put" {
+					// (Its `file` is the id, not a row: the name is in the file.put beside it.)
+					println!("  {kind:>12}  {} v{}", c["data"]["file"].as_str().unwrap_or("?"), c["data"]["version"]);
+				} else if let Some(file) = c["data"].get("file") {
 					let id = file["id"].as_str().unwrap_or_default();
 					let name = area.open(&Place::file_name(&area.name, id), file["name"].as_str().unwrap_or_default());
 					println!("  {kind:>12}  {}  {id}", name.unwrap_or_else(|| UNVERIFIED.into()));
@@ -341,10 +285,10 @@ fn run(args: &[String]) -> Result<(), Error> {
 						}
 					}
 					None => {
-						let file_id = new_item_id();
+						let file_id = gorani_client_core::new_item_id();
 						let ck = gorani_formats::formats::new_content_key();
 						let key = gorani_formats::formats::import_content_key(&ck);
-						let mut fields = new_file_fields(&area, &file_id, &name, &ck, size, &sha256, intake.as_ref())?;
+						let mut fields = area.new_file_fields(&file_id, &name, &ck, size, &sha256, intake.as_ref())?;
 						fields.push(("chunk".into(), chunk.to_string()));
 						transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, fields, None, progress)?
 					}
@@ -356,11 +300,11 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let sha256 = transfer::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
 			// The id first — the name, type, key, hash and intake are sealed
 			// into places that name it (O6); a new file is version 1.
-			let file_id = new_item_id();
+			let file_id = gorani_client_core::new_item_id();
 			let ck = gorani_formats::formats::new_content_key();
 			let key = gorani_formats::formats::import_content_key(&ck);
 			let sealed = gorani_formats::formats::seal_with(&key, &bytes);
-			let fields = api::UploadFields { form: new_file_fields(&area, &file_id, &name, &ck, bytes.len() as u64, &sha256, intake.as_ref())? };
+			let fields = api::UploadFields { form: area.new_file_fields(&file_id, &name, &ck, bytes.len() as u64, &sha256, intake.as_ref())? };
 			let row = client.upload_whole(&fields, &sealed)?;
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
@@ -382,33 +326,6 @@ fn intake_fields(flag: &dyn Fn(&str) -> Option<String>) -> Option<IntakeFields> 
 		collected_at: flag("collected-at").unwrap_or_default(),
 		notes: flag("notes").unwrap_or_default(),
 	})
-}
-
-/// A new file's form fields, every value sealed into its place in `area`:
-/// the name, the type, the content key — and, when the member's identity
-/// is open, the signed content hash with its timestamp imprint (commit
-/// 29d/29j) and, when given, the signed intake record (29g).
-#[allow(clippy::too_many_arguments)]
-fn new_file_fields(area: &Area, file_id: &str, name: &str, ck: &gorani_formats::formats::ContentKey, size: u64, sha256: &str, intake: Option<&IntakeFields>) -> Result<Vec<(String, String)>, Error> {
-	let ck_wrapped = placed::wrap_placed_key(&area.key, &Place::file_key(&area.name, file_id, 1), ck).map_err(|_| Error::Open("the area's store key"))?;
-	let mut fields = vec![
-		("file_id".to_string(), file_id.to_string()),
-		("ck".into(), ck_wrapped),
-		("name".into(), area.seal(&Place::file_name(&area.name, file_id), name)?),
-		("type".into(), area.seal(&Place::file_type(&area.name, file_id, 1), "application/octet-stream")?),
-		("size".into(), size.to_string()),
-	];
-	if let Some((signer, _)) = &area.team {
-		let (hash, stamp) = cases::sign_content_hash(signer, &area.key, &area.name, file_id, 1, sha256, size)?;
-		fields.push(("hash".into(), hash));
-		fields.push(("stamp".into(), stamp));
-		if let Some(f) = intake {
-			fields.push(("intake".into(), cases::sign_intake(signer, &area.key, &area.name, file_id, f)?));
-		}
-	} else if area.is_evidence() || intake.is_some() {
-		return Err(Error::Config("signing needs your identity — open the vault once in the web app (Team)".into()));
-	}
-	Ok(fields)
 }
 
 fn signed_note(area: &Area, intake: bool) -> String {
@@ -451,19 +368,15 @@ fn unlocked(flag: &dyn Fn(&str) -> Option<String>) -> Result<(DeviceProfile, Ses
 	if let Some(e) = flag("dev-email") {
 		profile.dev_email = Some(e);
 	}
-	let secret = flag("secret").unwrap_or_else(|| read_secret("Vault password or recovery code: "));
-	let sess = session::unlock(&profile, &secret)?;
+	// This computer's own wrapped copy when it holds one (the enrolment's
+	// point: no password per command), else a typed secret.
+	let sess = match flag("secret") {
+		Some(secret) => session::unlock(&profile, &secret)?,
+		None if session::has_device_copy(&profile) => session::unlock_device(&profile)?,
+		None => session::unlock(&profile, &read_secret("Vault password or recovery code: "))?,
+	};
 	Ok((profile, sess))
 }
 
 /// What a name that does not open in its place prints as (O6).
 const UNVERIFIED: &str = "⚠ unverified — not sealed here";
-
-/// A fresh file id, chosen before sealing (128 random bits, base64url — the
-/// Worker's id allow-list). The twin of `places.ts › newItemId`.
-fn new_item_id() -> String {
-	use base64::Engine;
-	let mut b = [0u8; 16];
-	rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
-	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-}

@@ -29,17 +29,18 @@ if (wantKind("rust")) {
 	// dev` (the API suites), but its pure helpers also build on the host —
 	// `--lib` runs their unit tests (schema.rs's forgivable-error rule).
 	const { cmd: cargo, env } = cargoCommand();
-	let r = spawnSync(cargo, ["test", "-p", "gorani-formats", "-p", "gorani-s3"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+	let r = spawnSync(cargo, ["test", "-p", "gorani-formats", "-p", "gorani-s3", "-p", "gorani-client-core"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 	if (r.status === 0) r = spawnSync(cargo, ["test", "-p", "gorani-worker", "--lib"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 	// Build the native CLI too: api:client-live drives target/debug/gorani-sync,
 	// and a binary left over from an older checkout would test old code while
 	// reporting green (it happened during the commit-23 review: a CLI fix
 	// "failed" because the suite ran yesterday's binary).
-	if (r.status === 0) r = spawnSync(cargo, ["build", "-p", "gorani-client-core"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+	// (…and the Linux shell, gorani-mount, which api:linux-shell drives — commit 33d.)
+	if (r.status === 0) r = spawnSync(cargo, ["build", "-p", "gorani-client-core", "-p", "gorani-linux"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 	const ok = r.status === 0;
 	if (!ok) failures.push("rust");
 	const out = `${String(r.stdout ?? "")}${String(r.stderr ?? "")}`;
-	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats -p gorani-s3 -p gorani-worker${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
+	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats -p gorani-s3 -p gorani-client-core -p gorani-worker; build gorani-sync, gorani-mount${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
 }
 
 if (wantKind("unit")) {

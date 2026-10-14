@@ -1,7 +1,7 @@
 # Desktop: the native clients (Rust) — protocol and design
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
-> Status: the protocol is implemented on both sides — the server (commits ⑦/⑧) and the Rust client core with the `gorani-sync` CLI (commit ⑬), live-proven against the real worker (the api suites `client-live` and `client-cases`). Since commits 33a–33c the core signs in as its member, moves files up to 255 GiB, and works in granted cases with signed evidence. What remains on this document: the platform shells (Windows Cloud Files API, Linux FUSE, macOS File Provider) that mount the same core.
+> Status: the protocol is implemented on both sides — the server (commits ⑦/⑧) and the Rust client core with the `gorani-sync` CLI (commit ⑬), live-proven against the real worker (the api suites `client-live` and `client-cases`). Since commits 33a–33d the core signs in as its member, unlocks with the device's own copy, moves files up to 255 GiB, works in granted cases with signed evidence, and runs a sync engine the Linux shell mounts with FUSE (`api:linux-shell`, through a real kernel mount). What remains on this document: the Windows (Cloud Files API) and macOS (File Provider) shells, which mount the same engine but need their own platforms to build and test.
 
 ## What the client is
 
@@ -15,7 +15,7 @@ file-system integration:
 | Platform | Shell | Mechanism |
 |---|---|---|
 | Windows | `clients/windows` | Cloud Files API (cfapi) — the OneDrive driver: placeholders, FETCH_DATA callbacks |
-| Linux | `clients/linux` | FUSE mount (`~/Gorani`), on-demand reads |
+| Linux | `clients/linux` | FUSE mount (`~/Gorani`), on-demand reads — **built (commit 33d)**: `gorani-mount` |
 | macOS | `clients/macos` | File Provider extension (Finder sidebar) |
 
 The platform-neutral core (`clients/core`) owns: unlocking, the sealed
@@ -95,7 +95,7 @@ before starting (commit 33, after D11/D12) found:
 | 33a *(landed)* | **Sign in as the member.** The core sends a user Access token (`cf-access-token`, from `cloudflared access token -app=<server>` or the `GORANI_ACCESS_TOKEN` variable) — short-lived and bound to the member's SSO/MFA, so the Worker sees the member's email and every rule (own area, case grants) applies unchanged. The device token stays what it is: the release of this computer's wrapped root copy. |
 | 33b *(landed)* | **Large files.** `push` streams from disk in GC01 frames at `chunk_for(size)`, parts with retry, and a resume journal on disk (sealed fields only, like the browser's); `pull` streams frame windows to disk and checks the signed hash. |
 | 33c *(landed)* | **Cases.** Open a granted case's key from its grant; list, pull, push into it; on an evidence case, sign the content hash (and send the stamp imprint) with the member's identity key, and carry an intake record. |
-| 33d | **The Linux shell** (`clients/linux`, FUSE): the engine first, against `wrangler dev` with an in-memory file system as the doc's testing pattern says; a real mount where the machine allows FUSE. |
+| 33d *(landed)* | **The Linux shell** (`clients/linux`, FUSE): the engine first, against `wrangler dev` with an in-memory file system as the doc's testing pattern says; a real mount where the machine allows FUSE. |
 | — | Windows (Cloud Files) and macOS (File Provider) need their platforms to build and test — not this repository's CI machine. |
 
 ### 33a as built
@@ -182,6 +182,56 @@ gorani-sync push --case … --file P     signed; on evidence with --source --col
 - `api:client-cases` runs the binary against a team built by the web app's
   own code — Rust verifies what TypeScript signed and the other way round;
   a deliberately mutated statement in Rust fails it.
+
+### 33d as built
+
+```text
+gorani-mount ~/Gorani                    your own area, until Ctrl-C (or umount)
+gorani-mount ~/Cases/ir-2026-014 --case ir-2026-014     a case (evidence: read-only)
+gorani-mount script [--case C]           the same engine over JSON lines (tests; no FUSE)
+```
+
+- **The engine is the core's, not the shell's** (`clients/core/src/engine.rs`):
+  the tree, names, reads, writes and conflicts are decided once, so the
+  Windows and macOS shells will call the same methods. `clients/linux` is
+  a thin FUSE adapter (`fuser` without libfuse: pure Rust, mounting
+  through `/dev/fuse` as root or `fusermount3` otherwise).
+- **It unlocks with this computer's copy** — the point of enrolment: the
+  server releases the wrapped root only to the device's token, and only
+  the device secret (never sent) opens it. Found on the way: the client's
+  unlock call dropped the salt the copy needs, so no native client had
+  ever unlocked this way; `gorani-sync` now does too when no `--secret` is
+  typed.
+- **The tree comes from the listing**, the change feed only says that
+  something moved (the journal is pruned after its retention, so it cannot
+  rebuild a tree from zero). A name opens only in its place; one that does
+  not is shown as `⚠ unverified ‹id›`, never as what it claims to be.
+- **Reads fetch only what they touch**: a chunked file's GC01 frames for
+  the range asked; a whole file once, into a bounded in-memory cache.
+- **Writes are held in memory** (≤ 48 MiB, so no plaintext is spooled to
+  disk) and sent on close: a new file, or the version after the one that
+  was opened. If the file moved on meanwhile, the bytes are saved beside
+  it as `name (conflict <date time>).ext` — nothing is overwritten, nothing
+  is lost. rename/move, mkdir/rmdir and unlink (to the Trash) map to the
+  same API the web app uses.
+- **What the shell will not do**: serve a malware sample (shown, mode 000,
+  every open refused); write into an evidence case (an item needs its
+  intake record, which a file system cannot ask for — `gorani-sync push
+  --case` does); serve evidence it has not checked: each evidence file is
+  verified against its uploader's signed hash at open (a chunked one is
+  streamed through once), and a mismatch, a bad record or — unless the
+  mount was started with `--accept-unverified` — an unverified signer
+  refuses the open. Mounted `noexec,nosuid,nodev`: a vault holds data,
+  often hostile.
+- **Honest limits, for now**: no offline cache (so nothing at rest to
+  encrypt yet; GL1 arrives with one), files above 48 MiB are read-only
+  through the mount, a rename over an existing file trashes the old one
+  instead of making the moved bytes its next version, and changes made
+  elsewhere appear on the next listing (≤ 3 s, no WebSocket yet).
+- `api:linux-shell` drives the engine through `gorani-mount script` and
+  then mounts it for real: Node's async `fs` reads, writes, renames and
+  unlinks through the kernel, and the browser's own code checks what
+  arrived.
 
 ## Testing (the pattern the port follows)
 

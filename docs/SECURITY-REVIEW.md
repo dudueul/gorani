@@ -116,11 +116,29 @@ shows 14 idle minutes open and 15 locked. (A side effect worth teaching:
 the CSP's `connect-src 'self'` already stops page scripts from `fetch`ing a
 blob: URL at all.)
 
+### O3, fixed in commit 24 — store-key records authenticated
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O3 | High | **A server could make clients seal to its own key.** Sealing needs only a public key, so whoever writes the settings row could mint a key pair, seal its private half to the victim's root, and swap the record; web and CLI opened it and sealed every later upload to the attacker. | A MAC under a record key derived from the root alone (ECDH of the root with its own public half from the bundle + the ML-KEM secret, HKDF, HMAC; ENCRYPTION.md › Authenticated store records), plus consistency checks (the opened key must reproduce the record's public halves and id) and strict opening (unsealed "key material" refused). Own records are MAC'd at setup; others are pinned on first open and saved. |
+| O3a | High | The CLI sealed names and content keys with the record's public JWK directly (`seal_for_files`, `files_public`) — the verification in `files_store` was never on the sealing path. Found by the new swap step in `api:client-live`. | `Session::files_public` derives the public half from the VERIFIED private key; the duplicate helper is gone. |
+
+Proven by unit:records (substitution, swapped halves, mismatched pairs,
+unsealed keys, foreign MACs — each refused; pinning), the `record` vector
+(TypeScript's MAC verified and recomputed by Rust), api:client-live (the
+real binary refuses to push through a swapped record), and e2e:app (setup
+creates the MAC; a seeded record is pinned and saved).
+
+**What it does not cover — stated, not hidden:** a record sealed to you by
+someone else is trusted on its FIRST open; a substitution before that is
+not caught. Member public keys handed to others (to seal TO you) and the
+parents' master public key are likewise server-supplied. Both need member
+identity keys with verified fingerprints — the D2/D4 redesign.
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |
 |---|---|---|---|
-| O3 | High | **Store-key records are not authenticated.** A server that controls settings can give clients an attacker key pair (private half sealed to the victim's root — sealing needs only the public key). New uploads then seal to the attacker. Same for family public halves. | MAC (key derived from the root, like `deriveIndexKey`) over keyId + publics + sealed private; check public halves against the opened private; recompute key ids; refuse unsealed text where key material is expected. |
 | O5 | High | **Member removal leaves old versions readable**: `files/reseal` re-wraps only the *current* version of each file; older versions stay wrapped to the old family key (docs/FAMILY.md claims otherwise). | Re-wrap every version row (or purge old versions on rotation). |
 | O6 | Medium | Content is not bound to its file id: the server can swap (key, object) pairs between files undetected. | Bind file id + version in the AAD (format v-next). |
 | O7 | Medium | GB1: header outside the AAD; nonce prefix not compared. | Hash the header into each segment's AAD; compare full nonce. |

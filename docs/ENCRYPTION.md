@@ -76,6 +76,28 @@ GK01 = "GK01" ‖ len(pkcs8):2 ‖ P-256 private PKCS#8 ‖ ML-KEM seed (64) ‖
 GW01 = "GW01" ‖ nonce (12) ‖ AES-256-GCM(KEK, key bytes) ‖ tag,   AAD = "GW01"
 ```
 
+### Authenticated store records (commit 24)
+
+A store record — `{ keyId, publicKey, pqPublicKey, privateKeySealed }` in
+the member's settings — is trusted only when its `mac` verifies under the
+member's **record key**, which only the root's holder can derive
+(web/src/vault/records.ts ⇄ crates/formats/src/records.rs; the `record`
+vector proves the two agree):
+
+```text
+shared = ECDH(root P-256 private, root P-256 public)        root with itself; the public half from the BUNDLE
+ikm    = shared (32) ‖ SHA-256(root ML-KEM-768 decapsulation key, FIPS 203 encoding)
+key    = HKDF-SHA256(ikm, salt = "gorani-records", info = "gorani-records-v1") → HMAC-SHA256 key
+mac    = base64(HMAC(key, len‖"gorani-store-record-v1" ‖ len‖name ‖ len‖keyId ‖ len‖P-256 raw (65)
+                          ‖ len‖ML-KEM public ‖ len‖privateKeySealed))          len = u32 BE
+```
+
+Opening a record also checks that the opened private key reproduces the
+record's public halves and key id, and that `privateKeySealed` is sealed
+text. Own records are MAC'd at creation; records sealed to a member by
+someone else are pinned (MAC'd) on first open — trust on first use, until
+member identity keys arrive (docs/DECISIONS.md › D2/D4).
+
 ### Unlock methods (KEK per kind)
 
 | Method | KEK | Strength |

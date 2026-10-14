@@ -326,7 +326,11 @@ Object's SQLite size. Strategy: retention (built), the reserved
 
 ## 6. Known gaps
 
-- Worker request caps: uploads are chunked (8 MiB frames); a *restore* of
-  very large backups is client-driven for the same reason.
+- Worker request caps: uploads are chunked — 8 MiB frames, growing to
+  32 MiB for files over 156 GiB (docs/LARGE-FILES.md) — and each part is
+  streamed through the Worker, never buffered. A part is at most one
+  64 MiB frame, under every plan's request-body limit (100 MB on Free and
+  Pro). A *restore* of very large backups is client-driven for the same
+  reason.
 - The backup job buffers one container in memory — right for family scale;
   multipart streaming is the documented next step.

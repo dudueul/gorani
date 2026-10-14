@@ -9,7 +9,10 @@
  */
 
 import assert from "node:assert/strict";
-import { framesForRange, frameAad, splitFrame, resolveRange, cutToRange, FRAME_OVERHEAD } from "../../web/public/gorani-media-lib.js";
+import { createHash, randomBytes } from "node:crypto";
+import { framesForRange, frameAad, splitFrame, resolveRange, cutToRange, downloadStream, sha256Stream, FRAME_OVERHEAD } from "../../web/public/gorani-media-lib.js";
+import { sealChunked } from "../../web/src/vault/chunked-file.ts";
+import { newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
 
 const chunk = 64;
 const size = 200; // four frames: 64, 64, 64, 8
@@ -77,4 +80,56 @@ assert.equal(cutToRange(plainFrames, 64, 180, 500).length, 12);
 // A start outside the frames is a bug, not a silent empty answer.
 assert.throws(() => cutToRange(plainFrames, 64, 10, 20));
 
-console.log("ok  media frames: range mapping, AAD binding, split, range resolution, exact cuts");
+
+// ── D12 (31c): the streamed download ────────────────────────────────
+// SHA-256 in plain JS (the worker imports nothing from the app bundle),
+// against node:crypto at every block boundary and in odd-sized pieces.
+for (const n of [0, 1, 55, 56, 63, 64, 65, 119, 120, 4097]) {
+	const b = randomBytes(n);
+	for (const step of [1, 7, 64, 1000]) {
+		const h = sha256Stream();
+		for (let i = 0; i < b.length; i += step) h.update(b.subarray(i, i + step));
+		assert.equal(h.hex(), createHash("sha256").update(b).digest("hex"), `sha256 of ${n} bytes in ${step}-byte steps`);
+	}
+}
+// A whole file through downloadStream, two frames per fetch: every byte, in
+// order, and the plaintext's hash handed back.
+{
+	const dlChunk = 64;
+	const plain = randomBytes(7 * dlChunk + 13);
+	const key = await importContentKey(newContentKey());
+	const sealed = await sealChunked(key, plain, dlChunk);
+	const read = async (bytes, mutate = (b) => b) => {
+		const fetched = [];
+		let result = null;
+		const stream = downloadStream({ key, chunk: dlChunk, size: plain.length, windowBytes: 2 * (dlChunk + FRAME_OVERHEAD), onDone: (r) => (result = r), fetchRange: async (a, b) => (fetched.push([a, b]), mutate(bytes.slice(a, b), a)) });
+		const out = [];
+		let error = null;
+		try {
+			for await (const piece of stream) out.push(piece);
+		} catch (e) {
+			error = e;
+		}
+		return { out: Buffer.concat(out), result, error, fetched };
+	};
+	const ok = await read(sealed);
+	assert.equal(ok.error, null);
+	assert.deepEqual(ok.out, plain, "the plaintext, whole and in order");
+	assert.deepEqual(ok.result, { ok: true, sha256: createHash("sha256").update(plain).digest("hex"), size: plain.length });
+	assert.equal(ok.fetched.length, 4, "eight frames, two per fetch");
+	// A byte changed in frame 3: the stream stops there, and says so.
+	const bad = await read(sealed, (b, at) => (at <= 3 * (dlChunk + FRAME_OVERHEAD) + 20 && at + b.length > 3 * (dlChunk + FRAME_OVERHEAD) + 20 ? ((b[3 * (dlChunk + FRAME_OVERHEAD) + 20 - at] ^= 1), b) : b));
+	assert.match(String(bad.error), /frame 4 of 8 does not open/);
+	assert.equal(bad.result.ok, false);
+	assert.ok(bad.out.length <= 3 * dlChunk, "nothing past the altered frame was released");
+	// Frames swapped: position is authenticated.
+	const swapped = Buffer.from(sealed);
+	const f = dlChunk + FRAME_OVERHEAD;
+	swapped.set(sealed.subarray(0, f), f);
+	swapped.set(sealed.subarray(f, 2 * f), 0);
+	assert.match(String((await read(swapped)).error), /frame 1 of 8 does not open/);
+	// A server that answers short: refused, not padded.
+	assert.match(String((await read(sealed, (b) => b.subarray(0, b.length - 1))).error), /answered \d+ bytes for a \d+-byte span/);
+}
+
+console.log("ok  media frames: range mapping, AAD binding, split, range resolution, exact cuts, and the streamed download (D12): plain-JS SHA-256 against node:crypto, a file whole through frame windows, an altered byte / swapped frames / a short answer each stopping it");

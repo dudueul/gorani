@@ -35,6 +35,28 @@ pub const MAGIC: &[u8; 4] = b"GC01";
 pub const FRAME_OVERHEAD: u64 = 28;
 /// Plain bytes per frame (and per uploaded part, which S3 wants at least 5 MiB and uniform).
 pub const DEFAULT_CHUNK: u64 = 8 * 1024 * 1024;
+/// The largest file (D12, docs/LARGE-FILES.md): 255 GiB.
+pub const MAX_FILE: u64 = 255 * 1024 * 1024 * 1024;
+/// The backends' part limit — one frame rides each part.
+pub const MAX_PARTS: u64 = 10_000;
+/// The largest chunk a part may carry through the Worker.
+pub const MAX_CHUNK: u64 = 64 * 1024 * 1024;
+
+/// The chunk for a file of `size` bytes: 8 MiB, doubled until the file
+/// needs at most 10 000 frames — 8 MiB to 78 GiB, 16 MiB to 156 GiB,
+/// 32 MiB to the 255 GiB ceiling. `None` above it. A power of two, so the
+/// browser, the CLI and the shells agree on every file's frames (the
+/// vectors pin it: tests/vectors.json › chunked › chunkFor).
+pub fn chunk_for(size: u64) -> Option<u64> {
+	if size > MAX_FILE {
+		return None;
+	}
+	let mut chunk = DEFAULT_CHUNK;
+	while size.div_ceil(chunk) > MAX_PARTS {
+		chunk *= 2;
+	}
+	Some(chunk)
+}
 
 pub fn frame_count(size: u64, chunk: u64) -> u64 {
 	size.div_ceil(chunk).max(1)

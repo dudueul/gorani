@@ -28,7 +28,7 @@ import { newContentKey, importContentKey, sealText, sealWith, openWith } from ".
 import { storeSealer } from "../lib/placed.mjs";
 import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { sealChunked, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
-import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
+import { newShareId, newShareSecret, shareKeys, sealShareMeta, newShareKdf } from "../../web/src/vault/share-crypto.ts";
 import { toBase64 } from "../../web/src/lib/encoding.ts";
 
 const dev = await suiteDev();
@@ -63,13 +63,15 @@ async function uploadWhole(member, path, fields, file) {
 
 /** Create a share for `member` with a chosen id; returns the start response. */
 async function shareStart(member, id, store, size) {
-	const keys = await shareKeys(id, newShareSecret());
+	// (A password, as every link carries since D11 — commit 30.)
+	const kdf = newShareKdf();
+	const keys = await shareKeys(id, newShareSecret(), "suite-password", kdf);
 	const metaSealed = await sealShareMeta(keys.meta, id, { name: "n.txt", type: "text/plain", size, modified: null });
 	const res = await api(dev.base, "POST", `/api/v1/members/${member}/files/shares`, {
 		email: `${member}@family.test`,
 		// (fileId: the server stores which file a share copies; it cannot check
 		// the copy against it — the copy is sealed under the link's key.)
-		body: { id, fileId: "shared-file", version: 1, nameSealed: await store.shareName(id, "n.txt"), metaSealed, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size },
+		body: { id, fileId: "shared-file", version: 1, nameSealed: await store.shareName(id, "n.txt"), metaSealed, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size, kdf },
 	});
 	return { res, keys, metaSealed };
 }

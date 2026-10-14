@@ -22,7 +22,7 @@ import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, openWith } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
 import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
-import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
+import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
 import { resealStore, opensAnything } from "../../web/src/vault/rotation.ts";
 
 const dev = await suiteDev();
@@ -70,8 +70,9 @@ try {
 	assert.equal(v2.status, 200, JSON.stringify(v2.json));
 	await call("PUT", "/api/v1/members/jinu/files/secrets", { sealed: await a.secrets(JSON.stringify({ fp: "fingerprint key", idx: "index key" })) });
 	const shareId = newShareId();
-	const sk = await shareKeys(shareId, newShareSecret());
-	await call("POST", "/api/v1/members/jinu/files/shares", { id: shareId, fileId, version: 2, nameSealed: await a.shareName(shareId, "timeline.txt"), metaSealed: await sealShareMeta(sk.meta, shareId, { name: "timeline.txt", type: "text/plain", size: v2plain.length, modified: null }), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 1, size: v2plain.length });
+	const kdf = newShareKdf(); // (every link carries a password since D11)
+	const sk = await shareKeys(shareId, newShareSecret(), "suite-password", kdf);
+	await call("POST", "/api/v1/members/jinu/files/shares", { id: shareId, fileId, version: 2, nameSealed: await a.shareName(shareId, "timeline.txt"), metaSealed: await sealShareMeta(sk.meta, shareId, { name: "timeline.txt", type: "text/plain", size: v2plain.length, modified: null }), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 1, size: v2plain.length, kdf });
 
 	const privA = a.priv;
 	const before = await opensAnything(call, "jinu", privA);

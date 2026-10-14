@@ -807,6 +807,10 @@ impl GoraniMemberDO {
 			return json_error(400, "the share meta must be sealed (GS01)");
 		}
 		let Some(expires_at) = get("expiresAt") else { return json_error(400, "expiresAt required") };
+		let downloads_left = body.get("downloadsLeft").and_then(|v| v.as_i64()).unwrap_or(5);
+		if let Some(msg) = share_policy_refusal(body.get("kdf"), &expires_at, downloads_left, worker::Date::now().as_millis() as f64) {
+			return json_error(400, &msg);
+		}
 		let Some(s3_upload_id) = get("s3UploadId") else { return json_error(400, "s3UploadId required") };
 		// A malware sample never leaves by link (D8, commit 29e): a link's
 		// recipient gets the bytes in a browser, outside every rule here. A
@@ -816,7 +820,6 @@ impl GoraniMemberDO {
 				return json_error(409, "a malware sample is never shared by link — grant the partner the case instead (docs/CUSTODY.md › stage 5)");
 			}
 		}
-		let downloads_left = body.get("downloadsLeft").and_then(|v| v.as_i64()).unwrap_or(9999);
 		self.sql
 			.exec(
 				"INSERT INTO shares (id, file_id, version, name_sealed, object_key, meta_sealed, kdf, expires_at, downloads_left, created_at, s3_upload_id, ready, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?10, 0, ?11)",
@@ -1296,6 +1299,80 @@ struct SealedRow {
 struct CurrentVersion {
 	version: i64,
 }
+/// The link policy (D11, docs/DECISIONS.md › Sharing; commit 30). Partners
+/// sign in — a guest account, a case grant — and a link is the exception,
+/// for working areas only (a case has no link route at all: routes.rs ›
+/// case_need). A link must:
+///
+/// - **carry a password.** The server never sees it (the recipient's page
+///   stretches it with Argon2id and mixes it into the link's key,
+///   share-crypto.ts); what the server CAN require is the KDF record that
+///   says one exists, with parameters inside the bounds the recipient's
+///   page enforces (kdf-bounds.ts, O8) — a link nobody could open is
+///   refused here, not discovered by the partner;
+/// - **expire within 7 days** (with five minutes for clock skew; a date
+///   already past is harmless — that link opens for nobody);
+/// - **allow 1–100 downloads.**
+///
+/// What it cannot enforce: a client that declares a KDF and then mixes in
+/// an empty password. The honest client cannot (share-dialog.ts refuses
+/// one shorter than 8 characters); a dishonest one holds the plaintext
+/// anyway — the policy binds the tool, not the person.
+pub(crate) fn share_policy_refusal(kdf: Option<&serde_json::Value>, expires_at: &str, downloads: i64, now_ms: f64) -> Option<String> {
+	const WEEK_MS: f64 = 7.0 * 86_400_000.0;
+	const SKEW_MS: f64 = 5.0 * 60_000.0;
+	let Some(k) = kdf.filter(|k| k.is_object()) else {
+		return Some("a link needs a password (D11): send its Argon2id parameters (kdf) — a partner who needs more gets a guest account and the case".into());
+	};
+	let within = |f: &str, lo: i64, hi: i64| k.get(f).and_then(|v| v.as_i64()).is_some_and(|v| (lo..=hi).contains(&v));
+	// The bounds of kdf-bounds.ts › ARGON2_BOUNDS and SALT_BOUNDS.
+	let salt = k.get("salt").and_then(|s| s.as_str()).and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok()).map(|b| b.len());
+	if !within("m", 19 * 1024, 256 * 1024) || !within("t", 2, 10) || !within("p", 1, 8) || !salt.is_some_and(|n| (16..=64).contains(&n)) {
+		return Some("the link's password parameters are outside what a recipient's page accepts (Argon2id m 19–256 MiB, t 2–10, p 1–8, a 16–64-byte salt)".into());
+	}
+	let well_formed = expires_at.len() >= 20 && expires_at.ends_with('Z') && expires_at.as_bytes().get(10) == Some(&b'T');
+	let Some(expires) = crate::audit::epoch_seconds(expires_at).filter(|_| well_formed).map(|s| s * 1000.0) else {
+		return Some("expiresAt must be an RFC 3339 UTC time (YYYY-MM-DDThh:mm:ssZ)".into());
+	};
+	if expires > now_ms + WEEK_MS + SKEW_MS {
+		return Some("a link expires within 7 days (D11) — for longer, grant the partner a guest account".into());
+	}
+	if !(1..=100).contains(&downloads) {
+		return Some("downloadsLeft is 1–100".into());
+	}
+	None
+}
+
+#[cfg(test)]
+mod share_policy_tests {
+	use super::share_policy_refusal;
+
+	const NOW: f64 = 1_791_996_658_000.0; // 2026-10-14T16:50:58Z
+
+	fn kdf() -> serde_json::Value {
+		serde_json::json!({ "salt": "AAAAAAAAAAAAAAAAAAAAAA==", "m": 65536, "t": 3, "p": 4 })
+	}
+
+	#[test]
+	fn a_compliant_link_passes() {
+		assert_eq!(share_policy_refusal(Some(&kdf()), "2026-10-21T16:50:58Z", 5, NOW), None, "exactly a week");
+		assert_eq!(share_policy_refusal(Some(&kdf()), "2026-10-13T00:00:00.000Z", 1, NOW), None, "already past: harmless");
+	}
+
+	#[test]
+	fn each_rule_refuses_by_name() {
+		let why = |k: Option<&serde_json::Value>, at: &str, n: i64| share_policy_refusal(k, at, n, NOW).unwrap_or_default();
+		assert!(why(None, "2026-10-15T00:00:00Z", 5).contains("needs a password"));
+		assert!(why(Some(&serde_json::json!({ "salt": "AAAAAAAAAAAAAAAAAAAAAA==", "m": 1024, "t": 3, "p": 4 })), "2026-10-15T00:00:00Z", 5).contains("outside"), "below OWASP's memory floor");
+		assert!(why(Some(&serde_json::json!({ "salt": "AAAA", "m": 65536, "t": 3, "p": 4 })), "2026-10-15T00:00:00Z", 5).contains("outside"), "a 3-byte salt");
+		assert!(why(Some(&kdf()), "2026-10-21T17:00:00Z", 5).contains("within 7 days"), "a week and ten minutes");
+		assert!(why(Some(&kdf()), "next tuesday", 5).contains("RFC 3339"));
+		assert!(why(Some(&kdf()), "2026-10-15T00:00:00+02:00", 5).contains("RFC 3339"), "UTC only");
+		assert!(why(Some(&kdf()), "2026-10-15T00:00:00Z", 0).contains("1–100"));
+		assert!(why(Some(&kdf()), "2026-10-15T00:00:00Z", 101).contains("1–100"));
+	}
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct TotalCount {
 	pub(crate) n: i64,

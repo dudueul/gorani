@@ -23,7 +23,7 @@ import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, openPlacedText } from "../../web/src/vault/vault-crypto.ts";
 import { places } from "../../web/src/vault/places.ts";
 import { isSampleType, originalType, sampleType } from "../../web/src/vault/samples.ts";
-import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
+import { newShareId, newShareSecret, shareKeys, sealShareMeta, newShareKdf } from "../../web/src/vault/share-crypto.ts";
 import { member, vouch, openCase, signedHash, signedIntake } from "../lib/team.mjs";
 
 const dev = await suiteDev();
@@ -50,8 +50,9 @@ const listed = async (who, base) => (await api(dev.base, "GET", `${base}/files/l
 const audit = async (who, base) => (await api(dev.base, "GET", `${base}/audit`, { email: who.email })).json;
 async function shareOf(who, base, sealer, fileId, size) {
 	const shareId = newShareId();
-	const keys = await shareKeys(shareId, newShareSecret());
-	return api(dev.base, "POST", `${base}/files/shares`, { email: who.email, body: { id: shareId, fileId, version: 1, nameSealed: await sealer.shareName(shareId, "x"), metaSealed: await sealShareMeta(keys.meta, shareId, { name: "x", type: "application/octet-stream", size, modified: null }), expiresAt: new Date(Date.now() + 3600_000).toISOString(), downloadsLeft: 1, size } });
+	const kdf = newShareKdf();
+	const keys = await shareKeys(shareId, newShareSecret(), "suite-password", kdf);
+	return api(dev.base, "POST", `${base}/files/shares`, { email: who.email, body: { id: shareId, fileId, version: 1, nameSealed: await sealer.shareName(shareId, "x"), metaSealed: await sealShareMeta(keys.meta, shareId, { name: "x", type: "application/octet-stream", size, modified: null }), expiresAt: new Date(Date.now() + 3600_000).toISOString(), downloadsLeft: 1, size, kdf } });
 }
 
 try {

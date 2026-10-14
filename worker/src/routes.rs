@@ -1083,6 +1083,14 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 	if chunk < MIN_PART {
 		return json_error(400, &format!("chunk {chunk} is below the backend's minimum part size of {MIN_PART} bytes (every part but the last must be at least that)"));
 	}
+	// D12 (docs/LARGE-FILES.md): at most 255 GiB a file, and a chunk the
+	// Worker streams through — at most 64 MiB a part.
+	if size > gorani_formats::chunked::MAX_FILE {
+		return json_error(413, "a file is at most 255 GiB (docs/LARGE-FILES.md)");
+	}
+	if chunk > gorani_formats::chunked::MAX_CHUNK {
+		return json_error(400, &format!("chunk {chunk} is above the largest part the Worker streams ({} bytes)", gorani_formats::chunked::MAX_CHUNK));
+	}
 	// (div_ceil, not `(size + chunk - 1) / chunk`: a hostile `size` near
 	// u64::MAX would wrap the sum in a release build.)
 	let parts = size.div_ceil(chunk).max(1);
@@ -1124,9 +1132,25 @@ async fn upload_part(mut req: Request, env: Env, identity: &Identity, member_id:
 		Err(resp) => return Ok(resp),
 	};
 	let Some(n) = part_number(part) else { return json_error(400, "part numbers are 1–10000") };
-	let bytes = req.bytes().await?;
-	let etag = s3::multipart_part(&env, &meta.object_key, &meta.s3_upload_id, n, bytes.to_vec()).await?;
+	let len = match part_length(&req)? {
+		Ok(len) => len,
+		Err(resp) => return Ok(resp),
+	};
+	let etag = s3::multipart_part_stream(&env, &meta.object_key, &meta.s3_upload_id, n, req.stream()?, len).await?;
 	Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
+}
+
+/// A part's declared length (D12): streamed parts need it up front — the
+/// backend is told it before the first byte — and it is at most one frame
+/// of the largest chunk. A body that then runs short or long fails the
+/// stream, and the part with it.
+fn part_length(req: &Request) -> Result<std::result::Result<u64, Response>> {
+	let max = gorani_formats::chunked::MAX_CHUNK + gorani_formats::chunked::FRAME_OVERHEAD;
+	Ok(match req.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok()) {
+		None => Err(json_error(411, "a part declares its length (Content-Length) — it is streamed to storage")?),
+		Some(len) if len > max => Err(json_error(413, &format!("a part is at most one frame of the largest chunk ({max} bytes)"))?),
+		Some(len) => Ok(len),
+	})
 }
 
 /// S3's part-number range (1-based, at most 10 000). Parsed before the body
@@ -1562,8 +1586,11 @@ async fn share_part(mut req: Request, env: Env, identity: &Identity, member_id: 
 		Err(resp) => return Ok(resp),
 	};
 	let Some(n) = part_number(part) else { return json_error(400, "part numbers are 1–10000") };
-	let bytes = req.bytes().await?;
-	let etag = s3::multipart_part(&env, &meta.object_key, &meta.s3_upload_id, n, bytes.to_vec()).await?;
+	let len = match part_length(&req)? {
+		Ok(len) => len,
+		Err(resp) => return Ok(resp),
+	};
+	let etag = s3::multipart_part_stream(&env, &meta.object_key, &meta.s3_upload_id, n, req.stream()?, len).await?;
 	Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
 }
 

@@ -23,6 +23,24 @@ const MAGIC = new TextEncoder().encode("GC01");
 export const FRAME_OVERHEAD = 28;
 /** Plain bytes per frame (and per uploaded part, which S3 wants at least 5 MiB and uniform). */
 export const DEFAULT_CHUNK = 8 * 1024 * 1024;
+/** The largest file (D12, docs/LARGE-FILES.md): 255 GiB. */
+export const MAX_FILE = 255 * 1024 ** 3;
+/** The backends' part limit — one frame rides each part. */
+export const MAX_PARTS = 10_000;
+
+/**
+ * The chunk for a file of `size` bytes: 8 MiB, doubled until the file
+ * needs at most 10 000 frames (8 MiB to 78 GiB, 16 MiB to 156 GiB, 32 MiB
+ * to 255 GiB). The Rust twin is crates/formats › chunked::chunk_for; the
+ * vectors (tests/vectors.json › chunked › chunkFor) pin both.
+ */
+export function chunkFor(size: number): number {
+	if (!Number.isSafeInteger(size) || size < 0) throw new Error("a file size is a whole number of bytes");
+	if (size > MAX_FILE) throw new Error(`a file is at most 255 GiB — this one is ${(size / 1024 ** 3).toFixed(1)} GiB`);
+	let chunk = DEFAULT_CHUNK;
+	while (Math.ceil(size / chunk) > MAX_PARTS) chunk *= 2;
+	return chunk;
+}
 
 export const frameCount = (size: number, chunk: number) => Math.max(1, Math.ceil(size / chunk));
 /** The stored object's size for a plain size. */

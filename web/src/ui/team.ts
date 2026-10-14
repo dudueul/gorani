@@ -28,6 +28,7 @@ import { approveRequest, requestApproval, verifyApproval, type Approval, type Ap
 import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
 import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
 import { devIdentityHeaders } from "../lib/api.ts";
+import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
 type Tab = "people" | "cases" | "recovery";
@@ -394,8 +395,7 @@ export class GoraniTeam extends LitElement {
 						<span class=${a.check.request ? "text-emerald-400" : "text-red-400"}>${a.check.request ? "signature verified" : "signature does NOT verify — do not agree"}</span>
 						${a.status === "approved" && a.action === "case.export" && (a.requestedBy === this.team.memberId || a.approvedBy === this.team.memberId) && c.grant
 							? html`<button class=${primary} ?disabled=${this.busy} data-test="export-${a.id}" @click=${() => this.act(`Exporting ${c.id}`, async () => {
-									const built = await buildExport(this.source(), this.team.signer, this.team.trust, await this.caseKey(c), c.id, a.id);
-									this.save(built.parts, `${c.id}-export-${a.id.slice(0, 8)}.zip`);
+									const built = await this.exportCase(c, a.id, `${c.id}-export-${a.id.slice(0, 8)}.zip`);
 									return built.problems.length ? `Exported ${c.id} — with ${built.problems.length} problem(s) recorded in the manifest: ${built.problems.join("; ")}` : `Exported ${c.id}: every record verified. Check it with tools/verify-export.mjs; give the recipient your fingerprint out of band.`;
 								})}>Export now</button>`
 							: nothing}
@@ -429,6 +429,34 @@ export class GoraniTeam extends LitElement {
 		</div>`;
 	}
 
+	/**
+	 * The export, streamed to disk where the media worker runs (D12, 31d):
+	 * the package goes out as it is made — no case is too large for the
+	 * tab. Without the worker it is built in memory and saved, as before.
+	 */
+	private async exportCase(c: CaseRow, approvalId: string, name: string): Promise<{ problems: string[] }> {
+		const worker = await controllingMediaWorker(2000);
+		if (!worker) {
+			const built = await buildExport(this.source(), this.team.signer, this.team.trust, await this.caseKey(c), c.id, approvalId);
+			this.save(built.parts, name);
+			return built;
+		}
+		const url = `/media/dl/${Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
+		const pipe = await pipeToDownload(worker, { url, name, mime: "application/zip" });
+		// A navigation the worker answers (not <a download>, which Chromium sends past it).
+		const a = document.createElement("a");
+		a.href = url;
+		a.click();
+		try {
+			const built = await buildExport(this.source(), this.team.signer, this.team.trust, await this.caseKey(c), c.id, approvalId, { sink: pipe.write });
+			await pipe.close();
+			return built;
+		} catch (e) {
+			pipe.fail(e);
+			throw e;
+		}
+	}
+
 	/** The API as the export and re-verification read it (this tab's fetches). */
 	private source(): ExportSource {
 		return {
@@ -439,6 +467,12 @@ export class GoraniTeam extends LitElement {
 				const r = await fetch(path, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web-export" } });
 				if (!r.ok) throw new Error(`download failed: ${r.status}`);
 				return { body: new Uint8Array(await r.arrayBuffer()), ck: r.headers.get("x-gorani-ck") ?? "", chunk: Number(r.headers.get("x-gorani-chunk")) || null, version: Number(r.headers.get("x-gorani-version")), hash: r.headers.get("x-gorani-hash") };
+			},
+			// (D12, 31d) Streamed: the export decrypts each version as it arrives.
+			objectStream: async (path) => {
+				const r = await fetch(path, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web-export" } });
+				if (!r.ok || !r.body) throw new Error(`download failed: ${r.status}`);
+				return { body: r.body, size: Number(r.headers.get("content-length")), ck: r.headers.get("x-gorani-ck") ?? "", chunk: Number(r.headers.get("x-gorani-chunk")) || null, version: Number(r.headers.get("x-gorani-version")), hash: r.headers.get("x-gorani-hash") };
 			},
 		};
 	}

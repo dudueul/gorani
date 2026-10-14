@@ -65,7 +65,10 @@ and its order matters:
    store private half, wrap to the new public half, store via
    `files/reseal` (the same client-driven walk as a child-store rotation;
    no file is re-encrypted). After this, their old store key unwraps
-   nothing — not even bytes already stored.
+   nothing among the CURRENT versions. **Caveat (security review,
+   commit 23, O5):** `files/reseal` re-wraps only each file's living
+   version; older versions keep content keys wrapped to the old family key
+   until they are re-wrapped or purged — see docs/SECURITY-REVIEW.md.
 3. **Update each remaining member's settings**: the new family key copy
    replaces the old (`stores.family`, sealed to their root — a parent can
    act for any member).

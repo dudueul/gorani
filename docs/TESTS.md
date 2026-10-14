@@ -35,6 +35,8 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `unit:music` + `api:music` | Tag parsing byte by byte (ID3v2.3/2.4, FLAC) and the sealed-blob feed's contract — the server stores ciphertext with a size | metadata without surveillance |
 | `e2e:app` | The SPA in a real browser (Playwright): boot, in-browser vault setup, password + recovery unlock, a sealed upload through the file picker, the decrypted listing, the wrong-password refusal | the product surface, finally watched — non-extractable keys as shipped |
 | `api:client-live` | The REAL native binary: enrol, ls (opened names), zero-trust spot checks | two independent implementations agreeing over the wire |
+| `api:security` | The review's regression suite (docs/SECURITY-REVIEW.md): registry scope, id validation before S3, write-once share ids, exact Range, device-token reports, write-once restore fill, a quiet health line | how a security fix earns its keep: the test fails on the old code |
+| `api:s3-live` | **Opt-in** (`GORANI_LIVE_S3=1` + `S3_*`): the same contract against a REAL bucket — private-bucket check, signed round trips, exact Range, multipart + size refusal, share copy, purge | what the stub cannot prove: a real server checking SigV4 and the part rules |
 
 ## Writing the next suite (the house style)
 
@@ -47,3 +49,13 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 ```
 
 Runs: `node tests/run.mjs` (everything), `node tests/run.mjs api` (worker only), `node tests/run.mjs unit` (no server). Suites must stay fast: the whole run is minutes.
+
+## A lesson from the review: the fake that agreed with the bug
+
+`unit:explorer` drives the UI's model against a fake server. Until commit 23
+the fake answered `GET …/files/keys` — but the real worker only has
+`POST …/files/keys`, so the shipped app could not open, preview or inspect
+a single file, and every test stayed green. Rule 2 above ("walk the real
+path") is not a style preference: a fake must enforce the real contract
+(method, path, body), or it becomes a second implementation that can agree
+with the bug. The fake now asserts the method.

@@ -9,7 +9,10 @@ enough readable structure to sync and browse; object storage is any
 S3-compatible bucket (MinIO over public HTTPS). Family key hierarchy: a
 parents' master key opens the children's areas — never the reverse.
 
-**Status: built and self-proving** — 33 green commits from the scaffold
+**Status: built, self-proving — and reviewed.** The commit-23 security
+review ([docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md)) fixed 32
+findings and lists the open ones with proposals; read it before deploying.
+34 green commits from the scaffold
 through the vault, explorer, streaming, shares, backups, retention, native
 clients (live-tested), the family hierarchy, ownership, the R2-priority
 storage path, the nightly cron, the music library, and a browser e2e. The

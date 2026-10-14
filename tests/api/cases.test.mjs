@@ -17,7 +17,9 @@
  *   5. revoke → "rotation required" → rotate (commit first, then the
  *      reseal walk, then "done"): the old key opens nothing, every
  *      remaining grantee opens the new one, the revoked member is refused;
- *      a walk interrupted after the commit resumes from the grants;
+ *      a walk interrupted after the commit resumes from the grants; grants
+ *      that end by themselves (a deactivated holder) count as a revoke, and
+ *      a deactivated manager does not count as the case's last one;
  *   6. closing makes the case read-only.
  */
 
@@ -226,16 +228,29 @@ try {
 	}
 	assert.equal((await as(ana).send("PUT", `${BASE}/grants/bo`, { permission: "read", keySealed: c.grant.keySealed, keyId: "stale" })).status, 409, "a grant names the current key");
 
+	// Grants that end by themselves count as a revoke: the holder kept the key.
+	assert.equal((await grant(ana, dee, "read")).status, 200);
+	assert.equal((await grant(ana, lu, "manage")).status, 200);
+	for (const id of ["dee", "lu"]) assert.equal((await api(dev.base, "POST", `/api/v1/family/members/${id}/deactivate`, { email: ana.email })).status, 200, `deactivate ${id}`);
+	c = await caseOf(ana);
+	assert.equal(c.rotationRequired, true, "deactivated holders kept their copies: a rotation is owed");
+	assert.deepEqual(c.grantees.map((g) => g.member).sort(), ["ana", "cy", "ext"], "ended grants are not listed (nobody seals the new key to them)");
+	assert.equal((await as(ana).send("DELETE", `${BASE}/grants/ana`)).status, 409, "a deactivated manager does not count — ana stays the last one");
+	await rotateCase(as(ana).call, ana.root, c, await Promise.all(c.grantees.map((g) => rootOf(ana, g.member))));
+	c = await caseOf(ana);
+	assert.equal(c.rotationRequired, false, "the rotation dropped the ended grants with the old key");
+	assert.equal((await as(dee).get(`${BASE}/files/list`)).status, 403);
+
 	// ── 6. Closing ──────────────────────────────────────────────────────
 	assert.equal((await as(cy).send("POST", `${BASE}/close`)).status, 403, "only a manager closes");
 	assert.equal((await as(ana).send("POST", `${BASE}/close`)).status, 200);
 	const newSealer = await storeSealer(await bundleOf(ana, await caseOf(ana)), AREA);
 	assert.equal((await putFile(ana, newSealer, "late.txt", "too late")).status, 409, "a closed case takes no writes");
 	assert.equal((await as(ext).get(`${BASE}/files/list`)).status, 200, "…and still reads");
-	assert.equal((await grant(ana, dee, "read")).status, 409, "…and takes no new grants");
-	const audit = (await as(lu).get(`${BASE}/audit`)).json.map((a) => a.action);
+	assert.equal((await grant(ana, bo, "read")).status, 409, "…and takes no new grants");
+	const audit = (await as(cy).get(`${BASE}/audit`)).json.map((a) => a.action);
 	assert.ok(audit.includes("files.reseal"), "the case audit records the walk");
-	const registry = (await as(lu).get("/api/v1/family")).json.audit.map((a) => a.action);
+	const registry = (await as(ana).get("/api/v1/family")).json.audit.map((a) => a.action);
 	for (const action of ["case.create", "case.grant", "case.revoke", "case.rekey", "case.rekey.done", "case.close"]) assert.ok(registry.includes(action), `the registry audit records ${action}`);
 
 	console.log("ok  api:cases — leads open, grants seal the key, read-only auditors, expiring externals, no links/devices, revoke → rotate (resumable), close");

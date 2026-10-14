@@ -630,7 +630,10 @@ impl GoraniFamilyDO {
 			let grantees: Vec<GranteeRow> = if me.role == "external" {
 				Vec::new()
 			} else {
-				self.sql.exec("SELECT member_id, permission, expires_at FROM case_grants WHERE case_id = ?1 ORDER BY member_id", Some(vec![c.id.clone().into()]))?.to_array()?
+				// Live grants only: an ended one (expired, deactivated holder)
+				// opens nothing and is dropped by the next rotation — listing it
+				// would have the manager seal the new key to someone who left.
+				self.sql.exec(&format!("SELECT member_id, permission, expires_at FROM case_grants WHERE case_id = ?1 AND rowid NOT IN (SELECT rowid FROM case_grants WHERE {}) ORDER BY member_id", Self::STALE_GRANTS), Some(vec![c.id.clone().into()]))?.to_array()?
 			};
 			out.push(serde_json::json!({
 				"id": c.id, "kind": c.kind, "titleSealed": c.title_sealed, "keyId": c.key_id,
@@ -720,7 +723,16 @@ impl GoraniFamilyDO {
 		if let Err(r) = self.require_manager(actor, case) {
 			return Ok(r);
 		}
-		let managers = self.sql.exec("SELECT COUNT(*) AS n FROM case_grants WHERE case_id = ?1 AND permission = 'manage' AND member_id != ?2", Some(vec![case.into(), member.into()]))?.one::<Count>()?.n;
+		// LIVE managers: a deactivated lead's manage grant would leave a case
+		// nobody can grant, rotate or close (only the quorum could, stage 5).
+		let managers = self
+			.sql
+			.exec(
+				&format!("SELECT COUNT(*) AS n FROM case_grants WHERE case_id = ?1 AND permission = 'manage' AND member_id != ?2 AND rowid NOT IN (SELECT rowid FROM case_grants WHERE {})", Self::STALE_GRANTS),
+				Some(vec![case.into(), member.into()]),
+			)?
+			.one::<Count>()?
+			.n;
 		if managers == 0 {
 			return json_error(409, "cannot remove the case's last manager");
 		}

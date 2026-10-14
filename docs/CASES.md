@@ -181,7 +181,10 @@ the member routes with the area, after one check:
   `rotating`). While a walk runs, readers fall back to the previous key.
 - **Ended grants count as a revoke.** An external whose grant or own
   access expired, or a deactivated member, kept their copy; the case lists
-  `rotationRequired` until a rotation drops those grants with the old key.
+  `rotationRequired` until a rotation drops those grants with the old key;
+  the listing leaves them out of `grantees` (nobody seals the new key to
+  someone who left), and the last-manager guard counts live managers only
+  — a deactivated lead's grant would leave a case nobody can manage.
 - **Externals have a vault root, not an area.** A grant is sealed to a
   root, so an external sets up their own vault (unlock methods, root) —
   and still has no files beside it.

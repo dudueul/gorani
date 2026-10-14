@@ -71,6 +71,33 @@ included — acts for another member's area, so the family edition's
 child's code) is gone. A team's shared work lives in cases; desktop sync of
 a case is a member syncing the cases they are granted (docs/CASES.md).
 
+## The desktop phase (commits 33+): what the core must do first
+
+The shells mount the core; the core is not yet what they need. A review
+before starting (commit 33, after D11/D12) found:
+
+1. **It could not sign in outside dev mode.** The core sent an Access
+   *service token* (`CF-Access-Client-Id/Secret`, PRODUCTION.md › 2.5 said
+   so). Access accepts it — and hands the Worker a JWT with no `email`
+   claim (service tokens have a `common_name`). The Worker takes identity
+   from `email` and fails closed (auth.rs: "token has no email"), so every
+   file call from a desktop was refused in production; `client-live`
+   proved it only in dev mode, where the email is a header.
+2. **It uploads whole files only** (≤ 48 MB, in memory) — D12's large
+   files (chunk_for, streamed parts, resume) never reached it.
+3. **It reaches the member's own area only.** Cases — where evidence
+   lives — need the case key (a grant sealed to the member's root, hybrid)
+   and, for evidence, the uploader's signature (the identity key, sealed
+   under the root), the timestamp imprint and the intake record.
+
+| Stage | What |
+|---|---|
+| 33a | **Sign in as the member.** The core sends a user Access token (`cf-access-token`, from `cloudflared access token -app=<server>` or the `GORANI_ACCESS_TOKEN` variable) — short-lived and bound to the member's SSO/MFA, so the Worker sees the member's email and every rule (own area, case grants) applies unchanged. The device token stays what it is: the release of this computer's wrapped root copy. |
+| 33b | **Large files.** `push` streams from disk in GC01 frames at `chunk_for(size)`, parts with retry, and a resume journal on disk (sealed fields only, like the browser's); `pull` streams frame windows to disk and checks the signed hash. |
+| 33c | **Cases.** Open a granted case's key from its grant; list, pull, push into it; on an evidence case, sign the content hash (and send the stamp imprint) with the member's identity key, and carry an intake record. |
+| 33d | **The Linux shell** (`clients/linux`, FUSE): the engine first, against `wrangler dev` with an in-memory file system as the doc's testing pattern says; a real mount where the machine allows FUSE. |
+| — | Windows (Cloud Files) and macOS (File Provider) need their platforms to build and test — not this repository's CI machine. |
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

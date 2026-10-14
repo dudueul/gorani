@@ -114,7 +114,11 @@ the Worker's logs.
    sealed twice over (the objects are already GV-sealed; the GB2 container
    wraps them under a key only your key file opens, and authenticates its
    own header — when it was made, which kind — so a copy cannot be
-   relabelled at rest). Runs are created on
+   relabelled at rest). The job streams into a multipart upload, so memory
+   does not bound the backup — one container holds up to ~78 GiB. An object
+   missing from storage is listed in the run's answer and counted in the
+   manifest (`missing`); a nonzero count means investigate the bucket, not
+   that the backup is fine. Runs are created on
    purpose — by the owner in the app — not silently by the server: the
    in-memory job is sized for on-demand runs, and a daily full copy is a
    storage-economics decision a family should make knowingly.
@@ -126,7 +130,11 @@ the Worker's logs.
    records each pass under the actor `cron`. The retention knobs
    (`trashDays`, `auditKeep`, …) are deployment defaults: the HTTP route
    honours them only on the dev server, so no member can shorten their own
-   audit trail.
+   audit trail. Deletions go through an **outbox** (commit 25): an object
+   leaves `pending_deletes` only when storage confirms it, so a failing
+   bucket delays deletion instead of orphaning objects — and fails the
+   scheduled event (look for `gorani cron:` errors). `GET
+   /api/v1/members/<id>/storage/pending` shows what is waiting and why.
 4. Keep the key file offline. Losing it loses the backups, not the vault.
 
 ## 5. Growth

@@ -29,9 +29,9 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `api:r2` | The R2 binding as the storage priority: same sealed contract over the binding (in-process, no SigV4), on workerd's local simulator | one contract, two backends |
 | `api:devices` | Enrol/token-once/unlock/rekey/revoke + crypto-shredding | the native device lifecycle |
 | `api:shares` | The recipient's walk (meta→claim→data) + exhaustion/revocation/expiry | fragment-secret authentication, honest statuses |
-| `api:backup` | Key file (private never crosses the wire) → job → download → decrypt → restore round trip; GB2 refuses a relabelled header and a header-only file | the container the server cannot open |
+| `api:backup` | Key file (private never crosses the wire) → job → download → decrypt → restore round trip; GB2 refuses a relabelled header and a header-only file; the job streams past one part and records a missing object (the restore skips it by name) | the container the server cannot open |
 | `api:housekeeping` | Retention levers with forced clocks; the growth metric | bounding the unbounded |
-| `api:cron` | The nightly pass fired like production fires it: fan-out over the registry, backup prune to 7, the `cron` actor in the audit | maintenance without an identity |
+| `api:cron` | The nightly pass fired like production fires it: fan-out over the registry, backup prune to 7 (objects gone from storage too), the `cron` actor in the audit; storage refusing deletes → keys wait in the outbox, the pass fails, the next one finishes | maintenance without an identity |
 | `unit:music` + `api:music` | Tag parsing byte by byte (ID3v2.3/2.4, FLAC) and the sealed-blob feed's contract — the server stores ciphertext with a size | metadata without surveillance |
 | `e2e:app` | The SPA in a real browser (Playwright): boot, in-browser vault setup, password + recovery unlock, a sealed upload through the file picker, the decrypted listing, the wrong-password refusal | the product surface, finally watched — non-extractable keys as shipped |
 | `api:client-live` | The REAL native binary: enrol, ls (opened names), zero-trust spot checks | two independent implementations agreeing over the wire |
@@ -52,6 +52,9 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 3. Success + refusal per property (the pair is the point).
 4. Deterministic: fresh DO state per run, forced clocks, no sleeps you can't justify.
 5. The failure message names the property ("owner never reassigned"), not the assert.
+6. Seal the way the browser does: tests/lib/placed.mjs (GV04 — ids first, the store's private key).
+7. Test the bad day too: tests/api/_dev.mjs › stubDelete / stubFault make the S3 stub lose an
+   object or refuse a method (O9, O10) — a fake backend that only ever succeeds proves half a contract.
 ```
 
 Runs: `node tests/run.mjs` (everything), `node tests/run.mjs api` (worker only), `node tests/run.mjs unit` (no server). Suites must stay fast: the whole run is minutes.

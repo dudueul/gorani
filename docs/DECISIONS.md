@@ -106,11 +106,21 @@ of at least 26.1 MiB — 32 MiB, rounded up to a power of two:
 adaptive chunk sizes (8 MiB default, larger for large files), resumable
 uploads, and the CLI as the path for very large images.
 
+Consequence for backups (recorded with O9, commit 25): the streaming
+backup job copies every object into ONE container, at most 10 000 × 8 MiB
+≈ 78 GiB. A store holding 255 GB files cannot be copied into one .gbak;
+backups of such stores become **manifests** — the rows plus a reference to
+each object (key, size, its sealed hash), with the objects themselves
+protected by the bucket's own versioning / Object Lock (D6). The copy
+format stays for stores that fit.
+
 ## D13 — Formats
 
 **Clean break.** There is no production data; v-next formats (store-key
 authentication O3, content bound to its file O6, backup header integrity
-O7) replace the current ones without migration code.
+O7) replace the current ones without migration code. (Done in commits
+24–25: store records carry MACs; store values are GV04; backups are GB2.
+Schema changes — not formats — DO migrate, through the ledger of O19.)
 
 ## D14 — Compliance targets
 

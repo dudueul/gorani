@@ -217,12 +217,33 @@ Upgrade note: backups written before commit 25 are GB1 and hold GV03
 values, which a GV04 store refuses — restore them with the release that
 wrote them, then take a fresh backup (docs/PRODUCTION.md › Backups).
 
+### O9 + O10, fixed in commit 25 — a backup that streams and tells the truth; retention that cannot orphan
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O9 | Medium | **The backup job held the whole backup in memory** — every object read whole (`s3::get`), the container concatenated, one PUT — so a store larger than the isolate (128 MB) could not be backed up at all; and **one missing object aborted the run** with nothing written. | The job streams (`worker/src/backup.rs`): rows and objects (read chunk by chunk via `stream_uncached`) feed the GB2 writer, whose output ships as 8 MiB multipart parts — memory is one part plus one segment, whatever the store's size. A missing object is **recorded**: its entry says `"missing": true`, the manifest counts it (`backups.missing`, the first column added under the O19 ledger), the response lists it, the audit says so — and a restore skips it by name instead of minting an empty object. An object whose length changes mid-read aborts the run (the entry format announces the length first; a backup must never be wrong) and frees its parts. `s3::get` is gone. |
+| O10 | Medium | **Retention could orphan objects.** Housekeeping and the backup prune deleted the rows FIRST — the only pointers to the objects — then the S3 deletes, every result discarded (`let _ =`). A failed delete left an object nothing would ever find again. And the cron fan-out ignored every answer: a member whose pass returned 500 nightly looked healthy. | A **deletion outbox** (`pending_deletes`, migration v8): each object key (or multipart upload) is queued in the same pass that removes its row, and leaves the queue only when storage confirms (204, or 404 — already gone). Failures stay queued with attempts and the error, retried every night, visible at `GET …/storage/pending`. A pass with failed deletes answers 503; the fan-out visits every member regardless, then fails the scheduled event naming each failure (`console_error!`). |
+| O10a | Low | The audit listing never selected the `details` column: every readable detail (retention outcomes, device names, backup counts) was written and then listed as null. | Selected. Found by the O10 test asking the audit what happened. |
+
+Proven by `api:backup` § 7 (a 9 MiB file pushes the container past one
+part; an object removed behind the Worker's back is listed, counted,
+marked in its entry, and skipped by the restore; the streamed object
+round-trips byte for byte) and `api:cron` § 4 (the stub refuses DELETE
+with 503: the manifest rows are pruned on schedule, both keys wait in the
+outbox with the error, the objects are still in storage, the audit says
+`deletesFailed:2`; storage recovers and the next pass empties the outbox).
+The stub gained a fault-injection route for it (`POST /__fault`,
+tests/lib/s3stub.mjs).
+
+The honest ceiling: one container is at most 10 000 parts × 8 MiB ≈ 78
+GiB. Past that — and for D12's 255 GB files — backups must become
+manifests of object references rather than copies (a decision, recorded
+in DECISIONS.md › D12).
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |
 |---|---|---|---|
-| O9 | Medium | The backup job is in memory and one missing object aborts the run. | Multipart streaming; record missing objects. |
-| O10 | Medium | Cron ignores non-2xx and S3-delete failures (manifest row removed, `.gbak` orphaned). | Collect failures, fail the pass, delete rows only after the object. |
 | O11 | Medium | Media service worker: keys never forgotten, scope cannot control `/`, wrong AAD on the whole-object path. | Scope `/` (handle `/media/` only), forget on close/lock, fix AAD. |
 | O12 | Medium | Share download limits are cooperative: `/data` does not decrement. | Claim returns a one-time data token. |
 | O13 | Medium | No rate limiting on device-token and share endpoints. | Cloudflare WAF rate-limiting rules on `/s/*` and `/devices/*`. |

@@ -48,6 +48,7 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 27 | The second start | worker/src/schema.rs, tests/api/restart.test.mjs (25) | A constructor runs on every wake-up; idempotent vs. non-idempotent DDL; a migration ledger (append-only history); fail loudly, never hang; testing the restart nobody runs |
 | 28 | A value knows where it lives | web/src/vault/places.ts, crates/formats/src/placed.rs, tests/api/security.test.mjs › 9 (25) | Cut-and-paste attacks on envelope encryption; binding context as AAD without storing it; why public-key sealing cannot authenticate the sealer, and a PSK that can; choose ids before you seal; a decision revisited with its reasons |
 | 29 | Labels and limits | crates/formats/src/backup.rs (GB2), web/src/vault/kdf-bounds.ts (25) | Authenticate what the reader acts on (the header), not just the payload; an empty container is not an empty backup; parameters from untrusted data are bounded both ways — and so is how many times you run them |
+| 30 | Failing honestly | worker/src/backup.rs (PartSink), worker/src/member.rs (pending_deletes), tests/lib/s3stub.mjs › /__fault (25) | Streaming with bounded memory; record what you could not do instead of aborting or skipping silently; the outbox pattern (queue the side effect with the state change, retire it on confirmation); fault injection in a fake backend |
 
 Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at

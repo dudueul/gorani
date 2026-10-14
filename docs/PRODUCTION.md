@@ -126,6 +126,29 @@ A store whose migration fails answers every request with a 500 naming the
 failed statement (it does not hang) — look for `member store schema:` in
 the Worker's logs.
 
+### Write-once evidence (commit 29c, D6)
+
+Object Lock can only be enabled when a bucket is CREATED. For evidence:
+
+- **MinIO**: `mc mb --with-lock alias/gorani` (a new bucket; versioning is
+  enabled with it). Then set `OBJECT_LOCK = "on"` in `wrangler.jsonc`.
+- **AWS S3**: create the bucket with "Object Lock" enabled (it enables
+  versioning). No default retention — gorani sets each evidence object's
+  retention itself, so working files keep their Trash and purge.
+- **R2**: no per-object retention through the Workers binding; add a
+  bucket lock rule for the prefix `cases/` with the retention you need
+  (it then applies to working cases too — a stricter default), and
+  `audit-checkpoints/`.
+
+With `OBJECT_LOCK = "on"`, every evidence version gets a **COMPLIANCE**
+retention until its creation + `EVIDENCE_RETAIN_DAYS` (2557 by default):
+nobody — not the Worker's credential, not the bucket owner, not root —
+can delete it or shorten that date. Choose the number with your legal
+counsel before turning it on; it cannot be taken back for objects already
+locked. Evidence uploaded while it was off is locked on the next request to
+its case. A lock that fails is retried; the nightly pass reports any still
+failing (HTTP 503 from the member pass, logged as a cron failure).
+
 ### Upgrading across commit 29 (the audit trails)
 
 `wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration

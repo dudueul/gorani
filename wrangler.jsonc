@@ -64,7 +64,15 @@
 		// are immutable; a month of TTL needs no invalidation, and deleted
 		// content's stale entries open to nothing (crypto-shredding).
 		"CACHE_MAX_OBJECT_MB": "256",
-		"CACHE_TTL_DAYS": "30"
+		"CACHE_TTL_DAYS": "30",
+
+		// ── Write-once evidence (docs/CUSTODY.md › Stage 3, D6) ────────────
+		// "on" ONLY for a bucket created with Object Lock enabled: every
+		// evidence version, and every audit checkpoint, then gets a COMPLIANCE
+		// retention nobody can shorten. Off, nothing is locked — and evidence
+		// opened meanwhile is locked the moment it is turned on.
+		"OBJECT_LOCK": "off",
+		"EVIDENCE_RETAIN_DAYS": "2557"
 	},
 
 	// ── Storage priority: Cloudflare R2 ──────────────────────────────────

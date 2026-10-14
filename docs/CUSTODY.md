@@ -23,7 +23,7 @@ rendered, delivered zipped under the industry's "infected" password).
 |---|---|---|
 | 1 *(landed: commit 29, `api:audit`)* | D7 + D5.3 | the audit leaves the area database: an outbox ships each line to a per-area **audit Durable Object** that hash-chains it, keeps it 7 years with no line cap, and checkpoints daily to object storage; `…/audit/verify` |
 | 2 *(landed: commit 29b, `api:retention`)* | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
-| 3 | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
+| 3 *(landed: commit 29c, `api:objectlock`)* | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
 | 4 | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
@@ -135,3 +135,22 @@ evidence version recorded (upload, version, restore)
   adds a delete marker — the locked version stays, recoverable, and an
   overwrite adds a new version above it. The test stub models the part
   that matters to gorani: a locked object cannot be deleted.
+
+### Stage 3 as built
+
+- `crates/s3`: `retention_xml` and `md5` (RFC 1321 vectors; the constant
+  table written out, not computed from `sin` — a platform's libm may round
+  differently). `worker/src/s3.rs › put_retention` (Content-MD5, unsigned;
+  R2 → `bucket-rule`).
+- `member.rs › lock_pass`: after every request to an evidence store, and in
+  the nightly pass (which fails loudly — 503 — while any lock is failing),
+  every version with `locked_until` NULL is locked until its creation +
+  `EVIDENCE_RETAIN_DAYS` (default 2557, seven years).
+- `audit.rs › checkpoint_area` locks each checkpoint for the audit's 7
+  years.
+- Opt-in: `OBJECT_LOCK = "on"` (wrangler.jsonc vars) — docs/PRODUCTION.md
+  says how to create the bucket so that it can be.
+- `tests/lib/s3stub.mjs` speaks `?retention` (checks the Content-MD5, never
+  shortens a COMPLIANCE date, refuses DELETE of a locked key) and fault
+  rules can match a query (`retention`), so a suite can fail the lock and
+  not the upload.

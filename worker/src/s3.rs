@@ -16,7 +16,7 @@
 //! sidecars, backup segments); the bucket is private and its keys are
 //! Worker secrets. Nothing here inspects content beyond sizes and statuses.
 
-use gorani_s3::{complete_multipart_body, sign_request, xml_val, S3Config, SignedRequest};
+use gorani_s3::{complete_multipart_body, md5, retention_xml, sign_request, xml_val, xml_vals, S3Config, SignedRequest};
 use worker::*;
 
 use crate::cache;
@@ -296,9 +296,9 @@ pub async fn list(env: &Env, prefix: &str, max: usize) -> Result<Vec<String>> {
 			return Err(Error::RustError(format!("S3 list {prefix}: HTTP {}", resp.status_code())));
 		}
 		let xml = resp.text().await?;
-		out.extend(xml_tags(&xml, "Key"));
-		let truncated = xml_tags(&xml, "IsTruncated").first().is_some_and(|t| t == "true");
-		token = xml_tags(&xml, "NextContinuationToken").into_iter().next();
+		out.extend(xml_vals(&xml, "Key"));
+		let truncated = xml_val(&xml, "IsTruncated").is_some_and(|t| t == "true");
+		token = xml_val(&xml, "NextContinuationToken");
 		if !truncated || token.is_none() || out.len() >= max {
 			break;
 		}
@@ -307,19 +307,38 @@ pub async fn list(env: &Env, prefix: &str, max: usize) -> Result<Vec<String>> {
 	Ok(out)
 }
 
-/// The text of every `<tag>…</tag>` in a small XML answer. (Our keys hold
-/// only `[A-Za-z0-9_./:-]`, so no entity ever needs decoding.)
-fn xml_tags(xml: &str, tag: &str) -> Vec<String> {
-	let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-	let mut out = Vec::new();
-	let mut rest = xml;
-	while let Some(i) = rest.find(&open) {
-		let after = &rest[i + open.len()..];
-		let Some(j) = after.find(&close) else { break };
-		out.push(after[..j].to_string());
-		rest = &after[j + close.len()..];
+/// How an object's retention was applied.
+pub enum Lock {
+	/// COMPLIANCE retention set on the object itself.
+	Locked,
+	/// R2: no per-object retention through the binding — the bucket's lock
+	/// rules are the control (docs/PRODUCTION.md).
+	BucketRule,
+}
+
+/// `PUT <key>?retention`: COMPLIANCE until `until` (docs/CUSTODY.md ›
+/// Stage 3). Content-MD5 because S3 and MinIO demand an integrity check on
+/// a retention write; it is not signed (only x-amz-* headers must be).
+pub async fn put_retention(env: &Env, key: &str, until: &str) -> Result<Lock> {
+	if r2_bucket(env).await?.is_some() {
+		return Ok(Lock::BucketRule);
 	}
-	out
+	let cfg = config(env)?;
+	let body = retention_xml(until);
+	let SignedRequest { url, headers, .. } = sign_request(&cfg, "PUT", key, &[("retention".to_string(), String::new())], now_secs()).map_err(|e| Error::RustError(format!("signing: {e}")))?;
+	let wh = Headers::new();
+	for (k, v) in &headers {
+		wh.set(k, v)?;
+	}
+	use base64::Engine;
+	wh.set("Content-MD5", &base64::engine::general_purpose::STANDARD.encode(md5(&body)))?;
+	wh.set("Content-Type", "application/xml")?;
+	let req = Request::new_with_init(&url, &RequestInit { method: Method::Put, headers: wh, body: Some(body.into()), ..Default::default() })?;
+	let mut resp = Fetch::Request(req).send().await?;
+	match resp.status_code() {
+		200 | 204 => Ok(Lock::Locked),
+		s => Err(Error::RustError(format!("S3 retention {key}: HTTP {s} {}", resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()))),
+	}
 }
 
 // ── Multipart upload (GC01 frames: one frame per part) ──────────────

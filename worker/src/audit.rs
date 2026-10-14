@@ -318,9 +318,14 @@ pub(crate) fn checkpoint_prefix(area: &str) -> String {
 	}
 }
 
-/// Today in UTC, `YYYY-MM-DD` (civil-from-days, Howard Hinnant's algorithm).
+/// Today in UTC, `YYYY-MM-DD`.
 pub(crate) fn today() -> String {
-	let days = (Date::now().as_millis() / 86_400_000) as i64;
+	civil((Date::now().as_millis() / 86_400_000) as i64)
+}
+
+/// A day number (days since 1970-01-01) as `YYYY-MM-DD` (civil-from-days,
+/// Howard Hinnant's algorithm).
+fn civil(days: i64) -> String {
 	let z = days + 719_468;
 	let era = z.div_euclid(146_097);
 	let doe = z - era * 146_097;
@@ -347,7 +352,15 @@ pub(crate) async fn checkpoint_area(env: &Env, area: &str) -> Result<()> {
 	let date = today();
 	let cp = call(env, area, Method::Post, &format!("checkpoint?date={date}")).await?;
 	let body = serde_json::json!({ "area": area, "date": date, "seq": cp["seq"], "hash": cp["hash"] });
-	crate::s3::put(env, &format!("{}{date}.json", checkpoint_prefix(area)), body.to_string().into_bytes()).await
+	let key = format!("{}{date}.json", checkpoint_prefix(area));
+	crate::s3::put(env, &key, body.to_string().into_bytes()).await?;
+	// Write-once, when the bucket can (D6, commit 29c): a checkpoint is what
+	// makes a rewritten trail detectable — only if it cannot be rewritten too.
+	if env.var("OBJECT_LOCK").map(|v| v.to_string()).unwrap_or_default() == "on" {
+		let until = format!("{}T00:00:00Z", civil((Date::now().as_millis() / 86_400_000) as i64 + RETENTION_DAYS));
+		crate::s3::put_retention(env, &key, &until).await?;
+	}
+	Ok(())
 }
 
 /// The 7-year retention (D7): drop older lines, moving the chain's base.

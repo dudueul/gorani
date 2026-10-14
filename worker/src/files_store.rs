@@ -1150,8 +1150,8 @@ struct CurrentVersion {
 	version: i64,
 }
 #[derive(serde::Deserialize)]
-struct TotalCount {
-	n: i64,
+pub(crate) struct TotalCount {
+	pub(crate) n: i64,
 }
 #[derive(serde::Deserialize)]
 struct JournalRow {

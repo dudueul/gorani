@@ -264,6 +264,11 @@ pub const MIGRATIONS: &[&str] = &[
 		requests INTEGER NOT NULL,
 		PRIMARY KEY (actor, file_id, version, client, win)
 	)",
+	// Migration v11 (commit 29c, docs/CUSTODY.md › Stage 3, D6): when an
+	// evidence version's object got its COMPLIANCE retention. NULL until the
+	// lock lands (the lock pass retries); 'bucket-rule' on R2, whose lock is
+	// a bucket rule, not a per-object call.
+	"ALTER TABLE file_versions ADD COLUMN locked_until TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -308,6 +313,11 @@ impl DurableObject for GoraniMemberDO {
 			Ok(r) => Ok(r),
 			Err(e) => json_error(500, &e.to_string()),
 		};
+		// Evidence versions recorded by this request (or left unlocked by an
+		// earlier one) get their write-once retention now (D6, commit 29c).
+		if let Err(e) = self.lock_pass().await {
+			worker::console_error!("gorani: evidence lock pass failed (retried next time): {e}");
+		}
 		// Ship this request's audit lines (and any a failed ship left) to the
 		// area's chained trail. Best effort: the outbox keeps what did not
 		// go, and the next request — or tonight's cron — sends it.
@@ -319,6 +329,59 @@ impl DurableObject for GoraniMemberDO {
 		out
 	}
 
+}
+
+// ── Write-once evidence (commit 29c, docs/CUSTODY.md › Stage 3, D6) ─────
+
+/// What one lock pass did.
+pub(crate) struct LockReport {
+	pub locked: u64,
+	pub failed: u64,
+	pub pending: u64,
+}
+
+impl GoraniMemberDO {
+	/// Lock every evidence version whose object has no retention yet:
+	/// COMPLIANCE until its creation + EVIDENCE_RETAIN_DAYS (default 7
+	/// years). Nothing to do unless the deployment turned OBJECT_LOCK on
+	/// (a bucket created with Object Lock) and this store is evidence.
+	pub(crate) async fn lock_pass(&self) -> Result<LockReport> {
+		let none = LockReport { locked: 0, failed: 0, pending: 0 };
+		if self.env.var("OBJECT_LOCK").map(|v| v.to_string()).unwrap_or_default() != "on" || !self.is_evidence().await? {
+			return Ok(none);
+		}
+		let days: i64 = self.env.var("EVIDENCE_RETAIN_DAYS").ok().and_then(|v| v.to_string().parse().ok()).unwrap_or(2557).max(1);
+		#[derive(serde::Deserialize)]
+		struct Unlocked {
+			file_id: String,
+			version: i64,
+			object_key: String,
+			until: String,
+		}
+		let rows: Vec<Unlocked> = self
+			.sql
+			.exec(&format!("SELECT file_id, version, object_key, strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+{days} days') AS until FROM file_versions WHERE locked_until IS NULL ORDER BY created_at LIMIT 100"), None)?
+			.to_array()?;
+		let mut report = none;
+		for r in rows {
+			match crate::s3::put_retention(&self.env, &r.object_key, &r.until).await {
+				Ok(lock) => {
+					let mark = match lock {
+						crate::s3::Lock::Locked => r.until.clone(),
+						crate::s3::Lock::BucketRule => "bucket-rule".to_string(),
+					};
+					self.sql.exec("UPDATE file_versions SET locked_until = ?1 WHERE file_id = ?2 AND version = ?3", Some(vec![mark.into(), r.file_id.into(), r.version.into()]))?;
+					report.locked += 1;
+				}
+				Err(e) => {
+					worker::console_error!("gorani: lock {} failed: {e}", r.object_key);
+					report.failed += 1;
+				}
+			}
+		}
+		report.pending = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE locked_until IS NULL", None)?.one::<crate::files_store::TotalCount>()?.n as u64;
+		Ok(report)
+	}
 }
 
 // ── The audit outbox (commit 29, docs/CUSTODY.md › Stage 1) ─────────────
@@ -893,9 +956,12 @@ impl GoraniMemberDO {
 		let house: serde_json::Value = house.json().await?;
 		let failed = house.get("deletesFailed").and_then(|v| v.as_u64()).unwrap_or(0);
 		let pending = house.get("deletesPending").and_then(|v| v.as_u64()).unwrap_or(0);
-		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending}"))).await?;
-		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending });
-		if failed > 0 {
+		// Evidence still without its write-once retention: a failure the pass
+		// reports (503), like a delete storage refused — never silence.
+		let locks = self.lock_pass().await?;
+		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending},locksFailed:{},locksPending:{}", locks.failed, locks.pending))).await?;
+		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending });
+		if failed > 0 || locks.failed > 0 {
 			return Ok(Response::from_json(&body)?.with_status(503));
 		}
 		Ok(Response::from_json(&body)?)

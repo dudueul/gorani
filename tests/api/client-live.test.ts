@@ -117,6 +117,41 @@ try {
 	assert.equal(pull.status, 0, `pull failed: ${pull.out}`);
 	assert.equal(fs.readFileSync(outPath, "utf8"), plainHello.toString("utf8"), "round trip: the exact bytes");
 
+	// ── 4a. A large file (D12 in the client, commit 33b) ────────────────
+	// 60 MiB: past the whole-upload limit, so GC01 frames at chunk_for —
+	// read from disk one at a time. The first push is stopped after three
+	// parts (a debug-build hook); the second resumes from part 4 and sends
+	// only the rest. The pull streams frame windows to disk.
+	const bigPath = path.join(home, "image.E01");
+	const big = Buffer.alloc(60 * 1024 * 1024);
+	for (let i = 0; i < big.length; i += 65536) big.fill((i / 65536) % 251, i, i + 65536);
+	big.write("gorani evidence image", 1234);
+	fs.writeFileSync(bigPath, big);
+	const { createHash } = await import("node:crypto");
+	const bigSha = createHash("sha256").update(big).digest("hex");
+	console.error("STEP push large (stopped)");
+	const stopped = await sync(["push", "--file", bigPath, "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode], { GORANI_TEST_STOP_AFTER_PARTS: "3" });
+	assert.notEqual(stopped.status, 0, "the hook stopped it");
+	assert.match(stopped.out, /stopped after 3 parts/);
+	const journalDir = path.join(home, "profile.uploads");
+	const journalFiles = fs.readdirSync(journalDir);
+	assert.equal(journalFiles.length, 1, "one unfinished upload journalled");
+	assert.ok(!journalFiles[0]!.includes("image") && !fs.readFileSync(path.join(journalDir, journalFiles[0]!), "utf8").includes("image.E01"), "no file name in the clear, in its name or its body");
+	console.error("STEP push large (resumed)");
+	const resumed = await sync(["push", "--file", bigPath, "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	assert.equal(resumed.status, 0, `the resumed push: ${resumed.out}`);
+	assert.match(resumed.out, /resuming image\.E01 from part 4 of 8/);
+	assert.match(resumed.out, new RegExp(`in 8 parts, SHA-256 ${bigSha}`));
+	assert.deepEqual(fs.readdirSync(journalDir), [], "the journal forgets a finished upload");
+	const bigId = resumed.out.match(/pushed: (\S+)/)?.[1];
+	console.error("STEP pull large");
+	const bigOut = path.join(home, "image.pulled");
+	const bigPull = await sync(["pull", "--id", bigId!, "--out", bigOut, "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	assert.equal(bigPull.status, 0, `pull: ${bigPull.out}`);
+	assert.match(bigPull.out, new RegExp(`SHA-256 ${bigSha}`), "streamed to disk, hashed on the way");
+	assert.ok(fs.readFileSync(bigOut).equals(big), "the 60 MiB image, byte for byte");
+	assert.ok(!fs.existsSync(`${bigOut}.part`), "no partial file left behind");
+
 	// ── 4b. A malware sample is never written to disk raw (commit 29e) ──
 	// Marked the way the web app marks it (every version's type re-sealed
 	// with the sample mark); then `pull` refuses, and writes nothing.

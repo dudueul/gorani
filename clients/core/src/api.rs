@@ -216,18 +216,59 @@ impl Client {
 		Ok(keys["keys"][id]["key"].as_str().unwrap_or_default().to_string())
 	}
 
-	/// Whole upload (≤ 48 MB plaintext): seal in GV02, wrap the key GV03.
+	/// Whole upload (≤ 48 MB plaintext): sealed GV02 under the file's content key.
 	pub fn upload_whole(&self, fields: &UploadFields, sealed: &[u8]) -> Result<Value, Error> {
+		self.post_form("/files", fields, Some(sealed))
+	}
+
+	/// A multipart upload's plan (D12, commit 33b): the Worker checks it
+	/// against the limits (255 GiB, 64 MiB chunks, 10 000 parts).
+	pub fn upload_start(&self, size: u64, chunk: u64, new_file_id: &str) -> Result<(String, String, u64), Error> {
+		let v = self.json("POST", "/files/uploads", Some(json!({ "size": size, "chunk": chunk, "newFileId": new_file_id })))?;
+		Ok((v["uploadId"].as_str().unwrap_or_default().to_string(), v["key"].as_str().unwrap_or_default().to_string(), v["parts"].as_u64().unwrap_or(0)))
+	}
+
+	/// One part (one GC01 frame). What the network lost is sent again —
+	/// three tries, 1 s then 4 s apart, for a dropped connection, a 5xx or
+	/// a 429; a refusal (any other 4xx) is the server's answer, at once.
+	pub fn upload_part(&self, upload_id: &str, object_key: &str, n: u64, frame: &[u8]) -> Result<String, Error> {
+		let url = self.url(&format!("/files/uploads/{upload_id}/{n}?key={}", percent(object_key)));
+		let mut last = String::new();
+		for attempt in 0..3u32 {
+			if attempt > 0 {
+				std::thread::sleep(std::time::Duration::from_secs(4u64.pow(attempt - 1)));
+			}
+			match self.req("PUT", &url).set("Content-Type", "application/octet-stream").send_bytes(frame) {
+				Ok(res) => {
+					let v: Value = res.into_json().map_err(|e| Error::Config(format!("bad answer: {e}")))?;
+					return v["etag"].as_str().map(str::to_string).ok_or_else(|| Error::Config("the part's answer had no etag".into()));
+				}
+				Err(ureq::Error::Status(code, resp)) if code < 500 && code != 429 => return Err(Error::Http(code, resp.into_string().unwrap_or_default())),
+				Err(e) => last = e.to_string(),
+			}
+		}
+		Err(Error::Config(format!("part {n} failed three times: {last}")))
+	}
+
+	/// Complete a multipart upload: the Worker checks the object adds up.
+	pub fn upload_complete(&self, upload_id: &str, fields: &UploadFields) -> Result<Value, Error> {
+		self.post_form(&format!("/files/uploads/{upload_id}/complete"), fields, None)
+	}
+
+	fn post_form(&self, rest: &str, fields: &UploadFields, file: Option<&[u8]>) -> Result<Value, Error> {
 		let boundary = format!("gorani{:032x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
 		let mut body = Vec::new();
 		for (k, v) in &fields.form {
 			body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes());
 		}
-		body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sealed.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
-		body.extend_from_slice(sealed);
-		body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+		if let Some(sealed) = file {
+			body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sealed.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+			body.extend_from_slice(sealed);
+			body.extend_from_slice(b"\r\n");
+		}
+		body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 		let res = self
-			.req("POST", &self.url("/files"))
+			.req("POST", &self.url(rest))
 			.set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
 			.send_bytes(&body)
 			.map_err(|e| match e {
@@ -241,6 +282,11 @@ impl Client {
 		}
 		Ok(v)
 	}
+}
+
+/// Percent-encode a query value (RFC 3986 unreserved characters pass).
+fn percent(s: &str) -> String {
+	s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 pub struct UploadFields {

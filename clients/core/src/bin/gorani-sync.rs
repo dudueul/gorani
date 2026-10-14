@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use gorani_client_core::{api, session, DeviceProfile, Error, Session};
+use gorani_client_core::{api, session, transfer, DeviceProfile, Error, Session};
 use gorani_formats::placed::Place;
 
 fn main() {
@@ -15,6 +15,9 @@ fn main() {
 		std::process::exit(1);
 	}
 }
+
+/// Files up to this size go up whole (one request), larger ones as GC01 frames — as the browser does.
+const WHOLE_LIMIT: u64 = 48 * 1024 * 1024;
 
 fn profile_path() -> PathBuf {
 	let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
@@ -129,17 +132,17 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let store = sess.files_store()?;
 			// The key opens only from THIS file's THIS version's place (O6).
 			let ck_key = gorani_formats::placed::unwrap_placed_key(&store, &Place::file_key(&member, &id, version), &ck).map_err(|_| Error::Open("content key (not sealed for this file and version)"))?;
-			let plain = if let Some(chunk) = chunk.filter(|c| *c > 0) {
-				// The reference reader, not a hand-rolled loop (security review,
-				// commit 23). The loop that stood here counted frames with FLOOR
-				// division: an empty or shortened body opened to zero bytes and
-				// `pull` happily overwrote --out with nothing, and every honest
-				// file whose size was not a multiple of the chunk failed. The
-				// format's own reader rounds up and binds the final flag, so a
-				// truncation at any frame boundary is an authentication failure.
-				let sealed = client.fetch(&id, Some(version as u64), None)?;
-				gorani_formats::chunked::open_chunked(&ck_key, &sealed, chunk).map_err(|_| Error::Open("content (altered, reordered or cut short)"))?
-			} else {
+			if let Some(chunk) = chunk.filter(|c| *c > 0) {
+				// Streamed to disk a window of frames at a time (D12, commit 33b
+				// — transfer.rs): each frame opened in its place, so a reordered,
+				// altered or cut-short object fails before --out is touched; the
+				// bytes land in <out>.part and are renamed on success only.
+				let size = size.ok_or(Error::Open("the server did not say the file's size"))?;
+				let sha256 = transfer::pull_frames(&client, &id, version as u64, &ck_key, chunk, size, std::path::Path::new(&out))?;
+				println!("pulled {id} → {out} ({size} bytes, SHA-256 {sha256})");
+				return Ok(());
+			}
+			let plain = {
 				let sealed = client.fetch(&id, Some(version as u64), None)?;
 				gorani_formats::formats::open_with(&ck_key, &sealed).map_err(|_| Error::Open("content"))?
 			};
@@ -155,9 +158,67 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let (profile, sess) = unlocked(&flag)?;
 			let path = req_flag("file")?;
 			let name = flag("name").unwrap_or_else(|| std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-			let bytes = std::fs::read(&path)?;
 			let member = profile.member.clone();
+			let journal_dir = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path).with_extension("uploads");
 			let client = api::Client::new(profile);
+			let meta = std::fs::metadata(&path)?;
+			// Large files (D12, commit 33b): GC01 frames at chunk_for(size),
+			// read from disk one at a time, journalled so a stopped push resumes.
+			if meta.len() > WHOLE_LIMIT {
+				let size = meta.len();
+				let chunk = gorani_formats::chunked::chunk_for(size).ok_or(Error::Config("a file is at most 255 GiB".into()))?;
+				eprintln!("hashing {name} ({size} bytes)…");
+				let (sha256, hashed) = transfer::sha256_file(std::path::Path::new(&path))?;
+				if hashed != size {
+					return Err(Error::Config("the file changed while it was being read".into()));
+				}
+				let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+				let journal = transfer::Journal::new(journal_dir);
+				let jkey = transfer::Journal::key_for(&member, &name, size, modified, &sha256);
+				let store = sess.files_store()?;
+				let progress = |done: u64, total: u64| {
+					if done == total || done % 16 == 0 {
+						eprintln!("  {done}/{total} parts");
+					}
+				};
+				let row = match journal.get(&jkey).filter(|r| r.member == member && r.size == size) {
+					Some(prior) => {
+						// The same file, stopped part-way: the SAME id, key and
+						// sealed fields the stored frames were made with.
+						let ck_sealed = prior.fields.iter().find(|(k, _)| k == "ck").map(|(_, v)| v.clone()).unwrap_or_default();
+						let key = gorani_formats::placed::unwrap_placed_key(&store, &Place::file_key(&member, &prior.file_id, 1), &ck_sealed).map_err(|_| Error::Open("the journalled content key"))?;
+						eprintln!("resuming {name} from part {} of {}", prior.parts.len() + 1, gorani_formats::chunked::frame_count(size, prior.chunk));
+						let (file_id, chunk) = (prior.file_id.clone(), prior.chunk);
+						match transfer::push_frames(&client, &journal, &jkey, std::path::Path::new(&path), &key, &member, &file_id, chunk, size, prior.fields.clone(), Some(prior), progress) {
+							Err(Error::Http(404, body)) if body.contains("no such upload") => {
+								journal.delete(&jkey);
+								return Err(Error::Config("the server no longer has the earlier upload (its window passed) — run push again to start over".into()));
+							}
+							other => other?,
+						}
+					}
+					None => {
+						let file_id = new_item_id();
+						let name_sealed = sess.seal_into(&Place::file_name(&member, &file_id), &name)?;
+						let type_sealed = sess.seal_into(&Place::file_type(&member, &file_id, 1), "application/octet-stream")?;
+						let ck = gorani_formats::formats::new_content_key();
+						let key = gorani_formats::formats::import_content_key(&ck);
+						let ck_wrapped = gorani_formats::placed::wrap_placed_key(&store, &Place::file_key(&member, &file_id, 1), &ck).map_err(|_| Error::Open("files store key"))?;
+						let fields = vec![
+							("file_id".to_string(), file_id.clone()),
+							("ck".into(), ck_wrapped),
+							("name".into(), name_sealed),
+							("type".into(), type_sealed),
+							("size".into(), size.to_string()),
+							("chunk".into(), chunk.to_string()),
+						];
+						transfer::push_frames(&client, &journal, &jkey, std::path::Path::new(&path), &key, &member, &file_id, chunk, size, fields, None, progress)?
+					}
+				};
+				println!("pushed: {} ({size} bytes in {} parts, SHA-256 {sha256})", row["id"].as_str().unwrap_or("?"), gorani_formats::chunked::frame_count(size, chunk));
+				return Ok(());
+			}
+			let bytes = std::fs::read(&path)?;
 			// The id first — the name, type and key are sealed into places
 			// that name it (O6); a new file is version 1.
 			let file_id = new_item_id();

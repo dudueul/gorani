@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod session;
+pub mod transfer;
 
 // Re-export the formats module at the crate root so bins can use
 // gorani_formats paths via the client's dependency.

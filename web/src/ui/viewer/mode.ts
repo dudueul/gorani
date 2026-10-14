@@ -49,9 +49,17 @@ export function pickViewerMode(kind: string, mime: string | null, size: number):
 export function renderMime(kind: string, mime: string | null, name: string): string {
 	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
 	if (kind === "image") {
-		const known = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp"];
-		if (known.includes(ext)) return `image/${ext === "jpg" ? "jpeg" : ext}`;
-		return mime?.startsWith("image/") ? mime : "image/png";
+		// A RASTER allow-list — for the stored mime too, not only the
+		// extension (security review, commit 23). The stored mime is chosen by
+		// whoever uploaded (and, sealed or not, a hostile server can swap it):
+		// `image/svg+xml` passed `startsWith("image/")`, and a blob URL lives
+		// on the APP's origin — "open image in new tab" would run the SVG's
+		// script next to the vault.
+		const raster = ["png", "jpeg", "gif", "webp", "avif", "bmp"];
+		const fromExt = ext === "jpg" ? "jpeg" : ext;
+		if (raster.includes(fromExt)) return `image/${fromExt}`;
+		const sub = mime?.startsWith("image/") ? (mime.slice("image/".length).split(";")[0] ?? "").trim().toLowerCase() : "";
+		return raster.includes(sub) ? `image/${sub}` : "image/png";
 	}
 	if (kind === "video") return mime?.startsWith("video/") ? mime : "video/mp4";
 	if (kind === "audio") return mime?.startsWith("audio/") ? mime : "audio/mpeg";

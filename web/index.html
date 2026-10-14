@@ -5,10 +5,13 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<!-- The deployed app gets a strict Content-Security-Policy header from
-		     the Worker (default-src 'none'; self only; Trusted Types). In the
-		     built app there is no inline script at all — the module below is
-		     the only one, served same-origin and hashed. -->
+		<!-- INTENDED: a strict Content-Security-Policy (default-src 'none';
+		     self only; Trusted Types). NOT YET DELIVERED: static assets are
+		     served by the platform, not the Worker, and there is no _headers
+		     file — docs/SECURITY-REVIEW.md › O1 (commit 23 corrected this
+		     comment, which used to say the header was sent). In the built
+		     app there is no inline script — the module below is the only
+		     one, served same-origin and hashed. -->
 		<meta name="color-scheme" content="dark" />
 		<meta name="robots" content="noindex" />
 		<title>Gorani</title>

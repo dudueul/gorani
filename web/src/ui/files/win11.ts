@@ -29,6 +29,7 @@ import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
+import { renderMime } from "../viewer/mode.ts";
 import "../viewer/viewer.ts";
 import "./share-dialog.ts";
 
@@ -136,7 +137,7 @@ export class GoraniWin11 extends LitElement {
 			try {
 				const p = await this.model.preview(id);
 				if (p && this.previewFile?.id === id) {
-					if (row.kind === "image") this.previewFile.url = URL.createObjectURL(new Blob([p.bytes as BlobPart], { type: p.mime }));
+					if (row.kind === "image") this.previewFile.url = URL.createObjectURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
 					else this.previewFile.text = new TextDecoder().decode(p.bytes.subarray(0, 8192));
 				}
 			} catch {

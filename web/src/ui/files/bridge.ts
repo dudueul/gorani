@@ -14,6 +14,7 @@ import type { FilesBridge } from "./model.ts";
 import { devIdentityHeaders } from "../../lib/api.ts";
 import { openWith, unwrapContentKey, type VaultPrivateKey, type SealTarget } from "../../vault/vault-crypto.ts";
 import type { VaultSession } from "../../vault/session.ts";
+import { openChunkedStream } from "../../vault/chunked-file.ts";
 
 export interface FilesHooks {
 	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
@@ -64,24 +65,13 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 				return;
 			}
 			// Frames as they arrive: a multi-GB download never holds itself.
-			const frame = chunk + 28;
-			const reader = res.body.getReader();
-			let buf = new Uint8Array(0);
-			for (;;) {
-				const { value, done } = await reader.read();
-				if (value?.length) {
-					const next = new Uint8Array(buf.length + value.length);
-					next.set(buf);
-					next.set(value, buf.length);
-					buf = next;
-					while (buf.length >= frame) {
-						await sink(await openWith(key, buf.subarray(0, frame)));
-						buf = buf.slice(frame);
-					}
-				}
-				if (done) break;
-			}
-			if (buf.length) await sink(await openWith(key, buf.subarray(0, buf.length)));
+			// GC01 frames are NOT GV02 values — this loop used `openWith` (the
+			// GV02 opener) on each frame, so every chunked file (> 48 MB) failed
+			// to open, and nothing checked frame order or the final flag. The
+			// format's streaming reader does both (commit 23).
+			const total = Number(res.headers.get("content-length"));
+			if (!total) throw new Error("download failed: the object's length is unknown");
+			await openChunkedStream(key, res.body, chunk, total, (plain) => sink(plain));
 		},
 
 		async putWhole(memberId, fields, sealed) {

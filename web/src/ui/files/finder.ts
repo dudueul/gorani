@@ -28,6 +28,7 @@ import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
+import { renderMime } from "../viewer/mode.ts";
 import "../viewer/viewer.ts";
 import "./share-dialog.ts";
 
@@ -120,7 +121,7 @@ export class GoraniFinder extends LitElement {
 		try {
 			const p = await this.model.preview(id, 512 * 1024);
 			if (p && this.quickLook?.id === id) {
-				if (row.kind === "image") this.quickLook.url = URL.createObjectURL(new Blob([p.bytes as BlobPart], { type: p.mime }));
+				if (row.kind === "image") this.quickLook.url = URL.createObjectURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
 				else if (row.kind === "text" || row.kind === "code" || row.kind === "pdf") this.quickLook.text = new TextDecoder().decode(p.bytes.subarray(0, 16384));
 				this.quickLook.meta = { size: row.size, version: row.version, updatedAt: row.updatedAt };
 			}

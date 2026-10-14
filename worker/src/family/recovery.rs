@@ -63,6 +63,10 @@ struct CopyRow {
 	updated_at: String,
 }
 #[derive(serde::Deserialize)]
+struct CopyKey {
+	area: String,
+}
+#[derive(serde::Deserialize)]
 struct SealedRow {
 	sealed: String,
 }
@@ -118,6 +122,9 @@ impl GoraniFamilyDO {
 		// Holders that are no longer leads, or leads without a share: a cue
 		// to rotate (the client says so; the registry only reports).
 		let current = holders == self.lead_ids()?;
+		// The caller's own area's copy: which recovery key it is sealed to,
+		// so their client can refresh a missing or stale one (team.ts).
+		let my_copy = self.sql.exec("SELECT key_id AS area FROM recovery_copies WHERE area = ?1", Some(vec![me.id.clone().into()]))?.to_array::<CopyKey>()?.into_iter().next().map(|c| c.area);
 		Ok(Response::from_json(&serde_json::json!({
 			"recovery": {
 				"keyId": r.key_id, "publicKey": serde_json::from_str::<serde_json::Value>(&r.public_key).unwrap_or_default(), "digest": r.digest,
@@ -125,6 +132,7 @@ impl GoraniFamilyDO {
 				"rotationRequired": r.rotation_required != 0 || !current, "holdersCurrent": current,
 			},
 			"myShare": my_share,
+			"myCopyKeyId": my_copy,
 		}))?)
 	}
 

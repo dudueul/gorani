@@ -56,6 +56,7 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 35 | Whose key is this? | web/src/vault/identity.ts, worker/src/family.rs › Identities, tests/unit/identity.test.ts (27) | Fingerprints people can compare; trust as pins under the member's own MAC; one-hop certification instead of a PKI; signing statements, not objects; full digests vs. short labels |
 | 36 | Many hands, in practice | web/src/vault/recovery.ts, worker/src/family/recovery.rs, tests/api/recovery.test.mjs (27) | A ceremony as a state machine; every key a threshold scheme seals to is a substitution point; verifying a reconstruction; the one audited path that may change a vault's root |
 | 37 | Removing a superuser | worker/src/routes.rs › scope_ctx, web/src/vault/keys.ts, tests/lib/team.mjs, every suite's setup (27) | Retiring a privilege without a hole: the replacement first (grants, ceremonies), then the removal; a "clean break" as a test-suite port; when two people share a store, model it as such (a case), not as one acting for the other |
+| 38 | Security UI is the check, shown | web/src/ui/team.ts, web/src/vault/team.ts, web/src/ui/shell.ts, tests/e2e/app.test.mjs §5–6 (28) | Screens as thin clients of the crypto modules; refusals shown verbatim (they are the checks); a fingerprint as the human step no server can fake; keys that live only in a tab, said out loud; a stale build is a fake that agrees with the bug |
 
 Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at

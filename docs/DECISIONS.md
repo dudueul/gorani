@@ -102,6 +102,17 @@ accounts behind Access with per-case grants. Anonymous links are disabled
 in evidence areas; in working areas they require a password, expire within
 7 days, and every access is audited.
 
+*As built (commit 30):* guest accounts are the `external` role, which
+expires and sees only its grants (stages 2–3 of CASES.md). A case has no
+link route at all (`routes.rs › case_need`), and a malware sample is never
+linked (D8). The server refuses a link without its password's Argon2id
+parameters, with parameters outside what a recipient's page accepts
+(`kdf-bounds.ts`), that expires more than 7 days out, or that allows
+other than 1–100 downloads (`files_store.rs › share_policy_refusal`). It
+never sees the password itself; the dialog generates one (80 bits) or
+takes the owner's own of 8+ characters. Every claim of a download is
+audited (`share.claim`).
+
 ## D12 — File size
 
 **Up to 255 GB per file.** S3 allows 10 000 parts, so 255 GiB needs parts

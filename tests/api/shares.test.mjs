@@ -56,12 +56,15 @@ try {
 	// ── 1. The owner creates the share (GS01) ──────────────────────────
 	const id = newShareId();
 	const secret = newShareSecret();
-	const keys = await shareKeys(id, secret);
+	// Every link carries a password (D11, commit 30 — section 7 is the policy).
+	const LINK_PW = "bread-secret-2026";
+	const kdf1 = newShareKdf();
+	const keys = await shareKeys(id, secret, LINK_PW, kdf1);
 	const copy = await sealChunked(keys.data, plain, DEFAULT_CHUNK);
 	const metaSealed = await sealShareMeta(keys.meta, id, { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
 	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id, fileId, version: 1, nameSealed: await ownerName(id), metaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length },
+		body: { id, fileId, version: 1, nameSealed: await ownerName(id), metaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf: kdf1 },
 	});
 	assert.equal(start.status, 200, JSON.stringify(start.json));
 	assert.equal(start.json.parts, 1, "one small file → one frame → one part");
@@ -156,11 +159,12 @@ try {
 	// ── 4. Revocation (owner side) deletes the object too ──────────────
 	const id2 = newShareId();
 	const secret2 = newShareSecret();
-	const keys2 = await shareKeys(id2, secret2);
+	const kdf2 = newShareKdf();
+	const keys2 = await shareKeys(id2, secret2, LINK_PW, kdf2);
 	const meta2 = await sealShareMeta(keys2.meta, id2, { name: "x.txt", type: null, size: 4, modified: null });
 	const s2 = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: id2, fileId, version: 1, nameSealed: await ownerName(id2), metaSealed: meta2, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: id2, fileId, version: 1, nameSealed: await ownerName(id2), metaSealed: meta2, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4, kdf: kdf2 },
 	});
 	assert.equal(s2.status, 200);
 	// No parts uploaded yet: the meta must refuse (still being prepared).
@@ -170,10 +174,11 @@ try {
 	// whose copy object did not exist. Since commit 23 the copy must add up
 	// to its declared size: the refusal on a throwaway share first…
 	const idEmpty = newShareId();
-	const metaEmpty = await sealShareMeta((await shareKeys(idEmpty, newShareSecret())).meta, idEmpty, { name: "x.txt", type: null, size: 4, modified: null });
+	const kdfEmpty = newShareKdf();
+	const metaEmpty = await sealShareMeta((await shareKeys(idEmpty, newShareSecret(), LINK_PW, kdfEmpty)).meta, idEmpty, { name: "x.txt", type: null, size: 4, modified: null });
 	const sEmpty = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: idEmpty, fileId, version: 1, nameSealed: await ownerName(idEmpty), metaSealed: metaEmpty, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: idEmpty, fileId, version: 1, nameSealed: await ownerName(idEmpty), metaSealed: metaEmpty, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4, kdf: kdfEmpty },
 	});
 	assert.equal(sEmpty.status, 200);
 	const empty = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${idEmpty}/complete`, { email: "jinu@family.test", body: { parts: [], size: 4 } });
@@ -201,11 +206,12 @@ try {
 	// ── 5. Expiry ───────────────────────────────────────────────────────
 	const id3 = newShareId();
 	const secret3 = newShareSecret();
-	const keys3 = await shareKeys(id3, secret3);
+	const kdf3 = newShareKdf();
+	const keys3 = await shareKeys(id3, secret3, LINK_PW, kdf3);
 	const meta3 = await sealShareMeta(keys3.meta, id3, { name: "old.txt", type: null, size: 4, modified: null });
 	await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: id3, fileId, version: 1, nameSealed: await ownerName(id3), metaSealed: meta3, expiresAt: new Date(Date.now() - 1000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: id3, fileId, version: 1, nameSealed: await ownerName(id3), metaSealed: meta3, expiresAt: new Date(Date.now() - 1000).toISOString(), downloadsLeft: 5, size: 4, kdf: kdf3 },
 	});
 	// (A real 4-byte copy: completion must add up since commit 23.)
 	const part3 = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${id3}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": "jinu@family.test" }, body: await sealChunked(keys3.data, enc.encode("aged"), DEFAULT_CHUNK) });
@@ -261,10 +267,33 @@ try {
 	}
 	assert.deepEqual(pwOut, plain, "the password-gated copy opens to the exact bytes");
 
-	// ── 7. The share index: public routes found the member every time ──
+	// ── 7. The link policy (D11): a password, a week, 1–100 downloads ──
+	// The server never sees the password; it requires the parameters that
+	// prove one is mixed in, within the bounds a recipient's page accepts.
+	const policy = async (over) => {
+		const pid = newShareId();
+		const pk = await shareKeys(pid, newShareSecret(), LINK_PW, kdf1);
+		const body = { id: pid, fileId, version: 1, nameSealed: await ownerName(pid), metaSealed: await sealShareMeta(pk.meta, pid, { name: "p.txt", type: null, size: 4, modified: null }), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4, kdf: newShareKdf(), ...over };
+		return api(dev.base, "POST", "/api/v1/members/jinu/files/shares", { email: "jinu@family.test", body });
+	};
+	const refused = async (over, why) => {
+		const r = await policy(over);
+		assert.equal(r.status, 400, `${JSON.stringify(over)} → ${r.status}`);
+		assert.match(r.json.error, why);
+	};
+	await refused({ kdf: undefined }, /needs a password/);
+	await refused({ kdf: { ...newShareKdf(), m: 1024 } }, /outside what a recipient's page accepts/);
+	await refused({ kdf: { ...newShareKdf(), salt: "AAAA" } }, /outside/);
+	await refused({ expiresAt: new Date(Date.now() + 8 * 86_400_000).toISOString() }, /within 7 days/);
+	await refused({ expiresAt: "next week" }, /RFC 3339/);
+	await refused({ downloadsLeft: 0 }, /1–100/);
+	await refused({ downloadsLeft: 1000 }, /1–100/);
+	assert.equal((await policy({ expiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(), downloadsLeft: 100 })).status, 200, "a week and 100 downloads: the limit, allowed");
+
+	// ── 8. The share index: public routes found the member every time ──
 	// (implicit: /s/f/:id resolved mom↔jinu without any identity header).
 
-	console.log("ok  api:shares — create/upload/complete, recipient decrypt, exhaustion, revocation, expiry, password links");
+	console.log("ok  api:shares — create/upload/complete, recipient decrypt, exhaustion, revocation, expiry, password links, the D11 policy (password, a week, 1–100 downloads)");
 } finally {
 	await dev.close();
 }

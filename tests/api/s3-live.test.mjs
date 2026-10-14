@@ -48,7 +48,7 @@ import assert from "node:assert/strict";
 import { startDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, openWith } from "../../web/src/vault/vault-crypto.ts";
 import { sealChunked, openChunk, FRAME_OVERHEAD } from "../../web/src/vault/chunked-file.ts";
-import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
+import { newShareId, newShareSecret, shareKeys, sealShareMeta, newShareKdf } from "../../web/src/vault/share-crypto.ts";
 import { member, vouch, openCase, signedHash, signedIntake } from "../lib/team.mjs";
 import { s3fetch } from "../lib/sigv4.mjs";
 
@@ -176,11 +176,12 @@ try {
 
 	// ── 4. A share copy through the public route ────────────────────────
 	const shareId = newShareId();
-	const keys = await shareKeys(shareId, newShareSecret());
+	const kdf = newShareKdf(); // (every link carries a password since D11)
+	const keys = await shareKeys(shareId, newShareSecret(), "live-suite-password", kdf);
 	const copy = await sealChunked(keys.data, plain, 8 * 1024 * 1024);
 	const sh = await api(dev.base, "POST", `${base}/files/shares`, {
 		email,
-		body: { id: shareId, fileId, version: 1, nameSealed: await sealer.shareName(shareId, "live.txt"), metaSealed: await sealShareMeta(keys.meta, shareId, { name: "live.txt", type: "text/plain", size: plain.length, modified: null }), expiresAt: new Date(Date.now() + 3600_000).toISOString(), downloadsLeft: 3, size: plain.length },
+		body: { id: shareId, fileId, version: 1, nameSealed: await sealer.shareName(shareId, "live.txt"), metaSealed: await sealShareMeta(keys.meta, shareId, { name: "live.txt", type: "text/plain", size: plain.length, modified: null }), expiresAt: new Date(Date.now() + 3600_000).toISOString(), downloadsLeft: 3, size: plain.length, kdf },
 	});
 	assert.equal(sh.status, 200, JSON.stringify(sh.json));
 	const part = await fetch(`${dev.base}${base}/files/shares/${shareId}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": email }, body: copy });

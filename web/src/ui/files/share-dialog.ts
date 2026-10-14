@@ -6,11 +6,17 @@
  * hand back the link. The server keeps ciphertext, the sealed meta and a
  * download counter — never the secret, never the password.
  *
- * With a password set, the key needs BOTH the link's secret and that
- * password: the password is stretched with Argon2id (the kdf rides the
- * share's meta) and mixed into the key material here. It is shown once for
- * out-of-band sharing (a chat message, a phone call) — the server never
- * sees it, and the sealed copy stays sealed without both halves.
+ * The key needs BOTH the link's secret and a password: the password is
+ * stretched with Argon2id (the kdf rides the share's meta) and mixed into
+ * the key material here. It is shown once for out-of-band sharing (a chat
+ * message, a phone call) — the server never sees it, and the sealed copy
+ * stays sealed without both halves.
+ *
+ * The policy (D11, commit 30): a password always (one is generated, the
+ * owner may type their own of 8+ characters), at most 7 days, at most 20
+ * downloads here (the server allows 100). The server refuses a link
+ * without the password's parameters or past a week — this dialog only
+ * never asks it to. A partner who needs more gets a guest account.
  */
 
 import { LitElement, html, nothing } from "lit";
@@ -29,6 +35,19 @@ export interface ShareTarget {
 	version: number;
 }
 
+/**
+ * A password to read aloud or paste: four groups of four from 32
+ * characters without look-alikes (no 0/o, 1/l) — 32 divides 256, so a
+ * random byte maps without bias — 80 bits, on top of the link's own
+ * 256-bit secret.
+ */
+function generatedPassword(): string {
+	const alphabet = "abcdefghijkmnpqrstuvwxyz23456789";
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	const chars = [...bytes].map((b) => alphabet[b % alphabet.length]);
+	return [0, 4, 8, 12].map((i) => chars.slice(i, i + 4).join("")).join("-");
+}
+
 @customElement("gorani-share")
 export class GoraniShare extends LitElement {
 	@property({ type: Object }) model!: FilesModel;
@@ -36,7 +55,7 @@ export class GoraniShare extends LitElement {
 
 	@state() private expiry = 7;
 	@state() private downloads = 5;
-	@state() private password = "";
+	@state() private password = generatedPassword();
 	@state() private busy = false;
 	@state() private error: string | null = null;
 	@state() private link: string | null = null;
@@ -67,8 +86,8 @@ export class GoraniShare extends LitElement {
 					Expires after
 					<select class="mt-1 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 outline-none focus:border-[var(--color-accent)]" .value=${String(this.expiry)} @change=${(e: Event) => (this.expiry = Number((e.target as HTMLSelectElement).value))}>
 						<option value="1">1 day</option>
-						<option value="7">7 days</option>
-						<option value="30">30 days</option>
+						<option value="3">3 days</option>
+						<option value="7">7 days (the longest a link lives)</option>
 					</select>
 				</label>
 				<label class="mt-3 block text-neutral-400">
@@ -80,13 +99,16 @@ export class GoraniShare extends LitElement {
 					</select>
 				</label>
 				<label class="mt-3 block text-neutral-400">
-					Password <span class="text-neutral-600">(optional — share it separately)</span>
-					<input type="password" autocomplete="new-password" placeholder="Leave empty for a secret-only link" class="mt-1 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 outline-none focus:border-[var(--color-accent)]" .value=${this.password} @input=${(e: Event) => (this.password = (e.target as HTMLInputElement).value)} />
+					Password <span class="text-neutral-600">(required — send it separately from the link)</span>
+					<span class="mt-1 flex gap-2">
+						<input type="text" autocomplete="off" spellcheck="false" minlength="8" required class="w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono outline-none focus:border-[var(--color-accent)]" .value=${this.password} @input=${(e: Event) => (this.password = (e.target as HTMLInputElement).value)} data-test="share-password" />
+						<button type="button" class="rounded-xl border border-neutral-700 px-3 text-xs hover:border-[var(--color-accent)]" @click=${() => (this.password = generatedPassword())}>New</button>
+					</span>
 				</label>
 				<p class="mt-3 text-xs text-neutral-500">
-					The link's secret lives after “#” — browsers never send it, so the server holds only sealed bytes. With a password, opening needs both halves; the password is stretched (Argon2id) in the recipient's tab and never sent.
+					The link's secret lives after “#” — browsers never send it, so the server holds only sealed bytes. Opening needs both the link and this password; the password is stretched (Argon2id) in the recipient's tab and never sent. Partners who need more than a week, or more than one file, get a guest account instead.
 				</p>
-				<button class="mt-4 w-full rounded-xl bg-[var(--color-accent)] px-4 py-2.5 font-medium text-neutral-950 hover:opacity-90 disabled:opacity-50" ?disabled=${this.busy}>
+				<button class="mt-4 w-full rounded-xl bg-[var(--color-accent)] px-4 py-2.5 font-medium text-neutral-950 hover:opacity-90 disabled:opacity-50" ?disabled=${this.busy || this.password.length < 8}>
 					${this.busy ? "Sealing and uploading…" : "Create the link"}
 				</button>
 			</form>
@@ -116,8 +138,9 @@ export class GoraniShare extends LitElement {
 			// fragment and this password, stretched with fresh Argon2id
 			// settings that ride the share's record (the server stores them —
 			// they are parameters, not secrets).
-			const kdf = this.password ? newShareKdf() : null;
-			const keys = await shareKeys(id, secret, this.password || null, kdf);
+			if (this.password.length < 8) throw new Error("a link's password is at least 8 characters");
+			const kdf = newShareKdf();
+			const keys = await shareKeys(id, secret, this.password, kdf);
 			// The copy: the plaintext opened in this tab, re-sealed under a
 			// fresh content key… no — under the LINK's data key (GS01): a copy
 			// that exists for this link alone, openable without the vault.

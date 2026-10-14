@@ -21,12 +21,12 @@
 
 import assert from "node:assert/strict";
 import { openSession } from "../../web/src/vault/session.ts";
-import { createChildVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { deriveRecordKey, macRecord, verifyRecord, recordBytes } from "../../web/src/vault/records.ts";
 import { importVaultKey } from "../../web/src/vault/vault-crypto.ts";
 import { toBase64 } from "../../web/src/lib/encoding.ts";
 
-const victim = await createChildVault();
+const victim = await createCodeVault();
 const victimPublic = { ec: victim.publicKey, kem: victim.pqPublicKey };
 const rootKey = await deriveRecordKey(await importVaultKey(victim.rootBundle.slice()));
 
@@ -59,7 +59,7 @@ await assert.rejects(() => open({ ...honest, mac: undefined, keyId: "pqAAAAAAAAA
 await assert.rejects(() => open({ ...honest, mac: undefined, privateKeySealed: toBase64(attackerStore.bundle) }), /plain text/, "4: an unsealed private key is refused");
 
 // 5. A MAC computed by another root.
-const other = await createChildVault();
+const other = await createCodeVault();
 const otherKey = await deriveRecordKey(await importVaultKey(other.rootBundle.slice()));
 const foreignMac = await macRecord(otherKey, "files", honest);
 await assert.rejects(() => open({ ...honest, mac: foreignMac }), /failed authentication/, "5: another root's MAC is refused");

@@ -72,6 +72,5 @@ export type TeamRole = "lead" | "analyst" | "auditor" | "external";
 
 export interface FamilyState {
 	members: Member[];
-	master: { keyId: string; publicKey: { ec: JsonWebKey; kem: string } } | null;
 	audit: { id: number; at: string; actor: string; action: string; target: string; details?: string }[];
 }

@@ -24,7 +24,7 @@ const sealedName = placedShape; // the shape check is all the DO applies
 
 let dev = await startDev({ persist: "restart" });
 try {
-	const first = await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
+	const first = await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
 	assert.equal(first.status, 200, first.text);
 	const folder = await api(dev.base, "POST", "/api/v1/members/mom/files/folders", { body: { name: sealedName("before") } });
 	assert.equal(folder.status, 200, folder.text);

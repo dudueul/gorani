@@ -44,9 +44,11 @@ use crate::files_store::urlquery;
 /// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
 pub const MIGRATIONS: &[&str] = &[
 	// Vault settings: one row. The JSON carries public halves, unlock methods
-	// (wrapped private copies), store keys, and the family links
-	// (masterSealed for parents, guardian.* for children) — shared/family.ts
-	// is the authoritative shape.
+	// (wrapped private copies), store keys and the identity record —
+	// web/src/vault/methods.ts › VaultSettings is the authoritative shape.
+	// (Until commit 27c it also carried the family links, masterSealed and
+	// guardian.*; the recovery copies that replaced them live in the
+	// registry.)
 	"CREATE TABLE IF NOT EXISTS vault (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
 	// The member's own audit log. Free-text details are sealed; structure is
 	// readable (docs/APPS.md's audit rules).
@@ -323,6 +325,13 @@ impl GoraniMemberDO {
 				let body = req.json::<VaultPut>().await?;
 				self.put_vault(&actor, body).await
 			}
+			// The ONE way a vault's root changes (commit 27): a completed
+			// recovery ceremony for this member (routes.rs › ceremony_complete,
+			// after the registry validated it). Internal — no public path.
+			("PUT", "vault-reroot") => {
+				let body = req.json::<VaultPut>().await?;
+				self.vault_reroot(&actor, body).await
+			}
 			("GET", "audit") => self.get_audit().await,
 			("POST", "audit") => {
 				let body = req.json::<AuditPut>().await?;
@@ -531,6 +540,17 @@ impl GoraniMemberDO {
 		let v = serde_json::to_string(&body.settings).map_err(|_| Error::RustError("bad settings JSON".into()))?;
 		self.sql.exec("INSERT INTO vault (k, v) VALUES ('settings', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", Some(vec![v.into()]))?;
 		self.audit(actor, "vault.save", "settings", None, None).await?;
+		self.get_vault().await
+	}
+
+	/// Replace the settings — root included — after a recovery ceremony.
+	/// The devices go too: each held a copy of the OLD root (the lost one),
+	/// which opens nothing in the new settings and must not linger.
+	async fn vault_reroot(&self, actor: &str, body: VaultPut) -> Result<Response> {
+		let v = serde_json::to_string(&body.settings).map_err(|_| Error::RustError("bad settings JSON".into()))?;
+		self.sql.exec("INSERT INTO vault (k, v) VALUES ('settings', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", Some(vec![v.into()]))?;
+		let devices = self.sql.exec("DELETE FROM devices", None)?.rows_written();
+		self.audit(actor, "vault.reroot", "settings", None, Some(&format!("devicesDropped:{devices}"))).await?;
 		self.get_vault().await
 	}
 

@@ -284,8 +284,10 @@ redacted `Debug`.
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in
-docs/DECISIONS.md (D2/D4 roles, cases and quorum recovery — which also close
-O3's trust-on-first-use gap — D5 custody, D6 Object Lock, D7 retention, D8
+docs/DECISIONS.md (D2/D4 roles, cases and quorum recovery — roles, cases and
+signed grants and the M-of-N recovery ceremony landed in commits 26–27,
+closing O3's trust-on-first-use gap for case keys and removing the family
+master key and the parent act-for rule — D5 custody, D6 Object Lock, D7 retention, D8
 samples, D11 partner sign-in, D12 large files) and the operational controls
 below.
 

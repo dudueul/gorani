@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, openWith, generateHybridKey } from "../../web/src/vault/vault-crypto.ts";
 import { sealChunked, FRAME_OVERHEAD, sealedSize } from "../../web/src/vault/chunked-file.ts";
-import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { sealText } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
 
@@ -58,19 +58,15 @@ async function upload(base, email, member, path, fields, file) {
 }
 
 try {
-	// ── 0. The family, its master, and the kid's vault ─────────────────
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "child", emails: ["jinu@family.test"] } });
-	const master = await createParentsMaster();
-	const mset = await api(dev.base, "PUT", "/api/v1/family/master", { email: "mom@family.test", body: { keyId: master.keyId, publicKey: master.publicKey } });
-	assert.equal(mset.status, 200, `master: ${JSON.stringify(mset.json)}`);
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "dad", name: "Dad", role: "parent", emails: ["dad@family.test"] } });
+	// ── 0. The team, and the analyst's vault (set up by the analyst) ──
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "analyst", emails: ["jinu@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "dad", name: "Dad", role: "lead", emails: ["dad@family.test"] } });
 
 	// The kid's vault, composed the way commit ⑨'s UI will:
-	const kidVault = await createChildVault();
+	const kidVault = await createCodeVault();
 	const filesStore = await createStoreKey();
 	const own = await sealStoreKeyToMember(filesStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
-	const guardian = await sealStoreKeyToMaster(filesStore, master);
 	const settings = {
 		enabled: true,
 		keyId: kidVault.keyId,
@@ -78,7 +74,6 @@ try {
 		pqPublicKey: kidVault.pqPublicKey,
 		methods: kidVault.methods,
 		stores: { files: own },
-		guardian,
 	};
 	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings } });
 	if (saved.status !== 200) console.error("SAVED FAIL", saved.status, JSON.stringify(saved.json));
@@ -141,14 +136,17 @@ try {
 
 	// The read is on record (O14, D10): one merged row per reader × version ×
 	// client × 5 minutes — a second download in the window adds a request,
-	// not a line; a parent's read is the parent's line.
+	// not a line; another client is another line. A lead's download is
+	// refused (no act-for since 27c) — and so is not a read.
 	await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
-	await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "mom@family.test", "x-gorani-client": "web" } });
+	await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "jinu@family.test", "x-gorani-client": "web" } });
+	assert.equal((await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "mom@family.test", "x-gorani-client": "web" } })).status, 403);
 	const reads = (await api(dev.base, "GET", `/api/v1/members/jinu/reads?file=${fileId}`, { email: "jinu@family.test" })).json.reads;
-	const jinuRead = reads.find((r) => r.actor === "jinu@family.test");
+	const jinuRead = reads.find((r) => r.actor === "jinu@family.test" && r.client !== "web");
 	assert.equal(jinuRead.requests, 2, `two downloads, one merged line: ${JSON.stringify(reads)}`);
 	assert.equal(jinuRead.version, 1);
-	assert.ok(reads.some((r) => r.actor === "mom@family.test" && r.client === "web"), "the parent's read is the parent's line, with its client");
+	assert.ok(reads.some((r) => r.actor === "jinu@family.test" && r.client === "web"), "another client, another line");
+	assert.ok(!reads.some((r) => r.actor === "mom@family.test"), "a refused download is not a read");
 
 	// ── 4. Folders: create, rename, move the file in ──────────────────
 	const folderId = store.newId();
@@ -264,13 +262,12 @@ try {
 	const unsealedSecrets = await api(dev.base, "PUT", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test", body: { sealed: "not sealed at all" } });
 	assert.equal(unsealedSecrets.status, 400);
 
-	// ── 10. Family access: a parent acts for the child; the child cannot
-	//        act for anyone else. ──────────────────────────────────────
+	// ── 10. Own areas only: neither direction (since 27c — the family's
+	//        "a parent acts for the child" is gone; shared work is a case).
 	const asMom = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "mom@family.test" });
-	assert.equal(asMom.status, 200);
-	assert.equal(asMom.json.files.length, 1, "the parent sees the child's listing");
+	assert.equal(asMom.status, 403, "a lead does not list an analyst's area");
 	const kidOther = await api(dev.base, "GET", "/api/v1/members/mom/files/list?folder=all", { email: "jinu@family.test" });
-	assert.equal(kidOther.status, 403, "the child cannot open the parent's area");
+	assert.equal(kidOther.status, 403, "nor the analyst the lead's");
 
 	// Unsealed content is refused at the boundary (the store never sees it).
 	const bad = await upload(dev.base, "jinu@family.test", "jinu", "/files", { file_id: store.newId(), ck: ckSealed, name, type: typeSealed, size: String(plain.length) }, enc.encode("plaintext bytes!!"));

@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, importVaultKey, openText, sealWith, openWith, generateHybridKey } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer, placedShape } from "../lib/placed.mjs";
-import { createChildVault, createParentsMaster, createStoreKey, openStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, openStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { toBase64, fromBase64 } from "../../web/src/lib/encoding.ts";
 import { resealStore } from "../../web/src/vault/rotation.ts";
 
@@ -26,15 +26,12 @@ const dec = new TextDecoder();
 
 try {
 	// ── 0. Family + kid vault (the setup files.test also walks) ────────
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
-	const master = await createParentsMaster();
-	await api(dev.base, "PUT", "/api/v1/family/master", { email: "mom@family.test", body: { keyId: master.keyId, publicKey: master.publicKey } });
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "child", emails: ["jinu@family.test"] } });
-	const kidVault = await createChildVault();
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "analyst", emails: ["jinu@family.test"] } });
+	const kidVault = await createCodeVault();
 	const filesStore = await createStoreKey();
 	const own = await sealStoreKeyToMember(filesStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
-	const guardian = await sealStoreKeyToMaster(filesStore, master);
-	const settings = { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian };
+	const settings = { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own } };
 	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings } });
 	assert.equal(saved.status, 200);
 
@@ -47,10 +44,12 @@ try {
 	assert.equal(enrolA.status, 200, `enrol: ${enrolA.status} ${enrolA.text.slice(0,300)}`);
 	const tokenA = enrolA.json.token;
 	assert.ok(tokenA.length >= 60);
-	const enrolB = await api(dev.base, "POST", "/api/v1/members/jinu/devices", {
-		email: "mom@family.test", // a parent can enrol for the child
+	const enrolDevice = (email) => api(dev.base, "POST", "/api/v1/members/jinu/devices", {
+		email,
 		body: { name: "Family desktop", platform: "windows", keyId: kidVault.keyId, wrapped: rootBundleB64, salt: toBase64(new Uint8Array(16)), protection: "windows-hello" },
 	});
+	assert.equal((await enrolDevice("mom@family.test")).status, 403, "a lead enrols no device for another member (no act-for since 27c)");
+	const enrolB = await enrolDevice("jinu@family.test");
 	assert.equal(enrolB.status, 200);
 	const idB = enrolB.json.deviceId;
 
@@ -144,7 +143,8 @@ try {
 	assert.equal(trashed.status, 200);
 	const trash = await api(dev.base, "GET", "/api/v1/members/jinu/files/trash", { email: "jinu@family.test" });
 	assert.ok(trash.json.files.some((x) => x.id === f.id));
-	const restored = await api(dev.base, "POST", "/api/v1/members/jinu/files/trash/restore", { email: "mom@family.test", body: { files: [f.id], folders: [] } });
+	assert.equal((await api(dev.base, "POST", "/api/v1/members/jinu/files/trash/restore", { email: "mom@family.test", body: { files: [f.id], folders: [] } })).status, 403, "nor restores their trash");
+	const restored = await api(dev.base, "POST", "/api/v1/members/jinu/files/trash/restore", { email: "jinu@family.test", body: { files: [f.id], folders: [] } });
 	assert.equal(restored.status, 200);
 	assert.equal(restored.json.files, 1);
 	const after = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" });
@@ -153,7 +153,6 @@ try {
 	// ── 6. Rotation: the client re-wraps; the server stores; both open ─
 	const newStore = await createStoreKey();
 	const newOwn = await sealStoreKeyToMember(newStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
-	const newGuardian = await sealStoreKeyToMaster(newStore, master);
 	// The client walks every sealed value (rotation.ts — commit 24 made it
 	// every version, folder, tag and secret, not just living versions; the
 	// full proof is api:rotation) — the raw keys stay in the client.
@@ -167,7 +166,7 @@ try {
 	const walked = await resealStore(call, "jinu", storePriv, await importVaultKey(newStore.bundle.slice()));
 	assert.ok(walked.resealed.version >= 1 && walked.resealed.file >= 1, JSON.stringify(walked));
 	// Settings updated to the new store key…
-	const updatedSettings = { ...settings, stores: { files: newOwn }, guardian: newGuardian };
+	const updatedSettings = { ...settings, stores: { files: newOwn } };
 	const save2 = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: updatedSettings } });
 	assert.equal(save2.status, 200);
 	// …and the keys endpoint now serves the new wrap, which opens.
@@ -178,9 +177,10 @@ try {
 	assert.equal(dec.decode(await openWith(ck2, sealed)), dec.decode(plain), "the rotated key opens the content");
 
 	// ── 7. Crypto-shredding: armed (dev secret), confirm phrase, gone ──
-	const noConfirm = await api(dev.base, "DELETE", "/api/v1/members/jinu/vault", { email: "mom@family.test" });
+	assert.equal((await api(dev.base, "DELETE", "/api/v1/members/jinu/vault?confirm=DESTROY%20VAULT%20KEY", { email: "mom@family.test" })).status, 403, "a lead cannot shred another member's vault");
+	const noConfirm = await api(dev.base, "DELETE", "/api/v1/members/jinu/vault", { email: "jinu@family.test" });
 	assert.equal(noConfirm.status, 403);
-	const destroyed = await api(dev.base, "DELETE", "/api/v1/members/jinu/vault?confirm=DESTROY%20VAULT%20KEY", { email: "mom@family.test" });
+	const destroyed = await api(dev.base, "DELETE", "/api/v1/members/jinu/vault?confirm=DESTROY%20VAULT%20KEY", { email: "jinu@family.test" });
 	assert.equal(destroyed.status, 200);
 	const gone = await api(dev.base, "GET", "/api/v1/members/jinu/vault", { email: "jinu@family.test" });
 	assert.equal(gone.json, null);

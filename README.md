@@ -2,12 +2,15 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 
-A zero-trust, end-to-end encrypted family NAS. Files are sealed in the
-browser (Lit + WebCrypto) or the native Rust clients before the server sees
-a byte; a Rust Cloudflare Worker holds ciphertext, wrapped keys and just
-enough readable structure to sync and browse; object storage is any
-S3-compatible bucket (MinIO over public HTTPS). Family key hierarchy: a
-parents' master key opens the children's areas — never the reverse.
+A zero-trust, end-to-end encrypted file store for a security-operations
+team (it began as a family NAS — docs/FAMILY.md is that history). Files are
+sealed in the browser (Lit + WebCrypto) or the native Rust clients before
+the server sees a byte; a Rust Cloudflare Worker holds ciphertext, wrapped
+keys and just enough readable structure to sync and browse; object storage
+is any S3-compatible bucket (MinIO over public HTTPS). Least privilege by
+key custody: every member has their own area, a case's key is sealed only
+to the people granted it, every grant is signed, and recovering a lost key
+takes several leads together — never one (docs/CASES.md).
 
 **Status: built, self-proving — and reviewed.** The commit-23 security
 review ([docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md)) fixed 32

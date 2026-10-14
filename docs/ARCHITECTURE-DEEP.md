@@ -121,31 +121,34 @@ sequenceDiagram
     Note over P,SW: the browser's own player parses the MP4 and seeks —<br/>no MSE, no box surgery, no DRM
 ```
 
-## 5. The family hierarchy (why the denials hold)
+## 5. Who holds which key (why the denials hold)
 
 ```mermaid
 flowchart TB
-    subgraph parents[Parents' roots]
-        PR1[Mom root] --> PM1[master priv, sealed GV03]
-        PR2[Dad root] --> PM2[master priv, sealed GV03]
+    subgraph members[Members' roots]
+        AR[Ana root · lead] --> AK[Ana's own store priv]
+        BR[Bo root · analyst] --> BK[Bo's own store priv]
+        CR[Cy root · auditor] --> CK[Cy's own store priv]
     end
-    PM["parents' MASTER key pair"] --- PM1 & PM2
-    MPub[master PUBLIC half] -- "seals each child's store PRIVATE key" --> CS1[Jinu store priv · guardian.storeSealed]
-    MPub --> CS2[Sora store priv · guardian.storeSealed]
-    subgraph children[Children's roots]
-        CR1[Jinu root] --> K1[Jinu store priv, own copy]
-        CR2[Sora root] --> K2[Sora store priv, own copy]
-    end
-    K1 -. cannot reach .-> PM1
-    CS1 -.-> J1[Jinu's content keys]
-    K1 -.-> J1
+    CASE["case ir-14 key pair"] -- "grant: sealed + SIGNED (stage 4)" --> AR
+    CASE -- "grant (write)" --> BR
+    CASE -- "grant (read; server refuses writes)" --> CR
+    REC["team recovery key<br/>(never whole at rest)"] -. "Shamir share, sealed" .-> AR
+    REC -. "share" .-> LR[Lu root · lead]
+    AK & BK & CASE -- "recovery copy, sealed to the recovery PUBLIC key" --> REC
+    BK -. cannot reach .-> AK
 ```
 
-- A child's root opens **only** their own store + the family area.
-- The master is sealed to parents' roots, never to children's — a child's
-  compromise stays contained.
-- Rotating the master re-seals a handful of store keys; content never
-  re-encrypts. `tests/unit/family.test.mjs` walks all of it.
+- A member's root opens their own store and the cases they are granted —
+  nothing else, a lead's included (docs/CASES.md › Roles).
+- A grant is the case key sealed to one grantee's root and signed by the
+  granter; the grantee verifies the signature against an identity they
+  pinned or one a pinned lead certified (stage 4).
+- The recovery key's private half exists only as M-of-N shares; opening a
+  recovery copy takes a ceremony that M leads approve, and leaves the key
+  "rotation required" (stage 5).
+- Until commit 27c a parents' master key opened every child's area —
+  docs/FAMILY.md keeps that design as history.
 
 ## 6. Backup / disaster (the container the server can't open)
 

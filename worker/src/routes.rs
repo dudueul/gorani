@@ -6,8 +6,9 @@
 //! 1. **Authenticate first** (auth.rs) — before reading a body, before
 //!    touching a DO.
 //! 2. **Member scope is resolved through the registry**: a member acts for
-//!    their own area; a **lead may still act for any member** (the family's
-//!    parent rule, transitional until docs/CASES.md › stage 5 removes it);
+//!    their own area and nobody else's — a lead included (the family's
+//!    "parent acts for any child" rule went with the master key, commit
+//!    27c: leads manage who holds which key, not other people's content);
 //!    an external has no own area; leads and auditors read every audit.
 //!    A **case** (`/api/v1/cases/<id>/…`, commit 26) is scoped by the
 //!    caller's grant instead — route_case checks read / write / manage once
@@ -39,9 +40,9 @@ struct Actor {
 	target_active: bool,
 }
 
-/// Resolve the caller's registry row, then enforce the member scope:
-/// themselves, or any member if they are a parent. The ORDER of the checks
-/// is the lesson (security review, commit 23):
+/// Resolve the caller's registry row, then enforce the member scope: a
+/// member acts for their own area only. The ORDER of the checks is the
+/// lesson (security review, commit 23):
 ///
 /// 1. **Shape** — the id becomes a DO instance name (`member:<id>`) and the
 ///    first segment of every object key (`files/<id>/…`), so it is held to
@@ -52,9 +53,10 @@ struct Actor {
 ///    fresh, empty Durable Object on first touch (a DO exists the moment it
 ///    is addressed): unbounded state, holding data for a member nobody can
 ///    see in the registry.
-/// 4. **Scope** — a child acts only for themselves, and only while active;
-///    a parent for anyone, deactivated members included (offboarding: a
-///    parent may still need to export or purge a former member's area).
+/// 4. **Scope** — the caller acts only for themselves, and only while
+///    active. (A departed member's area is reached by a recovery ceremony,
+///    docs/CASES.md — not by a lead's say-so; until commit 27c a parent
+///    could act for anyone.)
 ///
 /// It returns the whole Actor so no caller resolves the caller twice — the
 /// upload paths used to make a second registry round trip just to learn
@@ -95,17 +97,19 @@ async fn scope_ctx(env: &Env, identity: &Identity, id: &str, external_own_vault:
 	if !actor.target_exists {
 		return Err(json_error_raw(404, "no such member"));
 	}
-	// (Commit 26, docs/CASES.md › Roles: the four roles. A lead keeps the
-	// family parent's act-for rule until stage 5; an external member has
-	// no own area at all — their work lives in the cases they are granted.)
+	// (docs/CASES.md › Roles. Until commit 27c a lead could act for any
+	// member's area — the family parent's rule. Gone: a lead reads another
+	// member's content only through what the keys allow — a case grant, or
+	// a recovery ceremony that several leads approve. An external member
+	// has no own area at all — their work lives in the cases they are
+	// granted; they keep a vault root, which grants are sealed to.)
 	let own = actor.id == id && actor.target_active;
-	let allowed = actor.role == "lead" || (own && (actor.role != "external" || external_own_vault));
-	if allowed {
+	if own && (actor.role != "external" || external_own_vault) {
 		Ok(actor)
 	} else if actor.role == "external" {
 		Err(json_error_raw(403, "external members have no own area — only the cases they are granted"))
 	} else {
-		Err(json_error_raw(403, "members act only for their own area"))
+		Err(json_error_raw(403, "members act only for their own area — another member's content is reached through a case grant or a recovery ceremony"))
 	}
 }
 
@@ -408,10 +412,44 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		("POST", ["family", "members", id, "deactivate"]) => {
 			forward_family(&env, &identity.email, "POST", format!("members/{id}/deactivate"), Some(serde_json::json!({}))).await
 		}
-		("PUT", ["family", "master"]) => {
+		// ── Identities (commit 27, docs/CASES.md › Member identity keys) ──
+		("GET", ["family", "identities"]) => forward_family(&env, &identity.email, "GET", "identities", None).await,
+		("PUT", ["family", "identity"]) => {
 			let body = req.json::<serde_json::Value>().await?;
-			forward_family(&env, &identity.email, "PUT", "master", Some(body)).await
+			forward_family(&env, &identity.email, "PUT", "identity", Some(body)).await
 		}
+		("DELETE", ["family", "members", id, "identity"]) => forward_family(&env, &identity.email, "DELETE", format!("identity/{id}"), None).await,
+		("PUT", ["family", "members", id, "cert"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", format!("certs/{id}"), Some(body)).await
+		}
+		// ── Team recovery (commit 27, docs/CASES.md › Recovery) ──
+		("GET", ["recovery"]) => forward_family(&env, &identity.email, "GET", "recovery", None).await,
+		("PUT", ["recovery"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "recovery", Some(body)).await
+		}
+		("GET", ["recovery", "copies"]) => forward_family(&env, &identity.email, "GET", "recovery-copies", None).await,
+		("PUT", ["recovery", "copies"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "recovery-copies", Some(body)).await
+		}
+		("PUT", ["recovery", "reenrol"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "reenrol", Some(body)).await
+		}
+		("GET", ["recovery", "ceremonies"]) => forward_family(&env, &identity.email, "GET", "ceremonies", None).await,
+		("POST", ["recovery", "ceremonies"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "POST", "ceremonies", Some(body)).await
+		}
+		("PUT", ["recovery", "ceremonies", id, "shares"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", format!("ceremony-shares/{id}"), Some(body)).await
+		}
+		("GET", ["recovery", "ceremonies", id, "material"]) => forward_family(&env, &identity.email, "GET", format!("ceremony-material/{id}"), None).await,
+		("POST", ["recovery", "ceremonies", id, "complete"]) => ceremony_complete(req, &env, identity, id).await,
+		("POST", ["recovery", "ceremonies", id, "cancel"]) => forward_family(&env, &identity.email, "POST", format!("ceremony-cancel/{id}"), Some(serde_json::json!({}))).await,
 
 		// ── Member vault (settings; devices arrive in commit ⑧) ─────────
 		("GET", ["members", id, "vault"]) => match vault_ctx(&env, &identity, id).await {
@@ -475,7 +513,7 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "files/reseal", Some(body), actor)).await
 		}
 		// ── Devices (docs/DESKTOP.md): enrolment needs the member's unlocked
-		// session or a parent; the device routes themselves authenticate with
+		// session; the device routes themselves authenticate with
 		// the device token INSIDE the DO (the token is not the web session).
 		("GET", ["members", id, "devices"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "devices", None, actor)).await,
 		("POST", ["members", id, "devices"]) => {
@@ -566,6 +604,28 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 	}
 }
 
+/// Complete a recovery ceremony. A case's outcome (a signed grant) is the
+/// registry's alone. A member's needs three steps, in this order, each
+/// safe to retry: the registry validates and hands back the new settings
+/// (the ceremony waits in `applying`), the member's store takes them (the
+/// one write that may change a root), the registry closes the ceremony. A
+/// failure between the steps leaves the ceremony open, not half-applied.
+async fn ceremony_complete(mut req: Request, env: &Env, identity: &Identity, id: &str) -> Result<Response> {
+	let body = req.json::<serde_json::Value>().await?;
+	let mut first = forward_family(env, &identity.email, "POST", format!("ceremony-complete/{id}"), Some(body)).await?;
+	if first.status_code() != 200 {
+		return Ok(first);
+	}
+	let v: serde_json::Value = first.json().await?;
+	let Some(reroot) = v.get("reroot") else { return Response::from_json(&v) };
+	let Some(member) = reroot.get("member").and_then(|m| m.as_str()).filter(|m| auth::valid_member_id(m)) else { return json_error(500, "the registry named no member to re-root") };
+	let wrote = forward_member(env, member, "PUT", "vault-reroot", Some(serde_json::json!({ "settings": reroot["settings"] })), identity.email.clone()).await?;
+	if wrote.status_code() >= 300 {
+		return Ok(wrote);
+	}
+	forward_family(env, &identity.email, "POST", format!("ceremony-close/{id}"), Some(serde_json::json!({}))).await
+}
+
 /// The public halves of a member's vault root, for any active team member
 /// who is not an external (they never manage a case, so never seal grants).
 async fn member_root(env: &Env, identity: &Identity, id: &str) -> Result<Response> {
@@ -652,7 +712,8 @@ async fn forward_member(env: &Env, member_id: &str, method: &str, path: impl Int
 	// The member DO is told whose database it is (`x-gorani-member`): a DO
 	// cannot read its own instance name, and code that needs it (the restore
 	// minting `files/<member>/…` keys) used to guess from the ACTOR — wrong
-	// whenever a parent acts for a child.
+	// whenever the actor was not the area's own member (a parent acting for
+	// a child, before commit 27c; a case, always).
 	do_request(&stub, method, path, body, Some(actor.into().as_str()), Some(member_id)).await
 }
 

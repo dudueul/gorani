@@ -29,9 +29,12 @@
  * area's key, sealed by a parent) cannot carry your MAC when it arrives —
  * its creator does not hold your root. Such a record is pinned on first
  * open ("trust on first use", `session.ts`): from then on a swap is caught,
- * but a substitution BEFORE that first open is not. Closing that gap needs
- * member identity keys with verified fingerprints — the roles/cases/quorum
- * redesign (docs/DECISIONS.md › D2, D4).
+ * but a substitution BEFORE that first open is not. Case keys close that
+ * gap with signatures (identity.ts, commit 27): a copy sealed to you by a
+ * granter carries their identity's signature, verified against an identity
+ * you trust. What still arrives unsigned is a member's own store record
+ * written by a recovery ceremony (recovery.ts › recoverMemberStore): it is
+ * pinned on the member's first open after re-enrolling.
  *
  * The encoding is length-prefixed bytes, not JSON (JSON has more than one
  * spelling of the same object; a MAC must have exactly one input). The

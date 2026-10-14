@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { storeSealer } from "../lib/placed.mjs";
-import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -29,15 +29,12 @@ const feed = async () => (await api(dev.base, "GET", "/api/v1/members/jinu/files
 
 try {
 	// ── seed ────────────────────────────────────────────────────────────
-	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
-	const master = await createParentsMaster();
-	await api(dev.base, "PUT", "/api/v1/family/master", { body: { keyId: master.keyId, publicKey: master.publicKey } });
-	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "jinu", name: "Jinu", role: "child", emails: ["jinu@family.test"] } });
-	const kidVault = await createChildVault();
+	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "jinu", name: "Jinu", role: "analyst", emails: ["jinu@family.test"] } });
+	const kidVault = await createCodeVault();
 	const filesStore = await createStoreKey();
 	const own = await sealStoreKeyToMember(filesStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
-	const guardian = await sealStoreKeyToMaster(filesStore, master);
-	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian } } });
+	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own } } } });
 	assert.equal(saved.status, 200);
 	const s = await storeSealer(filesStore.bundle, "jinu");
 	/** A new file's fields, every value sealed into its place (version 1). */

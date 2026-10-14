@@ -3,7 +3,8 @@
 /**
  * api:roles — the team's four roles (commit 26, docs/CASES.md › Roles):
  *
- *   lead     manages the registry; (transitional) may act for any area
+ *   lead     manages the registry — and, since commit 27c, acts for no
+ *            area but their own (content needs a grant or a ceremony)
  *   analyst  their own area only
  *   auditor  their own area, and every member's audit and read log
  *   external no own area, no registry view, and an expiry that ends access
@@ -39,7 +40,8 @@ try {
 	assert.equal((await get("/api/v1/members/ana/files/list", "bo@team.test")).status, 403, "…and nobody else's");
 	assert.equal((await get("/api/v1/members/bo/files/list", "cy@team.test")).status, 403, "an auditor reads audits, not areas");
 	assert.equal((await get("/api/v1/members/ext/files/list", "ir@partner.test")).status, 403, "an external has no own area");
-	assert.equal((await get("/api/v1/members/bo/files/list", "ana@team.test")).status, 200, "a lead still may (the transitional parent rule, until stage 5)");
+	assert.equal((await get("/api/v1/members/bo/files/list", "ana@team.test")).status, 403, "…not even a lead (the family's parent rule is gone, commit 27c)");
+	assert.equal((await api(dev.base, "PUT", "/api/v1/family/master", { email: "ana@team.test", body: {} })).status, 404, "the family master key is gone too");
 
 	// ── 3. Audits and read logs ─────────────────────────────────────────
 	for (const path of ["/api/v1/members/bo/audit", "/api/v1/members/bo/reads"]) {
@@ -66,11 +68,10 @@ try {
 	// ── 6. Expiry ends access by itself ─────────────────────────────────
 	assert.equal((await add({ id: "old", name: "Last month's responder", role: "external", emails: ["old@partner.test"], expiresAt: yesterday }, "bo@team.test")).status, 200);
 	assert.equal((await get("/api/v1/members/old/audit", "old@partner.test")).status, 403, "an expired external is nobody");
-	// (A parent/child body still works — the aliases of the migration.)
-	assert.equal((await add({ id: "kid", name: "Alias", role: "child", emails: ["kid@team.test"] }, "bo@team.test")).status, 200);
-	assert.equal((await get("/api/v1/family", "bo@team.test")).json.members.find((m) => m.id === "kid").role, "analyst");
+	// The family's role names are gone with the master key (a clean break).
+	assert.equal((await add({ id: "kid", name: "Old name", role: "child", emails: ["kid@team.test"] }, "bo@team.test")).status, 400, "parent/child are no longer roles");
 
-	console.log("ok  api:roles — lead/analyst/auditor/external scopes, audits for auditors, no registry for externals, last-lead guards, expiry, aliases");
+	console.log("ok  api:roles — lead/analyst/auditor/external scopes, audits for auditors, no registry for externals, last-lead guards, expiry, no act-for, no family roles");
 } finally {
 	await dev.close();
 }

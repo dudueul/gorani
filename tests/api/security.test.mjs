@@ -26,7 +26,7 @@ import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealText, sealWith, openWith } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
-import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { sealChunked, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
 import { toBase64 } from "../../web/src/lib/encoding.ts";
@@ -36,15 +36,14 @@ const enc = new TextEncoder();
 
 /** A child member with an enabled vault and a files store; returns the store's sealer
  * (tests/lib/placed.mjs) and its public half (what the SERVER holds). */
-async function childWithVault(id, master) {
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id, name: id, role: "child", emails: [`${id}@family.test`] } });
-	const vault = await createChildVault();
+async function childWithVault(id) {
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id, name: id, role: "analyst", emails: [`${id}@family.test`] } });
+	const vault = await createCodeVault();
 	const store = await createStoreKey();
 	const own = await sealStoreKeyToMember(store, { ec: vault.publicKey, kem: vault.pqPublicKey });
-	const guardian = await sealStoreKeyToMaster(store, master);
 	const saved = await api(dev.base, "PUT", `/api/v1/members/${id}/vault`, {
 		email: `${id}@family.test`,
-		body: { settings: { enabled: true, keyId: vault.keyId, publicKey: vault.publicKey, pqPublicKey: vault.pqPublicKey, methods: vault.methods, stores: { files: own }, guardian } },
+		body: { settings: { enabled: true, keyId: vault.keyId, publicKey: vault.publicKey, pqPublicKey: vault.pqPublicKey, methods: vault.methods, stores: { files: own } } },
 	});
 	assert.equal(saved.status, 200, `vault for ${id}: ${saved.text.slice(0, 200)}`);
 	return { vault, store: await storeSealer(store.bundle, id), storePublic: { ec: store.publicKey, kem: store.pqPublicKey } };
@@ -77,12 +76,10 @@ async function shareStart(member, id, store, size) {
 
 try {
 	// ── 0. Family: mom (parent), jinu + sora (children with vaults) ────
-	const first = await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
+	const first = await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
 	assert.equal(first.status, 200);
-	const master = await createParentsMaster();
-	await api(dev.base, "PUT", "/api/v1/family/master", { email: "mom@family.test", body: { keyId: master.keyId, publicKey: master.publicKey } });
-	const jinu = await childWithVault("jinu", master);
-	const sora = await childWithVault("sora", master);
+	const jinu = await childWithVault("jinu");
+	const sora = await childWithVault("sora");
 
 	// ── 1. The registry is for members, not for every Access identity ──
 	const stranger = await api(dev.base, "GET", "/api/v1/family", { email: "stranger@elsewhere.test" });

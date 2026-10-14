@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, openWith } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
-import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
 import { resealStore, opensAnything } from "../../web/src/vault/rotation.ts";
 
@@ -45,14 +45,12 @@ async function upload(path, fields, file) {
 
 try {
 	// ── 0. A member whose store holds every sealed kind ────────────────
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
-	const master = await createParentsMaster();
-	await api(dev.base, "PUT", "/api/v1/family/master", { email: "mom@family.test", body: { keyId: master.keyId, publicKey: master.publicKey } });
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "child", emails: [email] } });
-	const vault = await createChildVault();
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "analyst", emails: [email] } });
+	const vault = await createCodeVault();
 	const storeA = await createStoreKey();
 	const a = await storeSealer(storeA.bundle, "jinu");
-	const settings = { enabled: true, keyId: vault.keyId, publicKey: vault.publicKey, pqPublicKey: vault.pqPublicKey, methods: vault.methods, stores: { files: await sealStoreKeyToMember(storeA, { ec: vault.publicKey, kem: vault.pqPublicKey }) }, guardian: await sealStoreKeyToMaster(storeA, master) };
+	const settings = { enabled: true, keyId: vault.keyId, publicKey: vault.publicKey, pqPublicKey: vault.pqPublicKey, methods: vault.methods, stores: { files: await sealStoreKeyToMember(storeA, { ec: vault.publicKey, kem: vault.pqPublicKey }) } };
 	assert.equal((await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email, body: { settings } })).status, 200);
 
 	const folderId = a.newId();

@@ -13,6 +13,7 @@
 import type { FilesBridge } from "./model.ts";
 import { devIdentityHeaders } from "../../lib/api.ts";
 import { areaPath } from "../../lib/area.ts";
+import { browserJournal } from "../../lib/upload-journal.ts";
 import { openWith, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
 import { places } from "../../vault/places.ts";
 import type { VaultSession } from "../../vault/session.ts";
@@ -108,30 +109,21 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 			await throwIfError(res);
 		},
 
-		async putMultipart(memberId, fields, frames, chunk) {
-			// The new file's id was chosen (and sealed into) by the model.
-			const { file_id: newFileId, ...rest } = fields;
-			const start = await fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `${areaPath(memberId)}/files/uploads`, { size: Number(fields.size), chunk, newFileId });
-			if (start.parts !== frames.count) throw new Error(`the server planned ${start.parts} parts for ${frames.count} frames`);
-			const parts: { partNumber: number; etag: string }[] = [];
-			// One frame in memory at a time (D12): read and sealed, sent, dropped.
-			// A part that fails for the network's sake is sent again — a 255 GB
-			// upload does not start over for one dropped request; one the server
-			// REFUSES (4xx) is not retried.
-			const step = Math.max(1, Math.floor(frames.count / 4));
-			for (let p = 1; p <= frames.count; p++) {
-				const frame = await frames.frame(p - 1);
-				parts.push(await sendPart(`${areaPath(memberId)}/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, frame, p));
-				if (frames.count >= 100 && p % step === 0 && p < frames.count) hooks.toast(`Uploading — ${Math.round((100 * p) / frames.count)}% (${p} of ${frames.count} parts)`);
-			}
-			const form = formBody({ ...rest, key: start.key, parts: JSON.stringify(parts) }, null);
-			const res = await fetch(`${areaPath(memberId)}/files/uploads/${start.uploadId}/complete`, {
+		// A GC01 upload in the model's three steps (D12, FilesModel › sendFrames).
+		multipartStart: (memberId, plan) => fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `${areaPath(memberId)}/files/uploads`, plan),
+		// One part; what the network lost is sent again, a refusal is not.
+		multipartPart: (memberId, uploadId, key, n, frame) => sendPart(`${areaPath(memberId)}/files/uploads/${uploadId}/${n}?key=${encodeURIComponent(key)}`, frame, n),
+		async multipartComplete(memberId, uploadId, fields) {
+			const form = formBody(fields, null);
+			const res = await fetch(`${areaPath(memberId)}/files/uploads/${uploadId}/complete`, {
 				method: "POST",
 				headers: { ...devIdentityHeaders(), "content-type": form.contentType },
 				body: form.body,
 			});
 			await throwIfError(res);
 		},
+		// Unfinished uploads, remembered in this browser (31b, lib/upload-journal.ts).
+		uploadJournal: browserJournal(),
 
 		confirmDuplicate: hooks.confirmDuplicate,
 		toast: hooks.toast,

@@ -40,7 +40,7 @@ desktop shells agree on every file's frames.
 | Stage | What |
 |---|---|
 | 31a *(landed)* | **Adaptive chunks, streamed parts, streamed browser uploads.** `chunkFor` in both languages; the Worker refuses sizes over 255 GiB and chunks over 64 MiB, and pipes each part's body to the backend (S3: `UNSIGNED-PAYLOAD` with the length fixed; R2: the binding's stream) — no copy in the isolate. The browser hashes the file in one streamed pass (the hash is signed before any byte leaves), then seals and uploads slice by slice, retrying a failed part (three tries, backoff). |
-| 31b | **Resumable uploads.** The in-flight upload — its id, object key, chunk, the sealed fields (name, type, key, signed hash, intake), the parts done — is kept in the browser (IndexedDB; every field already sealed). After a dropped connection or a closed tab, choosing the same file again (name, size, modified time, and the same SHA-256) continues from the first missing part. The server keeps an unfinished upload for the housekeeping window, then aborts it. |
+| 31b *(landed)* | **Resumable uploads.** The in-flight upload — its id, object key, chunk, the sealed fields (name, type, key, signed hash, intake), the parts done — is kept in the browser (IndexedDB; every field already sealed). After a dropped connection or a closed tab, choosing the same file again (name, size, modified time, and the same SHA-256) continues from the first missing part. The server keeps an unfinished upload for the housekeeping window, then aborts it. |
 | 31c | **Streaming downloads and export.** A download larger than the tab can hold streams through the media service worker (`/media/<id>?download`), decrypting frame by frame to the browser's own download. The export package streams too (File System Access where the browser has it, the service worker otherwise), with ZIP64 for entries and archives over 4 GiB; `tools/verify-export.mjs` reads ZIP64 and hashes entries from disk, never holding one whole. |
 
 Not in D12 (recorded here so nobody assumes otherwise):
@@ -80,6 +80,29 @@ Not in D12 (recorded here so nobody assumes otherwise):
 - Not yet: "copy" (duplicate) and a share link still read the file whole
   — both go through the plaintext in one buffer; they stay bounded by the
   tab's memory until 31c streams them.
+
+## 31b as built
+
+- The bridge's one `putMultipart` became three steps the MODEL drives —
+  `multipartStart`, `multipartPart` (the retrying `sendPart`),
+  `multipartComplete` — so `FilesModel › sendFrames` can journal every
+  part that lands (and so the unit test drives the real resume logic, not
+  a mock of it).
+- `web/src/lib/upload-journal.ts`: the record per unfinished upload in
+  IndexedDB (`gorani-uploads`), keyed by the model's keyed fingerprint of
+  "name ‖ size ‖ modified ‖ SHA-256" — no plaintext name at rest; every
+  stored field is already sealed or public. A memory journal where
+  IndexedDB is missing (and in tests).
+- Resume: the same file chosen again → the hash pass runs (as always) →
+  the key matches → the content key is unwrapped from the record's own
+  sealed field and the frames from the first missing part on are sealed
+  and sent under the SAME upload, id and signed record. A server that
+  forgot the upload ("no such upload": the housekeeping window passed, or
+  it was discarded) → the record is dropped and the file starts over.
+- The explorer says, when it opens, which uploads stopped part-way and how
+  far they got; `discardUpload` aborts one on the server and forgets it.
+- Not yet: no button for discarding (the window — `uploadDays`, 2 by
+  default — does it), and a resume needs the same browser profile.
 
 ## Why these choices
 

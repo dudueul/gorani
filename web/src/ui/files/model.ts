@@ -23,6 +23,7 @@ import { newContentKey, importContentKey, sealWith, openWith, sealPlacedText, op
 import { places, newItemId } from "../../vault/places.ts";
 import { controllingMediaWorker, registerMedia } from "../../lib/media-worker.ts";
 import { openChunk, sealChunk, chunkFor, frameCount, MAX_FILE } from "../../vault/chunked-file.ts";
+import type { UploadJournal, UploadRecord } from "../../lib/upload-journal.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { areaPath } from "../../lib/area.ts";
@@ -111,11 +112,16 @@ export interface FilesBridge {
 	 * made outside the bridge, i.e. by the media service worker. */
 	identityHeaders(): Record<string, string>;
 	/**
-	 * A GC01 upload, one part per frame (D12, docs/LARGE-FILES.md): the
-	 * bridge asks for each frame when it is ready to send it, so a 255 GB
-	 * file is never in memory — `frame(i)` reads, seals and returns frame i.
+	 * A GC01 upload, one part per frame (D12, docs/LARGE-FILES.md), in three
+	 * steps the MODEL drives (FilesModel › sendFrames) — so it can journal
+	 * each part and resume after a dropped connection or a closed tab.
+	 * `multipartPart` retries what the network lost, never a refusal.
 	 */
-	putMultipart(memberId: string, fields: Record<string, string>, frames: FrameSource, chunk: number): Promise<void>;
+	multipartStart(memberId: string, plan: { size: number; chunk: number; newFileId: string }): Promise<{ uploadId: string; key: string; parts: number }>;
+	multipartPart(memberId: string, uploadId: string, key: string, n: number, frame: Uint8Array): Promise<{ partNumber: number; etag: string }>;
+	multipartComplete(memberId: string, uploadId: string, fields: Record<string, string>): Promise<void>;
+	/** Where unfinished uploads are remembered (this browser's IndexedDB); absent → not resumable. */
+	uploadJournal?: UploadJournal;
 	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
 	toast(message: string): void;
 	/** The member's identity (commit 29d, docs/CUSTODY.md › stage 4): the
@@ -197,6 +203,15 @@ export class FilesModel {
 	async open(): Promise<void> {
 		await this.list(null);
 		void this.watchChanges();
+		// Uploads that stopped part-way here (D12, 31b): say so once, and how
+		// to continue — the parts already sent are not sent again.
+		void this.unfinishedUploads()
+			.then((u) => {
+				if (!u.length) return;
+				const list = u.map((x) => `“${x.name}” (${Math.floor((100 * x.done) / x.total)}%)`).join(", ");
+				this.bridge.toast(`${u.length === 1 ? "An upload" : `${u.length} uploads`} stopped part-way: ${list} — choose the same file again to continue from where it stopped`);
+			})
+			.catch(() => undefined);
 	}
 
 	async setFolder(id: string | null): Promise<void> {
@@ -445,11 +460,32 @@ export class FilesModel {
 	}
 
 	private async uploadOne(file: File, tag: string, folderId: string | null, sha256: string, sample = false, intakeFields: IntakeFields | null = null): Promise<void> {
+		const priv = await this.bridge.storePrivate();
+		// An upload of this very file that stopped part-way (D12, 31b): carry
+		// on with the SAME id, key and signed record its stored frames were
+		// sealed with — the journal knows it by a keyed fingerprint of the
+		// file's name, size, time and SHA-256, never by its name.
+		const journal = file.size > WHOLE_LIMIT ? this.bridge.uploadJournal : undefined;
+		const journalKey = journal ? await this.fingerprint(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`gorani-upload-v1\n${file.name}\n${file.size}\n${file.lastModified}\n${sha256}`)))) : null;
+		const prior = journal && journalKey ? await journal.get(journalKey) : null;
+		if (journal && journalKey && prior && prior.area === this.memberId && prior.size === file.size) {
+			const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, prior.fileId, 1), prior.fields.ck ?? "");
+			this.bridge.toast(`Resuming “${file.name}” from part ${prior.parts.length + 1} of ${frameCount(file.size, prior.chunk)}`);
+			try {
+				await this.sendFrames(file, key, prior.chunk, prior.fields, { journal, key: journalKey, prior });
+				return;
+			} catch (e) {
+				// The server forgot it (the housekeeping window passed, or it was
+				// discarded): drop the record and start this file over.
+				if (!/no such upload/.test(String(e))) throw e;
+				await journal.delete(journalKey);
+				this.bridge.toast(`The earlier upload of “${file.name}” is gone from the server — starting over`);
+			}
+		}
 		// The file id first: the name, the type and the content key are sealed
 		// INTO places that name it (O6) — so the server cannot move them to
 		// another file, and could not have made them up (it lacks the PSK).
 		// A new file is version 1.
-		const priv = await this.bridge.storePrivate();
 		const id = newItemId();
 		const ck = newContentKey();
 		const key = await importContentKey(ck);
@@ -487,12 +523,7 @@ export class FilesModel {
 				// to send it (D12): the chunk grows with the file so no upload
 				// needs more than 10 000 parts (chunkFor, docs/LARGE-FILES.md).
 				const chunk = chunkFor(file.size);
-				const count = frameCount(file.size, chunk);
-				const frames: FrameSource = {
-					count,
-					frame: async (i) => sealChunk(key, new Uint8Array(await file.slice(i * chunk, Math.min(file.size, (i + 1) * chunk)).arrayBuffer()), i, i === count - 1),
-				};
-				await this.bridge.putMultipart(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(file.size), chunk: String(chunk), tag, ...extra }, frames, chunk);
+				await this.sendFrames(file, key, chunk, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(file.size), chunk: String(chunk), tag, ...extra }, journal && journalKey ? { journal, key: journalKey, prior: null } : null);
 			} else {
 				const sealed = await sealWith(key, new Uint8Array(await file.arrayBuffer()));
 				await this.bridge.putWhole(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(file.size), tag, ...extra }, sealed);
@@ -501,6 +532,63 @@ export class FilesModel {
 			if (!hash && /signed content hash/.test(String(e))) throw new Error("this evidence case takes only signed uploads, and your identity is not open yet — wait for the team to open (or see Team › People), then try again");
 			throw e;
 		}
+	}
+
+	/**
+	 * Send a file as GC01 frames (D12): each frame read and sealed only when
+	 * it is next, sent, journalled, dropped — memory never grows with the
+	 * file. With a journal, every part that lands is recorded, so a stopped
+	 * upload continues from its first missing part (31b); `resume.prior` is
+	 * that record. The journal entry goes when the server confirms the file.
+	 */
+	private async sendFrames(file: File, key: CryptoKey, chunk: number, fields: Record<string, string>, resume: { journal: UploadJournal; key: string; prior: UploadRecord | null } | null): Promise<void> {
+		const count = frameCount(file.size, chunk);
+		const fileId = fields.file_id ?? "";
+		let rec = resume?.prior ?? null;
+		if (!rec) {
+			const start = await this.bridge.multipartStart(this.memberId, { size: file.size, chunk, newFileId: fileId });
+			if (start.parts !== count) throw new Error(`the server planned ${start.parts} parts for ${count} frames`);
+			rec = { area: this.memberId, fileId, uploadId: start.uploadId, objectKey: start.key, chunk, size: file.size, fields, parts: [], startedAt: new Date().toISOString() };
+			await resume?.journal.put(resume.key, rec);
+		}
+		const step = Math.max(1, Math.floor(count / 4));
+		for (let p = rec.parts.length + 1; p <= count; p++) {
+			const i = p - 1;
+			const frame = await sealChunk(key, new Uint8Array(await file.slice(i * chunk, Math.min(file.size, p * chunk)).arrayBuffer()), i, p === count);
+			rec.parts.push(await this.bridge.multipartPart(this.memberId, rec.uploadId, rec.objectKey, p, frame));
+			await resume?.journal.put(resume.key, rec);
+			if (count >= 100 && p % step === 0 && p < count) this.bridge.toast(`Uploading “${file.name}” — ${Math.round((100 * p) / count)}% (${p} of ${count} parts)`);
+		}
+		const { file_id: _id, ...rest } = rec.fields;
+		void _id;
+		await this.bridge.multipartComplete(this.memberId, rec.uploadId, { ...rest, key: rec.objectKey, parts: JSON.stringify(rec.parts) });
+		await resume?.journal.delete(resume.key);
+	}
+
+	/**
+	 * Uploads in this area that stopped part-way (D12, 31b), with their
+	 * names opened — for the explorer to say so. Choosing the same file
+	 * again resumes one; `discardUpload` gives one up.
+	 */
+	async unfinishedUploads(): Promise<{ key: string; name: string; done: number; total: number; startedAt: string }[]> {
+		const journal = this.bridge.uploadJournal;
+		if (!journal) return [];
+		const priv = await this.bridge.storePrivate();
+		const out: { key: string; name: string; done: number; total: number; startedAt: string }[] = [];
+		for (const { key, record } of await journal.list(this.memberId)) {
+			const name = await openPlacedText(priv, places.fileName(this.memberId, record.fileId), record.fields.name ?? "").catch(() => "(a file)");
+			out.push({ key, name, done: record.parts.length, total: frameCount(record.size, record.chunk), startedAt: record.startedAt });
+		}
+		return out;
+	}
+
+	/** Give up an unfinished upload: the server aborts it (its parts are freed), the journal forgets it. */
+	async discardUpload(key: string): Promise<void> {
+		const journal = this.bridge.uploadJournal;
+		const rec = journal ? await journal.get(key) : null;
+		if (!journal || !rec) return;
+		await this.bridge.apiSend("DELETE", `${areaPath(this.memberId)}/files/uploads/${rec.uploadId}`).catch(() => undefined);
+		await journal.delete(key);
 	}
 
 	/**
@@ -1010,12 +1098,6 @@ export function concat(parts: Uint8Array[]): Uint8Array {
 }
 
 /** Lowercase hex of a digest. */
-/** A file's frames, produced on demand (FilesBridge › putMultipart). */
-export interface FrameSource {
-	count: number;
-	frame(i: number): Promise<Uint8Array>;
-}
-
 /** Files up to this size go up whole, in one request; larger ones as GC01 frames. */
 export const WHOLE_LIMIT = 48 * 1024 * 1024;
 /** Audio tags are parsed from the whole file — up to this size (the parser needs it in memory). */

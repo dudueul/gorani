@@ -23,6 +23,7 @@ import assert from "node:assert/strict";
 import { generateHybridKey, importVaultKey, openWith, unwrapPlacedKey, isPlacedText } from "../../web/src/vault/vault-crypto.ts";
 import { openChunk, chunkFor, frameCount, sealedSize } from "../../web/src/vault/chunked-file.ts";
 import { FilesModel, UNVERIFIED, WHOLE_LIMIT, type FilesBridge } from "../../web/src/ui/files/model.ts";
+import { memoryJournal } from "../../web/src/lib/upload-journal.ts";
 import { places } from "../../web/src/vault/places.ts";
 import { createCodeVault } from "../../web/src/vault/keys.ts";
 import { buildTrust, createIdentity } from "../../web/src/vault/identity.ts";
@@ -170,6 +171,10 @@ const server = {
 const tags = new Map<string, string>();
 
 const multipartCalls: { chunk: number; count: number }[] = [];
+const uploadsOpen = new Map<string, { fileId: string; chunk: number; parts: Map<number, Uint8Array> }>();
+const partsSent: number[] = [];
+let failPartAt: number | null = null;
+const journal = memoryJournal();
 
 // ── the bridge: real crypto, the fake server behind it ──────────────
 const bridge: FilesBridge = {
@@ -214,15 +219,35 @@ const bridge: FilesBridge = {
 		feedCursor++;
 		feed.push({ seq: feedCursor, kind: "file.put", data: { id } });
 	},
-	async putMultipart(_member, fields, frames, chunk) {
-		// (D12) The model hands frames over one at a time; the fake server
-		// keeps them in order, as the backend assembles the parts.
-		multipartCalls.push({ chunk, count: frames.count });
-		const parts: Uint8Array[] = [];
-		for (let i = 0; i < frames.count; i++) parts.push(await frames.frame(i));
-		const sealed = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-		parts.reduce((at, p) => (sealed.set(p, at), at + p.length), 0);
-		const id = fields.file_id;
+	// (D12) A GC01 upload in the model's three steps: the fake server keeps
+	// each part as the backend would, and assembles them at completion in
+	// the order the client lists. `failPartAt` drops the connection once.
+	async multipartStart(_member, plan) {
+		const uploadId = `up-${plan.newFileId}`;
+		uploadsOpen.set(uploadId, { fileId: plan.newFileId, chunk: plan.chunk, parts: new Map() });
+		multipartCalls.push({ chunk: plan.chunk, count: Math.max(1, Math.ceil(plan.size / plan.chunk)) });
+		return { uploadId, key: `files/jinu/${plan.newFileId}/u-1`, parts: Math.max(1, Math.ceil(plan.size / plan.chunk)) };
+	},
+	async multipartPart(_member, uploadId, _key, n, frame) {
+		const up = uploadsOpen.get(uploadId);
+		if (!up) throw new Error("no such upload");
+		if (failPartAt === n) {
+			failPartAt = null;
+			throw new Error(`part ${n} failed three times — the network`);
+		}
+		partsSent.push(n);
+		up.parts.set(n, frame.slice());
+		return { partNumber: n, etag: `"etag-${n}"` };
+	},
+	async multipartComplete(_member, uploadId, fields) {
+		const up = uploadsOpen.get(uploadId);
+		if (!up) throw new Error("no such upload");
+		const listed = (JSON.parse(fields.parts) as { partNumber: number }[]).map((p) => up.parts.get(p.partNumber)!);
+		const sealed = new Uint8Array(listed.reduce((n, p) => n + p.length, 0));
+		listed.reduce((at, p) => (sealed.set(p, at), at + p.length), 0);
+		uploadsOpen.delete(uploadId);
+		const chunk = up.chunk;
+		const id = up.fileId;
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
 		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk, hash: fields.hash ?? null });
@@ -237,6 +262,7 @@ const bridge: FilesBridge = {
 	},
 	toast: (m) => void toasts.push(m),
 	identity: () => me,
+	uploadJournal: journal,
 };
 
 // The member's identity (commit 29d): its own entry, self-pinned, is all
@@ -308,6 +334,40 @@ assert.equal((await model.verify(row.id)).status, "verified");
 	const bigRow = model.state.get().files.find((f) => f.name === "memory.raw")!;
 	assert.equal(objects.get(versions.get(bigRow.id)!.object)!.length, sealedSize(big.length, call.chunk), "every frame, in order");
 	assert.equal((await model.verify(bigRow.id)).status, "verified", "the streamed SHA-256 is the one the frames open to");
+	assert.deepEqual(await journal.list("jinu"), [], "a finished upload leaves nothing in the journal");
+}
+
+// 5c. A connection that drops part-way (D12, 31b): the journal remembers
+// the parts that landed; choosing the same file again sends only the rest,
+// with the same id, key and signed record — and the file opens, verified.
+{
+	const big = new Uint8Array(WHOLE_LIMIT + 9 * 1024 * 1024);
+	for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, Math.min(big.length, i + 65536)));
+	const disk = new File([big as BlobPart], "disk.E01", { type: "application/octet-stream", lastModified: 1_700_000_000_000 });
+	failPartAt = 4;
+	partsSent.length = 0;
+	await assert.rejects(model.upload([disk]), /part 4 failed/);
+	assert.deepEqual(partsSent, [1, 2, 3], "three parts landed before the drop");
+	const stopped = await model.unfinishedUploads();
+	assert.deepEqual(stopped.map((u) => [u.name, u.done]), [["disk.E01", 3]], "the journal says what stopped, its name opened from the sealed field");
+	assert.ok(!JSON.stringify(await journal.list("jinu")).includes("disk.E01"), "no plaintext name at rest");
+	partsSent.length = 0;
+	await model.upload([disk]);
+	assert.deepEqual(partsSent, [4, 5, 6, 7, 8], "only the missing parts are sent");
+	assert.match(toasts.find((t) => /Resuming/.test(t)) ?? "", /Resuming “disk\.E01” from part 4 of 8/);
+	const row = model.state.get().files.find((f) => f.name === "disk.E01")!;
+	assert.equal((await model.verify(row.id)).status, "verified", "the resumed file opens to the bytes its signature names");
+	assert.deepEqual(await journal.list("jinu"), []);
+	// The server forgot an upload (its window passed): the next try starts over.
+	failPartAt = 2;
+	const memo = new File([big.subarray(0, WHOLE_LIMIT + 1) as BlobPart], "capture.pcap", { lastModified: 1_700_000_000_001 });
+	await assert.rejects(model.upload([memo]), /part 2 failed/);
+	uploadsOpen.clear();
+	partsSent.length = 0;
+	await model.upload([memo]);
+	assert.ok(toasts.some((t) => /gone from the server — starting over/.test(t)));
+	assert.deepEqual(partsSent, [1, 2, 3, 4, 5, 6, 7], "every part again, under a fresh upload");
+	assert.equal((await model.verify(model.state.get().files.find((f) => f.name === "capture.pcap")!.id)).status, "verified");
 }
 
 // 6. Rename re-seals; the server's stored name changes shape but stays sealed.

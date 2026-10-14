@@ -26,7 +26,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 3 *(landed: commit 29c, `api:objectlock`)* | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
-| 6 | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
+| 6 *(29f landed: `api:approvals`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
 | 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
 ## Stage 1 — the audit, tamper-evident
@@ -320,6 +320,30 @@ second lead (not the requester)
   trash (409), its housekeeping prunes no versions and purges nothing, and
   the nightly pass does the same. The Worker tells the case store (an
   internal call, like the kind at opening); the registry is the record.
+
+#### 29f as built
+
+- `worker/src/family/approvals.rs` — the registry's `approvals` table
+  (migration v6, with `cases.hold_at/hold_by`); request, list, approve,
+  withdraw; `case_hold`. The approve call re-checks that the action is
+  still possible, runs it, records who agreed, and audits both
+  (`approval.approve`, then the action itself naming the approval).
+- `web/src/vault/approvals.ts` — `requestApproval` (the id chosen before
+  signing), `approveRequest` (checks the REQUEST's signature against the
+  approver's trust before signing its own), `verifyApproval` (both
+  signatures, two different people).
+- The hold in the case store (`member.rs › is_held, sync_hold`): told by
+  the Worker after the registry records a change (`routes.rs ›
+  tell_case_hold`), and again by every nightly pass, which sends each case
+  store the registry's word (`case-holds`) before it purges. A held store
+  refuses trash (`files_store.rs › evidence_refusal`) and its housekeeping
+  gates every purge query with `AND 0` — it matches nothing.
+- The Team panel: "Place a legal hold", "Ask to lift the hold", "Ask to
+  close" (evidence), and each pending request with its signature's verdict
+  as THIS member's client sees it; "Agree" only for a different lead, only
+  when the request verifies.
+- Not yet: approvals expire after 7 days by the clock; `case.export` joins
+  in stage 7.
 
 ### 29g — intake and custody transfers
 

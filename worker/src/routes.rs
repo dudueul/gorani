@@ -316,6 +316,35 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 		}
 		("POST", [case, "key", "done"]) => return forward_family(&env, &identity.email, "POST", format!("case-key-done/{case}"), Some(serde_json::json!({}))).await,
 		("POST", [case, "close"]) => return forward_family(&env, &identity.email, "POST", format!("case-close/{case}"), Some(serde_json::json!({}))).await,
+		// ── The two-person rule and the legal hold (commit 29f, family/approvals.rs) ──
+		("GET", [case, "approvals"]) => return forward_family(&env, &identity.email, "GET", format!("case-approvals/{case}"), None).await,
+		("POST", [case, "approvals"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			return forward_family(&env, &identity.email, "POST", format!("case-approvals/{case}"), Some(body)).await;
+		}
+		("DELETE", [case, "approvals", approval]) => return forward_family(&env, &identity.email, "DELETE", format!("case-approvals/{case}/{approval}"), None).await,
+		("POST", [case, "approvals", approval, "approve"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			let mut done = forward_family(&env, &identity.email, "POST", format!("case-approve/{case}/{approval}"), Some(body)).await?;
+			if done.status_code() != 200 {
+				return Ok(done);
+			}
+			let answer: serde_json::Value = done.json().await?;
+			// A released hold reaches the case's store now (the registry is
+			// the record; tonight's pass would correct a lost call — cron.rs).
+			if answer.get("executed").and_then(|e| e.as_str()) == Some("hold.release") {
+				tell_case_hold(&env, case, false, &identity.email).await?;
+			}
+			return Response::from_json(&answer);
+		}
+		("POST", [case, "hold"]) => {
+			let placed = forward_family(&env, &identity.email, "POST", format!("case-hold/{case}"), Some(serde_json::json!({}))).await?;
+			if placed.status_code() != 200 {
+				return Ok(placed);
+			}
+			tell_case_hold(&env, case, true, &identity.email).await?;
+			return Response::from_json(&serde_json::json!({ "hold": true }));
+		}
 		_ => {}
 	}
 	let Some((case, content)) = rest.split_first() else { return json_error(404, "no such route") };
@@ -363,6 +392,20 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 /// lives there), then the case's store — settings that say only "on" and
 /// whose store it is. A case has no root and no unlock methods: its key is
 /// in the grants, sealed to each grantee's own root.
+/// Tell a case's store its legal hold (commit 29f), after the registry
+/// recorded the change. A store that does not confirm is an error the
+/// caller sees: the record already changed, and placing a hold again is
+/// harmless (idempotent) — retry it, or tonight's reconciliation (cron.rs)
+/// finishes the job. (A lost RELEASE leaves the store held a little longer:
+/// the safe side.)
+async fn tell_case_hold(env: &Env, case: &str, hold: bool, actor: &str) -> Result<()> {
+	let told = forward_member(env, &format!("case:{case}"), "PUT", "case-hold", Some(serde_json::json!({ "hold": hold })), actor.to_string()).await?;
+	if told.status_code() >= 300 {
+		return Err(Error::RustError(format!("the case store did not confirm the legal hold ({}); the registry has it, and tonight's pass will retry", told.status_code())));
+	}
+	Ok(())
+}
+
 async fn case_open(mut req: Request, env: Env, identity: &Identity) -> Result<Response> {
 	let body = req.json::<serde_json::Value>().await?;
 	let Some(id) = body.get("id").and_then(|v| v.as_str()).filter(|i| crate::area::valid_case_id(i)).map(str::to_string) else {

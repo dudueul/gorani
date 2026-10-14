@@ -370,6 +370,22 @@ try {
 		await page.locator('[data-test="viewer-refused"]').waitFor({ timeout: 30_000 });
 		assert.equal(await page.locator("text=pwned").count(), 0, "nothing of the sample is rendered");
 		await page.keyboard.press("Escape");
+		// The legal hold and the two-person rule (commit 29f), from the Team
+		// panel: one person places the hold; closing the EVIDENCE case is
+		// only ASKED for — the request shows its signature verified in this
+		// browser, and no "Agree" for the person who asked.
+		await teamButton.click();
+		await page.getByRole("button", { name: "Cases" }).click();
+		page.once("dialog", (d) => void d.accept());
+		await page.locator('[data-test="hold-place-ir-e2e"]').click();
+		await page.locator('[data-test="hold-ir-e2e"]').waitFor({ timeout: 30_000 });
+		await page.locator('[data-test="ask-case.close-ir-e2e"]').click();
+		const asked = page.locator('[data-test^="approval-"]').first();
+		await asked.waitFor({ timeout: 30_000 });
+		assert.match(await asked.textContent(), /case\.close asked by .*signature verified/s, "the request's signature verifies in the browser");
+		assert.equal(await asked.locator('[data-test^="approve-"]').count(), 0, "no Agree for the person who asked");
+		const reqs = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/approvals", { email: "mom@family.test" });
+		assert.equal(reqs.json.approvals[0].status, "pending", "the case stays open until a second lead agrees");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
 		await ctx.close();
 	}
@@ -395,7 +411,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, a sample refused by the viewer, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, a sample refused by the viewer, a legal hold and a two-person request, re-enrol");
 } finally {
 	await dev.close();
 }

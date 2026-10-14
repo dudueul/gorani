@@ -592,8 +592,17 @@ impl GoraniMemberDO {
 	/// + retention"; D6 makes the objects themselves write-once). A file can
 	/// gain versions, be renamed and moved — the audit records each — but
 	/// it does not go to the Trash, so nothing ever purges it.
+	///
+	/// A legal hold (commit 29f) refuses the same, on any case, until two
+	/// people lift it (family/approvals.rs).
 	async fn evidence_refusal(&self) -> Result<Option<Response>> {
-		Ok(if self.is_evidence().await? { Some(json_error(409, "this is an evidence case: its files and folders are never deleted — they leave with the case's retention")?) } else { None })
+		if self.is_evidence().await? {
+			return Ok(Some(json_error(409, "this is an evidence case: its files and folders are never deleted — they leave with the case's retention")?));
+		}
+		if self.is_held().await? {
+			return Ok(Some(json_error(409, "this case is under a legal hold: nothing is deleted until two leads lift it")?));
+		}
+		Ok(None)
 	}
 
 	/// The uploader's signed content hash (commit 29d, docs/CUSTODY.md ›

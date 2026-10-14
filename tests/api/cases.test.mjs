@@ -41,6 +41,7 @@ import { opensAnything } from "../../web/src/vault/rotation.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "../lib/placed.mjs";
 import { signedHash } from "../lib/team.mjs";
+import { approveRequest, requestApproval } from "../../web/src/vault/approvals.ts";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -320,8 +321,17 @@ try {
 	assert.equal((await as(dee).get(`${BASE}/files/list`)).status, 403);
 
 	// ── 6. Closing ──────────────────────────────────────────────────────
+	// An evidence case closes with TWO people since commit 29f (api:approvals
+	// has the rule in full): the direct close is refused; a manager asks, a
+	// second, active lead agrees. (lu was deactivated above, so a new lead
+	// joins — certified by ana, and pinning her.)
 	assert.equal((await as(cy).send("POST", `${BASE}/close`)).status, 403, "only a manager closes");
-	assert.equal((await as(ana).send("POST", `${BASE}/close`)).status, 200);
+	assert.equal((await as(ana).send("POST", `${BASE}/close`)).status, 409, "…and not alone: this is an evidence case");
+	const max = await join("max", "lead", ana.email);
+	assert.equal((await as(ana).send("PUT", "/api/v1/family/members/max/cert", await certify(ana.signer, await entryOf("max")))).status, 200);
+	await pinIdentity(max, ana);
+	const asked = await requestApproval(as(ana).call, ana.signer, CASE, "case.close");
+	assert.equal((await approveRequest(as(max).call, max.signer, await trustOf(max), asked)).executed, "case.close", "a second lead agreed: closed");
 	const newSealer = await storeSealer(await bundleOf(ana, await caseOf(ana)), AREA);
 	assert.equal((await putFile(ana, newSealer, "late.txt", "too late")).status, 409, "a closed case takes no writes");
 	assert.equal((await as(ext).get(`${BASE}/files/list`)).status, 200, "…and still reads");

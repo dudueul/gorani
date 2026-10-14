@@ -24,7 +24,7 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 3 | The dependency budget | web/package.json, NOTICE | Why ~12 runtime packages, why Trusted Types, why the supply chain is part of the threat model |
 | 4 | The sealed formats | crates/formats/ (②), docs/ENCRYPTION.md | GV01/GV02/GV03/GK01/GW01 byte by byte; how to read a crypto spec |
 | 5 | Chunked files | crates/formats/ GC01 (③) | 8 MiB authenticated frames; seeking into the middle of a video without the rest |
-| 6 | A family key hierarchy | web/src/vault/family.ts (④), docs/FAMILY.md | Parents' master key, dual-sealed kids' store keys, why kids *cannot* open parents |
+| 6 | A family key hierarchy *(retired in 27c — lesson 37)* | docs/FAMILY.md (historical; the code is in git history) | Parents' master key, dual-sealed kids' store keys, why kids *cannot* open parents — and, read with lesson 37, why a team must not work this way |
 | 7 | Speaking S3 from a Worker | crates/s3 + worker/src/s3.rs (⑤) | SigV4 by hand, golden vectors, streaming, multipart |
 | 8 | Durable Objects as per-member databases | worker/src/member.rs (⑥) | SQLite in a DO, trigger-only change feeds, tombstones, journals |
 | 9 | The vault in the browser | web/src/vault/ (⑨) | Passkey PRF, Argon2id, non-extractable keys, device hold, auto-lock |
@@ -55,6 +55,7 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 34 | A case is a store | worker/src/area.rs, worker/src/family.rs › Cases and grants, web/src/vault/cases.ts, tests/api/cases.test.mjs (26) | One abstraction (an area) instead of a second store type; key custody in grants; policy the crypto cannot express (read-only) enforced by the server and named as such; why a rotation commits before it walks |
 | 35 | Whose key is this? | web/src/vault/identity.ts, worker/src/family.rs › Identities, tests/unit/identity.test.ts (27) | Fingerprints people can compare; trust as pins under the member's own MAC; one-hop certification instead of a PKI; signing statements, not objects; full digests vs. short labels |
 | 36 | Many hands, in practice | web/src/vault/recovery.ts, worker/src/family/recovery.rs, tests/api/recovery.test.mjs (27) | A ceremony as a state machine; every key a threshold scheme seals to is a substitution point; verifying a reconstruction; the one audited path that may change a vault's root |
+| 37 | Removing a superuser | worker/src/routes.rs › scope_ctx, web/src/vault/keys.ts, tests/lib/team.mjs, every suite's setup (27) | Retiring a privilege without a hole: the replacement first (grants, ceremonies), then the removal; a "clean break" as a test-suite port; when two people share a store, model it as such (a case), not as one acting for the other |
 
 Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at

@@ -33,8 +33,8 @@
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, openWith, importVaultKey, openSealedText, sealText } from "../../web/src/vault/vault-crypto.ts";
-import { createChildVault } from "../../web/src/vault/family.ts";
-import { createStoreKey } from "../../web/src/vault/family.ts";
+import { createCodeVault } from "../../web/src/vault/keys.ts";
+import { createStoreKey } from "../../web/src/vault/keys.ts";
 import { newCase, openCaseKey, openCaseTitle, sealCaseGrant, rotateCase } from "../../web/src/vault/cases.ts";
 import { buildTrust, certify, createIdentity, hybridDigest, pin, statements } from "../../web/src/vault/identity.ts";
 import { opensAnything } from "../../web/src/vault/rotation.ts";
@@ -66,7 +66,7 @@ async function join(id, role, by, extra = {}) {
 	const email = `${id}@team.test`;
 	const added = await api(dev.base, "POST", "/api/v1/family/members", { email: by ?? email, body: { id, name: id, role, emails: [email], ...extra } });
 	assert.equal(added.status, 200, `add ${id}: ${added.text}`);
-	const vault = await createChildVault();
+	const vault = await createCodeVault();
 	const root = await importVaultKey(vault.rootBundle.slice());
 	const rootPublic = { ec: vault.publicKey, kem: vault.pqPublicKey };
 	const made = await createIdentity(id, root, rootPublic);
@@ -229,7 +229,7 @@ try {
 	assert.equal((await as(ana).send("PUT", `${BASE}/grants/cy`, { permission: "read", keyId: c.keyId, keySealed: fakeCopy, signature: boSig })).status, 200);
 	await assert.rejects(async () => openCaseKey(cy.root, await caseOf(cy), await trustOf(cy)), /the signature on your copy of case ir-2026-014's key does not verify/, "a replayed signature names another grantee and another key");
 	// A manager never seals to a root the grantee's trusted identity does not name.
-	const fakeRoot = await createChildVault();
+	const fakeRoot = await createCodeVault();
 	await assert.rejects(sealCaseGrant(ana.root, await caseOf(ana), { member: "cy", keyId: fakeRoot.keyId, publicKey: fakeRoot.publicKey, pqPublicKey: fakeRoot.pqPublicKey }, ana.signer, await trustOf(ana)), /not the one their identity names/);
 	await assert.rejects(sealCaseGrant(ana.root, await caseOf(ana), await rootOf(ana, "fay"), ana.signer, await trustOf(ana)), /not verified/, "nor to a member whose identity nobody verified");
 	assert.equal((await grant(ana, cy, "read")).status, 200, "the real grant back");

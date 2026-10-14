@@ -16,7 +16,7 @@
 | **GC01** | a large file in frames | AES-256-GCM per 8 MiB frame, position+finality AAD | 28 B/frame | the content key | yes |
 | **GB2** | the backup container (header authenticated; GB1 before commit 25) | AES-256-GCM segments under a per-backup file key | ~28 B/1 MiB | the key file | yes |
 
-The pattern everywhere: **content is GV02** (fast, symmetric, one fresh key per item) and only the small content key is sealed — into its place in the store (GV04, since commit 25; GV03 before). Key material sealed to a member's root (store records, master copies, guardian copies) stays GV03. Rotation re-seals keys, never content.
+The pattern everywhere: **content is GV02** (fast, symmetric, one fresh key per item) and only the small content key is sealed — into its place in the store (GV04, since commit 25; GV03 before). Key material sealed to a member's root (store records, case grants, the identity key) or to the team recovery key (recovery copies) stays GV03. Rotation re-seals keys, never content.
 
 ## The key hierarchy
 
@@ -25,14 +25,15 @@ unlock secret (passkey PRF ‖ Argon2id password ‖ recovery code)
    ──▶ KEK ──GW01──▶ root private key (GK01 bundle: P-256 PKCS#8 ‖ ML-KEM seed ‖ P-256 public)
                        │ everything below is sealed to the root's public half (GV03)
                        ├─▶ files store key          (stores.files; private half sealed to the root)
-                       ├─▶ family shared-area key   (one key, sealed to EVERY member's root)
-                       ├─▶ parents' master key      (private half sealed to each parent's root — docs/FAMILY.md)
+                       ├─▶ case keys               (each sealed to every grantee's root, signed — docs/CASES.md)
+                       ├─▶ identity signing key    (ECDSA P-256, sealed to the root — identity.ts)
                        ├─▶ backup public key        (private half ONLY in the owner's key file)
                        └─▶ retired keys             (never deleted)
 content key (32 random bytes per file version) ──GV02──▶ the bytes, preview, text
 ```
 
-- All public halves + wrapped private copies live in the member's settings; the server can open nothing.
+- All public halves + wrapped private copies live in the member's settings (own store, identity) or the registry (case grants, recovery copies and shares); the server can open nothing.
+- The team recovery key's private half is never stored whole: Shamir M-of-N shares, each sealed to a lead's root (docs/CASES.md › Recovery).
 - Key ids: `base64(SHA-256(raw pub)[..12])` with `+/=` removed (16 chars); hybrid keys: `"pq"` + 14 chars of SHA-256(P-256 raw ‖ ML-KEM pub).
 
 ## Byte layouts (big-endian; AAD = GCM additional authenticated data)

@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { startDev, api } from "../api/_dev.mjs";
-import { createParentsMaster, createChildVault, createParentVault, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
 import { sealChunked, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
@@ -55,20 +55,17 @@ if (!chromium) {
 const dev = await startDev();
 try {
 	// ── seed: mom (password vault), jinu (recovery vault), sora (none) ──
-	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
-	const master = await createParentsMaster();
-	await api(dev.base, "PUT", "/api/v1/family/master", { body: { keyId: master.keyId, publicKey: master.publicKey } });
-	const mom = await createParentVault("correct horse battery staple 42");
-	const momSaved = await api(dev.base, "PUT", "/api/v1/members/mom/vault", { body: { settings: { enabled: true, keyId: mom.keyId, publicKey: mom.publicKey, pqPublicKey: mom.pqPublicKey, methods: mom.methods, guardian: null } } });
+	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
+	const mom = await createVault("correct horse battery staple 42");
+	const momSaved = await api(dev.base, "PUT", "/api/v1/members/mom/vault", { body: { settings: { enabled: true, keyId: mom.keyId, publicKey: mom.publicKey, pqPublicKey: mom.pqPublicKey, methods: mom.methods } } });
 	assert.equal(momSaved.status, 200, JSON.stringify(momSaved.json));
-	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "jinu", name: "Jinu", role: "child", emails: ["jinu@family.test"] } });
-	const jinu = await createChildVault();
+	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "jinu", name: "Jinu", role: "analyst", emails: ["jinu@family.test"] } });
+	const jinu = await createCodeVault();
 	const filesStore = await createStoreKey();
 	const own = await sealStoreKeyToMember(filesStore, { ec: jinu.publicKey, kem: jinu.pqPublicKey });
-	const guardian = await sealStoreKeyToMaster(filesStore, master);
-	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { body: { settings: { enabled: true, keyId: jinu.keyId, publicKey: jinu.publicKey, pqPublicKey: jinu.pqPublicKey, methods: jinu.methods, stores: { files: own }, guardian } } });
+	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: jinu.keyId, publicKey: jinu.publicKey, pqPublicKey: jinu.pqPublicKey, methods: jinu.methods, stores: { files: own } } } });
 	assert.equal(saved.status, 200);
-	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "sora", name: "Sora", role: "child", emails: ["sora@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "sora", name: "Sora", role: "analyst", emails: ["sora@family.test"] } });
 
 	const browser = await chromium.launch({ headless: true });
 

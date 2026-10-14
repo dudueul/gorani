@@ -157,7 +157,7 @@ old CHECK constraint allowed only parent/child.
 2. **Roles** (landed: commit 26c, `api:roles`) — the registry's four roles (parent→lead, child→analyst);
    auditor writes refused; externals see only their grants. Transitional
    rule: a lead may still act for a member's own area (the parent rule)
-   until stage 5 removes it.
+   until stage 5 removes it (removed: commit 27c).
 3. **Cases** (landed: commit 26d, `api:cases`) — the registry's cases and
    grants; `case:<id>` stores; `/api/v1/cases/<id>/files/…`; the client's
    case-key grant and revoke (revoke = rotate + the reseal walk). What the
@@ -168,7 +168,9 @@ old CHECK constraint allowed only parent/child.
 5. **Recovery** — the team recovery key, shares to leads, recovery copies,
    the ceremony (landed: commit 27b, `api:recovery`; the protocol above is
    what was built); then the parent act-for rule and the master key go
-   (27c).
+   (landed: commit 27c — the master key, guardian copies, the family's
+   role aliases and the act-for rule removed; every suite ported, shared
+   work modelled as a case — `api:ownership`).
 6. **UI** — the case list, grant dialog, ceremony screens.
 
 ## Stage 3 as built

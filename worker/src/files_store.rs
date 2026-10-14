@@ -426,7 +426,8 @@ impl GoraniMemberDO {
 
 	/// The read log (`GET …/reads[?file=]`): who read which version, from
 	/// what kind of client, when — newest first. Structure only, like the
-	/// rest of this DO; readable to the member and their parents.
+	/// rest of this DO; readable to the member, leads and auditors
+	/// (routes.rs › audit_ctx), and for a case to anyone on it.
 	pub(crate) async fn read_log(&self, file: Option<&str>) -> Result<Response> {
 		let rows: Vec<ReadRow> = match file {
 			Some(f) => self.sql.exec("SELECT actor, file_id, version, client, first_at, last_at, requests FROM read_log WHERE file_id = ?1 ORDER BY last_at DESC LIMIT 500", Some(vec![f.into()]))?.to_array()?,

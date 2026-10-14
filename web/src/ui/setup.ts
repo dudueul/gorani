@@ -1,21 +1,24 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 
 /**
- * <gorani-setup>: creating a member's vault — the moment the family model
- * becomes real. The parent (or first member) picks a password, gets a
- * recovery code shown exactly once, and stores the settings: a hybrid
- * post-quantum root sealed under both methods, from birth (no upgrade path
- * will ever be needed — there was never a pre-quantum gorani key).
+ * <gorani-setup>: creating a member's vault. Every member sets up their
+ * OWN (since commit 27c nobody sets one up for someone else): they pick a
+ * password, get a recovery code shown exactly once, and store the
+ * settings — a hybrid post-quantum root sealed under both methods, from
+ * birth (no upgrade path will ever be needed — there was never a
+ * pre-quantum gorani key).
  *
- * After the vault exists, the store keys (files; the family shared area) are
- * created and sealed — here in code so the first session has them; the UI
- * does the same composition family.ts teaches.
+ * After the vault exists, the member's own files store key is created and
+ * sealed — here in code so the first session has it (keys.ts is the
+ * composition). Their identity key, its registration and their recovery
+ * copy are the next steps (identity.ts, recovery.ts; the screens are
+ * docs/CASES.md › stage 6).
  */
 
 import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { createVaultBundle, confirmKeyBytes, addPasswordMethod, addRecoveryMethod, type VaultSettings } from "../vault/methods.ts";
-import { createStoreKey, sealStoreKeyToMember } from "../vault/family.ts";
+import { createStoreKey, sealStoreKeyToMember } from "../vault/keys.ts";
 import { importVaultKey } from "../vault/vault-crypto.ts";
 import { deriveRecordKey, macRecord } from "../vault/records.ts";
 import { api } from "../lib/api.ts";
@@ -93,9 +96,8 @@ export class GoraniSetup extends LitElement {
 		this.busy = true;
 		try {
 			const bundle = await createVaultBundle(this.password);
-			// The first store key: this member's files. (The family shared
-			// area's key arrives with the family-admin screen — its copies are
-			// sealed per member there; docs/FAMILY.md.)
+			// The first store key: this member's files. (Shared work lives in
+			// cases, whose keys come with their grants — cases.ts.)
 			const filesStore = await createStoreKey();
 			bundle.settings.stores.files = await sealStoreKeyToMember(filesStore, { ec: bundle.settings.publicKey, kem: bundle.settings.pqPublicKey });
 			// …authenticated from birth: the record's MAC under the new root's

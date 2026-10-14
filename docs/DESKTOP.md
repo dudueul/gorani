@@ -63,11 +63,13 @@ lock drops the root from memory (nothing is opened, sealed or pulled while
 locked). Linux additionally keeps its local cache encrypted at rest (GL1:
 64 KiB sealed blocks, position-bound).
 
-## Guardian access
+## Whose device
 
-A parent enrols a device **for a child** with the child's guardian
-enrolment code (docs/FAMILY.md) — the child's password is never involved.
-Parents act for any member at the API layer; children only for themselves.
+A member enrols their own devices only: since commit 27c no one — a lead
+included — acts for another member's area, so the family edition's
+"guardian access" (a parent enrolling a computer for a child with the
+child's code) is gone. A team's shared work lives in cases; desktop sync of
+a case is a member syncing the cases they are granted (docs/CASES.md).
 
 ## Testing (the pattern the port follows)
 

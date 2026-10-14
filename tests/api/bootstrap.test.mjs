@@ -27,28 +27,28 @@ const create = (email, body, token) =>
 		headers: { "content-type": "application/json", "x-gorani-dev-email": email, ...(token ? { "x-gorani-bootstrap": token } : {}) },
 		body: JSON.stringify(body),
 	});
-const mom = { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] };
+const mom = { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] };
 
 try {
 	// The race the token closes: the first caller through Access, no token.
-	const raced = await create("stranger@elsewhere.test", { id: "eve", name: "Eve", role: "parent", emails: ["stranger@elsewhere.test"] });
+	const raced = await create("stranger@elsewhere.test", { id: "eve", name: "Eve", role: "lead", emails: ["stranger@elsewhere.test"] });
 	assert.equal(raced.status, 403, "without the token, nobody becomes the first parent");
-	assert.equal((await create("stranger@elsewhere.test", { id: "eve", name: "Eve", role: "parent", emails: [] }, "a-guess")).status, 403, "nor with a guess");
+	assert.equal((await create("stranger@elsewhere.test", { id: "eve", name: "Eve", role: "lead", emails: [] }, "a-guess")).status, 403, "nor with a guess");
 	// A body that is not an object is refused, not a panic (O19's lesson).
 	const notObject = await fetch(`${dev.base}/api/v1/family/members`, { method: "POST", headers: { "content-type": "application/json", "x-gorani-dev-email": "mom@family.test" }, body: "[]" });
 	assert.equal(notObject.status, 400);
 	// A client cannot forge the Worker's verdict.
 	assert.equal((await create("stranger@elsewhere.test", { ...mom, id: "eve", emails: [], __bootstrap: "ok" })).status, 403, "a client-sent __bootstrap is overwritten");
 	// The first member must be a parent.
-	assert.equal((await create("kid@family.test", { id: "kid", name: "Kid", role: "child", emails: ["kid@family.test"] }, TOKEN)).status, 400);
+	assert.equal((await create("kid@family.test", { id: "kid", name: "Kid", role: "analyst", emails: ["kid@family.test"] }, TOKEN)).status, 400);
 
 	// The operator, with the token: the first parent.
 	const first = await create("mom@family.test", mom, TOKEN);
 	assert.equal(first.status, 200, await first.clone().text());
 	// From here the token is irrelevant: a stranger holding it adds nobody…
-	assert.equal((await create("stranger@elsewhere.test", { id: "eve", name: "Eve", role: "parent", emails: [] }, TOKEN)).status, 403, "the token opens the door once");
+	assert.equal((await create("stranger@elsewhere.test", { id: "eve", name: "Eve", role: "lead", emails: [] }, TOKEN)).status, 403, "the token opens the door once");
 	// …and the parent needs none.
-	const kid = await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "child", emails: ["jinu@family.test"] } });
+	const kid = await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "analyst", emails: ["jinu@family.test"] } });
 	assert.equal(kid.status, 200);
 	const fam = await api(dev.base, "GET", "/api/v1/family", { email: "mom@family.test" });
 	assert.deepEqual(fam.json.members.map((m) => m.id).sort(), ["jinu", "mom"]);

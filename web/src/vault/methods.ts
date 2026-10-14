@@ -44,9 +44,11 @@ export interface VaultSettings {
 	methods: UnlockMethod[];
 	/** Store keys; each record's `mac` pins it to this member (records.ts). */
 	stores: Record<string, { keyId: string; publicKey: JsonWebKey; pqPublicKey?: string; privateKeySealed: string; mac?: string }>;
-	guardian?: { masterKeyId: string; masterPublicKey: { ec: JsonWebKey; kem: string }; storeSealed: string };
-	/** Parents only: their sealed copy of the family master (family.ts). */
-	masterSealed?: string;
+	/** The member's identity record — signing key sealed to the root, pins,
+	 * MAC (identity.ts, commit 27). (The family edition's guardian copy and
+	 * master key lived here until commit 27c; recovery copies replaced them,
+	 * in the registry.) */
+	identity?: import("./identity.ts").IdentityRecord;
 }
 
 /** The three ways a user presents a secret, before we know which method matches. */

@@ -15,12 +15,12 @@
 
 import assert from "node:assert/strict";
 import { buildTrust, certify, createIdentity, fingerprint, hybridDigest, identityKeyId, openIdentity, pin, statements, stmt, trustedRoot, type RegistryIdentity } from "../../web/src/vault/identity.ts";
-import { createChildVault } from "../../web/src/vault/family.ts";
+import { createCodeVault } from "../../web/src/vault/keys.ts";
 import { importVaultKey } from "../../web/src/vault/vault-crypto.ts";
 
 /** A member with a root and an identity, as the registry would list them. */
 async function member(id: string) {
-	const vault = await createChildVault();
+	const vault = await createCodeVault();
 	const root = await importVaultKey(vault.rootBundle.slice());
 	const rootPublic = { ec: vault.publicKey, kem: vault.pqPublicKey };
 	const made = await createIdentity(id, root, rootPublic);

@@ -35,7 +35,7 @@
  */
 
 import { combine, split } from "./shamir.ts";
-import { createStoreKey, sealStoreKeyToMember, type SealingKey } from "./family.ts";
+import { createStoreKey, sealStoreKeyToMember, type SealingKey } from "./keys.ts";
 import { checkRecordMatches } from "./records.ts";
 import { hybridDigest, hybridDigestOf, statements, stmt, trustedRoot, type Signer, type Trust } from "./identity.ts";
 import type { MemberRoot } from "./cases.ts";

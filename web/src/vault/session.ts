@@ -42,7 +42,7 @@
 
 import { importVaultKey, deriveIndexKey, type VaultPrivateKey } from "./vault-crypto.ts";
 import { deriveRecordKey, macRecord, verifyRecord } from "./records.ts";
-import { openStoreKey as openSealedStoreKey } from "./family.ts";
+import { openStoreKey as openSealedStoreKey } from "./keys.ts";
 import { toBase64, fromBase64 } from "../lib/encoding.ts";
 import type { VaultSettings } from "./methods.ts";
 

@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { autoLockDue, AUTO_LOCK, openSession } from "../../web/src/vault/session.ts";
-import { createChildVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 
 const MIN = 60_000;
 const t0 = 1_000_000_000;
@@ -29,7 +29,7 @@ assert.equal(autoLockDue(t0 + 60 * MIN, t0 + 60 * MIN, null), false, "an hour of
 assert.equal(autoLockDue(t0 + 2 * MIN, t0, null, { idleMinutes: 1, hiddenMinutes: 1 }), true, "rules are parameters (tests, future policy)");
 
 // ── 2. The session's lock ───────────────────────────────────────────
-const vault = await createChildVault();
+const vault = await createCodeVault();
 const store = await createStoreKey();
 const settings = {
 	enabled: true,

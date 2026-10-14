@@ -1,7 +1,17 @@
-# Family: the key hierarchy, walked through
+# Family: the key hierarchy, walked through (historical)
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
-> The code twin is `web/src/vault/family.ts`; the behavioral test is `tests/unit/family.test.mjs`.
+>
+> **Retired in commit 27c.** This is how gorani's first edition — a family
+> NAS — let parents open the children's areas: one master key, guardian
+> copies, a parent acting for a child. A security-operations team needs the
+> opposite default, and docs/CASES.md replaced all three: case grants
+> (signed, per case), the team recovery key (M-of-N leads, never one), and
+> no member — a lead included — acting for another member's area. The file
+> stays because the migration table in docs/CASES.md is written against it,
+> and because the contrast is the lesson. Its code (`web/src/vault/family.ts`,
+> `tests/unit/family.test.mjs`) is gone; `git show 72745a2:web/src/vault/family.ts`
+> has it.
 
 Gorani is a family NAS: several members, each with a full vault, and a
 **one-way hierarchy** — parents can open the children's areas; children can

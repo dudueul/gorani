@@ -44,9 +44,11 @@ use crate::files_store::urlquery;
 /// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
 pub const MIGRATIONS: &[&str] = &[
 	// Vault settings: one row. The JSON carries public halves, unlock methods
-	// (wrapped private copies), store keys, and the family links
-	// (masterSealed for parents, guardian.* for children) — shared/family.ts
-	// is the authoritative shape.
+	// (wrapped private copies), store keys and the identity record —
+	// web/src/vault/methods.ts › VaultSettings is the authoritative shape.
+	// (Until commit 27c it also carried the family links, masterSealed and
+	// guardian.*; the recovery copies that replaced them live in the
+	// registry.)
 	"CREATE TABLE IF NOT EXISTS vault (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
 	// The member's own audit log. Free-text details are sealed; structure is
 	// readable (docs/APPS.md's audit rules).

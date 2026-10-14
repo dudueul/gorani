@@ -13,9 +13,9 @@
 //! the moment `POLICY_AUD` is set — the two are mutually exclusive by
 //! construction, so a dev bypass can never leak to a deployment.
 //!
-//! Identity is the Access email. The family registry (GoraniFamilyDO) maps
-//! emails to members; a parent's email may act for their children at the
-//! API layer (the same one-way hierarchy the keys give them cryptographically).
+//! Identity is the Access email. The team registry (GoraniFamilyDO) maps
+//! emails to members; a member's email acts for their own area and for the
+//! cases they are granted (routes.rs), never for another member's area.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

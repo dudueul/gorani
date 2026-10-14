@@ -1,21 +1,21 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 
-//! `GoraniFamilyDO` — the family registry: one instance per deployment
-//! (named `family`). It holds the small, deliberately readable structure the
-//! whole product is organised around: who the members are (names, roles,
-//! Access emails) and the parents' master **public** half. It never holds a
-//! private key: the master's private half exists only sealed to each
-//! parent's root, in that parent's GoraniMemberDO settings.
+//! `GoraniFamilyDO` — the team registry: one instance per deployment (named
+//! `family`, a name kept from the family edition it grew out of). It holds
+//! the small, deliberately readable structure the product is organised
+//! around: who the members are (names, roles, Access emails, expiries), the
+//! cases and who holds their keys, identities and certificates, and the
+//! team recovery key's public record (docs/CASES.md). It never holds a
+//! private key: every key copy here is sealed to someone's root, and what
+//! the registry decides is only WHO may hold which copy.
 //!
-//! The member's *data* lives in a separate `GoraniMemberDO` (named
-//! `member:<id>`) — one SQLite database per member, so one member's file
-//! store never crowds another's. See member.rs.
+//! A member's *data* lives in a separate `GoraniMemberDO` (named
+//! `member:<id>`, and `case:<id>` for a case) — one SQLite database per
+//! area, so one area's file store never crowds another's. See member.rs.
 //!
-//! Bootstrap rule: the first member is created by any authenticated caller
-//! (the family deploys behind Cloudflare Access; whoever first signs up
-//! creates the first parent). After that, only an active parent may change
-//! the registry — the same one-way hierarchy the keys give, enforced here on
-//! the readable structure too.
+//! Bootstrap rule: the first member is created by an authenticated caller
+//! holding the bootstrap proof (O18), and must be a lead. After that, only
+//! an active lead changes the registry's membership.
 //!
 //! The Worker is the only caller: it authenticates (auth.rs), forwards the
 //! actor's email, and routes here. The DO re-checks role rules itself, so a
@@ -31,7 +31,8 @@ mod recovery;
 /// APPEND-ONLY: a statement's index is its identity in the schema ledger
 /// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
 pub const MIGRATIONS: &[&str] = &[
-	// Family-level key/values: the master's public half, deployment flags.
+	// Registry key/values (deployment flags; until commit 27, the family
+	// master's public half — unused since the master key was removed).
 	"CREATE TABLE IF NOT EXISTS family (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
 	// The registry. Names are readable by design (docs/FAMILY.md); emails are
 	// how Access identities map to members.
@@ -158,12 +159,12 @@ pub const MIGRATIONS: &[&str] = &[
 	"CREATE TABLE IF NOT EXISTS reenrol_drafts (member_id TEXT PRIMARY KEY, settings TEXT NOT NULL, root_digest TEXT NOT NULL, at TEXT NOT NULL)",
 ];
 
-/// The four roles (docs/CASES.md), with the family's names accepted as
-/// aliases while the migration lasts (removed with the master key, stage 5).
+/// The four roles (docs/CASES.md). (The family's parent/child were accepted
+/// as aliases until the master key went, commit 27c — a clean break.)
 pub(crate) fn normalize_role(role: &str) -> Option<&'static str> {
 	match role {
-		"lead" | "parent" => Some("lead"),
-		"analyst" | "child" => Some("analyst"),
+		"lead" => Some("lead"),
+		"analyst" => Some("analyst"),
 		"auditor" => Some("auditor"),
 		"external" => Some("external"),
 		_ => None,
@@ -185,7 +186,6 @@ struct MemberRow {
 #[derive(serde::Serialize)]
 struct FamilyState {
 	members: Vec<serde_json::Value>,
-	master: Option<serde_json::Value>,
 	audit: Vec<serde_json::Value>,
 }
 
@@ -268,10 +268,6 @@ impl GoraniFamilyDO {
 			}
 			("POST", id) if id.starts_with("members/") && id.ends_with("/deactivate") => {
 				self.deactivate(&actor, &id["members/".len()..id.len() - "/deactivate".len()]).await
-			}
-			("PUT", "master") => {
-				let body = req.json::<serde_json::Value>().await?;
-				self.set_master(&actor, body).await
 			}
 			("POST", "shares-index") => {
 				let body = req.json::<ShareIndexPut>().await?;
@@ -420,7 +416,6 @@ impl GoraniFamilyDO {
 
 	async fn state(&self) -> Result<Response> {
 		let members: Vec<MemberRow> = self.sql.exec("SELECT id, name, role, emails, active, created_at, expires_at FROM members ORDER BY created_at, id", None)?.to_array()?;
-		let master = self.sql.exec("SELECT v FROM family WHERE k = 'master'", None)?.to_array::<FamilyKv>().ok().and_then(|mut k| k.pop()).map(|k| serde_json::from_str(&k.v).unwrap_or(serde_json::Value::Null));
 		let audit: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details FROM audit ORDER BY id DESC LIMIT 100", None)?.to_array()?;
 		Ok(Response::from_json(&FamilyState {
 			members: members
@@ -433,7 +428,6 @@ impl GoraniFamilyDO {
 					})
 				})
 				.collect(),
-			master,
 			audit: audit
 				.into_iter()
 				.map(|a| serde_json::json!({ "id": a.id, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "details": a.details }))
@@ -537,31 +531,11 @@ impl GoraniFamilyDO {
 			return json_error(409, "cannot deactivate the last lead");
 		}
 		self.sql.exec("UPDATE members SET active = 0 WHERE id = ?1", Some(vec![id.into()]))?;
-		// The removed member's root still holds their copy of the family
-		// shared-area key — the audit line says so, because the NEXT step
-		// (the client-driven family-area rotation, docs/FAMILY.md › Removing
-		// a member) is what actually closes their access.
-		self.audit(actor, "member.deactivate", id, Some(&serde_json::json!({ "familyKeyRotationRequired": true }))).await?;
-		self.state().await
-	}
-
-	/// The master's **public** half, stored once and never rewritten (a
-	/// master rotation is a new key; rotating is done by re-sealing copies,
-	/// and the registry simply learns the new public — see docs/FAMILY.md).
-	async fn set_master(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
-		if self.sql.exec("SELECT v FROM family WHERE k = 'master'", None)?.to_array::<FamilyKv>().map(|v| !v.is_empty()).unwrap_or(false) {
-			return json_error(409, "the master key is already set");
-		}
-		if !self.is_lead(actor).await? {
-			// Before any lead exists, the bootstrap creator may set it.
-			let has_members = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE active = 1", None)?.one::<Count>()?.n > 0;
-			if has_members {
-				return json_error(403, "only a lead may set the master key");
-			}
-		}
-		let v = serde_json::to_string(&body).map_err(|_| Error::RustError("bad master JSON".into()))?;
-		self.sql.exec("INSERT INTO family (k, v) VALUES ('master', ?1)", Some(vec![v.into()]))?;
-		self.audit(actor, "master.set", "master", None).await?;
+		// The removed member still holds copies of every case key they were
+		// granted: each such case now lists "rotation required" (their grant
+		// ended — STALE_GRANTS), and a manager's rotation is what actually
+		// closes their access.
+		self.audit(actor, "member.deactivate", id, None).await?;
 		self.state().await
 	}
 
@@ -1072,10 +1046,6 @@ impl GoraniFamilyDO {
 
 // Row/JSON helpers shared by the DOs live in `store_util.rs`; the small
 // private ones here stay close to their use.
-#[derive(serde::Deserialize)]
-struct FamilyKv {
-	v: String,
-}
 #[derive(serde::Deserialize)]
 struct AuditRow {
 	id: i64,

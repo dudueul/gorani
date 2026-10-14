@@ -13,7 +13,7 @@ import { suiteDev, api, stubDelete } from "./_dev.mjs";
 import { generateHybridKey, sealWith, openWith, newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
 import { readBackup } from "../../web/src/vault/backup.ts";
-import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { toBase64, fromBase64 } from "../../web/src/lib/encoding.ts";
 
 const dev = await suiteDev();
@@ -21,15 +21,12 @@ const enc = new TextEncoder();
 
 try {
 	// ── 0. Family + kid vault ───────────────────────────────────────────
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
-	const master = await createParentsMaster();
-	await api(dev.base, "PUT", "/api/v1/family/master", { email: "mom@family.test", body: { keyId: master.keyId, publicKey: master.publicKey } });
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "child", emails: ["jinu@family.test"] } });
-	const kidVault = await createChildVault();
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "analyst", emails: ["jinu@family.test"] } });
+	const kidVault = await createCodeVault();
 	const filesStore = await createStoreKey();
 	const own = await sealStoreKeyToMember(filesStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
-	const guardian = await sealStoreKeyToMaster(filesStore, master);
-	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian } } });
+	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own } } } });
 	assert.equal(saved.status, 200);
 
 	// ── 1. The backup key: browser generates, downloads, PUTs public ───

@@ -11,7 +11,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { suiteDev, api } from "../api/_dev.mjs";
-import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { deriveRecordKey, macRecord } from "../../web/src/vault/records.ts";
 import { importVaultKey } from "../../web/src/vault/vault-crypto.ts";
 
@@ -52,19 +52,16 @@ function sync(args: string[], env: Record<string, string> = {}) {
 
 try {
 	// ── 0. The family + the member's vault (setup the UI would do) ──────
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
-	const master = await createParentsMaster();
-	await api(dev.base, "PUT", "/api/v1/family/master", { email: "mom@family.test", body: { keyId: master.keyId, publicKey: master.publicKey } });
-	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "child", emails: ["jinu@family.test"] } });
-	const kidVault = await createChildVault();
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
+	await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "jinu", name: "Jinu", role: "analyst", emails: ["jinu@family.test"] } });
+	const kidVault = await createCodeVault();
 	const filesStore = await createStoreKey();
 	const own = await sealStoreKeyToMember(filesStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
 	// Authenticated as the setup screen does it (records.ts): the CLI refuses
 	// a files-store record without a MAC under this root (commit 24, O3).
 	const recordKey = await deriveRecordKey(await importVaultKey(kidVault.rootBundle.slice()));
 	own.mac = await macRecord(recordKey, "files", own);
-	const guardian = await sealStoreKeyToMaster(filesStore, master);
-	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian } } });
+	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own } } } });
 	assert.equal(saved.status, 200);
 	const recoveryCode = kidVault.recoveryCode;
 
@@ -87,7 +84,7 @@ try {
 	assert.equal(setup.status, 0, `setup failed: ${setup.out}`);
 	assert.match(setup.out, /enrolled device /);
 	// The device's wrapped copy is on the server (the web app sees it).
-	const devices = await api(dev.base, "GET", "/api/v1/members/jinu/devices", { email: "mom@family.test" });
+	const devices = await api(dev.base, "GET", "/api/v1/members/jinu/devices", { email: "jinu@family.test" });
 	assert.ok(devices.json.find((d) => d.platform === "linux"), "the enrolled device is listed");
 
 	// ── 2. push: the native write path — the CLI seals and uploads ──────
@@ -132,7 +129,7 @@ try {
 	// the next push to the attacker. Now: refused, nothing sealed.
 	const attacker = await createStoreKey();
 	const forged = { ...(await sealStoreKeyToMember(attacker, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey })), mac: own.mac };
-	const swap = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: forged }, guardian } } });
+	const swap = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: forged } } } });
 	assert.equal(swap.status, 200, "(the server stores what it is given — the client is the judge)");
 	fs.writeFileSync(localFile, "this must never be sealed to the attacker");
 	const refused = await sync(["push", "--file", localFile, "--name", "secret.txt", "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);

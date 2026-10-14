@@ -22,7 +22,7 @@
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith, importVaultKey, openSealedText } from "../../web/src/vault/vault-crypto.ts";
-import { createChildVault, createStoreKey, sealStoreKeyToMember, openStoreKey } from "../../web/src/vault/family.ts";
+import { createCodeVault, createStoreKey, sealStoreKeyToMember, openStoreKey } from "../../web/src/vault/keys.ts";
 import { newCase, openCaseKey, openCaseTitle } from "../../web/src/vault/cases.ts";
 import { buildTrust, certify, createIdentity, hybridDigest, pin } from "../../web/src/vault/identity.ts";
 import { approveCeremony, combineCeremony, newCeremony, recoverCaseGrant, recoverMemberStore, sealRecoveryCopy, setupRecovery, trustedRecoveryKey } from "../../web/src/vault/recovery.ts";
@@ -42,7 +42,7 @@ async function join(id, role, by, extra = {}) {
 	const email = `${id}@team.test`;
 	const added = await api(dev.base, "POST", "/api/v1/family/members", { email: by ?? email, body: { id, name: id, role, emails: [email], ...extra } });
 	assert.equal(added.status, 200, `add ${id}: ${added.text}`);
-	const vault = await createChildVault();
+	const vault = await createCodeVault();
 	const root = await importVaultKey(vault.rootBundle.slice());
 	const rootPublic = { ec: vault.publicKey, kem: vault.pqPublicKey };
 	const store = await createStoreKey();
@@ -190,7 +190,7 @@ try {
 	assert.equal((await recoveryAs(lu)).recovery.rotationRequired, true, "the key existed whole in lu's browser: rotation owed");
 
 	// ── 4. bo lost every unlock method ──────────────────────────────────
-	const fresh = await createChildVault();
+	const fresh = await createCodeVault();
 	const newRoot = await importVaultKey(fresh.rootBundle.slice());
 	const newRootPublic = { ec: fresh.publicKey, kem: fresh.pqPublicKey };
 	const newIdentity = await createIdentity("bo", newRoot, newRootPublic);
@@ -210,7 +210,7 @@ try {
 	assert.equal(m2.draft.rootDigest, boDigest);
 	const key2 = await combineCeremony(c2.ephemeral, m2.shares, rec, luTrust);
 	// The server swaps the enrolled root for one of its own: the digest bo read aloud does not match.
-	const impostor = await createChildVault();
+	const impostor = await createCodeVault();
 	await assert.rejects(recoverMemberStore(key2, m2.copy, { ec: impostor.publicKey, kem: impostor.pqPublicKey }, boDigest), /not the one the member confirmed/);
 	const out2 = await recoverMemberStore(key2, m2.copy, m2.draft.root, boDigest);
 	assert.equal((await as(lu).send("POST", `/api/v1/recovery/ceremonies/${c2.body.id}/complete`, out2)).status, 200);

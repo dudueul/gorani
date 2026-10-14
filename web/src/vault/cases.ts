@@ -40,7 +40,7 @@
  * OLDER grant can be replayed to a member who never saw the newer one.
  */
 
-import { createStoreKey } from "./family.ts";
+import { createStoreKey } from "./keys.ts";
 import { checkRecordMatches } from "./records.ts";
 import { places } from "./places.ts";
 import { opensAnything, resealStore, type ApiCall, type RotationReport } from "./rotation.ts";

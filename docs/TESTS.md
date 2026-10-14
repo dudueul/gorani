@@ -17,14 +17,14 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 |---|---|---|
 | `rust: formats` | Byte-format round-trips + the three tamper classes (byte flip, truncation, reordering) | how AEAD misuse becomes "opens to nothing" |
 | `unit:formats` | TS ⇄ Rust **cross-language vectors** — both implementations seal, both open (GV04 included: the same store PSK, each placed value opens only in its place) | how two implementations stay byte-identical forever |
-| `unit:family` | The key-graph denials (child→parent/sibling/master) and rotations — a departed member can neither read nor seal into the rotated area | why hierarchy is structural, not policy |
+| `unit:keys` | Vaults (password and code methods open the same root), store keys open with their member's root only (a lead's included), mismatched records refused, values stay in their area's places — the family edition's `unit:family` and its master key retired in 27c | custody as the only privilege |
 | `unit:index` | The unlock-gated snapshot: foreign root ⇒ noise; flipped byte ⇒ GCM failure | deriving keys from roots so IndexedDB is sealed |
 | `unit:session` | Three unlock kinds open ONE root; adding a method requires the old one | the confirmation rule as a running argument |
 | `unit:media-frames` | Range→frame math, AAD binding, open-ended windows, exact cuts to the asked range — the worker's own file | why the player can seek multi-GB videos |
 | `unit:explorer` | The model's sealed round trips (upload/download/duplicate/copy) with REAL crypto + fake server; names swapped by the server show as *unverified*, a moved key refuses | model/view separation: Node drives the UI's brain |
 | `unit:viewer-modes` | The mode table + the mime rules that keep stored content inert | security decisions as pure, testable functions |
 | `unit:links` | GS01/GR01 derivations; id-bound AAD; password-gated keys | how "the key lives in the fragment" actually works |
-| `api:family` | Bootstrap, parents-only, master-once, last-parent guard | the registry's lifecycle through real HTTP |
+| `api:family` | Bootstrap, leads-only, last-lead guard, the master-key route gone | the registry's lifecycle through real HTTP |
 | `api:files` | Sealed-in boundary: unsealed bytes/names refused 400 **before storage**; feed, versions+409, Range, chunked multipart | the worker's contract, end to end |
 | `api:r2` | The R2 binding as the storage priority: same sealed contract over the binding (in-process, no SigV4), on workerd's local simulator | one contract, two backends |
 | `api:devices` | Enrol/token-once/unlock/rekey/revoke + crypto-shredding | the native device lifecycle |

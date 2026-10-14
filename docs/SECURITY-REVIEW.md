@@ -135,11 +135,22 @@ not caught. Member public keys handed to others (to seal TO you) and the
 parents' master public key are likewise server-supplied. Both need member
 identity keys with verified fingerprints — the D2/D4 redesign.
 
+### O5, fixed in commit 24 — a rotation that leaves nothing behind
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O5 | High | **Member removal left data readable.** `files/reseal` re-wrapped each file's *living* version and its name only; older versions' content keys and types, folder names, music tags, share names and the files secrets stayed sealed to the old store key — which the departing member keeps. | `GET files/sealed?kind=` lists every value sealed to the store (six kinds, paged by rowid); `PUT files/reseal { items }` writes exact rows (sealed text only, batch validated before any write); the old form is refused. The client walk is `web/src/vault/rotation.ts › resealStore` (idempotent: already-new values are skipped, values under neither key stop the walk), with `opensAnything` as the proof step. |
+
+Proven by api:rotation: a store holding every kind (two versions, a
+folder, tags, secrets, a share) — the old key opens 9 values before and
+**0** after; the new key opens all 9; version 1 still decrypts to its
+original bytes (via `?version=1`, the S17 fix); a second walk re-seals
+nothing; the old form and unsealed values are refused.
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |
 |---|---|---|---|
-| O5 | High | **Member removal leaves old versions readable**: `files/reseal` re-wraps only the *current* version of each file; older versions stay wrapped to the old family key (docs/FAMILY.md claims otherwise). | Re-wrap every version row (or purge old versions on rotation). |
 | O6 | Medium | Content is not bound to its file id: the server can swap (key, object) pairs between files undetected. | Bind file id + version in the AAD (format v-next). |
 | O7 | Medium | GB1: header outside the AAD; nonce prefix not compared. | Hash the header into each segment's AAD; compare full nonce. |
 | O8 | Medium | Argon2 bounds: floor below OWASP (t=1 at 19 MiB), ceiling lets a server freeze a phone. | t ≥ 2 floor; ~256 MiB / t ≤ 10 ceiling; cap methods tried. |

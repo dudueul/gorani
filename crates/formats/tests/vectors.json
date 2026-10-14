@@ -72,7 +72,17 @@
 		"plain": "mOPY2RJRSrUajL+l/hDpYwzZuaXpCYCRmFYnvO7S7brwY5780h/5G0kxRKvH+6xhyTnFdMoE+vzX4ZwVcBju7wZED/PhzLI7/IvLf90tczanONLu6ceXvy8KTp1SydKk6VIef2wbclFMJgw5FdEeG816PCAL8ZYCtBckwczGRscLAgG9JBTLLp5Ge5ZMoJv42sb5ZDT18tZi21wY8geX23QpRut2buhZL6V4HlG3uRexkdqYgyrJk5O05t3pOyR//5opQ1+FEKk=",
 		"sealed": "zuZRBzcHOjQ1J0pYZZ+JXQ/aTF7ZwkKvVZIt0B0OVrzVdFYhhCIJ1yeC7oPYFfwwlDH/XqLHxmuW+z7MPYCoEHQuoOHrU9J3BwuM6/9YKGz/u27do6HrZqxh6mahc2V0g5d4+n39UW/ujDwNftItcKYEySGftQa2OeISM3EgvNRlZz3AaO9ghwu1nmydDSgmlbh2UQENMpxHHv66Y/cEPEDrZ0nr7v1SSewq5t3ZzbFedJsWvPS7iaRuubrkgQJvgbSK+2bzca0e7q+87e+lTPSb5eOvaRCNXhW41sl0KwmGx0ZmaG/YV4dBqlwXQcq+JJ378GL7ZjShjyJ4FExZFVAR+K/pXcB7fWYy1+w+gLZGF37FUOrAqws053R+HOJJDXpofxvCDkt1U49KTFwY6ZZb1wq5U0oV",
 		"size": 200,
-		"chunkOverhead": 28
+		"chunkOverhead": 28,
+		"chunkFor": [
+			[0, 8388608],
+			[1, 8388608],
+			[83886080000, 8388608],
+			[83886080001, 16777216],
+			[167772160000, 16777216],
+			[167772160001, 33554432],
+			[273804165120, 33554432],
+			[273804165121, null]
+		]
 	},
 	"record": {
 		"name": "files",

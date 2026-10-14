@@ -108,21 +108,21 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 			await throwIfError(res);
 		},
 
-		async putMultipart(memberId, fields, sealed, chunk) {
+		async putMultipart(memberId, fields, frames, chunk) {
 			// The new file's id was chosen (and sealed into) by the model.
 			const { file_id: newFileId, ...rest } = fields;
 			const start = await fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `${areaPath(memberId)}/files/uploads`, { size: Number(fields.size), chunk, newFileId });
-			const frames = Math.ceil(sealed.length / (chunk + 28));
+			if (start.parts !== frames.count) throw new Error(`the server planned ${start.parts} parts for ${frames.count} frames`);
 			const parts: { partNumber: number; etag: string }[] = [];
-			for (let p = 1; p <= frames; p++) {
-				const frame = sealed.subarray((p - 1) * (chunk + 28), Math.min(sealed.length, p * (chunk + 28)));
-				const res = await fetch(`${areaPath(memberId)}/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, {
-					method: "PUT",
-					headers: { ...devIdentityHeaders(), "content-type": "application/octet-stream" },
-					body: frame as unknown as BodyInit, // (TS 5.9 ArrayBufferLike vs ArrayBuffer — the bytes are the same)
-				});
-				await throwIfError(res);
-				parts.push((await res.json()) as { partNumber: number; etag: string });
+			// One frame in memory at a time (D12): read and sealed, sent, dropped.
+			// A part that fails for the network's sake is sent again — a 255 GB
+			// upload does not start over for one dropped request; one the server
+			// REFUSES (4xx) is not retried.
+			const step = Math.max(1, Math.floor(frames.count / 4));
+			for (let p = 1; p <= frames.count; p++) {
+				const frame = await frames.frame(p - 1);
+				parts.push(await sendPart(`${areaPath(memberId)}/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, frame, p));
+				if (frames.count >= 100 && p % step === 0 && p < frames.count) hooks.toast(`Uploading — ${Math.round((100 * p) / frames.count)}% (${p} of ${frames.count} parts)`);
 			}
 			const form = formBody({ ...rest, key: start.key, parts: JSON.stringify(parts) }, null);
 			const res = await fetch(`${areaPath(memberId)}/files/uploads/${start.uploadId}/complete`, {
@@ -179,4 +179,31 @@ async function throwIfError<T>(res: Response): Promise<T> {
 	} catch {}
 	if (!res.ok) throw new Error((json as { error?: string } | null)?.error ?? `${res.status} ${res.statusText}`);
 	return json as T;
+}
+
+/**
+ * Send one part, retrying what the network lost (D12): up to three tries,
+ * 1 s then 4 s apart, for a dropped connection, a 5xx or a 429. A refusal
+ * (any other 4xx) is the server's answer, not a hiccup — thrown at once.
+ */
+async function sendPart(url: string, frame: Uint8Array, n: number): Promise<{ partNumber: number; etag: string }> {
+	let lastError: unknown = null;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		if (attempt) await new Promise((r) => setTimeout(r, 1000 * 4 ** (attempt - 1)));
+		let res: Response;
+		try {
+			res = await fetch(url, {
+				method: "PUT",
+				headers: { ...devIdentityHeaders(), "content-type": "application/octet-stream" },
+				body: frame as unknown as BodyInit, // (TS 5.9 ArrayBufferLike vs ArrayBuffer — the bytes are the same)
+			});
+		} catch (e) {
+			lastError = e; // the network: try again
+			continue;
+		}
+		if (res.ok) return (await res.json()) as { partNumber: number; etag: string };
+		if (res.status < 500 && res.status !== 429) await throwIfError(res);
+		lastError = new Error(`part ${n}: HTTP ${res.status}`);
+	}
+	throw new Error(`part ${n} failed three times — ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }

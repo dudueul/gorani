@@ -243,6 +243,49 @@ try {
 	assert.equal(slice.length, 2 * frame - 1, "both frames, one byte short");
 	assert.equal(sealedSize(bigPlain.length, chunk), bigSealed.length, "the server checked the object adds up");
 
+	// ── 7b. Large files (D12, docs/LARGE-FILES.md) ─────────────────────
+	// The plan's limits: 255 GiB a file, 64 MiB a chunk — and 255 GiB at the
+	// 32 MiB chunk chunkFor picks is a plan the backends accept.
+	const GiB = 1024 ** 3;
+	const MiB = 1024 ** 2;
+	const plan = (size, c) => api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size, chunk: c, newFileId: store.newId() } });
+	assert.equal((await plan(255 * GiB + 1, 32 * MiB)).status, 413, "over 255 GiB");
+	assert.equal((await plan(GiB, 128 * MiB)).status, 400, "a chunk over 64 MiB");
+	assert.equal((await plan(255 * GiB, 8 * MiB)).status, 400, "255 GiB in 8 MiB parts is more than 10 000");
+	const ceiling = await plan(255 * GiB, 32 * MiB);
+	assert.equal(ceiling.status, 200, JSON.stringify(ceiling.json));
+	assert.equal(ceiling.json.parts, 8160, "255 GiB / 32 MiB");
+	// A part must say its length: it is streamed to storage, never held.
+	const unsized = await fetch(`${dev.base}/api/v1/members/jinu/files/uploads/${ceiling.json.uploadId}/1?key=${encodeURIComponent(ceiling.json.key)}`, {
+		method: "PUT",
+		headers: { "x-gorani-dev-email": "jinu@family.test", "content-type": "application/octet-stream" },
+		body: new ReadableStream({ start: (c) => (c.enqueue(new Uint8Array(1024)), c.close()) }),
+		duplex: "half",
+	});
+	assert.equal(unsized.status, 411, "no Content-Length, no part");
+	assert.equal((await api(dev.base, "DELETE", `/api/v1/members/jinu/files/uploads/${ceiling.json.uploadId}`, { email: "jinu@family.test" })).status, 200, "the plan aborted");
+	// And a 16 MiB chunk end to end — parts piped through the Worker, the
+	// object adding up, the bytes opening to the plaintext.
+	const c16 = 16 * MiB;
+	const p20 = new Uint8Array(20 * MiB);
+	for (let i = 0; i < p20.length; i += 65536) crypto.getRandomValues(p20.subarray(i, i + 65536));
+	const ck20 = newContentKey();
+	const s20 = await sealChunked(await importContentKey(ck20), p20, c16);
+	const f20 = await store.newFile("image.E01", "application/octet-stream", ck20);
+	const st20 = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: p20.length, chunk: c16, newFileId: f20.id } });
+	assert.equal(st20.json.parts, 2);
+	const tags20 = [];
+	for (let p = 1; p <= 2; p++) {
+		const r = await fetch(`${dev.base}/api/v1/members/jinu/files/uploads/${st20.json.uploadId}/${p}?key=${encodeURIComponent(st20.json.key)}`, { method: "PUT", headers: { "x-gorani-dev-email": "jinu@family.test" }, body: s20.subarray((p - 1) * (c16 + FRAME_OVERHEAD), p * (c16 + FRAME_OVERHEAD)) });
+		assert.equal(r.status, 200, `16 MiB part ${p}: ${r.status}`);
+		tags20.push({ partNumber: p, etag: (await r.json()).etag });
+	}
+	const done20 = await upload(dev.base, "jinu@family.test", "jinu", `/files/uploads/${st20.json.uploadId}/complete`, { key: st20.json.key, size: String(p20.length), chunk: String(c16), ck: f20.fields.ck, name: f20.fields.name, type: f20.fields.type, parts: JSON.stringify(tags20) }, null);
+	assert.equal(done20.status, 200, JSON.stringify(done20.json));
+	const got20 = await fetch(`${dev.base}/api/v1/members/jinu/files/${f20.id}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
+	assert.equal(got20.headers.get("x-gorani-chunk"), String(c16));
+	assert.deepEqual(new Uint8Array(await got20.arrayBuffer()), s20, "the stored object is exactly the frames sent, streamed through");
+
 	// ── 8. Rename, trash, duplicates ───────────────────────────────────
 	const renamed = await api(dev.base, "PATCH", `/api/v1/members/jinu/files/${fileId}`, { email: "jinu@family.test", body: { name: await store.fileName(fileId, "letter (1).txt") } });
 	assert.equal(renamed.status, 200);

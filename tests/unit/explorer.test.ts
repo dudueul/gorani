@@ -21,8 +21,8 @@
 
 import assert from "node:assert/strict";
 import { generateHybridKey, importVaultKey, openWith, unwrapPlacedKey, isPlacedText } from "../../web/src/vault/vault-crypto.ts";
-import { openChunk } from "../../web/src/vault/chunked-file.ts";
-import { FilesModel, UNVERIFIED, type FilesBridge } from "../../web/src/ui/files/model.ts";
+import { openChunk, chunkFor, frameCount, sealedSize } from "../../web/src/vault/chunked-file.ts";
+import { FilesModel, UNVERIFIED, WHOLE_LIMIT, type FilesBridge } from "../../web/src/ui/files/model.ts";
 import { places } from "../../web/src/vault/places.ts";
 import { createCodeVault } from "../../web/src/vault/keys.ts";
 import { buildTrust, createIdentity } from "../../web/src/vault/identity.ts";
@@ -169,6 +169,8 @@ const server = {
 
 const tags = new Map<string, string>();
 
+const multipartCalls: { chunk: number; count: number }[] = [];
+
 // ── the bridge: real crypto, the fake server behind it ──────────────
 const bridge: FilesBridge = {
 	apiGet: <T>(path: string) => Promise.resolve(server.get(path) as T),
@@ -212,7 +214,14 @@ const bridge: FilesBridge = {
 		feedCursor++;
 		feed.push({ seq: feedCursor, kind: "file.put", data: { id } });
 	},
-	async putMultipart(_member, fields, sealed, chunk) {
+	async putMultipart(_member, fields, frames, chunk) {
+		// (D12) The model hands frames over one at a time; the fake server
+		// keeps them in order, as the backend assembles the parts.
+		multipartCalls.push({ chunk, count: frames.count });
+		const parts: Uint8Array[] = [];
+		for (let i = 0; i < frames.count; i++) parts.push(await frames.frame(i));
+		const sealed = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+		parts.reduce((at, p) => (sealed.set(p, at), at + p.length), 0);
 		const id = fields.file_id;
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
@@ -287,6 +296,19 @@ await model.download(row.id, "beach.png");
 void downloaded;
 assert.match(toasts.at(-1) ?? "", /content verified — exactly the bytes jinu signed/);
 assert.equal((await model.verify(row.id)).status, "verified");
+
+// 5b. A file past the whole-upload limit (D12): hashed in a streamed pass,
+// then sealed and handed over frame by frame — and it opens, verified.
+{
+	const big = new Uint8Array(WHOLE_LIMIT + 1024 * 1024);
+	for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, Math.min(big.length, i + 65536)));
+	await model.upload([new File([big as BlobPart], "memory.raw", { type: "application/octet-stream" })]);
+	const call = multipartCalls.at(-1)!;
+	assert.deepEqual(call, { chunk: chunkFor(big.length), count: frameCount(big.length, chunkFor(big.length)) }, "the chunk chunkFor picks, one frame per part");
+	const bigRow = model.state.get().files.find((f) => f.name === "memory.raw")!;
+	assert.equal(objects.get(versions.get(bigRow.id)!.object)!.length, sealedSize(big.length, call.chunk), "every frame, in order");
+	assert.equal((await model.verify(bigRow.id)).status, "verified", "the streamed SHA-256 is the one the frames open to");
+}
 
 // 6. Rename re-seals; the server's stored name changes shape but stays sealed.
 await model.rename("file", row.id, "sunset.png");

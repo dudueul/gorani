@@ -22,7 +22,7 @@ import { store, type Store } from "../../lib/store.ts";
 import { newContentKey, importContentKey, sealWith, openWith, sealPlacedText, openPlacedText, wrapPlacedKey, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
 import { places, newItemId } from "../../vault/places.ts";
 import { controllingMediaWorker, registerMedia } from "../../lib/media-worker.ts";
-import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
+import { openChunk, sealChunk, chunkFor, frameCount, MAX_FILE } from "../../vault/chunked-file.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { areaPath } from "../../lib/area.ts";
@@ -110,7 +110,12 @@ export interface FilesBridge {
 	 * dev server's identity header; nothing in production) — for fetches
 	 * made outside the bridge, i.e. by the media service worker. */
 	identityHeaders(): Record<string, string>;
-	putMultipart(memberId: string, fields: Record<string, string>, sealed: Uint8Array, chunk: number): Promise<void>;
+	/**
+	 * A GC01 upload, one part per frame (D12, docs/LARGE-FILES.md): the
+	 * bridge asks for each frame when it is ready to send it, so a 255 GB
+	 * file is never in memory — `frame(i)` reads, seals and returns frame i.
+	 */
+	putMultipart(memberId: string, fields: Record<string, string>, frames: FrameSource, chunk: number): Promise<void>;
 	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
 	toast(message: string): void;
 	/** The member's identity (commit 29d, docs/CUSTODY.md › stage 4): the
@@ -412,13 +417,16 @@ export class FilesModel {
 			}
 		}
 		for (const file of files) {
-			const plain = new Uint8Array(await file.arrayBuffer());
+			if (file.size > MAX_FILE) {
+				this.bridge.toast(`“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GiB — a file is at most 255 GiB`);
+				continue;
+			}
 			// One SHA-256, two uses: the duplicate tag (keyed, below) and the
-			// signed content hash (uploadOne).
-			const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", plain as BufferSource));
+			// signed content hash (uploadOne) — read once, streamed (D12).
+			const digest = await digestOf(file);
 			const tag = await this.fingerprint(digest);
 			// The duplicate check: same size on the server, compare tags locally.
-			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${plain.length}`);
+			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${file.size}`);
 			const twins = same.files.filter((x) => x.tag && x.tag === tag);
 			if (twins.length) {
 				const answer = await this.bridge.confirmDuplicate(twins.length);
@@ -431,12 +439,12 @@ export class FilesModel {
 				// nothing new. (A dead `asVersion` parameter used to pretend
 				// otherwise; removed in commit 25.)
 			}
-			await this.uploadOne(file, plain, tag, folderId, hexOf(digest), sample, intake);
+			await this.uploadOne(file, tag, folderId, hexOf(digest), sample, intake);
 		}
 		await this.refresh();
 	}
 
-	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null, sha256: string, sample = false, intakeFields: IntakeFields | null = null): Promise<void> {
+	private async uploadOne(file: File, tag: string, folderId: string | null, sha256: string, sample = false, intakeFields: IntakeFields | null = null): Promise<void> {
 		// The file id first: the name, the type and the content key are sealed
 		// INTO places that name it (O6) — so the server cannot move them to
 		// another file, and could not have made them up (it lacks the PSK).
@@ -456,8 +464,8 @@ export class FilesModel {
 		// feed opens these blobs instead of ever re-reading the audio.
 		// (Never for a sample: a tag parser is attack surface too.)
 		let mmeta: string | undefined;
-		if (!sample && file.type.startsWith("audio/")) {
-			const meta = parseAudioMeta(plain);
+		if (!sample && file.type.startsWith("audio/") && file.size <= TAG_PARSE_LIMIT) {
+			const meta = parseAudioMeta(new Uint8Array(await file.arrayBuffer()));
 			if (meta) mmeta = await sealPlacedText(priv, places.fileMusic(this.memberId, id, 1), JSON.stringify(meta));
 		}
 		// The uploader's signature over SHA-256 of the plaintext (commit 29d,
@@ -467,19 +475,27 @@ export class FilesModel {
 		const me = this.bridge.identity?.() ?? null;
 		// With it, the imprint the deployment's timestamp authority stamps
 		// (commit 29j, timestamp.ts) — SHA-256 of the signature, nothing more.
-		const signed = me ? await signContentHashStamped(me.signer, priv, this.memberId, id, 1, sha256, plain.length) : undefined;
+		const signed = me ? await signContentHashStamped(me.signer, priv, this.memberId, id, 1, sha256, file.size) : undefined;
 		const hash = signed?.sealed;
 		// …and, in an evidence case, its intake record, sealed into this
 		// file's place and signed the same way (commit 29g, intake.ts).
 		const intake = me && intakeFields ? await signIntake(me.signer, priv, this.memberId, id, intakeFields) : undefined;
 		const extra = { ...(mmeta ? { mmeta } : {}), ...(signed ? { hash: signed.sealed, stamp: signed.stamp } : {}), ...(intake ? { intake } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}) };
 		try {
-			if (plain.length > 48 * 1024 * 1024) {
-				const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
-				await this.bridge.putMultipart(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), chunk: String(DEFAULT_CHUNK), tag, ...extra }, chunked, DEFAULT_CHUNK);
+			if (file.size > WHOLE_LIMIT) {
+				// GC01 frames, each read and sealed only when the bridge is ready
+				// to send it (D12): the chunk grows with the file so no upload
+				// needs more than 10 000 parts (chunkFor, docs/LARGE-FILES.md).
+				const chunk = chunkFor(file.size);
+				const count = frameCount(file.size, chunk);
+				const frames: FrameSource = {
+					count,
+					frame: async (i) => sealChunk(key, new Uint8Array(await file.slice(i * chunk, Math.min(file.size, (i + 1) * chunk)).arrayBuffer()), i, i === count - 1),
+				};
+				await this.bridge.putMultipart(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(file.size), chunk: String(chunk), tag, ...extra }, frames, chunk);
 			} else {
-				const sealed = await sealWith(key, plain);
-				await this.bridge.putWhole(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), tag, ...extra }, sealed);
+				const sealed = await sealWith(key, new Uint8Array(await file.arrayBuffer()));
+				await this.bridge.putWhole(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(file.size), tag, ...extra }, sealed);
 			}
 		} catch (e) {
 			if (!hash && /signed content hash/.test(String(e))) throw new Error("this evidence case takes only signed uploads, and your identity is not open yet — wait for the team to open (or see Team › People), then try again");
@@ -874,7 +890,7 @@ export class FilesModel {
 			// exactly what it is — this case's own copy, checked first.
 			const me = this.bridge.identity?.() ?? null;
 			const intake: IntakeFields | null = this.bridge.areaKind?.() === "evidence" ? { source: `a copy of “${name}” (${id}) in this case`, collector: me?.signer.member ?? "", method: "duplicated in gorani from the case's own copy, after its signature was checked", collectedAt: new Date().toISOString(), notes: "" } : null;
-			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original }), plain, await this.fingerprint(digest), folderId, hexOf(digest), sample, intake);
+			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original }), await this.fingerprint(digest), folderId, hexOf(digest), sample, intake);
 		}
 		await this.refresh();
 		this.bridge.toast(`Duplicated ${clip.files.length} file${clip.files.length > 1 ? "s" : ""}`);
@@ -994,6 +1010,31 @@ export function concat(parts: Uint8Array[]): Uint8Array {
 }
 
 /** Lowercase hex of a digest. */
+/** A file's frames, produced on demand (FilesBridge › putMultipart). */
+export interface FrameSource {
+	count: number;
+	frame(i: number): Promise<Uint8Array>;
+}
+
+/** Files up to this size go up whole, in one request; larger ones as GC01 frames. */
+export const WHOLE_LIMIT = 48 * 1024 * 1024;
+/** Audio tags are parsed from the whole file — up to this size (the parser needs it in memory). */
+const TAG_PARSE_LIMIT = 512 * 1024 * 1024;
+/** The hashing pass reads this much at a time. */
+const HASH_SLICE = 8 * 1024 * 1024;
+
+/**
+ * SHA-256 of a file in one streamed pass (D12): the duplicate tag and the
+ * signed content hash need it before any byte is sealed, and a 255 GB
+ * image cannot be read whole. Small files take WebCrypto's one-shot digest.
+ */
+async function digestOf(file: Blob): Promise<Uint8Array> {
+	if (file.size <= WHOLE_LIMIT) return new Uint8Array(await crypto.subtle.digest("SHA-256", (await file.arrayBuffer()) as BufferSource));
+	const h = await sha256Stream();
+	for (let at = 0; at < file.size; at += HASH_SLICE) h.update(new Uint8Array(await file.slice(at, Math.min(file.size, at + HASH_SLICE)).arrayBuffer()));
+	return new Uint8Array(h.hex().match(/../g)!.map((x) => parseInt(x, 16)));
+}
+
 function hexOf(bytes: Uint8Array): string {
 	return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

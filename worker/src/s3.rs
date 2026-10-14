@@ -96,6 +96,12 @@ fn method_of(name: &str) -> Result<Method> {
 
 /// Sign (gorani-s3), build the Workers request, and send it.
 async fn fetch_signed(cfg: &S3Config, method: &str, object_key: &str, query_pairs: &[(String, String)], range: Option<(u64, u64)>, body: Option<Vec<u8>>, content_type: Option<&str>) -> Result<Response> {
+	fetch_signed_js(cfg, method, object_key, query_pairs, range, body.map(|b| b.into()), content_type).await
+}
+
+/// The same, with any JS body — a stream of known length included (D12:
+/// a part piped through, never buffered).
+async fn fetch_signed_js(cfg: &S3Config, method: &str, object_key: &str, query_pairs: &[(String, String)], range: Option<(u64, u64)>, body: Option<wasm_bindgen::JsValue>, content_type: Option<&str>) -> Result<Response> {
 	let SignedRequest { url, headers, .. } =
 		sign_request(cfg, method, object_key, query_pairs, now_secs()).map_err(|e| Error::RustError(format!("signing: {e}")))?;
 	let wh = Headers::new();
@@ -111,7 +117,7 @@ async fn fetch_signed(cfg: &S3Config, method: &str, object_key: &str, query_pair
 	if let Some(ct) = content_type {
 		wh.set("Content-Type", ct)?;
 	}
-	let req = Request::new_with_init(&url, &RequestInit { method: method_of(method)?, headers: wh, body: body.map(|b| b.into()), ..Default::default() })?;
+	let req = Request::new_with_init(&url, &RequestInit { method: method_of(method)?, headers: wh, body, ..Default::default() })?;
 	Fetch::Request(req).send().await
 }
 
@@ -376,6 +382,31 @@ pub async fn multipart_part(env: &Env, key: &str, upload_id: &str, part: u32, by
 	let cfg = config(env)?;
 	let q = [("partNumber".to_string(), part.to_string()), ("uploadId".to_string(), upload_id.to_string())];
 	let resp = fetch_signed(&cfg, "PUT", key, &q, None, Some(bytes), Some("application/octet-stream")).await?;
+	let status = resp.status_code();
+	let etag = resp.headers().get("ETag")?;
+	if status != 200 {
+		return Err(Error::RustError(format!("S3 part {part}: HTTP {status}")));
+	}
+	etag.ok_or_else(|| Error::RustError("S3 part: missing ETag".into()))
+}
+
+/// Upload one part AS IT ARRIVES (D12, docs/LARGE-FILES.md): `len` bytes
+/// from the client's request, piped to the backend with the length fixed —
+/// never held whole in the isolate. (`multipart_part` copied a part three
+/// times on its way: request → Vec → copy → the outgoing body. At 8 MiB
+/// that was 24 MB; at the 32 MiB a 255 GB file needs it would have been
+/// most of the isolate's 128 MB.) S3 signs `UNSIGNED-PAYLOAD`, so nothing
+/// needs the bytes before they go; the completion still checks that the
+/// object adds up to its frames.
+pub async fn multipart_part_stream(env: &Env, key: &str, upload_id: &str, part: u32, body: ByteStream, len: u64) -> Result<String> {
+	let stream = FixedLengthStream::wrap(body, len);
+	if let Some(bucket) = r2_bucket(env).await? {
+		let upload = bucket.resume_multipart_upload(key, upload_id)?;
+		return Ok(upload.upload_part(part as u16, stream).await?.etag());
+	}
+	let cfg = config(env)?;
+	let q = [("partNumber".to_string(), part.to_string()), ("uploadId".to_string(), upload_id.to_string())];
+	let resp = fetch_signed_js(&cfg, "PUT", key, &q, None, Some(Data::from(stream).into()), Some("application/octet-stream")).await?;
 	let status = resp.status_code();
 	let etag = resp.headers().get("ETag")?;
 	if status != 200 {

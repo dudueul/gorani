@@ -85,7 +85,12 @@ assert.equal(await openText(hPriv, r.textSealed), "러스트가 봉인한 이름
 // Rust re-wrapped the content key to the P-256 key; TS unwraps it too.
 assert.deepEqual(await unwrapContentKey(pPriv, r.rewrapped), ck);
 // Rust-sealed chunked frames open in TS, and TS span math matches.
-const { openChunked, sealChunked, FRAME_OVERHEAD, sealedSize } = await import("../../web/src/vault/chunked-file.ts");
+const { openChunked, sealChunked, FRAME_OVERHEAD, sealedSize, chunkFor } = await import("../../web/src/vault/chunked-file.ts");
+// The chunk for a size (D12): the table chunked::chunk_for reads in Rust.
+for (const [size, want] of v.chunked.chunkFor) {
+	if (want === null) assert.throws(() => chunkFor(size), /at most 255 GiB/, `chunkFor(${size})`);
+	else assert.equal(chunkFor(size), want, `chunkFor(${size})`);
+}
 const rustChunked = fromBase64(r.chunkedSealed);
 const rustPlain = fromBase64(r.chunkedPlain);
 assert.equal(new TextDecoder().decode(await openChunked(ck, rustChunked, r.chunkedChunk)), new TextDecoder().decode(rustPlain));

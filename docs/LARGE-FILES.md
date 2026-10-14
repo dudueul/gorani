@@ -39,7 +39,7 @@ desktop shells agree on every file's frames.
 
 | Stage | What |
 |---|---|
-| 31a | **Adaptive chunks, streamed parts, streamed browser uploads.** `chunkFor` in both languages; the Worker refuses sizes over 255 GiB and chunks over 64 MiB, and pipes each part's body to the backend (S3: `UNSIGNED-PAYLOAD` with the length fixed; R2: the binding's stream) — no copy in the isolate. The browser hashes the file in one streamed pass (the hash is signed before any byte leaves), then seals and uploads slice by slice, retrying a failed part (three tries, backoff). |
+| 31a *(landed)* | **Adaptive chunks, streamed parts, streamed browser uploads.** `chunkFor` in both languages; the Worker refuses sizes over 255 GiB and chunks over 64 MiB, and pipes each part's body to the backend (S3: `UNSIGNED-PAYLOAD` with the length fixed; R2: the binding's stream) — no copy in the isolate. The browser hashes the file in one streamed pass (the hash is signed before any byte leaves), then seals and uploads slice by slice, retrying a failed part (three tries, backoff). |
 | 31b | **Resumable uploads.** The in-flight upload — its id, object key, chunk, the sealed fields (name, type, key, signed hash, intake), the parts done — is kept in the browser (IndexedDB; every field already sealed). After a dropped connection or a closed tab, choosing the same file again (name, size, modified time, and the same SHA-256) continues from the first missing part. The server keeps an unfinished upload for the housekeeping window, then aborts it. |
 | 31c | **Streaming downloads and export.** A download larger than the tab can hold streams through the media service worker (`/media/<id>?download`), decrypting frame by frame to the browser's own download. The export package streams too (File System Access where the browser has it, the service worker otherwise), with ZIP64 for entries and archives over 4 GiB; `tools/verify-export.mjs` reads ZIP64 and hashes entries from disk, never holding one whole. |
 
@@ -54,6 +54,32 @@ Not in D12 (recorded here so nobody assumes otherwise):
 - **Backups of stores too large to copy.** The streaming backup job copies
   objects into one .gbak (at most 10 000 × 8 MiB); a store holding 255 GB
   files gets manifest backups (DECISIONS.md › D12), a later commit.
+
+## 31a as built
+
+- `chunkFor` (web/src/vault/chunked-file.ts) and `chunked::chunk_for`
+  (crates/formats), with `MAX_FILE`, `MAX_PARTS` and (Rust) `MAX_CHUNK`;
+  eight boundary sizes in tests/vectors.json › chunked › chunkFor, read
+  by both languages' vector tests.
+- The Worker (`routes.rs › upload_start`): 413 above 255 GiB, 400 for a
+  chunk above 64 MiB or a plan over 10 000 parts. Parts (file uploads and
+  share copies alike) go through `s3.rs › multipart_part_stream`: the
+  request's body wrapped in a `FixedLengthStream` of its declared
+  `Content-Length` and handed to the R2 binding or to the signed S3 PUT
+  (`UNSIGNED-PAYLOAD`, as every request already was). No length → 411; a
+  length over one 64 MiB frame → 413. The Worker's own uploads (backup
+  containers) keep the buffered `multipart_part`.
+- The browser (`model.ts`): one streamed SHA-256 pass (`digestOf`,
+  hash-wasm over 8 MiB slices; WebCrypto's one-shot digest for files that
+  go up whole), then — above 48 MiB — a `FrameSource` that reads, seals
+  and returns frame *i* only when the bridge asks for it. The bridge sends
+  each part with up to three tries (1 s, then 4 s) for a dropped
+  connection, a 5xx or a 429, never for a refusal, and says how far a
+  long upload has come at each quarter. Audio tags are parsed only for
+  files up to 512 MiB (the parser needs the whole file).
+- Not yet: "copy" (duplicate) and a share link still read the file whole
+  — both go through the plaintext in one buffer; they stay bounded by the
+  tab's memory until 31c streams them.
 
 ## Why these choices
 

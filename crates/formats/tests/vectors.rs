@@ -78,6 +78,14 @@ fn opens_what_the_browser_sealed_and_seals_what_it_opens() {
 
 	// Chunked files (GC01): the browser's frames open whole and by span
 	let ch = &v["chunked"];
+	// The chunk for a size (D12): the same table the browser's chunkFor reads.
+	for pair in ch["chunkFor"].as_array().unwrap() {
+		let (size, want) = (pair[0].as_u64().unwrap(), pair[1].as_u64());
+		assert_eq!(chunked::chunk_for(size), want, "chunk_for({size})");
+		if let Some(c) = want {
+			assert!(chunked::frame_count(size, c) <= chunked::MAX_PARTS && c <= chunked::MAX_CHUNK);
+		}
+	}
 	let chunk = ch["chunk"].as_u64().unwrap();
 	let plain = b(&ch["plain"]);
 	let sealed = b(&ch["sealed"]);

@@ -30,7 +30,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { suiteDev, api } from "./_dev.mjs";
-import { member, openCase, signedHashStamped, signedIntake } from "../lib/team.mjs";
+import { member, openCase, signedHashStamped, signedIntake, vouch } from "../lib/team.mjs";
 import { placedShape } from "../lib/placed.mjs";
 import { deriveRecordKey, macRecord } from "../../web/src/vault/records.ts";
 import { sampleType } from "../../web/src/vault/samples.ts";
@@ -248,6 +248,27 @@ try {
 	assert.equal((await es.ask({ op: "put", path: "/new.txt", b64: b64(enc.encode("x")) })).errno, 30, "no writes into evidence through the mount");
 	assert.equal(await es.close(), 0);
 
+	// A working case on a READ grant: read-only from the start, not refused at every save.
+	const bo = await member(dev, "bo", "analyst", { by: ana });
+	await vouch(dev, ana, [bo]);
+	const wk = await openCase(dev, ana, "wk-mount", "Shared notes", [[bo, "read"]]);
+	{
+		const ck = newContentKey();
+		const f = await wk.sealer.newFile("plan.md", "text/markdown", ck);
+		const plain = enc.encode("# plan");
+		assert.equal((await post(ana, `${wk.base}/files`, { ...f.fields, size: String(plain.length) }, await sealWith(await importContentKey(ck), plain))).status, 200);
+	}
+	const boProfile = path.join(home, "bo.json");
+	const boSetup = await cli(["setup", "--server", dev.base, "--member", "bo", "--name", "bo's laptop", "--secret", bo.recoveryCode, "--device-secret", "d".repeat(64), "--dev-email", bo.email, "--profile", boProfile]);
+	assert.equal(boSetup.status, 0, boSetup.out);
+	const rs = shell(["--profile", boProfile, "--dev-email", bo.email, "--case", "wk-mount"]);
+	const rready = await rs.ready;
+	assert.equal(rready.ready, "case:wk-mount", JSON.stringify(rready) + rs.stderr());
+	assert.match(String(rready.readOnly), /grant on this case is read-only/);
+	assert.equal(Buffer.from((ok(await rs.ask({ op: "cat", path: "/plan.md" }), "read grant reads") as { b64: string }).b64, "base64").toString(), "# plan");
+	assert.equal((await rs.ask({ op: "put", path: "/new.md", b64: b64(enc.encode("x")) })).errno, 30, "EROFS, before any request is made");
+	assert.equal(await rs.close(), 0);
+
 	// ── B. A real FUSE mount ─────────────────────────────────────────────
 	const dir = path.join(home, "Gorani");
 	fs.mkdirSync(dir);
@@ -313,7 +334,7 @@ try {
 		assert.match(mout, /unmounted/, `a clean unmount on SIGTERM: ${mout}`);
 	}
 
-	console.log(`ok  api:linux-shell — the sync engine (device unlock, names in their places and an unverified one marked, whole and frame-range reads, writes as new files and next versions the browser opens, a conflict kept as a copy, rename/move/mkdir/rmdir/trash, a sample never readable, evidence read-only and judged at open)${mounted ? ", and the same through a real FUSE mount" : fuseNote}`);
+	console.log(`ok  api:linux-shell — the sync engine (device unlock, names in their places and an unverified one marked, whole and frame-range reads, writes as new files and next versions the browser opens, a conflict kept as a copy, rename/move/mkdir/rmdir/trash, a sample never readable, evidence read-only and judged at open, a read grant read-only from the start)${mounted ? ", and the same through a real FUSE mount" : fuseNote}`);
 } finally {
 	await dev.close();
 }

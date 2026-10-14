@@ -221,8 +221,9 @@ gorani-mount script [--case C]           the same engine over JSON lines (tests;
   verified against its uploader's signed hash at open (a chunked one is
   streamed through once), and a mismatch, a bad record or — unless the
   mount was started with `--accept-unverified` — an unverified signer
-  refuses the open. Mounted `noexec,nosuid,nodev`: a vault holds data,
-  often hostile.
+  refuses the open. A case on a read grant mounts read-only from the start
+  (the server would refuse each save anyway). Mounted `noexec,nosuid,nodev`:
+  a vault holds data, often hostile.
 - **Honest limits, for now**: no offline cache (so nothing at rest to
   encrypt yet; GL1 arrives with one), files above 48 MiB are read-only
   through the mount, a rename over an existing file trashes the old one

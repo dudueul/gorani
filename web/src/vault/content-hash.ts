@@ -38,12 +38,15 @@
  *   evidence.
  * - **When**: the record says who and what, not when. The audit trail
  *   (stage 1) says when the version was recorded; an RFC 3161 timestamp
- *   (stage 7) will make that independent of the deployment.
+ *   (commit 29j, timestamp.ts) over the record's SIGNATURE makes that
+ *   independent of the deployment — `signContentHashStamped` returns the
+ *   imprint the upload sends for it.
  */
 
 import { toHex } from "../lib/encoding.ts";
 import { statements, type Signer, type Trust } from "./identity.ts";
 import { places } from "./places.ts";
+import { stampImprint } from "./timestamp.ts";
 import { openPlacedText, sealPlacedText, type VaultPrivateKey } from "./vault-crypto.ts";
 
 /** What is sealed into `file.hash(area, file, version)`. */
@@ -91,9 +94,21 @@ export async function sha256Stream(): Promise<{ update(bytes: Uint8Array): void;
 
 /** The uploader's half: sign the hash and seal the record into its place. */
 export async function signContentHash(signer: Signer, store: VaultPrivateKey, area: string, file: string, version: number, sha256: string, size: number): Promise<string> {
+	return (await signContentHashStamped(signer, store, area, file, version, sha256, size)).sealed;
+}
+
+/**
+ * The same, with the imprint the Worker's TSA stamps (commit 29j): SHA-256
+ * of the signature. Not of the content hash — a timestamp authority would
+ * then hold the evidence's fingerprint — and not of the sealed record,
+ * which nobody outside the case could tie to what it says. The signature
+ * is random-looking to the TSA, and an export's reader can hash it and
+ * verify it in the open.
+ */
+export async function signContentHashStamped(signer: Signer, store: VaultPrivateKey, area: string, file: string, version: number, sha256: string, size: number): Promise<{ sealed: string; stamp: string }> {
 	const signature = await signer.sign(statements.contentHash(area, file, version, sha256, size));
 	const record: ContentHashRecord = { v: 1, sha256, size, signer: signer.member, keyId: signer.keyId, signature };
-	return sealPlacedText(store, places.fileHash(area, file, version), JSON.stringify(record));
+	return { sealed: await sealPlacedText(store, places.fileHash(area, file, version), JSON.stringify(record)), stamp: await stampImprint(signature) };
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;

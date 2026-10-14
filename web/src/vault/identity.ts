@@ -94,6 +94,8 @@ export const statements = {
 	custodyOffer: (area: string, file: string, seq: number, from: string, to: string, reasonDigest: string) => stmt("gorani-custody-offer-v1", area, file, String(seq), from, to, reasonDigest),
 	custodyAccept: (area: string, file: string, seq: number, from: string, to: string) => stmt("gorani-custody-accept-v1", area, file, String(seq), from, to),
 	exportManifest: (caseId: string, exportId: string, manifestDigest: string) => stmt("gorani-export-v1", caseId, exportId, manifestDigest),
+	// The team's timestamp authority (commit 29j, timestamp.ts): a lead's word that this key is it.
+	tsa: (spki: string, name: string) => stmt("gorani-tsa-v1", spki, name),
 };
 
 // ── ids, digests, fingerprints ────────────────────────────────────────

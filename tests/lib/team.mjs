@@ -21,7 +21,7 @@ import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web
 import { importVaultKey, openSealedText } from "../../web/src/vault/vault-crypto.ts";
 import { buildTrust, certify, createIdentity, pin } from "../../web/src/vault/identity.ts";
 import { newCase, sealCaseGrant } from "../../web/src/vault/cases.ts";
-import { sha256Hex, signContentHash } from "../../web/src/vault/content-hash.ts";
+import { sha256Hex, signContentHash, signContentHashStamped } from "../../web/src/vault/content-hash.ts";
 import { signIntake } from "../../web/src/vault/intake.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "./placed.mjs";
@@ -85,6 +85,12 @@ export async function openCase(dev, lead, id, title, grants = [], kind = "workin
  * form field an evidence upload must carry. */
 export async function signedHash(who, sealer, id, version, plain) {
 	return signContentHash(who.signer, sealer.priv, sealer.member, id, version, await sha256Hex(plain), plain.length);
+}
+
+/** The same, with its timestamp imprint (commit 29j): `{ hash, stamp }` form fields. */
+export async function signedHashStamped(who, sealer, id, version, plain) {
+	const r = await signContentHashStamped(who.signer, sealer.priv, sealer.member, id, version, await sha256Hex(plain), plain.length);
+	return { hash: r.sealed, stamp: r.stamp };
 }
 
 /** `who`'s signed intake record for a NEW file `id` in the area `sealer`

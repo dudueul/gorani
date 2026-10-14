@@ -558,12 +558,29 @@ pub(crate) async fn checkpoint_area(env: &Env, area: &str) -> Result<()> {
 	let cp = call(env, area, Method::Post, &format!("checkpoint?date={date}")).await?;
 	let body = serde_json::json!({ "area": area, "date": date, "seq": cp["seq"], "hash": cp["hash"] });
 	let key = format!("{}{date}.json", checkpoint_prefix(area));
-	crate::s3::put(env, &key, body.to_string().into_bytes()).await?;
+	let bytes = body.to_string().into_bytes();
+	crate::s3::put(env, &key, bytes.clone()).await?;
 	// Write-once, when the bucket can (D6, commit 29c): a checkpoint is what
 	// makes a rewritten trail detectable — only if it cannot be rewritten too.
-	if env.var("OBJECT_LOCK").map(|v| v.to_string()).unwrap_or_default() == "on" {
-		let until = format!("{}T00:00:00Z", civil((Date::now().as_millis() / 86_400_000) as i64 + RETENTION_DAYS));
+	let lock = env.var("OBJECT_LOCK").map(|v| v.to_string()).unwrap_or_default() == "on";
+	let until = format!("{}T00:00:00Z", civil((Date::now().as_millis() / 86_400_000) as i64 + RETENTION_DAYS));
+	if lock {
 		crate::s3::put_retention(env, &key, &until).await?;
+	}
+	// And a third party's word for WHEN (commit 29j, tsa.rs): an RFC 3161
+	// token over SHA-256 of these exact bytes, beside them as `<date>.tsr`.
+	// The checkpoint names the chain's head, so the token dates every line
+	// up to it — a trail cannot be rewritten and re-checkpointed in the past.
+	// A TSA that fails fails the pass (reported); tomorrow's checkpoint and
+	// its token cover these lines too, a day later.
+	use sha2::Digest;
+	let imprint: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+	if let Some(stamp) = crate::tsa::stamp(env, &imprint).await? {
+		let tsr = format!("{}{date}.tsr", checkpoint_prefix(area));
+		crate::s3::put(env, &tsr, stamp.token).await?;
+		if lock {
+			crate::s3::put_retention(env, &tsr, &until).await?;
+		}
 	}
 	Ok(())
 }
@@ -594,16 +611,33 @@ pub(crate) async fn prune_area(env: &Env, area: &str) -> Result<()> {
 /// with the retention (reported, not a failure).
 pub(crate) async fn verify_area(env: &Env, area: &str) -> Result<serde_json::Value> {
 	let keys = crate::s3::list(env, &checkpoint_prefix(area), 4000).await?;
-	let mut checkpoints: Vec<(String, i64, String)> = Vec::new(); // (date, seq, hash)
-	for key in keys {
-		let mut resp = crate::s3::stream_uncached(env, &key).await?;
+	let tokens: std::collections::BTreeSet<&String> = keys.iter().filter(|k| k.ends_with(".tsr")).collect();
+	// (date, seq, hash, the checkpoint's exact text, its timestamp token)
+	let mut checkpoints: Vec<(String, i64, String, String, Option<String>)> = Vec::new();
+	for key in keys.iter().filter(|k| k.ends_with(".json")) {
+		let mut resp = crate::s3::stream_uncached(env, key).await?;
 		if resp.status_code() != 200 {
 			continue;
 		}
-		let v: serde_json::Value = serde_json::from_str(&resp.text().await?).unwrap_or_default();
+		let text = resp.text().await?;
+		let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
 		if let (Some(date), Some(seq), Some(hash)) = (v["date"].as_str(), v["seq"].as_i64(), v["hash"].as_str()) {
 			if v["area"].as_str() == Some(area) {
-				checkpoints.push((date.to_string(), seq, hash.to_string()));
+				// The token travels as the bucket holds it; the reader checks it
+				// (web/src/vault/timestamp.ts) — the Worker vouches for nothing.
+				let tsr = format!("{}.tsr", key.trim_end_matches(".json"));
+				let token = if tokens.contains(&tsr) {
+					let mut t = crate::s3::stream_uncached(env, &tsr).await?;
+					if t.status_code() == 200 {
+						use base64::Engine;
+						Some(base64::engine::general_purpose::STANDARD.encode(t.bytes().await?))
+					} else {
+						None
+					}
+				} else {
+					None
+				};
+				checkpoints.push((date.to_string(), seq, hash.to_string(), text, token));
 			}
 		}
 	}
@@ -614,7 +648,7 @@ pub(crate) async fn verify_area(env: &Env, area: &str) -> Result<serde_json::Val
 	let mut ok = chain["ok"].as_bool() == Some(true);
 	let mut report = Vec::new();
 	checkpoints.sort();
-	for (date, seq, hash) in &checkpoints {
+	for (date, seq, hash, text, token) in &checkpoints {
 		let (status, why) = if *seq < base {
 			("pruned", "older than the retention; the chain's base moved past it".to_string())
 		} else if *seq > last {
@@ -627,7 +661,7 @@ pub(crate) async fn verify_area(env: &Env, area: &str) -> Result<serde_json::Val
 		if status == "missing" || status == "mismatch" {
 			ok = false;
 		}
-		report.push(serde_json::json!({ "date": date, "seq": seq, "status": status, "why": why }));
+		report.push(serde_json::json!({ "date": date, "seq": seq, "hash": hash, "status": status, "why": why, "body": text, "token": token }));
 	}
 	Ok(serde_json::json!({ "ok": ok, "area": area, "chain": chain, "checkpoints": report }))
 }

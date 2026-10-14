@@ -27,7 +27,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 *(landed: 29f `api:approvals`, 29g `api:custody`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
-| 7 *(29h landed: `api:export`; 29i: `api:siem`)* | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
+| 7 *(landed: 29h `api:export`, 29i `api:siem`, 29j `api:timestamps`)* | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
 ## Stage 1 — the audit, tamper-evident
 
@@ -519,3 +519,62 @@ anyone      tools/verify-export.mjs package.zip — Node only, no gorani code, n
 - Verification is the client's and the export's: parse the token
   (CMS SignedData), check the message imprint, the TSA's signature, and
   its certificate against a pinned TSA certificate.
+
+#### 29j as built
+
+- **One change from the design: a version's imprint is SHA-256 of the
+  uploader's SIGNATURE, not of the sealed record.** A stamp over the
+  sealed record proves "this ciphertext existed" — and nobody outside the
+  case can tie a ciphertext to what it says, so an export's recipient
+  would have had to take the exporter's word for the link. The signature
+  is in the open in an export (`hashRecord.signature`): hash it, compare
+  the token's imprint, verify the signature names the content hash —
+  every step checkable with no key. To a TSA it is 64 random-looking
+  bytes: it learns nothing about the evidence. The client computes the
+  imprint (`content-hash.ts › signContentHashStamped`) and sends it as the
+  upload's `stamp` field; the store cannot check it (the record is
+  sealed), and a wrong one buys a stamp that verifies nothing, reported as
+  such — the same failure mode as a wrong hash record.
+- `worker/src/tsa.rs`: the TimeStampReq (SHA-256, an 8-byte nonce,
+  `certReq`), and the reply's check — status granted, the token over the
+  imprint asked about, the nonce echoed (no replayed or crossed reply).
+  It verifies NO signature: that is the reader's job, never the server's.
+  Unit-tested against a reply from OpenSSL's own TSA.
+- `worker/src/stamps.rs` (migration v15: `file_versions.stamp_imprint,
+  stamp_token, stamped_at`): evidence versions are stamped by the member
+  DO's ALARM — the upload never waits on a third party; up to 20 a run,
+  the first failure ends the run and backs off (1 s doubling to an hour);
+  the nightly pass tries too and reports what is pending. `GET
+  …/files/<id>/stamps` lists every version's token; `PUT` sets the imprint
+  of a version recorded without one — only then, never a replacement —
+  and re-verification (`export.ts › reverifyCase`) sends it.
+- Audit checkpoints: the nightly pass stamps SHA-256 of the checkpoint's
+  exact bytes and writes the token beside it (`<date>.tsr`, locked like
+  the checkpoint under Object Lock). `…/audit/verify` returns each
+  checkpoint's body and token. The checkpoint names the chain's head, so
+  its token dates every line up to it.
+- Which TSA counts — `family/tsa_certs.rs` (registry migration v8): a lead
+  probes the TSA (`POST /family/tsa/probe` — a token over a random
+  imprint, its certificate inside), compares the certificate's SHA-256
+  fingerprint with the one the authority publishes, and signs
+  `stmt("gorani-tsa-v1", SHA-256(SPKI), name)`. Readers count a key when
+  a certification of it verifies under an identity THEY trust. The KEY is
+  pinned, not a certificate chain to a root: a renewed certificate on the
+  same key needs nothing; a new key, a new certification, the old one
+  kept so old tokens still verify. Any lead withdraws a key (taking trust
+  away is protective); its tokens then read "uncertified".
+- `web/src/vault/timestamp.ts`: the reader's check — imprint,
+  messageDigest, the ESS signing-certificate binding, the timestamping
+  EKU, genTime within the certificate's validity, the signature (RSA
+  PKCS#1 v1.5 or ECDSA, WebCrypto), and the key's certification. Each
+  failure is named; only `verified` means "a TSA the team chose saw this
+  by then". The file explorer's "Verify signature" adds the stamp's line;
+  Team › People shows the authority and, for a lead, the certify flow.
+- The export carries every version's token and imprint, the checkpoints'
+  bodies and tokens, and `tsa.certs`; `tools/verify-export.mjs` checks
+  them with its own DER walk and Node's X.509 parser — a third reader —
+  and prints the TSA certificate's fingerprint to compare out of band
+  (`--tsa <spki>` trusts a key the package does not certify).
+- Not yet: no CRL/OCSP check of the TSA's certificate (a revoked TSA key
+  is the team's call — withdraw it); RSA-PSS tokens are reported
+  unsupported; working (non-evidence) stores are not stamped.

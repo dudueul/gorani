@@ -238,6 +238,35 @@ backoff (up to an hour), and the nightly pass logs every area still
 behind (`<area>: SIEM: … not yet delivered`). The first deploy with
 `SIEM_URL` set sends every trail from the start of its retained chain.
 
+### Trusted timestamps (commit 29j, D5.5)
+
+Set `TSA_URL` in `wrangler.jsonc` to an RFC 3161 authority's HTTP
+endpoint — a commercial TSA (DigiCert, Sectigo, GlobalSign — some are free
+for low volume, others want an account: `wrangler secret put
+TSA_AUTHORIZATION` with the header value they give you), a national
+qualified TSA if your evidence must meet eIDAS, or your own (`openssl ts`
+behind a small HTTP server is what the test suite uses). The Worker must
+be able to reach it. Each evidence version costs one request, each audit
+trail one a night.
+
+Then, once: a lead opens Team › People › Timestamp authority, presses
+"Read the authority's certificate", **compares the certificate SHA-256
+with the one the authority publishes on its own site**, and certifies.
+Until a lead does, stamps are stored but every reader reports them
+"uncertified". When the authority rotates its key, certify the new one
+(keep the old certification — tokens it signed stay valid); if a key is
+compromised, Withdraw it.
+
+Evidence uploaded before `TSA_URL` was set (or before commit 29j) is
+stamped when someone with write access re-verifies the case (Team ›
+Cases › Re-verify now): the stamp then dates the signature as of that day.
+The nightly pass logs `evidence version(s) … still without a trusted
+timestamp` while a TSA is failing; the alarm keeps retrying (backoff up to
+an hour). By hand, a token checks with OpenSSL: save it (base64 → DER) and
+`openssl ts -verify -in token.der -token_in -digest <imprint> -CAfile
+tsa.pem` — the imprint is SHA-256 of the version's `hashRecord.signature`
+(base64-decoded) or of the checkpoint's bytes.
+
 ### Upgrading across commit 29 (the audit trails)
 
 `wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration

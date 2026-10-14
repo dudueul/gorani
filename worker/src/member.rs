@@ -297,6 +297,14 @@ pub const MIGRATIONS: &[&str] = &[
 		cancelled_at TEXT,
 		PRIMARY KEY (file_id, seq)
 	)",
+	// Migration v15 (commit 29j, docs/CUSTODY.md › Stage 7, D5.5): an RFC
+	// 3161 timestamp per evidence version. The imprint is the client's
+	// (SHA-256 of the uploader's signature, which the store cannot open);
+	// the token is the TSA's, stored as it came (base64 DER), with the time
+	// it states — readable, because a token is a public proof.
+	"ALTER TABLE file_versions ADD COLUMN stamp_imprint TEXT",
+	"ALTER TABLE file_versions ADD COLUMN stamp_token TEXT",
+	"ALTER TABLE file_versions ADD COLUMN stamped_at TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -313,6 +321,8 @@ pub const MIGRATIONS: &[&str] = &[
 pub struct GoraniMemberDO {
 	pub(crate) sql: worker::SqlStorage,
 	pub(crate) env: Env,
+	/// (commit 29j) The alarm that stamps evidence versions (stamps.rs).
+	pub(crate) state: State,
 	/// A failed migration, kept instead of panicking (schema.rs): every
 	/// request is answered with it until a fixed deploy migrates cleanly.
 	schema: std::result::Result<(), String>,
@@ -324,7 +334,16 @@ impl DurableObject for GoraniMemberDO {
 		// Ledgered (commit 25): the constructor runs on EVERY wake-up, and
 		// re-running an ADD COLUMN panicked the second one (schema.rs).
 		let schema = crate::schema::migrate(&sql, MIGRATIONS);
-		Self { sql, env, schema }
+		Self { sql, env, schema, state }
+	}
+
+	/// The only alarm this DO sets: trusted timestamps for evidence versions
+	/// (commit 29j, stamps.rs), off every request's path.
+	async fn alarm(&self) -> Result<Response> {
+		if self.schema.is_ok() {
+			self.stamp_alarm().await?;
+		}
+		Response::ok("")
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
@@ -551,6 +570,12 @@ impl GoraniMemberDO {
 			// Custody (commit 29g, custody.rs). The Worker names the acting
 			// member in the body (`member`), from its own check of the caller.
 			("GET", id) if id.starts_with("custody/") => self.custody_get(&id["custody/".len()..]).await,
+			// Timestamps (commit 29j, stamps.rs).
+			("GET", id) if id.starts_with("stamps/") => self.stamps_get(&id["stamps/".len()..]).await,
+			("PUT", id) if id.starts_with("stamps/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.stamps_put(&actor, &id["stamps/".len()..], body).await
+			}
 			("POST", id) if id.starts_with("custody/") => {
 				let body = req.json::<serde_json::Value>().await?;
 				match id["custody/".len()..].split('/').collect::<Vec<_>>().as_slice() {
@@ -1095,15 +1120,21 @@ impl GoraniMemberDO {
 		// Evidence still without its write-once retention: a failure the pass
 		// reports (503), like a delete storage refused — never silence.
 		let locks = self.lock_pass().await?;
+		// Evidence versions still without their timestamp (commit 29j): the
+		// alarm retries on its own; tonight's pass tries too, and says so.
+		let stamps = self.stamp_pass().await?;
+		if stamps.pending > 0 {
+			worker::console_error!("gorani: {} evidence version(s) in {} still without a trusted timestamp (TSA_URL)", stamps.pending, self.area(None).unwrap_or_default());
+		}
 		// Evidence nobody re-verified lately (commit 29h): the server cannot
 		// re-hash (it has no key) — it can notice nobody did, and say so.
 		let reverify = self.reverify_state().await?;
 		if reverify.get("overdue").and_then(|o| o.as_bool()) == Some(true) {
 			worker::console_error!("gorani: evidence store {} not re-verified for {} days or more (REVERIFY_DAYS) — a client must re-hash it", self.area(None).unwrap_or_default(), reverify["days"]);
 		}
-		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending},locksFailed:{},locksPending:{}", locks.failed, locks.pending))).await?;
-		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending, "reverify": reverify });
-		if failed > 0 || locks.failed > 0 {
+		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending},locksFailed:{},locksPending:{},stampsFailed:{},stampsPending:{}", locks.failed, locks.pending, stamps.failed, stamps.pending))).await?;
+		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending, "stamped": stamps.stamped, "stampsFailed": stamps.failed, "stampsPending": stamps.pending, "reverify": reverify });
+		if failed > 0 || locks.failed > 0 || stamps.failed > 0 {
 			return Ok(Response::from_json(&body)?.with_status(503));
 		}
 		Ok(Response::from_json(&body)?)

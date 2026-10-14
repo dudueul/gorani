@@ -123,6 +123,10 @@ impl GoraniMemberDO {
 		if let Some(refused) = self.hash_refusal(get("hash").as_deref()).await? {
 			return Ok(refused);
 		}
+		// Its timestamp imprint (commit 29j, stamps.rs), when the client sent one.
+		if let Some(msg) = crate::stamps::stamp_refusal(get("hash").as_deref(), get("stamp").as_deref()) {
+			return json_error(400, msg);
+		}
 		// The intake record (commit 29g): where the item came from — sealed,
 		// signed, and required on evidence, like the hash. A NEW file only:
 		// an item is acquired once; its later versions are its processing.
@@ -157,7 +161,7 @@ impl GoraniMemberDO {
 		self.contributor_add(&file_id, actor).await?;
 		self.sql
 			.exec(
-				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, stamp_imprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
 				Some(vec![
 					file_id.clone().into(),
 					version.into(),
@@ -169,6 +173,7 @@ impl GoraniMemberDO {
 					body.get("chunkSize").and_then(|v| v.as_i64()).map(worker::SqlStorageValue::Integer).unwrap_or(worker::SqlStorageValue::Null),
 					bind(get("tag")),
 					bind(get("hash")),
+					bind(get("stamp")),
 				]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("version insert: {e}")))?;
@@ -176,6 +181,9 @@ impl GoraniMemberDO {
 			return Ok(resp);
 		}
 		self.audit(actor, if sample { "file.upload.sample" } else { "file.upload" }, &file_id, None, None).await?;
+		if get("stamp").is_some() {
+			self.arm_stamps().await?;
+		}
 		self.file_row(&file_id).await
 	}
 
@@ -225,9 +233,13 @@ impl GoraniMemberDO {
 		if let Some(refused) = self.hash_refusal(get("hash").as_deref()).await? {
 			return Ok(refused);
 		}
+		// Its timestamp imprint (commit 29j, stamps.rs), when the client sent one.
+		if let Some(msg) = crate::stamps::stamp_refusal(get("hash").as_deref(), get("stamp").as_deref()) {
+			return json_error(400, msg);
+		}
 		self.sql
 			.exec(
-				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, stamp_imprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
 				Some(vec![
 					file_id.clone().into(),
 					next.into(),
@@ -239,6 +251,7 @@ impl GoraniMemberDO {
 					body.get("chunkSize").and_then(|v| v.as_i64()).map(worker::SqlStorageValue::Integer).unwrap_or(worker::SqlStorageValue::Null),
 					bind(get("tag")),
 					bind(get("hash")),
+					bind(get("stamp")),
 				]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("version insert: {e}")))?;
@@ -251,6 +264,9 @@ impl GoraniMemberDO {
 			return Ok(resp);
 		}
 		self.audit(actor, "file.version", &file_id, None, None).await?;
+		if get("stamp").is_some() {
+			self.arm_stamps().await?;
+		}
 		self.file_row(&file_id).await
 	}
 

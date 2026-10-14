@@ -29,6 +29,12 @@
  *
  * Re-verification walks the same files the same way and reports counts
  * only: what was checked, what failed.
+ *
+ * Trusted timestamps (commit 29j, timestamp.ts) travel with each version
+ * and each audit checkpoint: the token as the TSA issued it, its imprint,
+ * and — in `tsa.certs` — the leads' certifications of the TSA keys, whose
+ * signers are among `identities`. Re-verification also asks for a stamp
+ * on any signed version recorded before stamps existed.
  */
 
 import { statements, type RegistryIdentity, type Signer, type Trust } from "./identity.ts";
@@ -41,11 +47,14 @@ import { verifyChain, type CustodyChain } from "./custody.ts";
 import { isSampleType, zipEncrypted } from "./samples.ts";
 import { zipEntries, type ZipEntry } from "./zip.ts";
 import type { Approval } from "./approvals.ts";
+import { checkCheckpointStamp, checkVersionStamp, stampImprint, trustedTsas, type StampCheck, type TrustedTsas, type TsaCert, type VersionStamp } from "./timestamp.ts";
 
 /** How this module reaches the API: the browser's fetches, or a test's. */
 export interface ExportSource {
 	get<T>(path: string): Promise<T>;
 	post<T>(path: string, body: unknown): Promise<T>;
+	/** (commit 29j) Re-verification's request for a missing stamp; absent → not asked. */
+	put?<T>(path: string, body: unknown): Promise<T>;
 	/** A version's sealed bytes and the headers that open it (`GET …/files/<id>?version=n`). */
 	object(path: string): Promise<{ body: Uint8Array; ck: string; chunk: number | null; version: number; hash: string | null }>;
 }
@@ -59,6 +68,10 @@ export interface VersionReport {
 	packed: "plain" | "zip-infected";
 	hashRecord: ContentHashRecord | null;
 	hashCheck: HashCheck["status"];
+	/** Its RFC 3161 token and imprint (the TSA's, untouched), and what the exporter's check said. */
+	stamp: { imprint: string; token: string; at: string | null } | null;
+	stampCheck: StampCheck["status"];
+	stampNote: string;
 }
 
 export interface FileReport {
@@ -82,7 +95,7 @@ interface FileRow {
  * check each signed record. `onVersion` receives the plaintext (the export
  * stores it; re-verification drops it).
  */
-async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, caseId: string, onVersion: (file: FileRow & { name: string }, v: VersionReport, plain: Uint8Array) => Promise<void> | void): Promise<FileReport[]> {
+async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, caseId: string, tsas: TrustedTsas, onVersion: (file: FileRow & { name: string }, v: VersionReport, plain: Uint8Array) => Promise<void> | void): Promise<FileReport[]> {
 	const base = `/api/v1/cases/${caseId}`;
 	const area = `case:${caseId}`;
 	const rows: FileRow[] = [];
@@ -108,6 +121,7 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 		}
 		const versions: VersionReport[] = [];
 		let sample = row.sample === true || keys?.sample === true;
+		const stamps = new Map((await source.get<{ versions: VersionStamp[] }>(`${base}/files/${row.id}/stamps`).catch(() => ({ versions: [] }))).versions.map((s) => [s.version, s]));
 		for (let after = 0; ; ) {
 			const page = await source.get<{ items: { row: number; b: string; v2: string | null }[]; next: number | null }>(`${base}/files/sealed?kind=version&file=${encodeURIComponent(row.id)}&after=${after}&limit=500`);
 			for (const it of page.items) {
@@ -122,7 +136,21 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 				const sha256 = await sha256Hex(plain);
 				const check = await checkContentHash(store, trust, area, row.id, obj.version, obj.hash, { sha256, size: plain.length });
 				const safe = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_") || row.id;
-				const v: VersionReport = { version: obj.version, size: plain.length, sha256, path: `evidence/${row.id}/v${obj.version}/${safe}${sample ? ".zip" : ""}`, packed: sample ? "zip-infected" : "plain", hashRecord: await openContentHash(store, area, row.id, obj.version, obj.hash), hashCheck: check.status };
+				const hashRecord = await openContentHash(store, area, row.id, obj.version, obj.hash);
+				const s = stamps.get(obj.version);
+				const stampCheck = await checkVersionStamp(hashRecord, s, tsas);
+				const v: VersionReport = {
+					version: obj.version,
+					size: plain.length,
+					sha256,
+					path: `evidence/${row.id}/v${obj.version}/${safe}${sample ? ".zip" : ""}`,
+					packed: sample ? "zip-infected" : "plain",
+					hashRecord,
+					hashCheck: check.status,
+					stamp: s?.token && s.imprint ? { imprint: s.imprint, token: s.token, at: s.at } : null,
+					stampCheck: stampCheck.status,
+					stampNote: s?.status === "no-imprint" ? "no-imprint" : stampCheck.status === "invalid" || stampCheck.status === "absent" ? stampCheck.why : "",
+				};
 				versions.push(v);
 				await onVersion({ ...row, name }, v, plain);
 			}
@@ -136,16 +164,45 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 
 const pick = (e: { offeredAt: string; offerSignature: string; acceptedAt: string | null; acceptSignature: string | null }) => ({ offeredAt: e.offeredAt, offerSignature: e.offerSignature, acceptedAt: e.acceptedAt, acceptSignature: e.acceptSignature });
 
-/** Re-hash every version against its signed record; record the counts in the case's audit. */
-export async function reverifyCase(source: ExportSource, store: VaultPrivateKey, trust: Trust, caseId: string): Promise<{ checked: number; failed: number; problems: string[] }> {
+/** The TSA keys this reader counts (commit 29j): the leads' certifications, under the reader's own trust. */
+async function tsasOf(source: ExportSource, trust: Trust): Promise<{ certs: TsaCert[]; trusted: TrustedTsas }> {
+	const { certs } = await source.get<{ certs: TsaCert[] }>("/api/v1/family/tsa").catch(() => ({ certs: [] as TsaCert[] }));
+	return { certs, trusted: await trustedTsas(trust, certs) };
+}
+
+/** A stamp the exporter or re-verifier should not pass over in silence. */
+const stampProblem = (v: VersionReport) => (v.stampCheck === "invalid" || v.stampCheck === "uncertified" ? `timestamp ${v.stampCheck}${v.stampNote ? ` (${v.stampNote})` : ""}` : null);
+
+/**
+ * Re-hash every version against its signed record; record the counts in
+ * the case's audit. A signed version without a timestamp imprint (recorded
+ * before commit 29j) gets one asked for now: a later stamp still dates the
+ * signature — later than the upload, earlier than any dispute.
+ */
+export async function reverifyCase(source: ExportSource, store: VaultPrivateKey, trust: Trust, caseId: string): Promise<{ checked: number; failed: number; problems: string[]; stampsRequested: number }> {
 	let checked = 0;
+	let stampsRequested = 0;
 	const problems: string[] = [];
-	await walk(source, store, trust, caseId, (f, v) => {
+	const { trusted } = await tsasOf(source, trust);
+	const missing: { file: string; version: number; signature: string }[] = [];
+	await walk(source, store, trust, caseId, trusted, (f, v) => {
 		checked++;
 		if (v.hashCheck !== "verified") problems.push(`${f.name} v${v.version}: ${v.hashCheck}`);
+		const sp = stampProblem(v);
+		if (sp) problems.push(`${f.name} v${v.version}: ${sp}`);
+		if (v.stampNote === "no-imprint" && v.hashCheck === "verified" && v.hashRecord) missing.push({ file: f.id, version: v.version, signature: v.hashRecord.signature });
 	});
+	for (const m of missing) {
+		if (!source.put) break;
+		try {
+			await source.put(`/api/v1/cases/${caseId}/files/${m.file}/stamps`, { version: m.version, imprint: await stampImprint(m.signature) });
+			stampsRequested++;
+		} catch {
+			// (a read-only grant cannot ask; the next re-verifier with write access will)
+		}
+	}
 	await source.post(`/api/v1/cases/${caseId}/reverify`, { checked, failed: problems.length });
-	return { checked, failed: problems.length, problems };
+	return { checked, failed: problems.length, problems, stampsRequested };
 }
 
 export interface ExportResult {
@@ -160,9 +217,12 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 	const started = await source.post<{ exportId: string; exporter: string; approval: Approval }>(`/api/v1/cases/${caseId}/export`, { approval: approvalId });
 	const entries: ZipEntry[] = [];
 	const problems: string[] = [];
-	const files = await walk(source, store, trust, caseId, (f, v, plain) => {
+	const tsa = await tsasOf(source, trust);
+	const files = await walk(source, store, trust, caseId, tsa.trusted, (f, v, plain) => {
 		entries.push({ name: v.path, data: v.packed === "zip-infected" ? concat(zipEncrypted(f.name, plain)) : plain });
 		if (v.hashCheck !== "verified") problems.push(`${f.name} v${v.version}: content ${v.hashCheck}`);
+		const sp = stampProblem(v);
+		if (sp) problems.push(`${f.name} v${v.version}: ${sp}`);
 	});
 	for (const f of files) {
 		if (f.intakeCheck !== "verified" && f.intakeCheck !== "none") problems.push(`${f.name}: intake ${f.intakeCheck}`);
@@ -179,7 +239,13 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 		if (page.next === null) break;
 		after = page.next;
 	}
-	const auditVerify = await source.get<unknown>(`${base}/audit/verify`);
+	const auditVerify = await source.get<{ checkpoints?: { date: string; body?: string; token?: string | null }[] }>(`${base}/audit/verify`);
+	// Each checkpoint's timestamp, checked like a version's.
+	for (const cp of auditVerify.checkpoints ?? []) {
+		if (!cp.body || !cp.token) continue;
+		const c = await checkCheckpointStamp(cp.body, cp.token, tsa.trusted);
+		if (c.status === "invalid" || c.status === "uncertified") problems.push(`audit checkpoint ${cp.date}: timestamp ${c.status}${c.status === "invalid" ? ` (${c.why})` : ""}`);
+	}
 	// Every identity the package names — the public halves a recipient checks signatures with.
 	const named = new Set<string>([signer.member, started.approval.requestedBy, started.approval.approvedBy ?? ""]);
 	for (const f of files) {
@@ -188,6 +254,7 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 		for (const l of f.custody?.links ?? []) named.add(l.from).add(l.to);
 		if (f.custody) named.add(f.custody.owner);
 	}
+	for (const c of tsa.certs) named.add(c.by);
 	const registry = (await source.get<{ identities: RegistryIdentity[] }>("/api/v1/family/identities")).identities;
 	const identities = registry.filter((e) => named.has(e.member)).map((e) => ({ member: e.member, keyId: e.keyId, publicKey: e.publicKey, rootDigest: e.rootDigest, signature: e.signature, active: e.active !== false, certs: e.certs }));
 	const manifest = {
@@ -201,6 +268,8 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 		problems,
 		files,
 		audit: { base: auditBase, lines, verify: auditVerify },
+		// The leads' word on which TSA keys count (timestamp.ts › trustedTsas).
+		tsa: { certs: tsa.certs },
 		identities,
 	};
 	const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
@@ -235,6 +304,9 @@ function verifyText(caseId: string, exportId: string, signer: Signer, digest: st
 		"Samples (packed: zip-infected) are zips under the password \"infected\": unzip, then hash.",
 		"Each version's hashRecord is its uploader's signature; each intake record and custody link",
 		"is signed too; the approval carries two leads' signatures. The public keys are in identities.",
+		"A version's stamp is an RFC 3161 token over SHA-256 of its hashRecord's signature; a",
+		"checkpoint's, over the checkpoint's bytes (audit › verify › checkpoints). `openssl ts",
+		"-verify` checks one by hand; tsa › certs says which TSA keys the team's leads certified.",
 		"",
 	].join("\n");
 }

@@ -17,7 +17,12 @@
 //! emails to members; a member's email acts for their own area and for the
 //! cases they are granted (routes.rs), never for another member's area.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+// (No std::time: `SystemTime::now()` PANICS on wasm32-unknown-unknown —
+// the platform has no clock std can reach. It was here until commit 33a,
+// on the Access path only: every production request that carried a token
+// panicked in the JWKS cache, and dev mode never reached it. The Workers
+// clock is `worker::Date`, milliseconds since the epoch. Found by api:access,
+// the first suite to run this path.)
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -49,7 +54,8 @@ pub struct Granted {
 /// One JWKS fetch, cached per isolate for ten minutes (a JWKS rotation
 /// propagates within minutes; Access signs short-lived tokens).
 struct JwksCache {
-	fetched_at: SystemTime,
+	/// When the keys were fetched, ms since the epoch (`worker::Date`).
+	fetched_at: u64,
 	keys: Vec<Jwk>,
 }
 
@@ -69,6 +75,11 @@ fn cache() -> &'static std::sync::Mutex<Option<JwksCache>> {
 	CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// The Workers clock, ms since the epoch.
+fn now_ms() -> u64 {
+	Date::now().as_millis()
+}
+
 /// The team's JWKS URL. `TEAM_DOMAIN` may be the team URL or the full certs
 /// URL, as with Mailflare's setup.
 fn certs_url(team_domain: &str) -> String {
@@ -82,7 +93,7 @@ fn certs_url(team_domain: &str) -> String {
 async fn fetch_jwks(env: &Env) -> Result<Vec<Jwk>> {
 	if let Ok(cached) = cache().lock() {
 		if let Some(c) = cached.as_ref() {
-			if c.fetched_at.elapsed().unwrap_or(Duration::MAX) < Duration::from_secs(600) {
+			if now_ms().saturating_sub(c.fetched_at) < 600_000 {
 				return Ok(c.keys.clone());
 			}
 		}
@@ -95,7 +106,7 @@ async fn fetch_jwks(env: &Env) -> Result<Vec<Jwk>> {
 		.and_then(|k| serde_json::from_value(k.clone()).ok())
 		.ok_or_else(|| Error::RustError("bad JWKS".into()))?;
 	if let Ok(mut cached) = cache().lock() {
-		*cached = Some(JwksCache { fetched_at: SystemTime::now(), keys: keys.clone() });
+		*cached = Some(JwksCache { fetched_at: now_ms(), keys: keys.clone() });
 	}
 	Ok(keys)
 }
@@ -179,7 +190,7 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 		.map_err(|_| Error::RustError("bad signature".into()))?;
 
 	// The claims, once the bytes are trusted.
-	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+	let now = now_ms() / 1000;
 	let iss = t.claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
 	let team_origin = {
 		let trimmed = team.trim_end_matches('/');

@@ -92,11 +92,31 @@ before starting (commit 33, after D11/D12) found:
 
 | Stage | What |
 |---|---|
-| 33a | **Sign in as the member.** The core sends a user Access token (`cf-access-token`, from `cloudflared access token -app=<server>` or the `GORANI_ACCESS_TOKEN` variable) — short-lived and bound to the member's SSO/MFA, so the Worker sees the member's email and every rule (own area, case grants) applies unchanged. The device token stays what it is: the release of this computer's wrapped root copy. |
+| 33a *(landed)* | **Sign in as the member.** The core sends a user Access token (`cf-access-token`, from `cloudflared access token -app=<server>` or the `GORANI_ACCESS_TOKEN` variable) — short-lived and bound to the member's SSO/MFA, so the Worker sees the member's email and every rule (own area, case grants) applies unchanged. The device token stays what it is: the release of this computer's wrapped root copy. |
 | 33b | **Large files.** `push` streams from disk in GC01 frames at `chunk_for(size)`, parts with retry, and a resume journal on disk (sealed fields only, like the browser's); `pull` streams frame windows to disk and checks the signed hash. |
 | 33c | **Cases.** Open a granted case's key from its grant; list, pull, push into it; on an evidence case, sign the content hash (and send the stamp imprint) with the member's identity key, and carry an intake record. |
 | 33d | **The Linux shell** (`clients/linux`, FUSE): the engine first, against `wrangler dev` with an in-memory file system as the doc's testing pattern says; a real mount where the machine allows FUSE. |
 | — | Windows (Cloud Files) and macOS (File Provider) need their platforms to build and test — not this repository's CI machine. |
+
+### 33a as built
+
+- `clients/core`: the profile's `accessTokenCmd` (or `GORANI_ACCESS_TOKEN`)
+  gives the member's Access token, fetched once per process and sent as
+  `cf-access-token`; a command that fails or prints nothing is an error,
+  never an anonymous request. `gorani-sync setup --access-token-cmd
+  "cloudflared access token -app=https://<host>"`.
+- **A second, larger finding on the way.** `api:access` — the first suite
+  to run the Worker with dev mode OFF, against a stub Access team — found
+  that the Access path **panicked on every request with a token**:
+  `auth.rs` aged its JWKS cache and checked expiry with
+  `std::time::SystemTime`, which panics on `wasm32-unknown-unknown` (the
+  platform gives std no clock). Dev mode never reached that code, so
+  every suite passed while no production deployment could have served one
+  authenticated request. It now uses the Workers clock (`worker::Date`).
+- `api:access` keeps both honest: a member's token is the member; a
+  service token's (no email) is refused, as the desktop's used to be; and
+  missing, foreign-audience, expired, foreign-issuer, forged, unknown-key,
+  non-ES256 and edited-after-signing tokens are each refused by name.
 
 ## Testing (the pattern the port follows)
 

@@ -1,9 +1,10 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 // Portions derived from Mailflare's desktop core (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
 
-//! The HTTP layer: every endpoint of docs/DESKTOP.md, one method each, with
-//! the Access service-token headers when configured (production) and none
-//! in dev. Blocking ureq on the CLI's own thread.
+//! The HTTP layer: every endpoint of docs/DESKTOP.md, one method each. In
+//! production the member signs in through Access — their token rides every
+//! request as `cf-access-token` (commit 33a); in dev, the dev-email header.
+//! Blocking ureq on the CLI's own thread.
 
 use serde_json::{json, Value};
 
@@ -47,6 +48,30 @@ pub struct Jwk {
 pub struct Client {
 	pub profile: DeviceProfile,
 	agent: ureq::Agent,
+	/// The member's Access token, fetched once per process (commit 33a).
+	access_token: std::sync::OnceLock<Option<String>>,
+}
+
+/// The member's Access token: `GORANI_ACCESS_TOKEN`, else the profile's
+/// command's output (trimmed). None when neither is set — dev mode, or a
+/// deployment that signs in some other way. A command that fails is an
+/// error the caller sees on its first request, not a silent anonymous call.
+pub fn access_token_from(env_token: Option<String>, cmd: Option<&str>) -> Result<Option<String>, Error> {
+	if let Some(t) = env_token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+		return Ok(Some(t));
+	}
+	let Some(cmd) = cmd.map(str::trim).filter(|c| !c.is_empty()) else { return Ok(None) };
+	let mut parts = cmd.split_whitespace();
+	let program = parts.next().unwrap_or_default();
+	let out = std::process::Command::new(program).args(parts).output().map_err(|e| Error::Config(format!("the access token command ({program}) did not run: {e}")))?;
+	if !out.status.success() {
+		return Err(Error::Config(format!("the access token command failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
+	}
+	let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+	if token.is_empty() || token.contains(char::is_whitespace) {
+		return Err(Error::Config("the access token command printed no token (sign in first: cloudflared access login <host>)".into()));
+	}
+	Ok(Some(token))
 }
 
 impl Client {
@@ -59,11 +84,24 @@ impl Client {
 			.redirects(0)
 			.timeout_connect(std::time::Duration::from_secs(15))
 			.timeout(std::time::Duration::from_secs(60));
-		Self { profile, agent: b.build() }
+		Self { profile, agent: b.build(), access_token: std::sync::OnceLock::new() }
 	}
 
 	fn url(&self, rest: &str) -> String {
 		format!("{}/api/v1/members/{}{rest}", self.profile.server.trim_end_matches('/'), self.profile.member)
+	}
+
+	/// The member's token for this process (fetched on first use).
+	fn member_token(&self) -> Option<&str> {
+		self.access_token
+			.get_or_init(|| match access_token_from(std::env::var("GORANI_ACCESS_TOKEN").ok(), self.profile.access_token_cmd.as_deref()) {
+				Ok(t) => t,
+				Err(e) => {
+					eprintln!("gorani: {e}");
+					None
+				}
+			})
+			.as_deref()
 	}
 
 	fn req(&self, method: &str, url: &str) -> ureq::Request {
@@ -75,6 +113,11 @@ impl Client {
 		// gzip` (ureq's default; bisected in the live-test session). Setting
 		// `identity` explicitly both opts out and stops ureq adding its own.
 		r = r.set("Accept-Encoding", "identity");
+		// The member, signed in through Access (commit 33a): their token, which
+		// Access validates and hands the Worker as the member's JWT.
+		if let Some(token) = self.member_token() {
+			r = r.set("cf-access-token", token);
+		}
 		if let (Some(id), Some(secret)) = (&self.profile.access_id, &self.profile.access_secret) {
 			r = r.set("CF-Access-Client-Id", id).set("CF-Access-Client-Secret", secret);
 		}
@@ -204,3 +247,22 @@ pub struct UploadFields {
 	pub form: Vec<(String, String)>,
 }
 
+#[cfg(test)]
+mod tests {
+	use super::access_token_from;
+
+	#[test]
+	fn the_variable_wins_then_the_command_then_nothing() {
+		assert_eq!(access_token_from(Some(" ey.tok ".into()), Some("false")).unwrap().as_deref(), Some("ey.tok"), "the variable, trimmed, and the command never runs");
+		assert_eq!(access_token_from(None, Some("echo ey.from.cmd")).unwrap().as_deref(), Some("ey.from.cmd"));
+		assert_eq!(access_token_from(None, None).unwrap(), None, "dev mode: no token, no header");
+		assert_eq!(access_token_from(Some("  ".into()), None).unwrap(), None);
+	}
+
+	#[test]
+	fn a_failing_or_silent_command_is_an_error_not_an_anonymous_call() {
+		assert!(access_token_from(None, Some("false")).unwrap_err().to_string().contains("failed"));
+		assert!(access_token_from(None, Some("true")).unwrap_err().to_string().contains("printed no token"));
+		assert!(access_token_from(None, Some("no-such-program-gorani")).unwrap_err().to_string().contains("did not run"));
+	}
+}

@@ -127,7 +127,9 @@ memory.
    `cloudflared access token -app=https://<your gorani host>` (or export
    `GORANI_ACCESS_TOKEN`). The client sends the member's short-lived token
    as `cf-access-token`; Access validates it and the Worker receives the
-   member's JWT — email included. *(Until commit 33a this step said to
+   member's JWT — email included. *(Commit 33a also fixed the Worker's
+   Access path itself, which panicked on every token — `std::time` on
+   wasm; see docs/DESKTOP.md › 33a. Until commit 33a this step said to
    give each computer a service token: Access accepts one, but its JWT has
    no email, so the Worker — which takes identity from the email — refused
    every desktop request. A service token identifies a machine, not a

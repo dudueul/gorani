@@ -41,7 +41,10 @@ fn read_secret(prompt: &str) -> String {
 
 fn run(args: &[String]) -> Result<(), Error> {
 	// Flags: --server --member --name --secret --device-secret --dev-email
-	//        --access-id --access-secret (Cloudflare Access service token)
+	//        --access-token-cmd ("cloudflared access token -app=https://<host>":
+	//          the member signs in through Access — commit 33a)
+	//        --access-id --access-secret (an Access service token; not enough
+	//          alone — its JWT has no email, docs/DESKTOP.md)
 	//        --file --id --out --profile
 	let mut flags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 	let mut pos: Vec<String> = Vec::new();
@@ -68,6 +71,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 				member: req_flag("member")?,
 				device_id: String::new(),
 				token: String::new(),
+				access_token_cmd: flag("access-token-cmd"),
 				access_id: flag("access-id"),
 				access_secret: flag("access-secret"),
 				device_secret: flag("device-secret"),

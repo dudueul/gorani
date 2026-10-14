@@ -125,8 +125,8 @@ old CHECK constraint allowed only parent/child.
 
 ## Build order (each stage green on its own)
 
-1. **Shamir** — `web/src/vault/shamir.ts`, pure, with its tests.
-2. **Roles** — the registry's four roles (parent→lead, child→analyst);
+1. **Shamir** (landed: commit 26b, `unit:shamir`) — `web/src/vault/shamir.ts`, pure, with its tests.
+2. **Roles** (landed: commit 26c, `api:roles`) — the registry's four roles (parent→lead, child→analyst);
    auditor writes refused; externals see only their grants. Transitional
    rule: a lead may still act for a member's own area (the parent rule)
    until stage 5 removes it.

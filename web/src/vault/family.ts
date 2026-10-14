@@ -64,6 +64,8 @@ import { checkRecordMatches } from "./records.ts";
 const toB64 = (b: Uint8Array) => toBase64(b);
 
 /** A family member's role. The server stores it readable; it is policy, not content. */
+/** The family's roles — the migration source of docs/CASES.md (parent →
+ * lead, child → analyst); the registry still accepts them as aliases. */
 export type Role = "parent" | "child";
 
 /** A hybrid public key as settings keep it (serialisable). */

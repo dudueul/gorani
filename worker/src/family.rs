@@ -55,7 +55,36 @@ pub const MIGRATIONS: &[&str] = &[
 		target TEXT NOT NULL,
 		details TEXT
 	)",
+	// Migration v2 (commit 26, docs/CASES.md › Roles): the team's four roles.
+	// SQLite cannot change a CHECK constraint in place, so the table is
+	// rebuilt — copy, drop, rename — each statement once, under the ledger
+	// (schema.rs). parent → lead, child → analyst. `expires_at`: externals'
+	// access ends on its own.
+	"CREATE TABLE IF NOT EXISTS members_v2 (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		role TEXT NOT NULL CHECK (role IN ('lead','analyst','auditor','external')),
+		emails TEXT NOT NULL DEFAULT '[]',
+		active INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL,
+		expires_at TEXT
+	)",
+	"INSERT OR IGNORE INTO members_v2 (id, name, role, emails, active, created_at) SELECT id, name, CASE role WHEN 'parent' THEN 'lead' ELSE 'analyst' END, emails, active, created_at FROM members",
+	"DROP TABLE members",
+	"ALTER TABLE members_v2 RENAME TO members",
 ];
+
+/// The four roles (docs/CASES.md), with the family's names accepted as
+/// aliases while the migration lasts (removed with the master key, stage 5).
+pub(crate) fn normalize_role(role: &str) -> Option<&'static str> {
+	match role {
+		"lead" | "parent" => Some("lead"),
+		"analyst" | "child" => Some("analyst"),
+		"auditor" => Some("auditor"),
+		"external" => Some("external"),
+		_ => None,
+	}
+}
 
 #[derive(Debug, Deserialize)]
 struct MemberRow {
@@ -65,6 +94,7 @@ struct MemberRow {
 	emails: String,
 	active: i64,
 	created_at: String,
+	expires_at: Option<String>,
 }
 
 /// The registry's state, as GET /state returns it.
@@ -118,8 +148,15 @@ impl GoraniFamilyDO {
 			// there is nothing to protect and the bootstrap screen needs the
 			// (empty) answer, so an empty registry stays readable.
 			("GET", "state") => {
-				if self.active_count()? > 0 && self.actor_row(&actor)?.is_none() {
-					return json_error(403, "not a family member");
+				if self.active_count()? > 0 {
+					match self.actor_row(&actor)? {
+						None => return json_error(403, "not a team member"),
+						// An external responder sees the cases they are granted,
+						// not the team: the registry lists every member's emails
+						// (docs/CASES.md › Roles).
+						Some(r) if r.role == "external" => return json_error(403, "external members do not see the team registry"),
+						Some(_) => {}
+					}
 				}
 				self.state().await
 			}
@@ -192,7 +229,12 @@ impl GoraniFamilyDO {
 		if email.is_empty() {
 			return Ok(None);
 		}
-		let rows: Vec<EmailRoleRow> = self.sql.exec("SELECT id, role, emails FROM members WHERE active = 1", None)?.to_array()?;
+		// An external whose access has expired is nobody: the expiry is
+		// enforced here, on every request, not by a cleanup job.
+		let rows: Vec<EmailRoleRow> = self
+			.sql
+			.exec("SELECT id, role, emails FROM members WHERE active = 1 AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))", None)?
+			.to_array()?;
 		Ok(rows.into_iter().find(|r| serde_json::from_str::<Vec<String>>(&r.emails).map(|list| list.iter().any(|e| e.eq_ignore_ascii_case(email))).unwrap_or(false)))
 	}
 
@@ -220,7 +262,7 @@ impl GoraniFamilyDO {
 	}
 
 	async fn state(&self) -> Result<Response> {
-		let members: Vec<MemberRow> = self.sql.exec("SELECT id, name, role, emails, active, created_at FROM members ORDER BY created_at, id", None)?.to_array()?;
+		let members: Vec<MemberRow> = self.sql.exec("SELECT id, name, role, emails, active, created_at, expires_at FROM members ORDER BY created_at, id", None)?.to_array()?;
 		let master = self.sql.exec("SELECT v FROM family WHERE k = 'master'", None)?.to_array::<FamilyKv>().ok().and_then(|mut k| k.pop()).map(|k| serde_json::from_str(&k.v).unwrap_or(serde_json::Value::Null));
 		let audit: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details FROM audit ORDER BY id DESC LIMIT 100", None)?.to_array()?;
 		Ok(Response::from_json(&FamilyState {
@@ -230,7 +272,7 @@ impl GoraniFamilyDO {
 					serde_json::json!({
 						"id": m.id, "name": m.name, "role": m.role,
 						"emails": serde_json::from_str::<serde_json::Value>(&m.emails).unwrap_or(serde_json::json!([])),
-						"active": m.active != 0, "createdAt": m.created_at,
+						"active": m.active != 0, "createdAt": m.created_at, "expiresAt": m.expires_at,
 					})
 				})
 				.collect(),
@@ -246,22 +288,30 @@ impl GoraniFamilyDO {
 		if !auth::valid_member_id(&body.id) {
 			return json_error(400, "member id: 2–32 chars of a–z, 0–9, dashes");
 		}
-		if !(body.role == "parent" || body.role == "child") {
-			return json_error(400, "role must be parent or child");
+		let Some(role) = normalize_role(&body.role) else {
+			return json_error(400, "role must be lead, analyst, auditor or external");
+		};
+		// Externals need an expiry (docs/CASES.md: their access ends on its
+		// own); nobody else may have one.
+		match (role, body.expires_at.as_deref()) {
+			("external", None) => return json_error(400, "an external member needs expiresAt"),
+			("external", Some(_)) => {}
+			(_, Some(_)) => return json_error(400, "only external members expire"),
+			_ => {}
 		}
 		let has_members = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE active = 1", None)?.one::<Count>()?.n > 0;
-		if has_members && !self.is_parent(actor).await? {
-			return json_error(403, "only a parent may add members");
+		if has_members && !self.is_lead(actor).await? {
+			return json_error(403, "only a lead may add members");
 		}
 		// The bootstrap (O18): the first member needs the Worker's proof that
-		// the operator's BOOTSTRAP_TOKEN was presented — and is a parent (a
-		// family whose only member is a child has no one to run it).
+		// the operator's BOOTSTRAP_TOKEN was presented — and is a lead (a team
+		// whose only member cannot manage it has no one to run it).
 		if !has_members {
 			if body.bootstrap.as_deref() != Some("ok") {
 				return json_error(403, body.bootstrap.as_deref().unwrap_or("the first member needs the bootstrap token"));
 			}
-			if body.role != "parent" {
-				return json_error(400, "the first member must be a parent");
+			if role != "lead" {
+				return json_error(400, "the first member must be a lead");
 			}
 		}
 		if let Some(e) = self.email_taken(&body.emails, None)? {
@@ -269,21 +319,40 @@ impl GoraniFamilyDO {
 		}
 		let emails = serde_json::to_string(&body.emails).unwrap_or_else(|_| "[]".into());
 		if let Err(e) = self.sql.exec(
-			"INSERT INTO members (id, name, role, emails, active, created_at) VALUES (?1, ?2, ?3, ?4, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-			Some(vec![body.id.clone().into(), body.name.clone().into(), body.role.clone().into(), emails.clone().into()]),
+			"INSERT INTO members (id, name, role, emails, active, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?5)",
+			Some(vec![body.id.clone().into(), body.name.clone().into(), role.into(), emails.clone().into(), crate::files_store::bind(body.expires_at.clone())]),
 		) {
 			return json_error(409, if e.to_string().contains("UNIQUE") { "member id already exists" } else { "insert failed" });
 		}
-		self.audit(actor, "member.create", &body.id, Some(&serde_json::json!({ "role": body.role, "name": body.name }))).await?;
+		self.audit(actor, "member.create", &body.id, Some(&serde_json::json!({ "role": role, "name": body.name, "expiresAt": body.expires_at }))).await?;
 		self.state().await
 	}
 
 	async fn patch_member(&self, actor: &str, id: &str, body: PatchMember) -> Result<Response> {
-		if !self.is_parent(actor).await? {
-			return json_error(403, "only a parent may change members");
+		if !self.is_lead(actor).await? {
+			return json_error(403, "only a lead may change members");
 		}
-		if self.member_row(id)?.is_none() {
+		let Some(current) = self.sql.exec("SELECT role FROM members WHERE id = ?1", Some(vec![id.into()]))?.to_array::<RoleRow>()?.into_iter().next() else {
 			return json_error(404, "no such member");
+		};
+		// A role change (commit 26): promotion, demotion, an analyst made
+		// auditor. The last active lead cannot be demoted — the team would
+		// have nobody left to manage it.
+		if let Some(r) = &body.role {
+			let Some(role) = normalize_role(r) else { return json_error(400, "role must be lead, analyst, auditor or external") };
+			if current.role == "lead" && role != "lead" && self.active_leads()? <= 1 {
+				return json_error(409, "cannot demote the last lead");
+			}
+			if role == "external" && body.expires_at.is_none() {
+				return json_error(400, "an external member needs expiresAt");
+			}
+			self.sql.exec("UPDATE members SET role = ?1 WHERE id = ?2", Some(vec![role.into(), id.into()]))?;
+			if role != "external" {
+				self.sql.exec("UPDATE members SET expires_at = NULL WHERE id = ?1", Some(vec![id.into()]))?;
+			}
+		}
+		if let Some(exp) = &body.expires_at {
+			self.sql.exec("UPDATE members SET expires_at = ?1 WHERE id = ?2 AND role = 'external'", Some(vec![exp.clone().into(), id.into()]))?;
 		}
 		if let Some(emails) = &body.emails {
 			if let Some(e) = self.email_taken(emails, Some(id))? {
@@ -296,22 +365,19 @@ impl GoraniFamilyDO {
 		if let Some(emails) = &body.emails {
 			self.sql.exec("UPDATE members SET emails = ?1 WHERE id = ?2", Some(vec![serde_json::to_string(emails).unwrap_or_else(|_| "[]".into()).into(), id.into()]))?;
 		}
-		self.audit(actor, "member.update", id, None).await?;
+		self.audit(actor, "member.update", id, Some(&serde_json::json!({ "role": body.role, "expiresAt": body.expires_at }))).await?;
 		self.state().await
 	}
 
 	async fn deactivate(&self, actor: &str, id: &str) -> Result<Response> {
-		if !self.is_parent(actor).await? {
-			return json_error(403, "only a parent may deactivate members");
+		if !self.is_lead(actor).await? {
+			return json_error(403, "only a lead may deactivate members");
 		}
 		let Some(row) = self.sql.exec("SELECT role FROM members WHERE id = ?1", Some(vec![id.into()]))?.to_array::<RoleRow>()?.into_iter().next() else {
 			return json_error(404, "no such member");
 		};
-		if row.role == "parent" {
-			let parents = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE role = 'parent' AND active = 1", None)?.one::<Count>()?.n;
-			if parents <= 1 {
-				return json_error(409, "cannot deactivate the last parent");
-			}
+		if row.role == "lead" && self.active_leads()? <= 1 {
+			return json_error(409, "cannot deactivate the last lead");
 		}
 		self.sql.exec("UPDATE members SET active = 0 WHERE id = ?1", Some(vec![id.into()]))?;
 		// The removed member's root still holds their copy of the family
@@ -329,11 +395,11 @@ impl GoraniFamilyDO {
 		if self.sql.exec("SELECT v FROM family WHERE k = 'master'", None)?.to_array::<FamilyKv>().map(|v| !v.is_empty()).unwrap_or(false) {
 			return json_error(409, "the master key is already set");
 		}
-		if !self.is_parent(actor).await? {
-			// Before any parent exists, the bootstrap creator may set it.
+		if !self.is_lead(actor).await? {
+			// Before any lead exists, the bootstrap creator may set it.
 			let has_members = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE active = 1", None)?.one::<Count>()?.n > 0;
 			if has_members {
-				return json_error(403, "only a parent may set the master key");
+				return json_error(403, "only a lead may set the master key");
 			}
 		}
 		let v = serde_json::to_string(&body).map_err(|_| Error::RustError("bad master JSON".into()))?;
@@ -380,13 +446,17 @@ impl GoraniFamilyDO {
 		Ok(Response::from_json(&serde_json::json!({ "memberId": member }))?)
 	}
 
-	async fn is_parent(&self, email: &str) -> Result<bool> {
+	fn active_leads(&self) -> Result<i64> {
+		Ok(self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE role = 'lead' AND active = 1", None)?.one::<Count>()?.n)
+	}
+
+	async fn is_lead(&self, email: &str) -> Result<bool> {
 		if email.is_empty() {
 			return Ok(false);
 		}
 		let rows: Vec<EmailRow> = self
 			.sql
-			.exec("SELECT emails FROM members WHERE role = 'parent' AND active = 1", None)?
+			.exec("SELECT emails FROM members WHERE role = 'lead' AND active = 1", None)?
 			.to_array()?;
 		for r in rows {
 			if let Ok(list) = serde_json::from_str::<Vec<String>>(&r.emails) {
@@ -476,6 +546,9 @@ struct NewMember {
 	/// on every create, overwriting anything a client sent (O18).
 	#[serde(default, rename = "__bootstrap")]
 	bootstrap: Option<String>,
+	/// External members only: when their access ends (ISO 8601).
+	#[serde(default, rename = "expiresAt")]
+	expires_at: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct PatchMember {
@@ -483,6 +556,10 @@ struct PatchMember {
 	name: Option<String>,
 	#[serde(default)]
 	emails: Option<Vec<String>>,
+	#[serde(default)]
+	role: Option<String>,
+	#[serde(default, rename = "expiresAt")]
+	expires_at: Option<String>,
 }
 
 /// A JSON error response ({ "error": … } with a status), the shape every

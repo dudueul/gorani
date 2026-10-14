@@ -6,8 +6,9 @@
 //! 1. **Authenticate first** (auth.rs) — before reading a body, before
 //!    touching a DO.
 //! 2. **Member scope is resolved through the registry**: a member acts for
-//!    themselves; a **parent may act for any member** (the same one-way
-//!    hierarchy the keys give, enforced at the API layer too — docs/FAMILY.md).
+//!    their own area; a **lead may still act for any member** (the family's
+//!    parent rule, transitional until docs/CASES.md › stage 5 removes it);
+//!    an external has no own area; leads and auditors read every audit.
 //!    The DOs re-check nothing about identity, only data rules; the routing
 //!    layer owns who-may-call-whose.
 //! 3. **Every error is JSON** `{ "error": … }` with an honest status.
@@ -61,17 +62,43 @@ async fn member_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Re
 	let actor = match actor_of(env, &identity.email, Some(id)).await {
 		Ok(Some(a)) => a,
 		// (No echo of the email: error bodies end up in logs and screenshots.)
-		Ok(None) => return Err(json_error_raw(403, "not a family member")),
+		Ok(None) => return Err(json_error_raw(403, "not a team member")),
 		Err(e) => return Err(json_error_raw(500, &e.to_string())),
 	};
 	if !actor.target_exists {
 		return Err(json_error_raw(404, "no such member"));
 	}
-	let allowed = actor.role == "parent" || (actor.id == id && actor.target_active);
+	// (Commit 26, docs/CASES.md › Roles: the four roles. A lead keeps the
+	// family parent's act-for rule until stage 5; an external member has
+	// no own area at all — their work lives in the cases they are granted.)
+	let allowed = actor.role == "lead" || (actor.id == id && actor.target_active && actor.role != "external");
 	if allowed {
 		Ok(actor)
+	} else if actor.role == "external" {
+		Err(json_error_raw(403, "external members have no own area — only the cases they are granted"))
 	} else {
-		Err(json_error_raw(403, "children act only for themselves"))
+		Err(json_error_raw(403, "members act only for their own area"))
+	}
+}
+
+/// The audit and the read log of a member's area: the member, and every
+/// lead and auditor (docs/CASES.md › Roles — auditors read every audit).
+async fn audit_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<Actor, Response> {
+	if !auth::valid_member_id(id) {
+		return Err(json_error_raw(400, "member id: 2–32 chars of a–z, 0–9, dashes"));
+	}
+	let actor = match actor_of(env, &identity.email, Some(id)).await {
+		Ok(Some(a)) => a,
+		Ok(None) => return Err(json_error_raw(403, "not a team member")),
+		Err(e) => return Err(json_error_raw(500, &e.to_string())),
+	};
+	if !actor.target_exists {
+		return Err(json_error_raw(404, "no such member"));
+	}
+	if actor.role == "lead" || actor.role == "auditor" || (actor.id == id && actor.role != "external") {
+		Ok(actor)
+	} else {
+		Err(json_error_raw(403, "a member's audit is theirs, their leads' and the auditors'"))
 	}
 }
 
@@ -184,7 +211,10 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "vault", Some(body), actor)).await
 		}
-		("GET", ["members", id, "audit"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "audit", None, actor)).await,
+		("GET", ["members", id, "audit"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(actor) => forward_member(&env, id, "GET", "audit", None, actor.email).await,
+			Err(resp) => Ok(resp),
+		},
 		("GET", ["members", id, "vault-stats"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "stats", None, actor)).await,
 
 		// ── Files ───────────────────────────────────────────────────────
@@ -210,7 +240,10 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		// storage has not confirmed deleting yet — keys, attempts, last error.
 		("GET", ["members", id, "storage", "pending"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "storage/pending", None, actor)).await,
 		// The read log (O14): who read which file version, from what, when.
-		("GET", ["members", id, "reads"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "reads", &req, actor)).await,
+		("GET", ["members", id, "reads"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(actor) => forward_member_qs(&env, id, "GET", "reads", &req, actor.email).await,
+			Err(resp) => Ok(resp),
+		},
 		("POST", ["members", id, "files", "trash", "restore"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await

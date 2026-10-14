@@ -25,9 +25,11 @@ try {
 	const first = await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "mom", name: "Mom", role: "parent", emails: ["mom@family.test"] } });
 	assert.equal(first.status, 200, JSON.stringify(first.json));
 	assert.equal(first.json.members.length, 1);
-	assert.equal(first.json.members[0].role, "parent");
+	// (Commit 26: the registry speaks the team's roles — "parent" is an alias
+	// for "lead" while the family model is migrated, docs/CASES.md.)
+	assert.equal(first.json.members[0].role, "lead");
 
-	// After bootstrap, only a parent may add members.
+	// After bootstrap, only a lead may add members.
 	const denied = await api(dev.base, "POST", "/api/v1/family/members", { email: "stranger@family.test", body: { id: "zed", name: "Z", role: "child" } });
 	assert.equal(denied.status, 403);
 

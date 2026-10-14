@@ -23,6 +23,7 @@
  */
 
 import { fromBase64, toBase64 } from "../lib/encoding.ts";
+import { checkArgon2, checkSalt } from "./kdf-bounds.ts";
 
 export const SHARE_ARGON2 = { m: 64 * 1024, t: 3, p: 4 } as const;
 export interface ShareKdf { salt: string; m: number; t: number; p: number }
@@ -45,10 +46,14 @@ export const isShareSecret = (s: string) => /^[A-Za-z0-9_-]{43}$/.test(s);
 export const newShareKdf = (): ShareKdf => ({ salt: toBase64(crypto.getRandomValues(new Uint8Array(16))), ...SHARE_ARGON2 });
 
 async function passwordBytes(password: string, kdf: ShareKdf): Promise<Uint8Array> {
-	// Bounds on what the server may ask for: never weaker than RFC 9106's minimum, never an absurd allocation.
-	if (!(kdf.m >= 19 * 1024 && kdf.m <= 1024 * 1024 && kdf.t >= 1 && kdf.t <= 20 && kdf.p >= 1 && kdf.p <= 16)) throw new Error("Unsupported password parameters");
+	// The SERVER serves this setting (the link's meta): bounded both ways —
+	// never weaker than OWASP's floor, never enough to freeze the recipient's
+	// phone (kdf-bounds.ts, O8).
+	checkArgon2(kdf);
+	const salt = fromBase64(kdf.salt);
+	checkSalt(salt);
 	const { argon2id } = await import("hash-wasm");
-	return argon2id({ password: password.normalize("NFKC"), salt: fromBase64(kdf.salt), memorySize: kdf.m, iterations: kdf.t, parallelism: kdf.p, hashLength: 32, outputType: "binary" });
+	return argon2id({ password: password.normalize("NFKC"), salt, memorySize: kdf.m, iterations: kdf.t, parallelism: kdf.p, hashLength: 32, outputType: "binary" });
 }
 
 /** The two keys of a share (the data key opens GC01 frames, the meta key the name and type). */

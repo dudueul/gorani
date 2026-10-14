@@ -31,6 +31,7 @@
 
 import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
 import { fromBase64, toBase64 } from "../lib/encoding.ts";
+import { checkArgon2, checkSalt } from "./kdf-bounds.ts";
 
 const MAGIC = new TextEncoder().encode("GV01");
 /** v2: symmetric AES-256-GCM under a per-item content key that is itself sealed (v1) to a store key. */
@@ -556,8 +557,8 @@ export interface UnlockMethod {
 export const ARGON2ID_PARAMS = { m: 64 * 1024, t: 3, p: 4 } as const;
 
 async function kekFromArgon2id(password: string, salt: Uint8Array, a: { m: number; t: number; p: number }): Promise<CryptoKey> {
-	// Bounds on what stored settings may ask for: never weaker than the RFC's minimum, never an absurd allocation.
-	if (!(a.m >= 19 * 1024 && a.m <= 1024 * 1024 && a.t >= 1 && a.t <= 20 && a.p >= 1 && a.p <= 16)) throw new Error("Unsupported password parameters");
+	// Bounds on what stored settings may ask for, both ways (kdf-bounds.ts, O8).
+	checkArgon2(a);
 	const { argon2id } = await import("hash-wasm");
 	const raw = await argon2id({ password: password.normalize("NFKC"), salt, memorySize: a.m, iterations: a.t, parallelism: a.p, hashLength: 32, outputType: "binary" });
 	try {
@@ -665,12 +666,15 @@ export async function makeDeviceCopy(keyBytes: Uint8Array, deviceSecret: Uint8Ar
 }
 
 export async function openDeviceCopy(wrapped: string, salt: string, deviceSecret: Uint8Array): Promise<Uint8Array> {
-	return unwrapPrivateKey(wrapped, await kekFromSecret(deviceSecret, fromBase64(salt), "gorani-device-v1"));
+	const s = fromBase64(salt);
+	checkSalt(s);
+	return unwrapPrivateKey(wrapped, await kekFromSecret(deviceSecret, s, "gorani-device-v1"));
 }
 
 /** Unwrap the private key with the secret matching the method kind. */
 export async function unlockWithMethod(method: UnlockMethod, secret: string | Uint8Array): Promise<Uint8Array> {
 	const salt = fromBase64(method.salt);
+	checkSalt(salt);
 	if (method.kind === "password") {
 		if (method.kdf !== "argon2id" || !method.argon2) throw new Error("Password method lacks Argon2id parameters");
 		return unwrapPrivateKey(method.wrapped, await kekFromArgon2id(String(secret), salt, method.argon2));

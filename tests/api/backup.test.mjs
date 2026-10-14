@@ -107,6 +107,22 @@ try {
 	bad[bad.length - 3] ^= 0x10;
 	await assert.rejects(() => readBackup(bad, keyFile));
 
+	// GB2 (commit 25, O7): the HEADER is authenticated too. Relabel when the
+	// backup was made (same length, valid JSON — last year's backup now
+	// claims to be tonight's) and nothing opens; GB1 had no time in the
+	// header at all, and would have opened any relabelled field.
+	assert.equal(parsed.header.v, 2);
+	const createdAt = String(parsed.header.createdAt);
+	assert.match(createdAt, /^\d{4}-\d{2}-\d{2}T/, "the header says when, sealed");
+	const at = Buffer.from(bytes).indexOf(Buffer.from(createdAt));
+	assert.ok(at > 0, "the time sits in the header");
+	const relabelled = bytes.slice();
+	relabelled.set(new TextEncoder().encode(createdAt.replace(/^\d{4}/, (y) => String(Number(y) - 1))), at);
+	await assert.rejects(() => readBackup(relabelled, keyFile), /altered/, "a relabelled header fails every segment");
+	// A container cut down to its header is a truncation, not an empty backup.
+	const headerOnly = bytes.subarray(0, 10 + new DataView(bytes.buffer, bytes.byteOffset + 6, 4).getUint32(0));
+	await assert.rejects(() => readBackup(headerOnly, keyFile), /no segments/);
+
 	// ── 5. The private bundle never crossed the wire ────────────────────
 	const keyGet2 = await api(dev.base, "GET", "/api/v1/members/jinu/backup-key", { email: "jinu@family.test" });
 	assert.ok(!JSON.stringify(keyGet2.json).includes(toBase64(backup.bundle).slice(0, 24)), "the private bundle is absent from the stored record");

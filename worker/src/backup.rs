@@ -81,9 +81,19 @@ impl GoraniMemberDO {
 		let file_key: FileKey = backup::new_file_key();
 		let wrapped = gorani_formats::formats::seal_text(&pub_key, base64_of(file_key.as_ref()).as_str());
 		let stamp = stamp();
+		// When this backup was made, INSIDE the authenticated header (GB2): the
+		// time a restore shows is one the server cannot relabel afterwards —
+		// the manifest row's created_at is the server's word, this is sealed.
+		let created_at = self
+			.sql
+			.exec("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS v", None)?
+			.one::<KvRow>()
+			.map(|r| r.v)
+			.unwrap_or_default();
 		let header = serde_json::json!({
 			"format": "gorani-backup",
-			"v": 1,
+			"v": 2, // GB2 (commit 25): the header is authenticated by every segment
+			"createdAt": created_at,
 			"stamp": stamp,
 			"kind": kind,
 			"keyId": key_id,
@@ -104,11 +114,10 @@ impl GoraniMemberDO {
 			.to_array()?;
 		let secrets: Vec<KvRow> = self.sql.exec("SELECT v FROM files_secrets LIMIT 1", None)?.to_array()?;
 
-		let mut writer = BackupWriter::new(file_key);
+		// The writer emits the prefix itself and binds its hash into every
+		// segment (GB2) — the stamp a restore trusts is the stamp that was sealed.
 		let mut out: Vec<u8> = Vec::new();
-		out.extend_from_slice(backup::MAGIC);
-		out.extend_from_slice(&(header.to_string().len() as u32).to_be_bytes());
-		out.extend_from_slice(header.to_string().as_bytes());
+		let mut writer = BackupWriter::start(file_key, header.to_string().as_bytes(), &mut out);
 
 		let mut entries = 0u64;
 		let push_entry = |json: serde_json::Value, object: Option<Vec<u8>>, writer: &mut BackupWriter, out: &mut Vec<u8>| -> Result<()> {

@@ -134,7 +134,9 @@ old CHECK constraint allowed only parent/child.
    grants; `case:<id>` stores; `/api/v1/cases/<id>/files/…`; the client's
    case-key grant and revoke (revoke = rotate + the reseal walk). What the
    build settled, below in **Stage 3 as built**.
-4. **Identity keys** — signing keys and fingerprints; signed grants.
+4. **Identity keys** (landed: commit 27a, `unit:identity`, `api:cases` §0b/§3b)
+   — signing keys and fingerprints; signed grants. What the build settled,
+   below in **Stage 4 as built**.
 5. **Recovery** — the team recovery key, shares to leads, recovery copies,
    the ceremony; then the parent act-for rule and the master key go.
 6. **UI** — the case list, grant dialog, ceremony screens.
@@ -195,6 +197,59 @@ the member routes with the area, after one check:
   the case (`openCaseKey`), not for authenticity — a server that replaced
   both before your first open is not caught. Stage 4's signed grants close
   it; `GET …/root` is likewise the server's word until fingerprints.
+
+## Stage 4 as built
+
+`web/src/vault/identity.ts` is the client half; the registry's migration v4
+holds the public half.
+
+**Three records, three owners:**
+
+| Record | Where | Who can write it | What protects it |
+|---|---|---|---|
+| identity (public key, root digest, self-signature) | registry `identities` | the member, once (a reset — by them or a lead — first) | the self-signature over (member, key id, root digest) |
+| certificate (a lead's signature over the same three) | registry `identity_certs` | leads, naming the CURRENT key and root | the lead's signature |
+| pins (the identities this member verified) + the sealed private key | the member's vault settings, `identity` | the member's client | an HMAC from the member's root (records.ts' key, its own domain) |
+
+**The trust rule** (`buildTrust`), evaluated by every client for itself: an
+identity counts if its key id matches its key and its self-signature
+verifies, AND it is pinned — or certified by a member whose identity is
+pinned. **One hop**: a certificate from someone trusted only through a
+certificate counts for nothing. The intended practice: each member compares
+fingerprints with a lead when they join, both ways (the lead certifies the
+member; the member pins the lead), and from then on trusts whomever that
+lead verified.
+
+**What is signed** — statements, length-prefixed under a domain string, so
+no signature can be replayed as another kind:
+
+```text
+identity  "gorani-identity-v1" ‖ member ‖ identity key id ‖ root digest
+cert      "gorani-cert-v1"     ‖ member ‖ identity key id ‖ root digest
+grant     "gorani-grant-v1"    ‖ case   ‖ case key digest ‖ grantee
+```
+
+Digests are full SHA-256 over the public halves; the short `keyId`s are
+labels (~84 bits), too short to sign against a server that can grind.
+
+**What it closes:**
+
+- A substituted case-key copy (the server's own key, sealed to you): the
+  signature over (case, the key's digest, you) cannot verify — refused
+  before you use it. A real signature replayed from another grant names
+  another grantee and another key.
+- A substituted ROOT when a manager seals (`GET …/root` is the server's
+  word): the root's digest must be the one the grantee's trusted identity
+  names (`trustedRoot`).
+- A resumed rotation handed an unsigned old key: the previous copy keeps its
+  signature (`prev_signature`) and is verified like the current one.
+
+**What it does not:** rollback — a validly signed OLDER grant replayed to a
+member who never saw the newer key (identity.ts › the honest limits); and
+the registry's role column is still the server's word (who is a lead), which
+is why trust flows from pins, not from roles. The family area's store
+records keep their trust-on-first-use pin until stage 5 replaces the family
+area with a case.
 
 ## What this does NOT change
 

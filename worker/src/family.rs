@@ -104,6 +104,33 @@ pub const MIGRATIONS: &[&str] = &[
 		prev_key_sealed TEXT,
 		PRIMARY KEY (case_id, member_id)
 	)",
+	// Migration v4 (commit 27, docs/CASES.md › Member identity keys): each
+	// member's identity PUBLIC key (self-signed over their root's digest),
+	// the certificates leads sign after comparing fingerprints, and the
+	// granter's signature on every case-key copy (and on the previous copy
+	// while a rotation walks — a resumed walk must not trust an unsigned
+	// old key, or the server could launder values sealed to its own).
+	"CREATE TABLE IF NOT EXISTS identities (
+		member_id TEXT PRIMARY KEY,
+		key_id TEXT NOT NULL,
+		public_key TEXT NOT NULL,
+		root_digest TEXT NOT NULL,
+		signature TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	)",
+	"CREATE TABLE IF NOT EXISTS identity_certs (
+		member_id TEXT NOT NULL,
+		by_member TEXT NOT NULL,
+		key_id TEXT NOT NULL,
+		root_digest TEXT NOT NULL,
+		signature TEXT NOT NULL,
+		at TEXT NOT NULL,
+		PRIMARY KEY (member_id, by_member)
+	)",
+	"ALTER TABLE case_grants ADD COLUMN signature TEXT",
+	"ALTER TABLE case_grants ADD COLUMN signed_by TEXT",
+	"ALTER TABLE case_grants ADD COLUMN prev_signature TEXT",
+	"ALTER TABLE case_grants ADD COLUMN prev_signed_by TEXT",
 ];
 
 /// The four roles (docs/CASES.md), with the family's names accepted as
@@ -261,6 +288,17 @@ impl GoraniFamilyDO {
 				self.case_rekey(&actor, &id["case-key/".len()..], body).await
 			}
 			("POST", id) if id.starts_with("case-close/") => self.case_close(&actor, &id["case-close/".len()..]).await,
+			// ── Identities (commit 27, docs/CASES.md › Member identity keys) ──
+			("GET", "identities") => self.identities(&actor).await,
+			("PUT", "identity") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.identity_put(&actor, body).await
+			}
+			("DELETE", id) if id.starts_with("identity/") => self.identity_reset(&actor, &id["identity/".len()..]).await,
+			("PUT", id) if id.starts_with("certs/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.cert_put(&actor, &id["certs/".len()..], body).await
+			}
 			_ => Response::error("Not Found", 404),
 		}
 	}
@@ -555,7 +593,7 @@ impl GoraniFamilyDO {
 		Ok(self
 			.sql
 			.exec(
-				"SELECT permission, key_sealed, key_id, expires_at, prev_key_sealed FROM case_grants WHERE case_id = ?1 AND member_id = ?2 AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+				"SELECT permission, key_sealed, key_id, expires_at, prev_key_sealed, signature, signed_by, prev_signature, prev_signed_by FROM case_grants WHERE case_id = ?1 AND member_id = ?2 AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
 				Some(vec![case.into(), member.into()]),
 			)?
 			.to_array::<GrantRow>()?
@@ -599,6 +637,7 @@ impl GoraniFamilyDO {
 		if !gorani_formats::formats::is_sealed_text(&key_sealed) || get("titleSealed").is_some_and(|t| !gorani_formats::placed::is_placed_text(&t)) {
 			return json_error(400, "the key copy must be sealed; the title placed (GV04)");
 		}
+		let Some(signature) = get("signature").filter(|s| is_signature(s)) else { return json_error(400, "signature required: your identity's signature over the grant (docs/CASES.md › Member identity keys)") };
 		if self.case_row(&id)?.is_some() {
 			return json_error(409, "a case with this id exists");
 		}
@@ -607,8 +646,8 @@ impl GoraniFamilyDO {
 			Some(vec![id.clone().into(), kind.clone().into(), crate::files_store::bind(get("titleSealed")), key_id.clone().into(), public_key.to_string().into(), me.id.clone().into()]),
 		)?;
 		self.sql.exec(
-			"INSERT INTO case_grants (case_id, member_id, permission, key_sealed, key_id, granted_by, granted_at) VALUES (?1, ?2, 'manage', ?3, ?4, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-			Some(vec![id.clone().into(), me.id.clone().into(), key_sealed.into(), key_id.into()]),
+			"INSERT INTO case_grants (case_id, member_id, permission, key_sealed, key_id, granted_by, granted_at, signature, signed_by) VALUES (?1, ?2, 'manage', ?3, ?4, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?5, ?2)",
+			Some(vec![id.clone().into(), me.id.clone().into(), key_sealed.into(), key_id.into(), signature.into()]),
 		)?;
 		self.audit(actor, "case.create", &id, Some(&serde_json::json!({ "kind": kind }))).await?;
 		Ok(Response::from_json(&serde_json::json!({ "id": id, "kind": kind }))?)
@@ -643,7 +682,13 @@ impl GoraniFamilyDO {
 				// key (id here, each grantee's copy in their grant) still opens
 				// what the walk has not reached.
 				"rotating": c.prev_key_id.as_ref().map(|k| serde_json::json!({ "prevKeyId": k })),
-				"grant": grant.map(|g| serde_json::json!({ "permission": g.permission, "keySealed": g.key_sealed, "keyId": g.key_id, "expiresAt": g.expires_at, "prevKeySealed": g.prev_key_sealed })),
+				// The copy and WHO SIGNED IT: the grantee's client verifies the
+				// signature against an identity it trusts before opening.
+				"grant": grant.map(|g| serde_json::json!({
+					"permission": g.permission, "keySealed": g.key_sealed, "keyId": g.key_id, "expiresAt": g.expires_at,
+					"signature": g.signature, "signedBy": g.signed_by,
+					"prevKeySealed": g.prev_key_sealed, "prevSignature": g.prev_signature, "prevSignedBy": g.prev_signed_by,
+				})),
 				"grantees": grantees.into_iter().map(|g| serde_json::json!({ "member": g.member_id, "permission": g.permission, "expiresAt": g.expires_at })).collect::<Vec<_>>(),
 			}));
 		}
@@ -711,9 +756,13 @@ impl GoraniFamilyDO {
 		if !gorani_formats::formats::is_sealed_text(&key_sealed) {
 			return json_error(400, "the key copy must be sealed text");
 		}
+		// The signer is the granting manager, recorded by the registry (never
+		// taken from the body); the signature is checked by the GRANTEE's
+		// client — the registry only refuses what cannot be one.
+		let Some(signature) = get("signature").filter(|s| is_signature(s)) else { return json_error(400, "signature required: your identity's signature over the grant") };
 		self.sql.exec(
-			"INSERT INTO case_grants (case_id, member_id, permission, key_sealed, key_id, granted_by, granted_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7) ON CONFLICT (case_id, member_id) DO UPDATE SET permission = ?3, key_sealed = ?4, key_id = ?5, granted_by = ?6, granted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), expires_at = ?7",
-			Some(vec![case.into(), member.into(), permission.clone().into(), key_sealed.into(), key_id.into(), me.id.into(), crate::files_store::bind(get("expiresAt"))]),
+			"INSERT INTO case_grants (case_id, member_id, permission, key_sealed, key_id, granted_by, granted_at, expires_at, signature, signed_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7, ?8, ?6) ON CONFLICT (case_id, member_id) DO UPDATE SET permission = ?3, key_sealed = ?4, key_id = ?5, granted_by = ?6, granted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), expires_at = ?7, signature = ?8, signed_by = ?6",
+			Some(vec![case.into(), member.into(), permission.clone().into(), key_sealed.into(), key_id.into(), me.id.into(), crate::files_store::bind(get("expiresAt")), signature.into()]),
 		)?;
 		self.audit(actor, "case.grant", case, Some(&serde_json::json!({ "member": member, "permission": permission, "expiresAt": get("expiresAt") }))).await?;
 		self.case_list(actor).await
@@ -757,9 +806,10 @@ impl GoraniFamilyDO {
 	/// would leave a crashed walk's values under a key that lived only in
 	/// the dead tab.) Step 2 is case_rekey_done.
 	async fn case_rekey(&self, actor: &str, case: &str, body: serde_json::Value) -> Result<Response> {
-		if let Err(r) = self.require_manager(actor, case) {
-			return Ok(r);
-		}
+		let me = match self.require_manager(actor, case) {
+			Ok(m) => m,
+			Err(r) => return Ok(r),
+		};
 		let Some(c) = self.case_row(case)? else { return json_error(404, "no such case") };
 		if c.prev_key_id.is_some() {
 			return json_error(409, "a rotation is still walking — finish it (POST …/key/done) before starting another");
@@ -773,10 +823,15 @@ impl GoraniFamilyDO {
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let Some(key_id) = get("keyId") else { return json_error(400, "keyId required") };
 		let Some(public_key) = body.get("publicKey").filter(|p| p.is_object()) else { return json_error(400, "publicKey required") };
-		let copies: std::collections::BTreeMap<String, String> = body
+		// member → (copy, signature)
+		let copies: std::collections::BTreeMap<String, (String, String)> = body
 			.get("grants")
 			.and_then(|g| g.as_array())
-			.map(|list| list.iter().filter_map(|g| Some((g.get("member")?.as_str()?.to_string(), g.get("keySealed")?.as_str()?.to_string()))).collect())
+			.map(|list| {
+				list.iter()
+					.filter_map(|g| Some((g.get("member")?.as_str()?.to_string(), (g.get("keySealed")?.as_str()?.to_string(), g.get("signature")?.as_str()?.to_string()))))
+					.collect()
+			})
 			.unwrap_or_default();
 		// Grants that ended by themselves (expiry, deactivation) go with the
 		// old key: nobody seals the new one to a holder who left.
@@ -792,13 +847,13 @@ impl GoraniFamilyDO {
 		if want != have {
 			return json_error(409, "a rotation re-seals the key for exactly the current grantees — no more, no fewer");
 		}
-		if copies.values().any(|k| !gorani_formats::formats::is_sealed_text(k)) {
-			return json_error(400, "every copy must be sealed text");
+		if copies.values().any(|(k, sig)| !gorani_formats::formats::is_sealed_text(k) || !is_signature(sig)) {
+			return json_error(400, "every copy must be sealed text, with the rotating manager's signature");
 		}
-		for (member, sealed) in &copies {
+		for (member, (sealed, signature)) in &copies {
 			self.sql.exec(
-				"UPDATE case_grants SET prev_key_sealed = key_sealed, key_sealed = ?1, key_id = ?2 WHERE case_id = ?3 AND member_id = ?4",
-				Some(vec![sealed.clone().into(), key_id.clone().into(), case.into(), member.clone().into()]),
+				"UPDATE case_grants SET prev_key_sealed = key_sealed, prev_signature = signature, prev_signed_by = signed_by, key_sealed = ?1, key_id = ?2, signature = ?5, signed_by = ?6 WHERE case_id = ?3 AND member_id = ?4",
+				Some(vec![sealed.clone().into(), key_id.clone().into(), case.into(), member.clone().into(), signature.clone().into(), me.id.clone().into()]),
 			)?;
 		}
 		// `rotation_required` stays set until the walk is done: until then the
@@ -821,7 +876,7 @@ impl GoraniFamilyDO {
 		}
 		let Some(c) = self.case_row(case)? else { return json_error(404, "no such case") };
 		let Some(prev) = c.prev_key_id else { return json_error(409, "no rotation is walking") };
-		self.sql.exec("UPDATE case_grants SET prev_key_sealed = NULL WHERE case_id = ?1", Some(vec![case.into()]))?;
+		self.sql.exec("UPDATE case_grants SET prev_key_sealed = NULL, prev_signature = NULL, prev_signed_by = NULL WHERE case_id = ?1", Some(vec![case.into()]))?;
 		self.sql.exec("UPDATE cases SET prev_key_id = NULL, rotation_required = 0 WHERE id = ?1", Some(vec![case.into()]))?;
 		self.audit(actor, "case.rekey.done", case, Some(&serde_json::json!({ "keyId": c.key_id, "retired": prev }))).await?;
 		self.case_list(actor).await
@@ -833,6 +888,109 @@ impl GoraniFamilyDO {
 		}
 		self.sql.exec("UPDATE cases SET closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND closed_at IS NULL", Some(vec![case.into()]))?;
 		self.audit(actor, "case.close", case, None).await?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	// ── Identities and certificates (commit 27) ─────────────────────────
+	//
+	// The registry stores PUBLIC identity keys and the signatures over them;
+	// it verifies none of it, and needs to verify none of it: every client
+	// checks every signature against the identities IT pinned (identity.ts ›
+	// buildTrust). What the registry does enforce is the bookkeeping that
+	// keeps a stale signature from looking current:
+	//
+	//   - a member registers their own identity, once; a new one (a lost
+	//     device, a re-enrolment) needs a reset first, by the member or a lead;
+	//   - a reset drops every certificate OF that identity and BY it — a
+	//     signature from a key that is gone vouches for nothing;
+	//   - only leads certify, and a certificate must name the member's
+	//     CURRENT identity key and root digest.
+
+	/// Every active member's identity and its certificates — for any member,
+	/// externals included (an external must verify who granted them; ids and
+	/// keys, no emails).
+	async fn identities(&self, actor: &str) -> Result<Response> {
+		if self.member_by_email(actor)?.is_none() {
+			return json_error(403, "not a team member");
+		}
+		let rows: Vec<IdentityRow> = self
+			.sql
+			.exec("SELECT i.member_id, i.key_id, i.public_key, i.root_digest, i.signature FROM identities i JOIN members m ON m.id = i.member_id WHERE m.active = 1 ORDER BY i.member_id", None)?
+			.to_array()?;
+		let mut out = Vec::new();
+		for r in rows {
+			let certs: Vec<CertRow> = self.sql.exec("SELECT by_member, key_id, root_digest, signature FROM identity_certs WHERE member_id = ?1 ORDER BY by_member", Some(vec![r.member_id.clone().into()]))?.to_array()?;
+			out.push(serde_json::json!({
+				"member": r.member_id, "keyId": r.key_id, "rootDigest": r.root_digest, "signature": r.signature,
+				"publicKey": serde_json::from_str::<serde_json::Value>(&r.public_key).unwrap_or(serde_json::Value::Null),
+				"certs": certs.into_iter().map(|c| serde_json::json!({ "by": c.by_member, "keyId": c.key_id, "rootDigest": c.root_digest, "signature": c.signature })).collect::<Vec<_>>(),
+			}));
+		}
+		Ok(Response::from_json(&serde_json::json!({ "identities": out }))?)
+	}
+
+	async fn identity_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let Some(me) = self.member_by_email(actor)? else { return json_error(403, "not a team member") };
+		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+		let (Some(key_id), Some(root_digest), Some(signature)) = (get("keyId").filter(|k| is_hex256(k)), get("rootDigest").filter(|k| is_hex256(k)), get("signature").filter(|s| is_signature(s))) else {
+			return json_error(400, "keyId and rootDigest (SHA-256 hex) and the self-signature are required");
+		};
+		let Some(public_key) = body.get("publicKey").filter(|p| is_p256_jwk(p)) else { return json_error(400, "publicKey: a P-256 JWK { kty, crv, x, y }") };
+		let existing: Option<IdRow> = self.sql.exec("SELECT key_id AS id FROM identities WHERE member_id = ?1", Some(vec![me.id.clone().into()]))?.to_array()?.into_iter().next();
+		match existing {
+			Some(e) if e.id == key_id => return Ok(Response::from_json(&serde_json::json!({ "ok": true, "unchanged": true }))?),
+			Some(_) => return json_error(409, "you already have an identity — reset it first (DELETE …/identity), then have it verified again"),
+			None => {}
+		}
+		let pk = serde_json::json!({ "kty": "EC", "crv": "P-256", "x": public_key["x"], "y": public_key["y"] });
+		self.sql.exec(
+			"INSERT INTO identities (member_id, key_id, public_key, root_digest, signature, created_at) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+			Some(vec![me.id.clone().into(), key_id.clone().into(), pk.to_string().into(), root_digest.into(), signature.into()]),
+		)?;
+		self.audit(actor, "identity.register", &me.id, Some(&serde_json::json!({ "keyId": key_id }))).await?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
+	async fn identity_reset(&self, actor: &str, member: &str) -> Result<Response> {
+		let Some(me) = self.member_by_email(actor)? else { return json_error(403, "not a team member") };
+		if me.id != member && me.role != "lead" {
+			return json_error(403, "an identity is reset by its member or a lead");
+		}
+		let gone = self.sql.exec("DELETE FROM identities WHERE member_id = ?1", Some(vec![member.into()]))?.rows_written();
+		if gone == 0 {
+			return json_error(404, "no identity to reset");
+		}
+		let certs = self.sql.exec("DELETE FROM identity_certs WHERE member_id = ?1 OR by_member = ?1", Some(vec![member.into()]))?.rows_written();
+		self.audit(actor, "identity.reset", member, Some(&serde_json::json!({ "certsDropped": certs }))).await?;
+		Ok(Response::from_json(&serde_json::json!({ "ok": true, "certsDropped": certs }))?)
+	}
+
+	async fn cert_put(&self, actor: &str, member: &str, body: serde_json::Value) -> Result<Response> {
+		let Some(me) = self.member_by_email(actor)? else { return json_error(403, "not a team member") };
+		if me.role != "lead" {
+			return json_error(403, "only a lead certifies an identity");
+		}
+		if me.id == member {
+			return json_error(400, "a certificate is for someone else (your own identity is self-signed)");
+		}
+		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+		let (Some(key_id), Some(root_digest), Some(signature)) = (get("keyId"), get("rootDigest"), get("signature").filter(|s| is_signature(s))) else {
+			return json_error(400, "keyId, rootDigest and signature required");
+		};
+		if self.sql.exec("SELECT COUNT(*) AS n FROM identities WHERE member_id = ?1", Some(vec![me.id.clone().into()]))?.one::<Count>()?.n == 0 {
+			return json_error(409, "register your own identity first — a certificate is signed with it");
+		}
+		let current: Option<IdentityRow> = self.sql.exec("SELECT member_id, key_id, public_key, root_digest, signature FROM identities WHERE member_id = ?1", Some(vec![member.into()]))?.to_array()?.into_iter().next();
+		match current {
+			None => return json_error(404, "that member has no identity yet"),
+			Some(c) if c.key_id != key_id || c.root_digest != root_digest => return json_error(409, "the certificate names an identity or root that is not the member's current one — compare fingerprints again"),
+			Some(_) => {}
+		}
+		self.sql.exec(
+			"INSERT INTO identity_certs (member_id, by_member, key_id, root_digest, signature, at) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT (member_id, by_member) DO UPDATE SET key_id = ?3, root_digest = ?4, signature = ?5, at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+			Some(vec![member.into(), me.id.clone().into(), key_id.clone().into(), root_digest.into(), signature.into()]),
+		)?;
+		self.audit(actor, "identity.certify", member, Some(&serde_json::json!({ "keyId": key_id }))).await?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
 	}
 
@@ -896,6 +1054,10 @@ struct GrantRow {
 	key_id: String,
 	expires_at: Option<String>,
 	prev_key_sealed: Option<String>,
+	signature: Option<String>,
+	signed_by: Option<String>,
+	prev_signature: Option<String>,
+	prev_signed_by: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct GranteeRow {
@@ -925,6 +1087,40 @@ struct CaseRow {
 #[derive(serde::Deserialize)]
 struct IdRow {
 	id: String,
+}
+#[derive(serde::Deserialize)]
+struct IdentityRow {
+	member_id: String,
+	key_id: String,
+	public_key: String,
+	root_digest: String,
+	signature: String,
+}
+#[derive(serde::Deserialize)]
+struct CertRow {
+	by_member: String,
+	key_id: String,
+	root_digest: String,
+	signature: String,
+}
+
+/// Can this be an ECDSA P-256 signature (WebCrypto's raw r ‖ s, base64)?
+/// A shape check only — clients verify (identity.ts).
+fn is_signature(s: &str) -> bool {
+	use base64::Engine;
+	base64::engine::general_purpose::STANDARD.decode(s).map(|b| b.len() == 64).unwrap_or(false)
+}
+
+/// A SHA-256 in lowercase hex.
+fn is_hex256(s: &str) -> bool {
+	s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `{ kty: "EC", crv: "P-256", x, y }` with 32-byte coordinates.
+fn is_p256_jwk(v: &serde_json::Value) -> bool {
+	use base64::Engine;
+	let coord = |k: &str| v.get(k).and_then(|c| c.as_str()).and_then(|c| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c).ok()).is_some_and(|b| b.len() == 32);
+	v.get("kty").and_then(|k| k.as_str()) == Some("EC") && v.get("crv").and_then(|k| k.as_str()) == Some("P-256") && coord("x") && coord("y")
 }
 #[derive(serde::Deserialize)]
 struct ActiveRow {

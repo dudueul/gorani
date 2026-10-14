@@ -164,8 +164,11 @@ mac    = base64(HMAC(key, len‖"gorani-store-record-v1" ‖ len‖name ‖ len�
 Opening a record also checks that the opened private key reproduces the
 record's public halves and key id, and that `privateKeySealed` is sealed
 text. Own records are MAC'd at creation; records sealed to a member by
-someone else are pinned (MAC'd) on first open — trust on first use, until
-member identity keys arrive (docs/DECISIONS.md › D2/D4).
+someone else are pinned (MAC'd) on first open — trust on first use. Case
+keys (commit 26) do better: every copy is signed by its granter's identity
+key and verified against an identity the grantee trusts (commit 27,
+docs/CASES.md › Stage 4 as built); the family area's records keep the
+first-use pin until stage 5 turns that area into a case.
 
 ### Unlock methods (KEK per kind)
 

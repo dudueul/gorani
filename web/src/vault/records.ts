@@ -29,9 +29,11 @@
  * area's key, sealed by a parent) cannot carry your MAC when it arrives —
  * its creator does not hold your root. Such a record is pinned on first
  * open ("trust on first use", `session.ts`): from then on a swap is caught,
- * but a substitution BEFORE that first open is not. Closing that gap needs
- * member identity keys with verified fingerprints — the roles/cases/quorum
- * redesign (docs/DECISIONS.md › D2, D4).
+ * but a substitution BEFORE that first open is not. Case keys close that
+ * gap with signatures (identity.ts, commit 27): a copy sealed to you by a
+ * granter carries their identity's signature, verified against an identity
+ * you trust. The family area keeps this first-use pin until it becomes a
+ * case (docs/CASES.md › stage 5).
  *
  * The encoding is length-prefixed bytes, not JSON (JSON has more than one
  * spelling of the same object; a MAC must have exactly one input). The

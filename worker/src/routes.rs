@@ -408,6 +408,17 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		("POST", ["family", "members", id, "deactivate"]) => {
 			forward_family(&env, &identity.email, "POST", format!("members/{id}/deactivate"), Some(serde_json::json!({}))).await
 		}
+		// ── Identities (commit 27, docs/CASES.md › Member identity keys) ──
+		("GET", ["family", "identities"]) => forward_family(&env, &identity.email, "GET", "identities", None).await,
+		("PUT", ["family", "identity"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", "identity", Some(body)).await
+		}
+		("DELETE", ["family", "members", id, "identity"]) => forward_family(&env, &identity.email, "DELETE", format!("identity/{id}"), None).await,
+		("PUT", ["family", "members", id, "cert"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "PUT", format!("certs/{id}"), Some(body)).await
+		}
 		("PUT", ["family", "master"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			forward_family(&env, &identity.email, "PUT", "master", Some(body)).await

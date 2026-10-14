@@ -20,16 +20,25 @@
  *      a walk interrupted after the commit resumes from the grants; grants
  *      that end by themselves (a deactivated holder) count as a revoke, and
  *      a deactivated manager does not count as the case's last one;
- *   6. closing makes the case read-only.
+ *   6. closing makes the case read-only;
+ *   7. (commit 27) identities: every copy is SIGNED by its granter and
+ *      verified by the grantee against an identity they trust — a copy the
+ *      server substituted, or a valid signature replayed from another
+ *      member's grant, is refused; a manager seals only to a root the
+ *      grantee's trusted identity names; the registry keeps identities and
+ *      certificates current (register once, reset drops certificates, only
+ *      leads certify, certificates name the current key).
  */
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { newContentKey, importContentKey, sealWith, openWith, importVaultKey, openSealedText } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith, openWith, importVaultKey, openSealedText, sealText } from "../../web/src/vault/vault-crypto.ts";
 import { createChildVault } from "../../web/src/vault/family.ts";
+import { createStoreKey } from "../../web/src/vault/family.ts";
 import { newCase, openCaseKey, openCaseTitle, sealCaseGrant, rotateCase } from "../../web/src/vault/cases.ts";
+import { buildTrust, certify, createIdentity, hybridDigest, pin, statements } from "../../web/src/vault/identity.ts";
 import { opensAnything } from "../../web/src/vault/rotation.ts";
-import { fromBase64 } from "../../web/src/lib/encoding.ts";
+import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "../lib/placed.mjs";
 
 const dev = await suiteDev();
@@ -50,17 +59,35 @@ const as = (who) => ({
 	},
 });
 
-/** A team member with a vault root (what grants are sealed to). */
+/** A team member with a vault root (what grants are sealed to) and an
+ * identity (what grants are signed with) — the record in their settings,
+ * the public half in the registry. */
 async function join(id, role, by, extra = {}) {
 	const email = `${id}@team.test`;
 	const added = await api(dev.base, "POST", "/api/v1/family/members", { email: by ?? email, body: { id, name: id, role, emails: [email], ...extra } });
 	assert.equal(added.status, 200, `add ${id}: ${added.text}`);
 	const vault = await createChildVault();
-	const settings = { enabled: true, keyId: vault.keyId, publicKey: vault.publicKey, pqPublicKey: vault.pqPublicKey, methods: vault.methods };
+	const root = await importVaultKey(vault.rootBundle.slice());
+	const rootPublic = { ec: vault.publicKey, kem: vault.pqPublicKey };
+	const made = await createIdentity(id, root, rootPublic);
+	const settings = { enabled: true, keyId: vault.keyId, publicKey: vault.publicKey, pqPublicKey: vault.pqPublicKey, methods: vault.methods, identity: made.record };
 	const put = await api(dev.base, "PUT", `/api/v1/members/${id}/vault`, { email, body: { settings } });
 	assert.equal(put.status, 200, `${id}'s vault: ${put.text}`);
-	return { id, email, root: await importVaultKey(vault.rootBundle.slice()) };
+	const reg = await api(dev.base, "PUT", "/api/v1/family/identity", { email, body: made.registry });
+	assert.equal(reg.status, 200, `${id}'s identity: ${reg.text}`);
+	return { id, email, root, rootPublic, settings, record: made.record, signer: made.signer, registry: made.registry };
 }
+
+/** `who` pins another member's identity (they compared fingerprints) and
+ * saves the re-MAC'd record in their settings. */
+async function pinIdentity(who, other) {
+	who.record = await pin(who.id, who.root, who.record, { member: other.id, keyId: other.record.keyId });
+	who.settings = { ...who.settings, identity: who.record };
+	assert.equal((await api(dev.base, "PUT", `/api/v1/members/${who.id}/vault`, { email: who.email, body: { settings: who.settings } })).status, 200);
+}
+
+/** Whom `who` trusts, from the registry's identities and their own pins. */
+const trustOf = async (who) => buildTrust(who.id, who.root, who.record, (await api(dev.base, "GET", "/api/v1/family/identities", { email: who.email })).json.identities);
 
 async function upload(who, fields, file) {
 	const boundary = `c${Math.random().toString(16).slice(2)}`;
@@ -93,6 +120,32 @@ try {
 	const dee = await join("dee", "analyst", ana.email);
 	const ext = await join("ext", "external", ana.email, { expiresAt: inDays(7) });
 
+	// ── 0b. Identities: the lead certifies, everyone pins the lead ──────
+	const entryOf = async (id) => (await as(ana).get("/api/v1/family/identities")).json.identities.find((e) => e.member === id);
+	for (const who of [lu, bo, cy, dee, ext]) {
+		const cert = await certify(ana.signer, await entryOf(who.id));
+		assert.equal((await as(ana).send("PUT", `/api/v1/family/members/${who.id}/cert`, cert)).status, 200, `ana certifies ${who.id}`);
+		await pinIdentity(who, ana); // …and each of them compared ana's fingerprint
+	}
+	assert.equal((await as(bo).send("PUT", "/api/v1/family/members/cy/cert", await certify(bo.signer, await entryOf("cy")))).status, 403, "only a lead certifies");
+	assert.equal((await as(ana).send("PUT", "/api/v1/family/members/cy/cert", { ...(await certify(ana.signer, await entryOf("cy"))), rootDigest: "0".repeat(64) })).status, 409, "a certificate names the member's CURRENT root");
+	assert.equal((await as(bo).send("PUT", "/api/v1/family/identity", bo.registry)).status, 200, "re-registering the same identity is a no-op");
+	const other = await createIdentity("bo", bo.root, bo.rootPublic);
+	assert.equal((await as(bo).send("PUT", "/api/v1/family/identity", other.registry)).status, 409, "a new identity needs a reset first");
+	assert.equal((await as(ext).get("/api/v1/family/identities")).status, 200, "externals read identities (to verify who granted them) …");
+	assert.ok(!(await as(ext).get("/api/v1/family/identities")).text.includes("@team.test"), "… which carry no emails");
+	assert.equal((await trustOf(bo)).of("cy")?.via, "cert:ana", "bo trusts cy through ana's certificate");
+	// A reset (lost device) drops the identity's certificates; until a lead
+	// verifies the new one, nobody's client trusts it.
+	const fay = await join("fay", "analyst", ana.email);
+	assert.equal((await as(ana).send("PUT", "/api/v1/family/members/fay/cert", await certify(ana.signer, await entryOf("fay")))).status, 200);
+	assert.equal((await trustOf(bo)).of("fay")?.via, "cert:ana");
+	assert.equal((await as(dee).send("DELETE", "/api/v1/family/members/fay/identity")).status, 403, "a reset is the member's or a lead's");
+	assert.equal((await as(fay).send("DELETE", "/api/v1/family/members/fay/identity")).json.certsDropped, 1);
+	const fay2 = await createIdentity("fay", fay.root, fay.rootPublic);
+	assert.equal((await as(fay).send("PUT", "/api/v1/family/identity", fay2.registry)).status, 200);
+	assert.equal((await trustOf(bo)).of("fay"), null, "a re-enrolled identity is trusted again only once someone verifies it");
+
 	// A member's root public halves: what a grant is sealed to.
 	const boRoot = await rootOf(ana, "bo");
 	assert.equal(boRoot.member, "bo");
@@ -104,7 +157,8 @@ try {
 	assert.equal((await as(ext).get("/api/v1/members/ext/files/list")).status, 403, "…but no files beside it");
 
 	// ── 1. Opening a case ───────────────────────────────────────────────
-	const opened = await newCase(CASE, "evidence", "Phishing wave, October", { ec: (await rootOf(ana, "ana")).publicKey, kem: (await rootOf(ana, "ana")).pqPublicKey });
+	const opened = await newCase(CASE, "evidence", "Phishing wave, October", ana.rootPublic, ana.signer);
+	assert.equal((await as(ana).send("POST", "/api/v1/cases", { ...opened.body, signature: undefined })).status, 400, "an unsigned grant is refused");
 	assert.equal((await as(bo).send("POST", "/api/v1/cases", opened.body)).status, 403, "only a lead opens a case");
 	assert.equal((await as(ana).send("POST", "/api/v1/cases", { ...opened.body, id: "IR 14" })).status, 400, "case ids are readable codes: a–z, 0–9, dashes");
 	assert.equal((await as(ana).send("POST", "/api/v1/cases", { ...opened.body, keySealed: "plain" })).status, 400, "the key copy must be sealed");
@@ -115,7 +169,7 @@ try {
 	let c = await caseOf(ana);
 	assert.equal(c.grant.permission, "manage", "the opener manages the case");
 	assert.equal(c.kind, "evidence");
-	const anaKey = await openCaseKey(ana.root, c);
+	const anaKey = await openCaseKey(ana.root, c, await trustOf(ana));
 	assert.equal(await openCaseTitle(anaKey, c), "Phishing wave, October", "the title opens in its place (case.title)");
 
 	// The case's store takes files sealed into `case:<id>` places.
@@ -141,11 +195,11 @@ try {
 	assert.equal((await as(bo).get("/api/v1/members/case:ir-2026-014/files/list")).status, 400, "a case is not reachable through the member routes");
 
 	// ── 3. Grants ───────────────────────────────────────────────────────
-	const grant = async (by, who, permission, extra = {}) => as(by).send("PUT", `${BASE}/grants/${who.id}`, { permission, ...(await sealCaseGrant(by.root, await caseOf(by), await rootOf(by, who.id))), ...extra });
+	const grant = async (by, who, permission, extra = {}) => as(by).send("PUT", `${BASE}/grants/${who.id}`, { permission, ...(await sealCaseGrant(by.root, await caseOf(by), await rootOf(by, who.id), by.signer, await trustOf(by))), ...extra });
 	assert.equal((await grant(ana, bo, "write")).status, 200);
 	assert.equal((await grant(bo, dee, "read")).status, 403, "only a manager grants");
 	c = await caseOf(bo);
-	const boKey = await openCaseKey(bo.root, c);
+	const boKey = await openCaseKey(bo.root, c, await trustOf(bo));
 	assert.equal(await openCaseTitle(boKey, c), "Phishing wave, October", "bo opens their copy");
 	const boSealer = await storeSealer(await bundleOf(bo, c), AREA);
 	const ioc = await putFile(bo, boSealer, "iocs.csv", "evil.test,203.0.113.7");
@@ -158,6 +212,28 @@ try {
 	assert.equal((await grant(ana, cy, "write")).status, 400, "an auditor's grant is read-only");
 	assert.equal((await grant(ana, cy, "read")).status, 200);
 	assert.equal((await as(cy).get(`${BASE}/files/list`)).status, 200, "the auditor reads with a grant");
+	await openCaseKey(cy.root, await caseOf(cy), await trustOf(cy)); // signed by ana, whom cy pinned
+
+	// ── 3b. What the signatures stop (commit 27) ────────────────────────
+	// The server's move before stage 4: hand cy a case key of ITS OWN —
+	// sealed to cy's root, under the current key id — with any signature.
+	// (Played here through a manager's write; the registry cannot tell.)
+	const fake = await createStoreKey();
+	const fakeDigest = await hybridDigest(fake.publicKey, fake.pqPublicKey);
+	const fakeCopy = await sealText(cy.rootPublic, toBase64(fake.bundle));
+	const notAna = await createIdentity("ana", ana.root, ana.rootPublic); // a key that is not ana's registered one
+	assert.equal((await as(ana).send("PUT", `${BASE}/grants/cy`, { permission: "read", keyId: c.keyId, keySealed: fakeCopy, signature: await notAna.signer.sign(statements.grant(CASE, fakeDigest, "cy")) })).status, 200, "the registry stores what it cannot check");
+	await assert.rejects(async () => openCaseKey(cy.root, await caseOf(cy), await trustOf(cy)), /the signature on your copy of case ir-2026-014's key does not verify/, "a substituted key: refused before cy uses it");
+	// …or replay a REAL signature of ana's — the one on bo's grant — over it.
+	const boSig = (await caseOf(bo)).grant.signature;
+	assert.equal((await as(ana).send("PUT", `${BASE}/grants/cy`, { permission: "read", keyId: c.keyId, keySealed: fakeCopy, signature: boSig })).status, 200);
+	await assert.rejects(async () => openCaseKey(cy.root, await caseOf(cy), await trustOf(cy)), /the signature on your copy of case ir-2026-014's key does not verify/, "a replayed signature names another grantee and another key");
+	// A manager never seals to a root the grantee's trusted identity does not name.
+	const fakeRoot = await createChildVault();
+	await assert.rejects(sealCaseGrant(ana.root, await caseOf(ana), { member: "cy", keyId: fakeRoot.keyId, publicKey: fakeRoot.publicKey, pqPublicKey: fakeRoot.pqPublicKey }, ana.signer, await trustOf(ana)), /not the one their identity names/);
+	await assert.rejects(sealCaseGrant(ana.root, await caseOf(ana), await rootOf(ana, "fay"), ana.signer, await trustOf(ana)), /not verified/, "nor to a member whose identity nobody verified");
+	assert.equal((await grant(ana, cy, "read")).status, 200, "the real grant back");
+	await openCaseKey(cy.root, await caseOf(cy), await trustOf(cy));
 	const cySealer = await storeSealer(await bundleOf(cy, await caseOf(cy)), AREA);
 	assert.equal((await putFile(cy, cySealer, "note.txt", "x")).status, 403, "…and the server refuses their writes (the key would allow it: policy, not crypto)");
 
@@ -195,7 +271,7 @@ try {
 	const roots = async () => Promise.all(c.grantees.map((g) => rootOf(ana, g.member)));
 	// A rotation names exactly the current grantees.
 	const short = (await roots()).filter((r) => r.member !== "cy");
-	await assert.rejects(rotateCase(as(ana).call, ana.root, c, short), /409/, "one grantee short is refused");
+	await assert.rejects(rotateCase(as(ana).call, ana.root, c, short, ana.signer, await trustOf(ana)), /409/, "one grantee short is refused");
 	// Interrupt a rotation after its commit (the tab "dies" before the walk).
 	c = await caseOf(ana);
 	const all = await roots();
@@ -206,25 +282,25 @@ try {
 			return as(ana).call(method, path, body);
 		},
 	};
-	await assert.rejects(rotateCase(interrupted.call, ana.root, c, all), /the tab died/);
+	await assert.rejects(rotateCase(interrupted.call, ana.root, c, all, ana.signer, await trustOf(ana)), /the tab died/);
 	c = await caseOf(ana);
 	assert.ok(c.rotating, "the commit landed; the walk did not");
 	assert.ok(c.grant.prevKeySealed, "…and the grant still holds the previous key");
 	assert.equal((await as(ana).send("PUT", `${BASE}/key`, { keyId: "x", publicKey: {}, grants: [] })).status, 409, "no second rotation while one walks");
 	// Resume from the grants alone — no key survived in "the tab".
-	const done = await rotateCase(as(ana).call, ana.root, c, all);
+	const done = await rotateCase(as(ana).call, ana.root, c, all, ana.signer, await trustOf(ana));
 	assert.equal(done.report.resealed.version, 2, "both files' content keys");
 	c = await caseOf(ana);
 	assert.equal(c.rotating, null);
 	assert.equal(c.rotationRequired, false);
 	assert.equal(c.grant.prevKeySealed, null, "the previous copies are gone");
 	assert.equal(await opensAnything(as(ana).call, AREA, boKey), 0, "bo's old key opens nothing in the case");
-	const newKey = await openCaseKey(ana.root, c);
+	const newKey = await openCaseKey(ana.root, c, await trustOf(ana));
 	assert.equal(await openCaseTitle(newKey, c), "Phishing wave, October", "the title moved to the new key");
 	for (const who of [cy, ext]) {
 		const theirs = await caseOf(who);
 		assert.equal(theirs.keyId, c.keyId);
-		await openCaseKey(who.root, theirs); // throws if their copy is not the new key
+		await openCaseKey(who.root, theirs, await trustOf(who)); // throws if their copy is not the new key, signed
 	}
 	assert.equal((await as(ana).send("PUT", `${BASE}/grants/bo`, { permission: "read", keySealed: c.grant.keySealed, keyId: "stale" })).status, 409, "a grant names the current key");
 
@@ -236,7 +312,7 @@ try {
 	assert.equal(c.rotationRequired, true, "deactivated holders kept their copies: a rotation is owed");
 	assert.deepEqual(c.grantees.map((g) => g.member).sort(), ["ana", "cy", "ext"], "ended grants are not listed (nobody seals the new key to them)");
 	assert.equal((await as(ana).send("DELETE", `${BASE}/grants/ana`)).status, 409, "a deactivated manager does not count — ana stays the last one");
-	await rotateCase(as(ana).call, ana.root, c, await Promise.all(c.grantees.map((g) => rootOf(ana, g.member))));
+	await rotateCase(as(ana).call, ana.root, c, await Promise.all(c.grantees.map((g) => rootOf(ana, g.member))), ana.signer, await trustOf(ana));
 	c = await caseOf(ana);
 	assert.equal(c.rotationRequired, false, "the rotation dropped the ended grants with the old key");
 	assert.equal((await as(dee).get(`${BASE}/files/list`)).status, 403);
@@ -251,9 +327,9 @@ try {
 	const audit = (await as(cy).get(`${BASE}/audit`)).json.map((a) => a.action);
 	assert.ok(audit.includes("files.reseal"), "the case audit records the walk");
 	const registry = (await as(ana).get("/api/v1/family")).json.audit.map((a) => a.action);
-	for (const action of ["case.create", "case.grant", "case.revoke", "case.rekey", "case.rekey.done", "case.close"]) assert.ok(registry.includes(action), `the registry audit records ${action}`);
+	for (const action of ["case.create", "case.grant", "case.revoke", "case.rekey", "case.rekey.done", "case.close", "identity.register", "identity.certify", "identity.reset"]) assert.ok(registry.includes(action), `the registry audit records ${action}`);
 
-	console.log("ok  api:cases — leads open, grants seal the key, read-only auditors, expiring externals, no links/devices, revoke → rotate (resumable), close");
+	console.log("ok  api:cases — leads open, signed grants seal the key, substituted/replayed copies refused, read-only auditors, expiring externals, no links/devices, revoke → rotate (resumable), close");
 } finally {
 	await dev.close();
 }

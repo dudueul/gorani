@@ -53,6 +53,7 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 32 | Counting what matters | worker/src/files_store.rs (share tokens, read log), worker/src/routes.rs (rate_limited), worker/src/auth.rs (bootstrap_allowed) (25) | A limit enforced by the client is a suggestion; the last-unit bug of a counter checked twice; merging audit events so they stay readable; fail-open vs. fail-closed, chosen per control; a one-time secret for the first, unguarded write |
 | 33 | Many hands | docs/CASES.md, web/src/vault/shamir.ts (26) | Designing least privilege before code; Shamir sharing — polynomials over a finite field, why M−1 points say nothing, why the result must still be verified |
 | 34 | A case is a store | worker/src/area.rs, worker/src/family.rs › Cases and grants, web/src/vault/cases.ts, tests/api/cases.test.mjs (26) | One abstraction (an area) instead of a second store type; key custody in grants; policy the crypto cannot express (read-only) enforced by the server and named as such; why a rotation commits before it walks |
+| 35 | Whose key is this? | web/src/vault/identity.ts, worker/src/family.rs › Identities, tests/unit/identity.test.ts (27) | Fingerprints people can compare; trust as pins under the member's own MAC; one-hop certification instead of a PKI; signing statements, not objects; full digests vs. short labels |
 
 Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at

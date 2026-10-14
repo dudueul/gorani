@@ -195,6 +195,59 @@ try {
 		assert.equal(await page.evaluate(async () => (await fetch("/api/healthz")).status), 200);
 		await assertNoViolations(page, "streamed media");
 
+		// ── A download streamed through the media worker (D12, 31c) ────
+		// The app hands a chunked file this big to the worker only above
+		// 256 MiB; the worker's half is driven here directly, with a small
+		// chunked file (two 5 MiB frames): it decrypts window by window into
+		// the browser's own download, hands back the plaintext's SHA-256, and
+		// serves its URL once.
+		{
+			const sealer = await storeSealer(filesStore.bundle, "jinu");
+			const chunk = 5 * 1024 * 1024;
+			const plain = Buffer.alloc(chunk + 12_345);
+			for (let i = 0; i < plain.length; i++) plain[i] = (i * 13) % 251;
+			const ck = newContentKey();
+			const file = await sealer.newFile("image.raw", "application/octet-stream", ck);
+			const sealed = await sealChunked(await importContentKey(ck), plain, chunk);
+			const who = { "x-gorani-dev-email": "jinu@family.test" };
+			const start = (await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: plain.length, chunk, newFileId: file.id } })).json;
+			const parts = [];
+			for (let p = 1; p <= start.parts; p++) {
+				const r = await fetch(`${dev.base}/api/v1/members/jinu/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, { method: "PUT", headers: who, body: sealed.subarray((p - 1) * (chunk + 28), p * (chunk + 28)) });
+				parts.push({ partNumber: p, etag: (await r.json()).etag });
+			}
+			const done = new FormData();
+			for (const [k, v] of Object.entries({ key: start.key, size: String(plain.length), chunk: String(chunk), ck: file.fields.ck, name: file.fields.name, type: file.fields.type, parts: JSON.stringify(parts) })) done.append(k, v);
+			assert.equal((await fetch(`${dev.base}/api/v1/members/jinu/files/uploads/${start.uploadId}/complete`, { method: "POST", headers: who, body: done })).status, 200);
+			const [download] = await Promise.all([
+				page.waitForEvent("download"),
+				page.evaluate(async ({ ck, fileId, size, chunk }) => {
+					const key = await crypto.subtle.importKey("raw", Uint8Array.from(atob(ck), (c) => c.charCodeAt(0)), "AES-GCM", false, ["decrypt"]);
+					const url = `/media/dl/e2e-${Math.random().toString(36).slice(2)}`;
+					const ack = new MessageChannel();
+					const result = new MessageChannel();
+					window.__dl = { url, done: new Promise((r) => (result.port1.onmessage = (e) => r(e.data))) };
+					const acked = new Promise((r) => (ack.port1.onmessage = r));
+					navigator.serviceWorker.controller.postMessage({ type: "download", url, memberId: "jinu", fileId, version: 1, key, chunk, size, name: "image.raw", headers: { "x-gorani-dev-email": "jinu@family.test" } }, [ack.port2, result.port2]);
+					await acked;
+					// A navigation, not <a download>: Chromium sends a download-attribute
+					// request past the service worker; a navigation it intercepts,
+					// and an attachment answer downloads while the page stays put.
+					const a = document.createElement("a");
+					a.href = url;
+					document.body.append(a);
+					a.click();
+					a.remove();
+				}, { ck: Buffer.from(ck).toString("base64"), fileId: file.id, size: plain.length, chunk }),
+			]);
+			assert.equal(download.suggestedFilename(), "image.raw");
+			assert.deepEqual(await (await import("node:fs/promises")).readFile(await download.path()), plain, "the decrypted file, byte for byte, on disk");
+			const sha256 = (await import("node:crypto")).createHash("sha256").update(plain).digest("hex");
+			assert.deepEqual(await page.evaluate(() => window.__dl.done), { ok: true, sha256, size: plain.length }, "the plaintext's hash, back to the page");
+			assert.equal(await page.evaluate(async () => (await fetch(window.__dl.url)).status), 404, "a download URL is used once");
+			await assertNoViolations(page, "streamed download");
+		}
+
 		// ── Lock means locked (docs/SECURITY-REVIEW.md › O2) ───────────
 		// An image opened in the viewer is a blob: URL over DECRYPTED bytes.
 		// After Lock, that handle must stop resolving, the explorer must be

@@ -21,7 +21,7 @@
 import { store, type Store } from "../../lib/store.ts";
 import { newContentKey, importContentKey, sealWith, openWith, sealPlacedText, openPlacedText, wrapPlacedKey, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
 import { places, newItemId } from "../../vault/places.ts";
-import { controllingMediaWorker, registerMedia } from "../../lib/media-worker.ts";
+import { controllingMediaWorker, registerDownload, registerMedia } from "../../lib/media-worker.ts";
 import { openChunk, sealChunk, chunkFor, frameCount, MAX_FILE } from "../../vault/chunked-file.ts";
 import type { UploadJournal, UploadRecord } from "../../lib/upload-journal.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
@@ -649,6 +649,9 @@ export class FilesModel {
 	 * frame — a 100 MB file arrived as thirteen 8 MiB pieces. The frames are
 	 * collected and saved as one Blob; a Blob of parts is not a copy.) */
 	async download(id: string, name: string): Promise<void> {
+		// A large chunked file streams through the media worker straight to
+		// the browser's own download (D12, 31c) — never into this tab.
+		if (await this.streamDownload(id, name)) return;
 		const parts: Uint8Array[] = [];
 		// The signed content hash is checked on the way (commit 29d): the
 		// bytes pass through SHA-256 as they are collected, frame by frame.
@@ -673,6 +676,53 @@ export class FilesModel {
 		}
 		this.save(parts, name);
 		this.bridge.toast(check.status === "unsigned" ? `Downloaded “${name}”` : `Downloaded “${name}” — ${describeHashCheck(check)}`);
+	}
+
+	/**
+	 * The streamed download (D12, docs/LARGE-FILES.md › 31c): above
+	 * STREAM_DOWNLOAD_AT, a chunked file goes through the media service
+	 * worker — decrypted a window of frames at a time into the browser's own
+	 * download — and its SHA-256 comes back to be checked against the
+	 * uploader's signed record, as the in-tab path checks it. False when
+	 * this path does not apply (small, whole, a sample, no worker); a file
+	 * too large for the tab with no worker is refused rather than tried.
+	 */
+	private async streamDownload(id: string, name: string): Promise<boolean> {
+		const row = this.state.get().files.find((f) => f.id === id);
+		if (!row || row.size <= STREAM_DOWNLOAD_AT) return false;
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number; type: string | null; sample?: boolean; hash?: string | null }> }>(id);
+		const meta = keys.keys[id];
+		if (!meta?.chunk) return false;
+		if ((await this.policyOf(meta, id, null)) !== "normal") {
+			// A sample leaves only zipped under "infected" — in this tab (31d streams the export's).
+			if (row.size > IN_TAB_LIMIT) throw new Error(`“${name}” is a sample of ${(row.size / 1024 ** 3).toFixed(1)} GiB — too large to zip in the browser; export the case instead`);
+			return false;
+		}
+		const worker = await controllingMediaWorker(2000);
+		if (!worker) {
+			if (row.size > IN_TAB_LIMIT) throw new Error(`“${name}” is ${(row.size / 1024 ** 3).toFixed(1)} GiB: it downloads through the media worker, which is not running — reload the page and try again`);
+			return false;
+		}
+		const priv = await this.bridge.storePrivate();
+		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, meta.version), meta.key);
+		const url = `/media/dl/${toBase64(crypto.getRandomValues(new Uint8Array(18))).replace(/\+/g, "-").replace(/\//g, "_")}`;
+		const { done } = await registerDownload(worker, { url, memberId: this.memberId, fileId: id, version: meta.version, key, chunk: meta.chunk, size: row.size, name, headers: this.bridge.identityHeaders() });
+		if (typeof document !== "undefined") {
+			// A NAVIGATION to the worker's URL, not <a download>: Chromium sends a
+			// download-attribute request straight to the network, past the
+			// worker; a navigation the worker answers, and its attachment answer
+			// downloads while this page stays where it is.
+			const a = document.createElement("a");
+			a.href = url;
+			a.click();
+		}
+		this.bridge.toast(`Downloading “${name}” (${(row.size / 1024 ** 3).toFixed(1)} GiB) — it is checked against its signature when it finishes`);
+		void done.then(async (r) => {
+			if (!r.ok || !r.sha256) return this.bridge.toast(`⚠ “${name}” did not finish downloading: ${r.error ?? "stopped"} — the file on disk is incomplete`);
+			const check = await this.checkHash(id, { version: meta.version, hash: meta.hash ?? null }, { sha256: r.sha256, size: r.size ?? 0 });
+			this.bridge.toast(check.status === "unsigned" ? `Downloaded “${name}” — SHA-256 ${r.sha256}` : `Downloaded “${name}” — ${describeHashCheck(check)}`);
+		});
+		return true;
 	}
 
 	/** The last download's parts — what a Node test can inspect (the browser saves them). */
@@ -1098,6 +1148,10 @@ export function concat(parts: Uint8Array[]): Uint8Array {
 }
 
 /** Lowercase hex of a digest. */
+/** Downloads above this stream through the media worker to disk (D12, 31c). */
+export const STREAM_DOWNLOAD_AT = 256 * 1024 * 1024;
+/** Above this, a download is not even tried in the tab's memory. */
+const IN_TAB_LIMIT = 2 * 1024 ** 3;
 /** Files up to this size go up whole, in one request; larger ones as GC01 frames. */
 export const WHOLE_LIMIT = 48 * 1024 * 1024;
 /** Audio tags are parsed from the whole file — up to this size (the parser needs it in memory). */

@@ -60,6 +60,27 @@ export async function registerMedia(worker: ServiceWorker, msg: { url: string; m
 }
 
 /** Forget one file's key (the viewer closed) or every key (Lock). */
+/**
+ * A streamed download (D12, 31c): the worker decrypts a chunked file frame
+ * window by frame window into the browser's own download, so its size is
+ * not bounded by the tab's memory. `done` settles when the last byte has
+ * passed, with the plaintext's SHA-256 (or why it stopped).
+ */
+export async function registerDownload(worker: ServiceWorker, msg: { url: string; memberId: string; fileId: string; version: number; key: CryptoKey; chunk: number; size: number; name: string; headers?: Record<string, string> }): Promise<{ done: Promise<{ ok: boolean; sha256?: string; size?: number; error?: string }> }> {
+	const ack = new MessageChannel();
+	const result = new MessageChannel();
+	const acked = new Promise<void>((resolve, reject) => {
+		const t = setTimeout(() => reject(new Error("the media worker did not answer")), 5000);
+		ack.port1.onmessage = () => (clearTimeout(t), resolve());
+	});
+	const done = new Promise<{ ok: boolean; sha256?: string; size?: number; error?: string }>((resolve) => {
+		result.port1.onmessage = (e) => resolve(e.data as { ok: boolean; sha256?: string; size?: number; error?: string });
+	});
+	worker.postMessage({ type: "download", ...msg }, [ack.port2, result.port2]);
+	await acked;
+	return { done };
+}
+
 export async function forgetMedia(url?: string): Promise<void> {
 	if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
 	try {

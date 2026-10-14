@@ -32,9 +32,12 @@
  * sent either.
  */
 
-import { framesForRange, frameAad, splitFrame, resolveRange, cutToRange, OPEN_RANGE_WINDOW } from "/gorani-media-lib.js";
+import { framesForRange, frameAad, splitFrame, resolveRange, cutToRange, downloadStream, OPEN_RANGE_WINDOW } from "/gorani-media-lib.js";
 
 const registrations = new Map(); // pathname → { memberId, fileId, version, key, chunk, size, type }
+// (D12, 31c) One-use downloads: /media/dl/<random> → { …, name, port } — the
+// port carries the plaintext's SHA-256 back to the page when it is done.
+const downloads = new Map();
 
 self.addEventListener("install", () => self.skipWaiting());
 // Claim the open app page right away: a page loaded before the worker
@@ -59,10 +62,27 @@ self.addEventListener("message", (event) => {
 		});
 		event.ports?.[0]?.postMessage({ ok: true }); // the page may wait for this
 	}
+	if (msg.type === "download" && msg.url && msg.key && msg.chunk) {
+		downloads.set(new URL(msg.url, self.location.origin).pathname, {
+			memberId: msg.memberId,
+			fileId: msg.fileId,
+			version: msg.version,
+			key: msg.key,
+			chunk: msg.chunk,
+			size: msg.size,
+			name: String(msg.name ?? "download"),
+			headers: { ...(msg.headers && typeof msg.headers === "object" ? msg.headers : {}), "x-gorani-client": "download" },
+			port: event.ports?.[1] ?? null,
+		});
+		event.ports?.[0]?.postMessage({ ok: true });
+	}
 	if (msg.type === "media-forget" && msg.url) {
 		registrations.delete(new URL(msg.url, self.location.origin).pathname);
 	}
-	if (msg.type === "media-forget-all") registrations.clear();
+	if (msg.type === "media-forget-all") {
+		registrations.clear();
+		downloads.clear(); // locking ends a download not yet started, too
+	}
 });
 
 const encoder = new TextEncoder();
@@ -71,6 +91,17 @@ self.addEventListener("fetch", (event) => {
 	const url = new URL(event.request.url);
 	// Not ours: return WITHOUT respondWith — the browser proceeds natively.
 	if (url.origin !== self.location.origin || !url.pathname.startsWith("/media/")) return;
+	// A download (D12, 31c): used once — the path is forgotten as it is served.
+	if (url.pathname.startsWith("/media/dl/")) {
+		const dl = downloads.get(url.pathname);
+		downloads.delete(url.pathname);
+		if (!dl || event.request.method !== "GET") {
+			event.respondWith(new Response("not available", { status: 404, headers: { "Cache-Control": "no-store" } }));
+			return;
+		}
+		event.respondWith(serveDownload(dl));
+		return;
+	}
 	const reg = registrations.get(url.pathname);
 	// A /media/ path with no key registered (locked, forgotten, never opened)
 	// is a 404 — not a fall-through, which would fetch the app's HTML.
@@ -130,5 +161,38 @@ async function serveMedia(request, reg) {
 	return new Response(body, {
 		status: 206,
 		headers: { ...headers, "Content-Range": `bytes ${range.start}-${range.start + body.length - 1}/${reg.size}`, "Content-Length": String(body.length) },
+	});
+}
+
+/**
+ * A whole chunked file, decrypted as it streams to the browser's own
+ * download (D12, docs/LARGE-FILES.md › 31c): a 255 GB image never sits in
+ * the tab or here — one window of frames at a time (downloadStream). The
+ * plaintext's SHA-256 goes back to the page, which checks it against the
+ * uploader's signed record and says what it found.
+ */
+function serveDownload(dl) {
+	const base = dl.memberId.startsWith("case:") ? `/api/v1/cases/${dl.memberId.slice(5)}` : `/api/v1/members/${dl.memberId}`;
+	const objectPath = `${base}/files/${dl.fileId}?version=${dl.version}`;
+	const body = downloadStream({
+		key: dl.key,
+		chunk: dl.chunk,
+		size: dl.size,
+		onDone: (result) => dl.port?.postMessage(result),
+		fetchRange: async (start, end) => {
+			const res = await fetch(objectPath, { headers: { ...dl.headers, Range: `bytes=${start}-${end - 1}` } });
+			if (res.status !== 206 && res.status !== 200) throw new Error(`the server answered HTTP ${res.status}`);
+			return new Uint8Array(await res.arrayBuffer());
+		},
+	});
+	return new Response(body, {
+		status: 200,
+		headers: {
+			"Content-Type": "application/octet-stream",
+			"Content-Length": String(dl.size),
+			"Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(dl.name)}`,
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
+		},
 	});
 }

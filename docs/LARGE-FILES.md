@@ -41,7 +41,7 @@ desktop shells agree on every file's frames.
 |---|---|
 | 31a *(landed)* | **Adaptive chunks, streamed parts, streamed browser uploads.** `chunkFor` in both languages; the Worker refuses sizes over 255 GiB and chunks over 64 MiB, and pipes each part's body to the backend (S3: `UNSIGNED-PAYLOAD` with the length fixed; R2: the binding's stream) — no copy in the isolate. The browser hashes the file in one streamed pass (the hash is signed before any byte leaves), then seals and uploads slice by slice, retrying a failed part (three tries, backoff). |
 | 31b *(landed)* | **Resumable uploads.** The in-flight upload — its id, object key, chunk, the sealed fields (name, type, key, signed hash, intake), the parts done — is kept in the browser (IndexedDB; every field already sealed). After a dropped connection or a closed tab, choosing the same file again (name, size, modified time, and the same SHA-256) continues from the first missing part. The server keeps an unfinished upload for the housekeeping window, then aborts it. |
-| 31c | **Streaming downloads and export.** A download larger than the tab can hold streams through the media service worker (`/media/<id>?download`), decrypting frame by frame to the browser's own download. The export package streams too (File System Access where the browser has it, the service worker otherwise), with ZIP64 for entries and archives over 4 GiB; `tools/verify-export.mjs` reads ZIP64 and hashes entries from disk, never holding one whole. |
+| 31c *(downloads landed; the export is 31d)* | **Streaming downloads and export.** A download larger than the tab can hold streams through the media service worker (`/media/<id>?download`), decrypting frame by frame to the browser's own download. The export package streams too (File System Access where the browser has it, the service worker otherwise), with ZIP64 for entries and archives over 4 GiB; `tools/verify-export.mjs` reads ZIP64 and hashes entries from disk, never holding one whole. |
 
 Not in D12 (recorded here so nobody assumes otherwise):
 
@@ -103,6 +103,30 @@ Not in D12 (recorded here so nobody assumes otherwise):
   far they got; `discardUpload` aborts one on the server and forgets it.
 - Not yet: no button for discarding (the window — `uploadDays`, 2 by
   default — does it), and a resume needs the same browser profile.
+
+## 31c as built (downloads)
+
+- `web/public/gorani-media-lib.js › downloadStream`: a whole GC01 file
+  as a pull-based stream (highWaterMark 0): a window of frames (about
+  32 MiB of ciphertext, at least one frame) fetched by Range, each opened
+  in its place, hashed as it passes; the stream errors at the first frame
+  that does not open, and never pads a short answer. With it, a plain-JS
+  `sha256Stream` (the worker imports nothing from the app bundle) — both
+  checked in Node by `unit:media-frames`.
+- `sw-media.js`: one-use download registrations (`/media/dl/<random>`,
+  forgotten as they are served, and on Lock) answered with the stream, an
+  exact `Content-Length` and `Content-Disposition: attachment`; the
+  plaintext's SHA-256 goes back to the page over a MessagePort.
+- `model.ts › streamDownload`: above 256 MiB, a chunked file downloads
+  this way, and the page checks the returned hash against the uploader's
+  signed record when it finishes (the in-tab path checks it the same way).
+  The page **navigates** to the worker's URL — a link without the
+  `download` attribute: Chromium sends a download-attribute request
+  straight to the network, past the service worker (found by the e2e
+  test, which caught the app's own page arriving as the "file").
+- Samples still download zipped in the tab (up to 2 GiB; larger ones go
+  through the export), and a file too large for the tab with no worker is
+  refused with the reason rather than tried.
 
 ## Why these choices
 

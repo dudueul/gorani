@@ -19,6 +19,8 @@
 use gorani_s3::{complete_multipart_body, sign_request, xml_unescape, xml_val, S3Config, SignedRequest};
 use worker::*;
 
+use crate::cache;
+
 /// A HEAD result: size and etag (the store keeps etags for upload parts).
 #[derive(Debug, Clone)]
 pub struct HeadInfo {
@@ -100,8 +102,30 @@ async fn fetch_signed(cfg: &S3Config, method: &str, object_key: &str, query_pair
 
 // ── Object operations ───────────────────────────────────────────────
 
-/// Full GET; None on 404.
+/// Full GET; None on 404. Whole-object entries are cached like the
+/// streaming reads — the caller asked for bytes anyway, so the cached copy
+/// costs one clone at put time.
 pub async fn get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
+	let cache = Cache::default();
+	let url = cache::url(key, None);
+	if let Some(mut hit) = cache.get(&cache::request_of(&url, None)?, false).await? {
+		// (cache-served headers are immutable — the bytes path has no
+		// response headers of its own to mark anyway)
+		return Ok(Some(hit.bytes().await?));
+	}
+	let bytes = origin_get(env, key).await?;
+	if let Some(b) = &bytes {
+		if (b.len() as u64) <= cache::max_bytes(env) {
+			let mut entry = Response::from_bytes(b.clone())?;
+			entry.headers_mut().set("Cache-Control", &format!("public, max-age={}, immutable", cache::max_age(env)))?;
+			entry.headers_mut().set("Content-Type", "application/octet-stream")?;
+			let _ = cache.put(&url, entry).await;
+		}
+	}
+	Ok(bytes)
+}
+
+async fn origin_get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
 	if let Some(bucket) = r2_bucket(env).await? {
 		return match bucket.get(key).execute().await? {
 			Some(o) => match o.body() {
@@ -143,7 +167,62 @@ pub async fn read_range(env: &Env, key: &str, offset: u64, length: u64) -> Resul
 
 /// Full GET as a **streamable** Response (the file route pipes the body
 /// through with a Range header); None-style errors surfaced via status.
-pub async fn fetch_stream(env: &Env, method: &str, key: &str, range: Option<(u64, u64)>, query_pairs: &[(String, String)]) -> Result<Response> {
+///
+/// The cache (crate::cache) wraps this: whole-object entries for small
+/// reads (any later Range sliced by the platform itself), frame-span
+/// entries for chunked media (`cache_span` vouched for by the route — the
+/// media worker requests whole frames, so the span is deterministic).
+/// Bodies stream through `cache.put`; the worker never buffers a blob.
+pub async fn fetch_stream(env: &Env, method: &str, key: &str, range: Option<(u64, u64)>, query_pairs: &[(String, String)], cache_span: Option<(u64, u64)>) -> Result<Response> {
+	// Every GET consults the cache: whole entries are asked WITH the
+	// caller's Range so the platform slices them itself; span entries are
+	// asked plain (their bytes are the span). A ranged MISS on the whole
+	// key streams through — caching it would mean inflating the fetch to
+	// the whole object, not worth it on external-S3 egress.
+	if method != "GET" {
+		return Ok(origin_stream(env, key, range, query_pairs).await?);
+	}
+	let cache = Cache::default();
+	let url = cache::url(key, cache_span);
+	let lookup = cache::request_of(&url, if cache_span.is_some() { None } else { range })?;
+	if let Some(hit) = cache.get(&lookup, false).await? {
+		return cache::serve(hit, range, cache_span.is_some(), "hit");
+	}
+	if range.is_some() && cache_span.is_none() {
+		return cache::mark(origin_stream(env, key, range, query_pairs).await?, "bypass");
+	}
+	// ── miss: origin, then cache the copy when it fits the gate ────────
+	let mut origin = origin_stream(env, key, range, query_pairs).await?;
+	if origin.status_code() != 200 && origin.status_code() != 206 {
+		return Ok(origin); // 404s and oddities are the caller's business
+	}
+	// The honest size: what the origin says it is sending (the route's
+	// spans end at the object's end, so a span's length == its actual).
+	let len: Option<u64> = origin.headers().get("Content-Length")?.and_then(|v| v.parse().ok());
+	if len.map(|l| l > cache::max_bytes(env)).unwrap_or(true) {
+		return cache::mark(origin, "bypass");
+	}
+	// Span copies are stored as 200 entries whose bytes are the span; whole
+	// copies keep their origin headers. The entry is a REBUILD — fetched and
+	// cache-served responses carry immutable headers — and the body streams
+	// through `cache.put` untouched: no worker buffering, either way.
+	let stream = origin.stream()?;
+	let mut entry = Response::from_stream(stream)?;
+	entry.headers_mut().set("Cache-Control", &format!("public, max-age={}, immutable", cache::max_age(env)))?;
+	entry.headers_mut().set("Content-Length", &len.unwrap_or(0).to_string())?;
+	entry.headers_mut().set("Content-Type", "application/octet-stream")?;
+	cache.put(&url, entry).await?;
+	match cache.get(&lookup, false).await? {
+		Some(hit) => cache::serve(hit, range, cache_span.is_some(), "miss"),
+		// The cache write vanished (plan limits, eviction mid-flight):
+		// serve from origin rather than failing the read.
+		None => origin_stream(env, key, range, query_pairs).await,
+	}
+}
+
+/// The uncached origin read: the R2 binding when bound, the signed S3
+/// transport otherwise.
+async fn origin_stream(env: &Env, key: &str, range: Option<(u64, u64)>, query_pairs: &[(String, String)]) -> Result<Response> {
 	if let Some(bucket) = r2_bucket(env).await? {
 		// (query_pairs serve the S3 signed URL; the binding needs none. The
 		// headers mirror what the S3 answer carries — length and an honest
@@ -154,15 +233,15 @@ pub async fn fetch_stream(env: &Env, method: &str, key: &str, range: Option<(u64
 		}
 		return match g.execute().await? {
 			Some(o) => {
-				let (status, cr) = match range {
-					Some((off, len)) => (206, Some(format!("bytes {off}-{}/*", off + len - 1))),
-					None => (200, None),
-				};
+				let status = if range.is_some() { 206 } else { 200 };
 				let headers = Headers::new();
 				headers.set("Content-Type", "application/octet-stream")?;
-				headers.set("Content-Length", &o.size().to_string())?;
-				if let Some(cr) = cr {
-					headers.set("Content-Range", &cr)?;
+				// The honest length: a span's bytes are its declared length
+				// clamped by the object's end (the last frame may be short).
+				let clen = range.map(|(off, len)| len.min(o.size().saturating_sub(off))).unwrap_or_else(|| o.size());
+				headers.set("Content-Length", &clen.to_string())?;
+				if let Some((off, len)) = range {
+					headers.set("Content-Range", &format!("bytes {off}-{}/*", off + len - 1))?;
 				}
 				let body = o.body().ok_or_else(|| Error::RustError(format!("R2 stream {key}: no body")))?;
 				Ok(Response::from_stream(body.stream()?)?.with_status(status).with_headers(headers))
@@ -171,7 +250,7 @@ pub async fn fetch_stream(env: &Env, method: &str, key: &str, range: Option<(u64
 		};
 	}
 	let cfg = config(env)?;
-	fetch_signed(&cfg, method, key, query_pairs, range, None, None).await
+	fetch_signed(&cfg, "GET", key, query_pairs, range, None, None).await
 }
 
 /// Size + etag via HEAD. None on 404.

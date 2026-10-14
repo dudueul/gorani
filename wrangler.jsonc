@@ -54,6 +54,15 @@
 		"S3_BUCKET": "gorani"
 	},
 
+	// ── Object caching (worker/src/cache.rs) ─────────────────────────────
+	// Whole-object and frame-span entries of encrypted blobs, keyed by
+	// STORAGE span (shared by every member and share link — ciphertext is
+	// recipient-independent). Object keys are version-unique, so entries
+	// are immutable; a month of TTL needs no invalidation, and deleted
+	// content's stale entries open to nothing (crypto-shredding).
+	"CACHE_MAX_OBJECT_MB": "256",
+	"CACHE_TTL_DAYS": "30",
+
 	// ── Storage priority: Cloudflare R2 ──────────────────────────────────
 	// Uncomment this block to bind an R2 bucket, and the Worker routes EVERY
 	// object operation through it instead of the signed S3 transport: an

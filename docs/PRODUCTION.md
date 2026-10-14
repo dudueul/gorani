@@ -31,6 +31,30 @@ picks is the part size; the init route refuses smaller plans with an
 honest 400 (before a single part is uploaded). The clients' default chunk
 is 8 MiB.
 
+### Object caching (the Workers Cache API)
+
+Every blob read goes through the edge cache (`worker/src/cache.rs`), keyed
+by **storage span** — never by member or URL. Ciphertext is
+recipient-independent, so one entry serves the whole family and every
+share link; object keys are version-unique, so entries are immutable: a
+month of TTL needs no invalidation, and deleted content's stale entries
+open to nothing (crypto-shredding destroyed the key).
+
+| Read | Behavior |
+|---|---|
+| Whole GET, object ≤ `CACHE_MAX_OBJECT_MB` (256 MB) | One entry; any later Range is sliced **by the platform** from the cached body |
+| Range on a GC01 object, frame-aligned (the media worker's shape) | Frame-span entry (`key?frames=a-b`) — deterministic on replays, and exactly what future HLS segments would ask |
+| Anything else (oversized objects, stray ranges, writes) | Bypass; `x-gorani-cache: bypass` says so |
+
+Billing arithmetic per backend: **R2** saves Class B read operations (the
+free tier is 10 M/month); **external S3** saves real egress fees; **MinIO**
+saves NAS bandwidth and latency. Responses carry `x-gorani-cache:
+hit|miss|bypass` for observability. Two physical notes: the cache is
+per-POP (family members on different continents warm their own copies),
+and bodies stream through `cache.put` — the worker never buffers a blob,
+so the size gate protects the plan's cacheable-object limit, not worker
+memory.
+
 ## 2. Cloudflare Access (the perimeter)
 
 1. Enable Access on the Worker (one-click modal or manual app).

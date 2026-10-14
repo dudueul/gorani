@@ -620,7 +620,25 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 			}
 			Some((start, end - start + 1))
 		});
-	let mut s3_resp = s3::fetch_stream(&env, "GET", &object_key, range, &[]).await?;
+	// The cache keys CHUNKED media by its frame span (docs/PRODUCTION.md ›
+	// Object caching): the media worker requests whole frames, so the span
+	// is the same bytes on every play — the deterministic half of the
+	// design. A range that doesn't land on frame edges (a stray direct
+	// client) skips the span layer honestly.
+	let frame = meta
+		.get("chunk")
+		.and_then(|c| c.as_u64())
+		.filter(|c| *c > 0)
+		.map(|c| c + gorani_formats::chunked::FRAME_OVERHEAD as u64);
+	let cache_span = range
+		.zip(frame)
+		.and_then(|((off, len), f)| {
+			let end = off + len; // exclusive
+			let size = meta.get("size").and_then(|x| x.as_u64());
+			let aligned = off % f == 0 && (Some(end) == size || end % f == 0);
+			aligned.then(|| (off / f, (end - 1) / f))
+		});
+	let mut s3_resp = s3::fetch_stream(&env, "GET", &object_key, range, &[], cache_span).await?;
 	let status = s3_resp.status_code();
 	if status != 200 && status != 206 {
 		return Response::error("Not Found", 404);
@@ -644,6 +662,10 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 	}
 	if let Some(cr) = s3_resp.headers().get("Content-Range")? {
 		headers.set("Content-Range", &cr)?;
+	}
+	// The cache layer's observability rides through (worker/src/cache.rs).
+	if let Some(c) = s3_resp.headers().get("x-gorani-cache")? {
+		headers.set("x-gorani-cache", &c)?;
 	}
 	let stream = s3_resp.stream()?;
 	Ok(Response::from_stream(stream)?.with_status(status).with_headers(headers))
@@ -733,7 +755,7 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 			let object = v.get("objectKey").and_then(|x| x.as_str()).unwrap_or_default().to_string();
 			let range_header = req.headers().get("Range")?.unwrap_or_default();
 			let range = parse_range(&range_header);
-			let mut s3_resp = s3::fetch_stream(&env, "GET", &object, range, &[]).await?;
+			let mut s3_resp = s3::fetch_stream(&env, "GET", &object, range, &[], None).await?;
 			let mut s3_resp = s3_resp;
 			let mut headers = Headers::new();
 			headers.set("Content-Type", "application/octet-stream")?;

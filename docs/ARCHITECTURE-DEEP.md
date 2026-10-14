@@ -32,7 +32,12 @@ flowchart LR
 bucket, every object operation is an in-process call into R2 — no signing,
 no HTTP hop, no egress — and the SigV4 adapter serves any other
 S3-compatible endpoint when no binding exists. One contract, two
-transports, chosen at boot (`worker/src/s3.rs › r2_bucket`).
+transports, chosen at boot (`worker/src/s3.rs › r2_bucket`). Reads add an edge
+cache (`worker/src/cache.rs`): whole-object entries for small blobs (the
+platform slices Ranges itself) and deterministic frame-span entries for
+GC01 media — keyed by storage span, immutable by construction, ciphertext
+only. The same trust rule as everywhere else: the edge never learns a
+plaintext byte.
 
 **Read the zones, not the boxes**: a device and the object storage never
 talk directly; the Worker sees only ciphertext; the DOs hold structure

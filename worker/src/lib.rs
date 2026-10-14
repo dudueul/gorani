@@ -30,6 +30,7 @@ use worker::*;
 
 mod auth;
 mod backup;
+mod cache;
 mod cron;
 mod devices;
 mod family;

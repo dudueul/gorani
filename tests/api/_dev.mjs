@@ -37,7 +37,7 @@ export function r2Twin() {
  * (tests/api/s3-live.test.mjs) uses it. The credentials go only into the
  * gitignored .dev.vars, exactly where `wrangler dev` reads secrets from.
  */
-export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3 } = {}) {
+export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3, keepState = false } = {}) {
 	if (!fs.existsSync(path.join(ROOT, "web/dist/index.html"))) {
 		const b = spawnSync("npm", ["--prefix", "web", "run", "build"], { cwd: ROOT, encoding: "utf8" });
 		if (b.status !== 0) throw new Error(`web build failed:\n${b.stdout}\n${b.stderr}`);
@@ -76,8 +76,10 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 	// suites stay independent; production state lives in the cloud. Suites
 	// with their own config (the R2 twin) get their own directory — two live
 	// servers must never share one SQLite home.
+	// (`keepState`: the restart suite starts a second server on the SAME
+	// directory — what a deploy or an evicted Durable Object does.)
 	const persistDir = path.join(ROOT, "tests/output", persist);
-	fs.rmSync(persistDir, { recursive: true, force: true });
+	if (!keepState) fs.rmSync(persistDir, { recursive: true, force: true });
 	fs.mkdirSync(persistDir, { recursive: true });
 	const wr = ["wrangler", "dev"];
 	if (config) wr.push("--config", config);

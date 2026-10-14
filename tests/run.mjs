@@ -25,10 +25,12 @@ const wantKind = (k) => !kinds.length || kinds.includes(k);
 const failures = [];
 
 if (wantKind("rust")) {
-	// The crates with Rust tests; the worker crate is wasm-only and joins via
-	// miniflare API suites (commit ⑥+), not host `cargo test`.
+	// The crates with Rust tests. The worker runs as wasm under `wrangler
+	// dev` (the API suites), but its pure helpers also build on the host —
+	// `--lib` runs their unit tests (schema.rs's forgivable-error rule).
 	const { cmd: cargo, env } = cargoCommand();
 	let r = spawnSync(cargo, ["test", "-p", "gorani-formats", "-p", "gorani-s3"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+	if (r.status === 0) r = spawnSync(cargo, ["test", "-p", "gorani-worker", "--lib"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 	// Build the native CLI too: api:client-live drives target/debug/gorani-sync,
 	// and a binary left over from an older checkout would test old code while
 	// reporting green (it happened during the commit-23 review: a CLI fix
@@ -37,7 +39,7 @@ if (wantKind("rust")) {
 	const ok = r.status === 0;
 	if (!ok) failures.push("rust");
 	const out = `${String(r.stdout ?? "")}${String(r.stderr ?? "")}`;
-	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats -p gorani-s3${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
+	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats -p gorani-s3 -p gorani-worker${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
 }
 
 if (wantKind("unit")) {
@@ -57,9 +59,10 @@ if (wantKind("api")) {
 	const { suiteDev } = await import("./api/_dev.mjs");
 	for (const f of fs.readdirSync(path.join(ROOT, "tests/api")).filter((f) => f.endsWith(".test.mjs") || f.endsWith(".test.ts")).sort()) {
 		// Suites that bring their own server (the R2-bound twin config, the
-		// live-S3 suite pointed at a real bucket) don't get the runner's
-		// stub-configured one — it would sit unused.
-		const ownServer = f.startsWith("r2.") || f.startsWith("s3-live.");
+		// live-S3 suite pointed at a real bucket, the restart suite that stops
+		// and starts its own) don't get the runner's stub-configured one — it
+		// would sit unused.
+		const ownServer = f.startsWith("r2.") || f.startsWith("s3-live.") || f.startsWith("restart.");
 		const dev = ownServer ? null : await suiteDev();
 		try {
 			// Async spawn on purpose: the parent owns the S3 stub's event

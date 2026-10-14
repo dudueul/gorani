@@ -38,6 +38,7 @@ mod files_store;
 mod member;
 mod routes;
 mod s3;
+mod schema;
 
 /// The nightly maintenance pass (wrangler.jsonc › `triggers` › `crons`):
 /// per member — retention housekeeping on the deployment defaults and

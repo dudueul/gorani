@@ -40,6 +40,8 @@ use crate::family::json_error;
 use crate::devices::EnrolBody;
 use crate::files_store::urlquery;
 
+/// APPEND-ONLY: a statement's index is its identity in the schema ledger
+/// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
 pub const MIGRATIONS: &[&str] = &[
 	// Vault settings: one row. The JSON carries public halves, unlock methods
 	// (wrapped private copies), store keys, and the family links
@@ -237,18 +239,24 @@ pub const MIGRATIONS: &[&str] = &[
 pub struct GoraniMemberDO {
 	pub(crate) sql: worker::SqlStorage,
 	pub(crate) env: Env,
+	/// A failed migration, kept instead of panicking (schema.rs): every
+	/// request is answered with it until a fixed deploy migrates cleanly.
+	schema: std::result::Result<(), String>,
 }
 
 impl DurableObject for GoraniMemberDO {
 	fn new(state: State, env: Env) -> Self {
 		let sql = state.storage().sql();
-		for stmt in MIGRATIONS {
-			sql.exec(stmt, None).expect("member migration");
-		}
-		Self { sql, env }
+		// Ledgered (commit 25): the constructor runs on EVERY wake-up, and
+		// re-running an ADD COLUMN panicked the second one (schema.rs).
+		let schema = crate::schema::migrate(&sql, MIGRATIONS);
+		Self { sql, env, schema }
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
+		if let Err(e) = &self.schema {
+			return json_error(500, &format!("member store schema: {e}"));
+		}
 		// Errors become JSON with their message: an opaque 500 helps nobody,
 		// least of all the tests that must tell refusals from faults.
 		match self.dispatch(req).await {

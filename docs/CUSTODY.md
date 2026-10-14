@@ -154,3 +154,31 @@ evidence version recorded (upload, version, restore)
   shortens a COMPLIANCE date, refuses DELETE of a locked key) and fault
   rules can match a query (`retention`), so a suite can fail the lock and
   not the upload.
+
+## Stage 4 — the uploader signs what they uploaded (D5.1), the design
+
+```text
+uploader's browser:  h = SHA-256(plaintext)        (before sealing — what the evidence IS)
+                     s = sign(identity key, "gorani-content-hash-v1" ‖ area ‖ file ‖ version ‖ h ‖ size)
+                     record = { sha256: h, size, signer, signature: s }
+                     sealed into the place file.hash(area, file, version)   (GV04 — the server cannot read it)
+server:              stores it beside the version (file_versions.hash_sealed); an evidence
+                     upload WITHOUT one is refused
+any reader:          opens the record in its place, verifies the signature against an
+                     identity they trust (stage 4 of CASES.md), recomputes SHA-256 of what
+                     they decrypted, and compares
+```
+
+- **Why sealed, not readable**: a plaintext hash is a fingerprint of the
+  content — with it, the server could confirm "this case holds the file
+  with hash X" (a known document, a known sample) without the key.
+  Zero-trust means the server learns nothing it could not learn from
+  ciphertext lengths. An investigator who needs to look a hash up (a
+  malware sample in a reputation service) reads it from their own client.
+- **Why signed by a person, not the server**: the claim worth having in a
+  review is "Bo uploaded exactly these bytes" — only Bo's key can make it.
+  The record names the signer; it rides in exports (stage 7) for anyone
+  with the case key to verify independently.
+- **Where it is required**: evidence cases (the Worker refuses an upload or
+  a version without it). Elsewhere it is sent when the client can sign and
+  verified when present.

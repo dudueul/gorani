@@ -419,6 +419,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "gorani-formats",
+ "hmac",
+ "p256",
  "rand_core",
  "rpassword",
  "serde",

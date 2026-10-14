@@ -1,7 +1,7 @@
 # Desktop: the native clients (Rust) — protocol and design
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
-> Status: the protocol is implemented on both sides — the server (commits ⑦/⑧) and the Rust client core with the `gorani-sync` CLI (commit ⑬), live-proven against the real worker (the api suite `client-live`). What remains on this document: the platform shells (Windows Cloud Files API, Linux FUSE, macOS File Provider) that mount the same core.
+> Status: the protocol is implemented on both sides — the server (commits ⑦/⑧) and the Rust client core with the `gorani-sync` CLI (commit ⑬), live-proven against the real worker (the api suites `client-live` and `client-cases`). Since commits 33a–33c the core signs in as its member, moves files up to 255 GiB, and works in granted cases with signed evidence. What remains on this document: the platform shells (Windows Cloud Files API, Linux FUSE, macOS File Provider) that mount the same core.
 
 ## What the client is
 
@@ -94,7 +94,7 @@ before starting (commit 33, after D11/D12) found:
 |---|---|
 | 33a *(landed)* | **Sign in as the member.** The core sends a user Access token (`cf-access-token`, from `cloudflared access token -app=<server>` or the `GORANI_ACCESS_TOKEN` variable) — short-lived and bound to the member's SSO/MFA, so the Worker sees the member's email and every rule (own area, case grants) applies unchanged. The device token stays what it is: the release of this computer's wrapped root copy. |
 | 33b *(landed)* | **Large files.** `push` streams from disk in GC01 frames at `chunk_for(size)`, parts with retry, and a resume journal on disk (sealed fields only, like the browser's); `pull` streams frame windows to disk and checks the signed hash. |
-| 33c | **Cases.** Open a granted case's key from its grant; list, pull, push into it; on an evidence case, sign the content hash (and send the stamp imprint) with the member's identity key, and carry an intake record. |
+| 33c *(landed)* | **Cases.** Open a granted case's key from its grant; list, pull, push into it; on an evidence case, sign the content hash (and send the stamp imprint) with the member's identity key, and carry an intake record. |
 | 33d | **The Linux shell** (`clients/linux`, FUSE): the engine first, against `wrangler dev` with an in-memory file system as the doc's testing pattern says; a real mount where the machine allows FUSE. |
 | — | Windows (Cloud Files) and macOS (File Provider) need their platforms to build and test — not this repository's CI machine. |
 
@@ -141,6 +141,47 @@ before starting (commit 33, after D11/D12) found:
   fault hook, `GORANI_TEST_STOP_AFTER_PARTS`), resumes it "from part 4 of
   8", checks the journal names no file, pulls it back streamed and compares
   bytes and SHA-256.
+
+### 33c as built
+
+```text
+gorani-sync cases                      the grants, each opened to SAY whether it opens
+gorani-sync ls   --case ir-2026-014    the case's feed, names opened in their places
+gorani-sync pull --case … --id F       checked against what the uploader signed, BEFORE writing
+gorani-sync push --case … --file P     signed; on evidence with --source --collector
+                                       --method --collected-at [--notes]
+```
+
+- `clients/core/src/identity.rs` — the browser's `identity.ts`, natively:
+  length-prefixed statements, identity key ids and full hybrid digests,
+  the identity record's MAC under the root, ECDSA P-256 signatures in
+  WebCrypto's P1363 encoding (a DER signature is refused, as the browser
+  refuses it), and trust built from the member's OWN pins plus one hop of
+  certificates. The CLI reads the identity the web app made; it creates,
+  pins and certifies nothing (it never writes settings).
+- `clients/core/src/cases.rs` — a case key opens only when (1) the grant is
+  signed by someone the member trusts, (2) it opens under their root, (3)
+  the signature names this case, this key's full digest and them, and (4)
+  the key is the registry's (both public halves and the id). A grant from
+  a lead the member never verified is listed by `cases` and named — and
+  refused for any use. During a rotation's walk the CLI waits (values sit
+  under two keys; the web app finishes the walk).
+- **Evidence pushes** carry what the browser's do: the content hash signed
+  by the member and sealed into version 1's place, its RFC 3161 imprint
+  (SHA-256 of the signature), and the signed intake record — asked for
+  before a large file is hashed, not after. Pushes into the member's own
+  area are signed too when their vault has an identity.
+- **Pulls decide before writing.** A record that does not open in its
+  place, does not verify, or vouches for other bytes refuses the pull and
+  writes nothing (the chunked path checks before `<out>.part` is renamed).
+  Evidence that is unsigned or signed by someone the member has not
+  verified is refused unless `--accept-unverified`; elsewhere it is written
+  with a line saying what it is.
+- Not yet in the CLI: checking the RFC 3161 token itself (the web app and
+  `tools/verify-export.mjs` do), custody transfers, approvals, exports.
+- `api:client-cases` runs the binary against a team built by the web app's
+  own code — Rust verifies what TypeScript signed and the other way round;
+  a deliberately mutated statement in Rust fails it.
 
 ## Testing (the pattern the port follows)
 

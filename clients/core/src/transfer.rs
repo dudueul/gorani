@@ -15,8 +15,9 @@
 //! Memory is one window, whatever the file. The journal (one JSON file per
 //! unfinished upload, next to the profile) holds only what the server
 //! already has — ids, the object key, sealed fields — keyed by a hash of
-//! the member, the file's name, size, modified time and SHA-256: no file
-//! name in the clear, and a different file never matches.
+//! the member, the area (their own, or a case — commit 33c), the file's
+//! name, size, modified time and SHA-256: no file name in the clear, and a
+//! different file, or the same file bound for another area, never matches.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,6 +56,9 @@ pub fn sha256_file(path: &Path) -> Result<(String, u64), Error> {
 #[serde(rename_all = "camelCase")]
 pub struct UploadRecord {
 	pub member: String,
+	/// Where it is going: `<member>` or `case:<id>` (commit 33c).
+	#[serde(default)]
+	pub area: String,
 	pub file_id: String,
 	pub upload_id: String,
 	pub object_key: String,
@@ -76,10 +80,11 @@ impl Journal {
 		Self { dir }
 	}
 
-	/// The key for one file: no name in the clear, and only the same bytes match.
-	pub fn key_for(member: &str, name: &str, size: u64, modified: u64, sha256: &str) -> String {
+	/// The key for one file: no name in the clear, and only the same bytes,
+	/// bound for the same area, match.
+	pub fn key_for(member: &str, area: &str, name: &str, size: u64, modified: u64, sha256: &str) -> String {
 		let mut h = Sha256::new();
-		for part in ["gorani-upload-v1", member, name, &size.to_string(), &modified.to_string(), sha256] {
+		for part in ["gorani-upload-v2", member, area, name, &size.to_string(), &modified.to_string(), sha256] {
 			h.update((part.len() as u32).to_be_bytes());
 			h.update(part.as_bytes());
 		}
@@ -114,6 +119,7 @@ impl Journal {
 /// under the SAME upload. Returns the completed file row.
 #[allow(clippy::too_many_arguments)]
 pub fn push_frames(client: &Client, journal: &Journal, journal_key: &str, path: &Path, key: &[u8; 32], member: &str, file_id: &str, chunk: u64, size: u64, fields: Vec<(String, String)>, resume: Option<UploadRecord>, mut progress: impl FnMut(u64, u64)) -> Result<serde_json::Value, Error> {
+	let area = client.area().to_string();
 	let count = gorani_formats::chunked::frame_count(size, chunk);
 	let mut rec = match resume {
 		Some(r) => r,
@@ -122,7 +128,7 @@ pub fn push_frames(client: &Client, journal: &Journal, journal_key: &str, path: 
 			if parts != count {
 				return Err(Error::Config(format!("the server planned {parts} parts for {count} frames")));
 			}
-			let r = UploadRecord { member: member.into(), file_id: file_id.into(), upload_id, object_key, chunk, size, fields, parts: vec![], started_at: now_secs() };
+			let r = UploadRecord { member: member.into(), area, file_id: file_id.into(), upload_id, object_key, chunk, size, fields, parts: vec![], started_at: now_secs() };
 			journal.put(journal_key, &r)?;
 			r
 		}
@@ -173,8 +179,11 @@ fn now_secs() -> u64 {
 /// Pull a chunked version to `out`, a window of frames at a time: each
 /// frame opened in its place (a reordered, altered or truncated object
 /// fails), the plaintext written to `<out>.part` and hashed, the size
-/// checked, then renamed onto `out`. Returns the plaintext's SHA-256.
-pub fn pull_frames(client: &Client, id: &str, version: u64, key: &[u8; 32], chunk: u64, size: u64, out: &Path) -> Result<String, Error> {
+/// checked, then `judge` asked about the SHA-256 (the uploader's signed
+/// hash — commit 33c), and only then renamed onto `out`. Returns the
+/// plaintext's SHA-256. On any refusal, `<out>.part` is removed.
+#[allow(clippy::too_many_arguments)]
+pub fn pull_frames(client: &Client, id: &str, version: u64, key: &[u8; 32], chunk: u64, size: u64, out: &Path, judge: impl FnOnce(&str) -> Result<(), Error>) -> Result<String, Error> {
 	let count = gorani_formats::chunked::frame_count(size, chunk);
 	let frame = chunk + gorani_formats::chunked::FRAME_OVERHEAD;
 	let sealed = gorani_formats::chunked::sealed_size(size, chunk);
@@ -209,13 +218,14 @@ pub fn pull_frames(client: &Client, id: &str, version: u64, key: &[u8; 32], chun
 		}
 		Ok(())
 	})();
-	if let Err(e) = result {
+	let sha256 = hex(&h.finalize());
+	drop(w);
+	if let Err(e) = result.and_then(|()| judge(&sha256)) {
 		let _ = std::fs::remove_file(&part);
 		return Err(e);
 	}
-	drop(w);
 	std::fs::rename(&part, out)?;
-	Ok(hex(&h.finalize()))
+	Ok(sha256)
 }
 
 #[cfg(test)]
@@ -224,18 +234,19 @@ mod tests {
 
 	#[test]
 	fn the_journal_key_names_no_file_and_only_the_same_bytes_match() {
-		let k = Journal::key_for("jinu", "disk.E01", 10, 1_700_000_000, "ab");
+		let k = Journal::key_for("jinu", "jinu", "disk.E01", 10, 1_700_000_000, "ab");
 		assert_eq!(k.len(), 64);
 		assert!(!k.contains("disk"), "no name in the clear");
-		assert_ne!(k, Journal::key_for("jinu", "disk.E01", 10, 1_700_000_000, "ac"), "other bytes, another key");
-		assert_ne!(k, Journal::key_for("jinu", "disk.E0", 110, 1_700_000_000, "ab"), "length-prefixed: fields cannot slide");
+		assert_ne!(k, Journal::key_for("jinu", "jinu", "disk.E01", 10, 1_700_000_000, "ac"), "other bytes, another key");
+		assert_ne!(k, Journal::key_for("jinu", "case:ir-7", "disk.E01", 10, 1_700_000_000, "ab"), "the same file bound for a case: another upload");
+		assert_ne!(k, Journal::key_for("jinu", "jinu", "disk.E0", 110, 1_700_000_000, "ab"), "length-prefixed: fields cannot slide");
 	}
 
 	#[test]
 	fn the_journal_round_trips_and_forgets() {
 		let dir = std::env::temp_dir().join(format!("gorani-journal-{}", std::process::id()));
 		let j = Journal::new(dir.clone());
-		let rec = UploadRecord { member: "jinu".into(), file_id: "f".into(), upload_id: "u".into(), object_key: "files/jinu/f/u-1".into(), chunk: 8, size: 20, fields: vec![("name".into(), "GV04:x".into())], parts: vec![(1, "\"e1\"".into())], started_at: 1 };
+		let rec = UploadRecord { member: "jinu".into(), area: "jinu".into(), file_id: "f".into(), upload_id: "u".into(), object_key: "files/jinu/f/u-1".into(), chunk: 8, size: 20, fields: vec![("name".into(), "GV04:x".into())], parts: vec![(1, "\"e1\"".into())], started_at: 1 };
 		j.put("k", &rec).unwrap();
 		assert_eq!(j.get("k").unwrap().parts, rec.parts);
 		j.delete("k");

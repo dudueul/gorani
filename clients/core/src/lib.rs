@@ -15,6 +15,8 @@
 //! only while a command runs (`Zeroizing` everywhere, dropped at exit).
 
 pub mod api;
+pub mod cases;
+pub mod identity;
 pub mod session;
 pub mod transfer;
 

@@ -23,6 +23,11 @@ pub struct VaultSettings {
 	pub methods: Vec<gorani_formats::unlock::UnlockMethod>,
 	#[serde(default)]
 	pub stores: std::collections::BTreeMap<String, StoreKey>,
+	/// The member's identity (commit 27; read by the CLI from commit 33c):
+	/// their signing key sealed to the root, and the identities they pinned
+	/// — MAC'd by the root (identity.rs). The web app creates it.
+	#[serde(default)]
+	pub identity: Option<crate::identity::IdentityRecord>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -43,10 +48,19 @@ pub struct StoreKey {
 pub struct Jwk {
 	pub x: String,
 	pub y: String,
+	/// `EC` / `P-256` when present (identity.rs refuses any other).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kty: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub crv: Option<String>,
 }
 
 pub struct Client {
 	pub profile: DeviceProfile,
+	/// Which store the file routes address (lib/area.ts' twin): the member's
+	/// own (`<member>`, the default) or a case (`case:<id>`, commit 33c). The
+	/// vault and the devices are always the member's own.
+	area: String,
 	agent: ureq::Agent,
 	/// The member's Access token, fetched once per process (commit 33a).
 	access_token: std::sync::OnceLock<Option<String>>,
@@ -84,11 +98,37 @@ impl Client {
 			.redirects(0)
 			.timeout_connect(std::time::Duration::from_secs(15))
 			.timeout(std::time::Duration::from_secs(60));
-		Self { profile, agent: b.build(), access_token: std::sync::OnceLock::new() }
+		let area = profile.member.clone();
+		Self { profile, area, agent: b.build(), access_token: std::sync::OnceLock::new() }
 	}
 
+	/// The same client, its file routes addressing `area` (`case:<id>`).
+	pub fn in_area(mut self, area: &str) -> Self {
+		self.area = area.into();
+		self
+	}
+
+	pub fn area(&self) -> &str {
+		&self.area
+	}
+
+	fn server(&self) -> &str {
+		self.profile.server.trim_end_matches('/')
+	}
+
+	/// The member's own routes (vault, devices).
 	fn url(&self, rest: &str) -> String {
-		format!("{}/api/v1/members/{}{rest}", self.profile.server.trim_end_matches('/'), self.profile.member)
+		format!("{}/api/v1/members/{}{rest}", self.server(), self.profile.member)
+	}
+
+	/// The area's routes (files): a case's are `/api/v1/cases/<id>/…`, where
+	/// the Worker checks the caller's grant once and rewrites them to the
+	/// same store routes a member's own area has.
+	fn area_url(&self, rest: &str) -> String {
+		match self.area.strip_prefix("case:") {
+			Some(case) => format!("{}/api/v1/cases/{case}{rest}", self.server()),
+			None => format!("{}/api/v1/members/{}{rest}", self.server(), self.area),
+		}
 	}
 
 	/// The member's token for this process (fetched on first use).
@@ -129,7 +169,20 @@ impl Client {
 	}
 
 	fn json(&self, method: &str, rest: &str, body: Option<Value>) -> Result<Value, Error> {
-		let r = self.req(method, &self.url(rest));
+		self.json_at(method, &self.url(rest), body)
+	}
+
+	fn area_json(&self, method: &str, rest: &str, body: Option<Value>) -> Result<Value, Error> {
+		self.json_at(method, &self.area_url(rest), body)
+	}
+
+	/// A team route (`/api/v1/<path>`): the registry's identities, the cases.
+	pub fn team_get(&self, path: &str) -> Result<Value, Error> {
+		self.json_at("GET", &format!("{}/api/v1/{path}", self.server()), None)
+	}
+
+	fn json_at(&self, method: &str, url: &str, body: Option<Value>) -> Result<Value, Error> {
+		let r = self.req(method, url);
 		let res = match body {
 			Some(b) => r.send_json(b),
 			None => r.call(),
@@ -181,12 +234,12 @@ impl Client {
 	// ── files ───────────────────────────────────────────────────────────
 
 	pub fn changes(&self, since: u64) -> Result<(u64, Vec<Value>), Error> {
-		let v = self.json("GET", &format!("/files/changes?since={since}&limit=1000"), None)?;
+		let v = self.area_json("GET", &format!("/files/changes?since={since}&limit=1000"), None)?;
 		Ok((v["cursor"].as_u64().unwrap_or(since), v["changes"].as_array().cloned().unwrap_or_default()))
 	}
 
 	pub fn keys(&self, ids: &[String]) -> Result<Value, Error> {
-		self.json("POST", "/files/keys", Some(json!({ "ids": ids })))
+		self.area_json("POST", "/files/keys", Some(json!({ "ids": ids })))
 	}
 
 	/// Fetch a version's sealed object (Range honoured; chunked objects are
@@ -198,7 +251,7 @@ impl Client {
 		let query = version.map(|v| format!("?version={v}")).unwrap_or_default();
 		// `x-gorani-client`: what kind of client read this, for the read log
 		// (O14) — a description, not a credential.
-		let mut r = self.req("GET", &self.url(&format!("/files/{id}{query}"))).set("x-gorani-client", "cli");
+		let mut r = self.req("GET", &self.area_url(&format!("/files/{id}{query}"))).set("x-gorani-client", "cli");
 		if let Some((a, b)) = range {
 			r = r.set("Range", &format!("bytes={a}-{}", b.saturating_sub(1)));
 		}
@@ -224,7 +277,7 @@ impl Client {
 	/// A multipart upload's plan (D12, commit 33b): the Worker checks it
 	/// against the limits (255 GiB, 64 MiB chunks, 10 000 parts).
 	pub fn upload_start(&self, size: u64, chunk: u64, new_file_id: &str) -> Result<(String, String, u64), Error> {
-		let v = self.json("POST", "/files/uploads", Some(json!({ "size": size, "chunk": chunk, "newFileId": new_file_id })))?;
+		let v = self.area_json("POST", "/files/uploads", Some(json!({ "size": size, "chunk": chunk, "newFileId": new_file_id })))?;
 		Ok((v["uploadId"].as_str().unwrap_or_default().to_string(), v["key"].as_str().unwrap_or_default().to_string(), v["parts"].as_u64().unwrap_or(0)))
 	}
 
@@ -232,7 +285,7 @@ impl Client {
 	/// three tries, 1 s then 4 s apart, for a dropped connection, a 5xx or
 	/// a 429; a refusal (any other 4xx) is the server's answer, at once.
 	pub fn upload_part(&self, upload_id: &str, object_key: &str, n: u64, frame: &[u8]) -> Result<String, Error> {
-		let url = self.url(&format!("/files/uploads/{upload_id}/{n}?key={}", percent(object_key)));
+		let url = self.area_url(&format!("/files/uploads/{upload_id}/{n}?key={}", percent(object_key)));
 		let mut last = String::new();
 		for attempt in 0..3u32 {
 			if attempt > 0 {
@@ -268,7 +321,7 @@ impl Client {
 		}
 		body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 		let res = self
-			.req("POST", &self.url(rest))
+			.req("POST", &self.area_url(rest))
 			.set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
 			.send_bytes(&body)
 			.map_err(|e| match e {

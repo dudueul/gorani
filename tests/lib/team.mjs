@@ -42,7 +42,8 @@ export async function member(dev, id, role, { by, email = `${id}@team.test`, ext
 	const put = await api(dev.base, "PUT", `/api/v1/members/${id}/vault`, { email, body: { settings: own } });
 	assert.equal(put.status, 200, `${id}'s vault: ${put.text}`);
 	assert.equal((await api(dev.base, "PUT", "/api/v1/family/identity", { email, body: made.registry })).status, 200);
-	return { id, email, root, rootPublic, settings: own, record: made.record, signer: made.signer, storeB64, sealer: await storeSealer(fromBase64(storeB64), id) };
+	// (recoveryCode: what a native client unlocks this vault with — api:client-cases.)
+	return { id, email, root, rootPublic, settings: own, record: made.record, signer: made.signer, storeB64, sealer: await storeSealer(fromBase64(storeB64), id), recoveryCode: vault.recoveryCode };
 }
 
 /** `who` pins `other` (they compared fingerprints) and saves the record. */

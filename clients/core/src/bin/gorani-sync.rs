@@ -2,11 +2,26 @@
 
 //! `gorani-sync`: the command line. Platform shells replace the UI; the
 //! commands stay (scriptability, tests, power users).
+//!
+//! ```text
+//! setup                                   enrol this computer (the device's wrapped root copy)
+//! cases                                   the cases you are granted: kind, permission, title, state
+//! ls    [--case C]                        the change feed of your area, or of case C
+//! pull  --id F [--case C] [--out O]       a file, decrypted to disk — and, where its uploader
+//!       [--accept-unverified]             signed it, checked against what they signed
+//! push  --file P [--case C] [--name N]    a file, sealed and uploaded; into an evidence case
+//!       [--source S --collector W         with your signed content hash and the intake record
+//!        --method M --collected-at T      (where it came from, who collected it, how, when)
+//!        --notes X]
+//! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use gorani_client_core::cases::{self, CaseRow, HashCheck, IntakeFields};
+use gorani_client_core::identity::{self, RegistryIdentity, Signer, Trust};
 use gorani_client_core::{api, session, transfer, DeviceProfile, Error, Session};
-use gorani_formats::placed::Place;
+use gorani_formats::formats::VaultPrivateKey;
+use gorani_formats::placed::{self, Place};
 
 fn main() {
 	let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,6 +33,9 @@ fn main() {
 
 /// Files up to this size go up whole (one request), larger ones as GC01 frames — as the browser does.
 const WHOLE_LIMIT: u64 = 48 * 1024 * 1024;
+
+/// Flags that take no value.
+const SWITCHES: &[&str] = &["accept-unverified"];
 
 fn profile_path() -> PathBuf {
 	let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
@@ -42,19 +60,85 @@ fn read_secret(prompt: &str) -> String {
 	}
 }
 
+/// Where a command works (commit 33c): the member's own area, or a case
+/// they are granted — the store key that seals and opens there, and the
+/// member's identity and trust when their vault has one (always in a case:
+/// the case key opens only through a trusted signature).
+struct Area {
+	/// `<member>` or `case:<id>` — the GV04 `store` of every place.
+	name: String,
+	key: VaultPrivateKey,
+	case: Option<CaseRow>,
+	team: Option<(Signer, Trust)>,
+}
+
+impl Area {
+	fn is_evidence(&self) -> bool {
+		self.case.as_ref().is_some_and(CaseRow::is_evidence)
+	}
+
+	/// Open text sealed into a place of this area; None when it does not
+	/// open there (moved, minted, or another store's).
+	fn open(&self, place: &Place, sealed: &str) -> Option<String> {
+		placed::open_placed_text(&self.key, place, sealed).ok().map(|s| s.to_string())
+	}
+
+	fn seal(&self, place: &Place, text: &str) -> Result<String, Error> {
+		placed::seal_placed_text(&self.key, place, text).map_err(|_| Error::Open("the area's store key"))
+	}
+}
+
+/// The member's identity and trust (identity.rs): the record from their
+/// settings (MAC'd by the root), the registry's identities. None when the
+/// vault has no identity yet — the web app makes one on first open.
+fn open_team(client: &api::Client, sess: &Session, member: &str) -> Result<Option<(Signer, Trust)>, Error> {
+	let Some(rec) = &sess.settings.identity else { return Ok(None) };
+	let root = VaultPrivateKey::from_bytes(&sess.root).map_err(|_| Error::Open("root bundle"))?;
+	let signer = identity::open_identity(member, &root, rec)?;
+	let registry: Vec<RegistryIdentity> = serde_json::from_value(client.team_get("family/identities")?["identities"].clone()).map_err(|e| Error::Config(format!("identities: {e}")))?;
+	let trust = identity::build_trust(member, &root, rec, &registry)?;
+	Ok(Some((signer, trust)))
+}
+
+fn granted_cases(client: &api::Client) -> Result<Vec<CaseRow>, Error> {
+	serde_json::from_value(client.team_get("cases")?["cases"].clone()).map_err(|e| Error::Config(format!("cases: {e}")))
+}
+
+/// Open the area a command names: `--case <id>`, or the member's own.
+fn open_area(client: &api::Client, sess: &Session, member: &str, case: Option<&str>) -> Result<Area, Error> {
+	let team = open_team(client, sess, member)?;
+	let Some(case_id) = case else {
+		return Ok(Area { name: member.into(), key: sess.files_store()?, case: None, team });
+	};
+	let Some((signer, trust)) = team else {
+		return Err(Error::Config("your vault has no identity yet — open it once in the web app (Team), where it is made and your lead's fingerprint compared; a case key opens only through a signature you can check".into()));
+	};
+	let c = granted_cases(client)?.into_iter().find(|c| c.id == case_id).ok_or_else(|| Error::Config(format!("no case {case_id} is listed for you")))?;
+	let root = VaultPrivateKey::from_bytes(&sess.root).map_err(|_| Error::Open("root bundle"))?;
+	let key = cases::open_case_key(&root, &c, &trust)?;
+	Ok(Area { name: c.area(), key, case: Some(c), team: Some((signer, trust)) })
+}
+
 fn run(args: &[String]) -> Result<(), Error> {
 	// Flags: --server --member --name --secret --device-secret --dev-email
 	//        --access-token-cmd ("cloudflared access token -app=https://<host>":
 	//          the member signs in through Access — commit 33a)
 	//        --access-id --access-secret (an Access service token; not enough
 	//          alone — its JWT has no email, docs/DESKTOP.md)
-	//        --file --id --out --profile
+	//        --file --id --out --profile --case
+	//        --source --collector --method --collected-at --notes (intake, 33c)
+	//        --accept-unverified (a switch)
 	let mut flags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 	let mut pos: Vec<String> = Vec::new();
 	let mut i = 0;
 	while i < args.len() {
 		let a = &args[i];
 		if let Some(name) = a.strip_prefix("--") {
+			if SWITCHES.contains(&name) {
+				flags.insert(name.to_string(), "1".into());
+				i += 1;
+				continue;
+			}
 			if let Some(v) = args.get(i + 1) {
 				flags.insert(name.to_string(), v.clone());
 				i += 2;
@@ -87,10 +171,48 @@ fn run(args: &[String]) -> Result<(), Error> {
 			session::save_profile(&path, &profile)?;
 			println!("enrolled device {} for root {} (member {})", profile.device_id, sess.settings.key_id, profile.member);
 		}
+		Some("cases") => {
+			let (profile, sess) = unlocked(&flag)?;
+			let member = profile.member.clone();
+			let client = api::Client::new(profile);
+			let Some((_, trust)) = open_team(&client, &sess, &member)? else {
+				return Err(Error::Config("your vault has no identity yet — open it once in the web app (Team)".into()));
+			};
+			let root = VaultPrivateKey::from_bytes(&sess.root).map_err(|_| Error::Open("root bundle"))?;
+			let listed = granted_cases(&client)?;
+			let mine: Vec<&CaseRow> = listed.iter().filter(|c| c.grant.is_some()).collect();
+			println!("{} case(s) granted to you", mine.len());
+			for c in mine {
+				let g = c.grant.as_ref().expect("filtered");
+				let mut state: Vec<String> = Vec::new();
+				if c.closed {
+					state.push("closed".into());
+				}
+				if c.hold.is_some() {
+					state.push("legal hold".into());
+				}
+				if c.rotation_required {
+					state.push("rotation owed".into());
+				}
+				if let Some(at) = &g.expires_at {
+					state.push(format!("grant expires {at}"));
+				}
+				// The key is opened to SAY whether it opens: a grant from someone
+				// you have not verified is listed, and named as such.
+				let (title, key) = match cases::open_case_key(&root, c, &trust) {
+					Ok(k) => (cases::open_title(&k, c).unwrap_or_else(|| "(untitled)".into()), format!("key verified — granted by {}", g.signed_by.as_deref().unwrap_or("?"))),
+					Err(e) => ("(title not opened)".into(), format!("⚠ key not opened: {e}")),
+				};
+				let state = if state.is_empty() { String::new() } else { format!(" [{}]", state.join(", ")) };
+				println!("  {}  {:<8} {:<6} {title}{state}\n      {key}", c.id, c.kind, g.permission);
+			}
+		}
 		Some("ls") => {
 			let (profile, sess) = unlocked(&flag)?;
 			let member = profile.member.clone();
 			let client = api::Client::new(profile);
+			let area = open_area(&client, &sess, &member, flag("case").as_deref())?;
+			let client = client.in_area(&area.name);
 			let (cursor, changes) = client.changes(0)?;
 			println!("cursor {cursor}, {} changes", changes.len());
 			for c in &changes {
@@ -99,11 +221,11 @@ fn run(args: &[String]) -> Result<(), Error> {
 				// the server moved here, or minted, prints as unverified.
 				if let Some(file) = c["data"].get("file") {
 					let id = file["id"].as_str().unwrap_or_default();
-					let name = open_name(&sess, &Place::file_name(&member, id), file["name"].as_str().unwrap_or_default());
-					println!("  {kind:>12}  {}", name.unwrap_or_else(|| UNVERIFIED.into()));
+					let name = area.open(&Place::file_name(&area.name, id), file["name"].as_str().unwrap_or_default());
+					println!("  {kind:>12}  {}  {id}", name.unwrap_or_else(|| UNVERIFIED.into()));
 				} else if let Some(folder) = c["data"].get("folder") {
 					let id = folder["id"].as_str().unwrap_or_default();
-					let name = open_name(&sess, &Place::folder_name(&member, id), folder["name"].as_str().unwrap_or_default());
+					let name = area.open(&Place::folder_name(&area.name, id), folder["name"].as_str().unwrap_or_default());
 					println!("  {kind:>12}  [folder] {}", name.unwrap_or_else(|| UNVERIFIED.into()));
 				}
 			}
@@ -114,53 +236,75 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let out = flag("out").unwrap_or_else(|| format!("./{id}"));
 			let member = profile.member.clone();
 			let client = api::Client::new(profile);
+			let area = open_area(&client, &sess, &member, flag("case").as_deref())?;
+			let client = client.in_area(&area.name);
 			let keys = client.keys(&[id.clone()])?;
-			let ck = keys["keys"][&id]["key"].as_str().unwrap_or_default().to_string();
-			let chunk = keys["keys"][&id]["chunk"].as_u64();
-			let size = keys["keys"][&id]["size"].as_u64();
-			let version = keys["keys"][&id]["version"].as_i64().filter(|v| *v >= 1).ok_or(Error::Open("the server did not say which version this is"))?;
+			let k = &keys["keys"][&id];
+			let ck = k["key"].as_str().unwrap_or_default().to_string();
+			let chunk = k["chunk"].as_u64();
+			let size = k["size"].as_u64();
+			let version = k["version"].as_i64().filter(|v| *v >= 1).ok_or(Error::Open("the server did not say which version this is"))?;
 			// A malware sample is never written to disk raw (D8, commit 29e;
 			// docs/CUSTODY.md › stage 5): desktop antivirus would quarantine it
 			// mid-investigation, or a double-click would run it. Either mark
 			// counts — the readable flag, or the sealed type the server cannot
 			// clear (`application/x-gorani-sample; original=…`).
-			let sealed_type = keys["keys"][&id]["type"].as_str().unwrap_or_default();
-			let typed_sample = open_name(&sess, &Place::file_type(&member, &id, version), sealed_type).is_some_and(|t| t.starts_with("application/x-gorani-sample"));
-			if keys["keys"][&id]["sample"].as_bool() == Some(true) || typed_sample {
+			let sealed_type = k["type"].as_str().unwrap_or_default();
+			let typed_sample = area.open(&Place::file_type(&area.name, &id, version), sealed_type).is_some_and(|t| t.starts_with("application/x-gorani-sample"));
+			if k["sample"].as_bool() == Some(true) || typed_sample {
 				return Err(Error::Open("this is a malware sample — gorani-sync never writes one to disk raw; download it zipped from the web app (password: infected)"));
 			}
-			let store = sess.files_store()?;
 			// The key opens only from THIS file's THIS version's place (O6).
-			let ck_key = gorani_formats::placed::unwrap_placed_key(&store, &Place::file_key(&member, &id, version), &ck).map_err(|_| Error::Open("content key (not sealed for this file and version)"))?;
+			let ck_key = placed::unwrap_placed_key(&area.key, &Place::file_key(&area.name, &id, version), &ck).map_err(|_| Error::Open("content key (not sealed for this file and version)"))?;
+			let hash_sealed = k["hash"].as_str().map(str::to_string);
+			// What the uploader signed, asked BEFORE --out is written (33c).
+			let judge = |sha256: &str, size: u64| judge_content(&area, &id, version as u64, hash_sealed.as_deref(), sha256, size, flag("accept-unverified").is_some());
 			if let Some(chunk) = chunk.filter(|c| *c > 0) {
 				// Streamed to disk a window of frames at a time (D12, commit 33b
 				// — transfer.rs): each frame opened in its place, so a reordered,
 				// altered or cut-short object fails before --out is touched; the
 				// bytes land in <out>.part and are renamed on success only.
 				let size = size.ok_or(Error::Open("the server did not say the file's size"))?;
-				let sha256 = transfer::pull_frames(&client, &id, version as u64, &ck_key, chunk, size, std::path::Path::new(&out))?;
+				let sha256 = transfer::pull_frames(&client, &id, version as u64, &ck_key, chunk, size, Path::new(&out), |sha| judge(sha, size))?;
 				println!("pulled {id} → {out} ({size} bytes, SHA-256 {sha256})");
-				return Ok(());
+			} else {
+				let plain = {
+					let sealed = client.fetch(&id, Some(version as u64), None)?;
+					gorani_formats::formats::open_with(&ck_key, &sealed).map_err(|_| Error::Open("content"))?
+				};
+				// The listing's size and the opened bytes must agree before
+				// anything touches the disk.
+				if size.is_some_and(|s| s != plain.len() as u64) {
+					return Err(Error::Open("content size does not match the file's size"));
+				}
+				judge(&transfer::hex(&<sha2::Sha256 as sha2::Digest>::digest(&plain[..])), plain.len() as u64)?;
+				std::fs::write(&out, &*plain)?;
+				println!("pulled {id} → {out}");
 			}
-			let plain = {
-				let sealed = client.fetch(&id, Some(version as u64), None)?;
-				gorani_formats::formats::open_with(&ck_key, &sealed).map_err(|_| Error::Open("content"))?
-			};
-			// The listing's size and the opened bytes must agree before anything
-			// touches the disk.
-			if size.is_some_and(|s| s != plain.len() as u64) {
-				return Err(Error::Open("content size does not match the file's size"));
+			if let (Some((_, trust)), Some(intake)) = (&area.team, k["intake"].as_str()) {
+				if let Some(line) = cases::describe_intake(&area.key, trust, &area.name, &id, Some(intake)) {
+					println!("  {line}");
+				}
 			}
-			std::fs::write(&out, &*plain)?;
-			println!("pulled {id} → {out}");
 		}
 		Some("push") => {
 			let (profile, sess) = unlocked(&flag)?;
 			let path = req_flag("file")?;
-			let name = flag("name").unwrap_or_else(|| std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+			let name = flag("name").unwrap_or_else(|| Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
 			let member = profile.member.clone();
 			let journal_dir = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path).with_extension("uploads");
 			let client = api::Client::new(profile);
+			let area = open_area(&client, &sess, &member, flag("case").as_deref())?;
+			let client = client.in_area(&area.name);
+			if area.case.as_ref().is_some_and(|c| c.rotation_required) {
+				eprintln!("note: this case's key rotation is owed (someone's grant was revoked, and they kept the key) — its manager rotates it in the web app");
+			}
+			// An evidence item says where it came from (commit 29g) — asked for
+			// before a large file is hashed, not after.
+			let intake = intake_fields(&flag);
+			if area.is_evidence() && intake.is_none() {
+				return Err(Error::Config("an evidence file needs its intake record: --source (the host or device), --collector (who), --method (how, the tool), --collected-at (ISO 8601) [--notes]".into()));
+			}
 			let meta = std::fs::metadata(&path)?;
 			// Large files (D12, commit 33b): GC01 frames at chunk_for(size),
 			// read from disk one at a time, journalled so a stopped push resumes.
@@ -168,28 +312,27 @@ fn run(args: &[String]) -> Result<(), Error> {
 				let size = meta.len();
 				let chunk = gorani_formats::chunked::chunk_for(size).ok_or(Error::Config("a file is at most 255 GiB".into()))?;
 				eprintln!("hashing {name} ({size} bytes)…");
-				let (sha256, hashed) = transfer::sha256_file(std::path::Path::new(&path))?;
+				let (sha256, hashed) = transfer::sha256_file(Path::new(&path))?;
 				if hashed != size {
 					return Err(Error::Config("the file changed while it was being read".into()));
 				}
 				let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
 				let journal = transfer::Journal::new(journal_dir);
-				let jkey = transfer::Journal::key_for(&member, &name, size, modified, &sha256);
-				let store = sess.files_store()?;
+				let jkey = transfer::Journal::key_for(&member, &area.name, &name, size, modified, &sha256);
 				let progress = |done: u64, total: u64| {
 					if done == total || done % 16 == 0 {
 						eprintln!("  {done}/{total} parts");
 					}
 				};
-				let row = match journal.get(&jkey).filter(|r| r.member == member && r.size == size) {
+				let row = match journal.get(&jkey).filter(|r| r.member == member && r.area == area.name && r.size == size) {
 					Some(prior) => {
 						// The same file, stopped part-way: the SAME id, key and
-						// sealed fields the stored frames were made with.
+						// sealed (and signed) fields the stored frames were made with.
 						let ck_sealed = prior.fields.iter().find(|(k, _)| k == "ck").map(|(_, v)| v.clone()).unwrap_or_default();
-						let key = gorani_formats::placed::unwrap_placed_key(&store, &Place::file_key(&member, &prior.file_id, 1), &ck_sealed).map_err(|_| Error::Open("the journalled content key"))?;
+						let key = placed::unwrap_placed_key(&area.key, &Place::file_key(&area.name, &prior.file_id, 1), &ck_sealed).map_err(|_| Error::Open("the journalled content key"))?;
 						eprintln!("resuming {name} from part {} of {}", prior.parts.len() + 1, gorani_formats::chunked::frame_count(size, prior.chunk));
 						let (file_id, chunk) = (prior.file_id.clone(), prior.chunk);
-						match transfer::push_frames(&client, &journal, &jkey, std::path::Path::new(&path), &key, &member, &file_id, chunk, size, prior.fields.clone(), Some(prior), progress) {
+						match transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, prior.fields.clone(), Some(prior), progress) {
 							Err(Error::Http(404, body)) if body.contains("no such upload") => {
 								journal.delete(&jkey);
 								return Err(Error::Config("the server no longer has the earlier upload (its window passed) — run push again to start over".into()));
@@ -199,53 +342,107 @@ fn run(args: &[String]) -> Result<(), Error> {
 					}
 					None => {
 						let file_id = new_item_id();
-						let name_sealed = sess.seal_into(&Place::file_name(&member, &file_id), &name)?;
-						let type_sealed = sess.seal_into(&Place::file_type(&member, &file_id, 1), "application/octet-stream")?;
 						let ck = gorani_formats::formats::new_content_key();
 						let key = gorani_formats::formats::import_content_key(&ck);
-						let ck_wrapped = gorani_formats::placed::wrap_placed_key(&store, &Place::file_key(&member, &file_id, 1), &ck).map_err(|_| Error::Open("files store key"))?;
-						let fields = vec![
-							("file_id".to_string(), file_id.clone()),
-							("ck".into(), ck_wrapped),
-							("name".into(), name_sealed),
-							("type".into(), type_sealed),
-							("size".into(), size.to_string()),
-							("chunk".into(), chunk.to_string()),
-						];
-						transfer::push_frames(&client, &journal, &jkey, std::path::Path::new(&path), &key, &member, &file_id, chunk, size, fields, None, progress)?
+						let mut fields = new_file_fields(&area, &file_id, &name, &ck, size, &sha256, intake.as_ref())?;
+						fields.push(("chunk".into(), chunk.to_string()));
+						transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, fields, None, progress)?
 					}
 				};
-				println!("pushed: {} ({size} bytes in {} parts, SHA-256 {sha256})", row["id"].as_str().unwrap_or("?"), gorani_formats::chunked::frame_count(size, chunk));
+				println!("pushed: {} ({size} bytes in {} parts, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), gorani_formats::chunked::frame_count(size, chunk), signed_note(&area, intake.is_some()));
 				return Ok(());
 			}
 			let bytes = std::fs::read(&path)?;
-			// The id first — the name, type and key are sealed into places
-			// that name it (O6); a new file is version 1.
+			let sha256 = transfer::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+			// The id first — the name, type, key, hash and intake are sealed
+			// into places that name it (O6); a new file is version 1.
 			let file_id = new_item_id();
-			let name_sealed = sess.seal_into(&Place::file_name(&member, &file_id), &name)?;
-			let type_sealed = sess.seal_into(&Place::file_type(&member, &file_id, 1), "application/octet-stream")?;
 			let ck = gorani_formats::formats::new_content_key();
 			let key = gorani_formats::formats::import_content_key(&ck);
 			let sealed = gorani_formats::formats::seal_with(&key, &bytes);
-			let ck_wrapped = gorani_formats::placed::wrap_placed_key(&sess.files_store()?, &Place::file_key(&member, &file_id, 1), &ck).map_err(|_| Error::Open("files store key"))?;
-			let fields = api::UploadFields {
-				form: vec![
-					("file_id".into(), file_id),
-					("ck".into(), ck_wrapped),
-					("name".into(), name_sealed),
-					("type".into(), type_sealed),
-					("size".into(), bytes.len().to_string()),
-				],
-			};
+			let fields = api::UploadFields { form: new_file_fields(&area, &file_id, &name, &ck, bytes.len() as u64, &sha256, intake.as_ref())? };
 			let row = client.upload_whole(&fields, &sealed)?;
-			println!("pushed: {}", row["id"].as_str().unwrap_or("?"));
+			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|ls|pull|push> [--server S --member M --name N --secret S --device-secret H --access-id I --access-secret S --dev-email E --file P --id I --out O --profile P]");
+			eprintln!("usage: gorani-sync <setup|cases|ls|pull|push> [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified]");
 			std::process::exit(2);
 		}
 	}
 	Ok(())
+}
+
+/// The intake fields, when any was given (all are checked by sign_intake).
+fn intake_fields(flag: &dyn Fn(&str) -> Option<String>) -> Option<IntakeFields> {
+	let any = ["source", "collector", "method", "collected-at", "notes"].iter().any(|k| flag(k).is_some());
+	any.then(|| IntakeFields {
+		source: flag("source").unwrap_or_default(),
+		collector: flag("collector").unwrap_or_default(),
+		method: flag("method").unwrap_or_default(),
+		collected_at: flag("collected-at").unwrap_or_default(),
+		notes: flag("notes").unwrap_or_default(),
+	})
+}
+
+/// A new file's form fields, every value sealed into its place in `area`:
+/// the name, the type, the content key — and, when the member's identity
+/// is open, the signed content hash with its timestamp imprint (commit
+/// 29d/29j) and, when given, the signed intake record (29g).
+#[allow(clippy::too_many_arguments)]
+fn new_file_fields(area: &Area, file_id: &str, name: &str, ck: &gorani_formats::formats::ContentKey, size: u64, sha256: &str, intake: Option<&IntakeFields>) -> Result<Vec<(String, String)>, Error> {
+	let ck_wrapped = placed::wrap_placed_key(&area.key, &Place::file_key(&area.name, file_id, 1), ck).map_err(|_| Error::Open("the area's store key"))?;
+	let mut fields = vec![
+		("file_id".to_string(), file_id.to_string()),
+		("ck".into(), ck_wrapped),
+		("name".into(), area.seal(&Place::file_name(&area.name, file_id), name)?),
+		("type".into(), area.seal(&Place::file_type(&area.name, file_id, 1), "application/octet-stream")?),
+		("size".into(), size.to_string()),
+	];
+	if let Some((signer, _)) = &area.team {
+		let (hash, stamp) = cases::sign_content_hash(signer, &area.key, &area.name, file_id, 1, sha256, size)?;
+		fields.push(("hash".into(), hash));
+		fields.push(("stamp".into(), stamp));
+		if let Some(f) = intake {
+			fields.push(("intake".into(), cases::sign_intake(signer, &area.key, &area.name, file_id, f)?));
+		}
+	} else if area.is_evidence() || intake.is_some() {
+		return Err(Error::Config("signing needs your identity — open the vault once in the web app (Team)".into()));
+	}
+	Ok(fields)
+}
+
+fn signed_note(area: &Area, intake: bool) -> String {
+	match &area.team {
+		Some((s, _)) => format!(" — content hash signed by {}{}", s.member, if intake { ", intake recorded" } else { "" }),
+		None => String::new(),
+	}
+}
+
+/// What the uploader signed, against what was decrypted (cases.rs ›
+/// check_content_hash) — printed, and decisive:
+///
+/// - a **mismatch** or an **invalid** record refuses the pull: nothing is
+///   written (a trusted person vouched for other bytes, or someone forged
+///   their voice);
+/// - **untrusted** or **unsigned** in an EVIDENCE case refuses too, unless
+///   `--accept-unverified`: evidence that cannot be tied to a person you
+///   verified is not silently handed over as if it could;
+/// - elsewhere they are written, with the line saying what they are.
+fn judge_content(area: &Area, id: &str, version: u64, hash: Option<&str>, sha256: &str, size: u64, accept_unverified: bool) -> Result<(), Error> {
+	let Some((_, trust)) = &area.team else {
+		if hash.is_some() {
+			println!("  content signed by its uploader — not checked (this vault has no identity yet)");
+		}
+		return Ok(());
+	};
+	let check = cases::check_content_hash(&area.key, trust, &area.name, id, version, hash, sha256, size);
+	println!("  {}", check.describe());
+	match check {
+		HashCheck::Verified { .. } => Ok(()),
+		HashCheck::Mismatch { .. } | HashCheck::Invalid { .. } => Err(Error::Config("refusing to write it — the content is not what its signature says".into())),
+		HashCheck::Untrusted { .. } | HashCheck::Unsigned if area.is_evidence() && !accept_unverified => Err(Error::Config("refusing to write unverified evidence — pass --accept-unverified to write it anyway".into())),
+		_ => Ok(()),
+	}
 }
 
 fn unlocked(flag: &dyn Fn(&str) -> Option<String>) -> Result<(DeviceProfile, Session), Error> {
@@ -259,17 +456,8 @@ fn unlocked(flag: &dyn Fn(&str) -> Option<String>) -> Result<(DeviceProfile, Ses
 	Ok((profile, sess))
 }
 
-
-
 /// What a name that does not open in its place prints as (O6).
 const UNVERIFIED: &str = "⚠ unverified — not sealed here";
-
-/// Open a name in the place its row names (the files store key, opened from
-/// the root and verified — `Session::files_store`).
-fn open_name(sess: &Session, place: &Place, sealed: &str) -> Option<String> {
-	let store = sess.files_store().ok()?;
-	gorani_formats::placed::open_placed_text(&store, place, sealed).ok().map(|s| s.to_string())
-}
 
 /// A fresh file id, chosen before sealing (128 random bits, base64url — the
 /// Worker's id allow-list). The twin of `places.ts › newItemId`.

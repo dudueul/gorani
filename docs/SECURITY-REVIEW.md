@@ -240,11 +240,28 @@ GiB. Past that — and for D12's 255 GB files — backups must become
 manifests of object references rather than copies (a decision, recorded
 in DECISIONS.md › D12).
 
+### O11, fixed in commit 25 — the media worker, which had never worked
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O11 | Medium | **Scope**: registered at "/media/"; a service worker receives the fetches of the pages it controls, and the app page is "/" — `<video src=/media/…>` never reached it. Streaming had never worked; large videos fetched a path the Worker does not serve. | Scope "/" (`web/src/lib/media-worker.ts`); the fetch handler claims only `/media/` paths and returns without `respondWith` for everything else (no pass-through); an unregistered `/media/` path is a 404, never a fall-through to the app's HTML. The old "/media/" registration is retired on upgrade. |
+| O11a | Medium | The worker begins with an `import` but was registered as a classic worker: the script failed to evaluate and the worker never installed. | `type: "module"`; where module service workers are unsupported, the registration fails and the viewer falls back to a decrypted blob. |
+| O11b | Medium | **Wrong AAD** on the whole-file path: the magic alone (4 bytes) instead of GV02's 16-byte header — no whole-file media could ever decrypt. | `sealed.subarray(0, 16)`, plus a size check. |
+| O11c | Low | Answers were the whole frame span (starting before the requested offset) and always `video/mp4`; the worker fetched the CURRENT version, not the one its key was opened for. | `cutToRange` (unit-tested) serves exactly the asked bytes with an honest Content-Range; the file's own type; `?version=` from the registration. The page waits for the worker's acknowledgement before the player's first request. |
+| O11d | — | The worker's fetches carried no identity on the dev server (a service worker cannot read the page's localStorage). | The bridge's `identityHeaders()` ride the registration — empty in production, where Access's cookie rides every same-origin fetch. |
+
+Keys are forgotten on viewer close and on Lock (commit 24, O2). Proven by
+`e2e:app` (a 9 MiB video plays through the worker: the page is
+controlled, `bytes=1000-1999` comes back as exactly those decrypted bytes
+with `Content-Range: bytes 1000-1999/9437184` and `video/mp4`; after the
+viewer closes the same URL is a 404; other requests are untouched) and
+`unit:media-frames` (exact cuts). The chunked (GC01, > 48 MB) path shares
+the frame math; an e2e over 48 MB is left to the live suite's budget.
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |
 |---|---|---|---|
-| O11 | Medium | Media service worker: keys never forgotten, scope cannot control `/`, wrong AAD on the whole-object path. | Scope `/` (handle `/media/` only), forget on close/lock, fix AAD. |
 | O12 | Medium | Share download limits are cooperative: `/data` does not decrement. | Claim returns a one-time data token. |
 | O13 | Medium | No rate limiting on device-token and share endpoints. | Cloudflare WAF rate-limiting rules on `/s/*` and `/devices/*`. |
 | O14 | Medium | Reads/downloads are not audited (only writes are). | Audit download/share-access events (see questions). |

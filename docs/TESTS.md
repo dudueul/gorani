@@ -20,7 +20,7 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `unit:family` | The key-graph denials (child→parent/sibling/master) and rotations — a departed member can neither read nor seal into the rotated area | why hierarchy is structural, not policy |
 | `unit:index` | The unlock-gated snapshot: foreign root ⇒ noise; flipped byte ⇒ GCM failure | deriving keys from roots so IndexedDB is sealed |
 | `unit:session` | Three unlock kinds open ONE root; adding a method requires the old one | the confirmation rule as a running argument |
-| `unit:media-frames` | Range→frame math, AAD binding, open-ended windows — the worker's own file | why the player can seek multi-GB videos |
+| `unit:media-frames` | Range→frame math, AAD binding, open-ended windows, exact cuts to the asked range — the worker's own file | why the player can seek multi-GB videos |
 | `unit:explorer` | The model's sealed round trips (upload/download/duplicate/copy) with REAL crypto + fake server; names swapped by the server show as *unverified*, a moved key refuses | model/view separation: Node drives the UI's brain |
 | `unit:viewer-modes` | The mode table + the mime rules that keep stored content inert | security decisions as pure, testable functions |
 | `unit:links` | GS01/GR01 derivations; id-bound AAD; password-gated keys | how "the key lives in the fragment" actually works |
@@ -33,7 +33,7 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `api:housekeeping` | Retention levers with forced clocks; the growth metric | bounding the unbounded |
 | `api:cron` | The nightly pass fired like production fires it: fan-out over the registry, backup prune to 7 (objects gone from storage too), the `cron` actor in the audit; storage refusing deletes → keys wait in the outbox, the pass fails, the next one finishes | maintenance without an identity |
 | `unit:music` + `api:music` | Tag parsing byte by byte (ID3v2.3/2.4, FLAC) and the sealed-blob feed's contract — the server stores ciphertext with a size | metadata without surveillance |
-| `e2e:app` | The SPA in a real browser (Playwright): boot, in-browser vault setup, password + recovery unlock, a sealed upload through the file picker, the decrypted listing, the wrong-password refusal | the product surface, finally watched — non-extractable keys as shipped |
+| `e2e:app` | The SPA in a real browser (Playwright): boot, in-browser vault setup, password + recovery unlock, a sealed upload through the file picker, the decrypted listing, the wrong-password refusal; a 9 MiB video streamed through the media worker (exact range, own type, 404 after close) | the product surface, finally watched — non-extractable keys as shipped |
 | `api:client-live` | The REAL native binary: enrol, ls (opened names), zero-trust spot checks | two independent implementations agreeing over the wire |
 | `unit:trusted-types` | The default policy's allow-list: same-origin app scripts only — no data:, blob:, javascript:, foreign or query-altered URLs | what "which code may this page start?" looks like as a function |
 | `unit:lock` | The auto-lock rule at its boundaries (15 idle / 5 hidden) and the lock's semantics (locked for good, one lock, listeners after the hold is gone) | security decisions as pure functions; ordering as a property |

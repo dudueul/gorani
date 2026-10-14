@@ -72,16 +72,31 @@ in NOTICE.
 - ⑩a: the viewer plays images, text/code, and audio/video from the
   decrypted blob — seeking inside the downloaded blob works because GC1
   frames open independently; ≤256 MB inline.
-- ⑩b (landed): **streaming playback through a scoped service worker** —
-  the browser's own `<video>` player drives; the worker (scope /media/
-  ONLY, so the app's requests never pass through it — Mailflare's iOS
-  pass-through lesson) answers Range requests with decrypted plaintext:
+- ⑩b (landed in ⑩ on paper; **working since commit 25** — see below):
+  **streaming playback through a service worker** — the browser's own
+  `<video>` player drives; the worker (scope "/", claiming ONLY `/media/`
+  paths and never answering anything else — Mailflare's iOS pass-through
+  lesson) answers Range requests with decrypted plaintext:
   `gorani-media-lib.js` maps a plaintext range to whole GC01 frames, one
   ciphertext range fetch, frame-by-frame decrypt (the content key rides
   from the page as a cloned, still non-extractable CryptoKey), honest 206
   headers. Multi-GB files seek without downloading; no MSE, no box
   surgery, no DRM. The frame math is imported by the worker AND tested in
   Node from the same file.
+
+  **Why "landed" was not true until commit 25** (docs/SECURITY-REVIEW.md ›
+  O11) — four bugs, each enough on its own, none visible to a test that
+  never played a video: the worker was registered at scope "/media/", but
+  a service worker serves the pages it *controls* and the app page is "/",
+  so `<video>` requests never reached it; it began with an `import` but was
+  registered as a classic worker, so it never even installed; its
+  whole-file path authenticated the magic alone (4 bytes) instead of
+  GV02's 16-byte header, so no whole file could decrypt; and its fetches
+  carried no dev identity, so even a working worker was refused by the dev
+  server. Plus two wrong answers: whole frames instead of the asked range,
+  and always `video/mp4`. `e2e:app` now plays the path: a 9 MiB video, a
+  Range fetched through the worker, exact bytes and headers, and a 404
+  once the viewer closes.
 - ⑩b-next: the `.hlsmeta` sidecar (mp4-hls-core → WASM) as an
   *optimization* on top — keyframe-accurate prefetch and instant seek
   hints; the streaming path above works without it, because the browser

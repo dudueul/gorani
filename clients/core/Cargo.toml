@@ -20,6 +20,12 @@ base64 = "0.22"
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1", features = ["derive"] }
 rpassword = "7"
+sha2 = "0.10" # streamed SHA-256 for large files (transfer.rs, commit 33b)
+# Identity keys (identity.rs, commit 33c): ECDSA P-256 as WebCrypto signs
+# it, and the HMAC over the identity record. The same RustCrypto crates the
+# formats crate already builds on.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+hmac = "0.12"
 
 [[bin]]
 name = "gorani-sync"

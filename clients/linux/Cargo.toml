@@ -1,0 +1,23 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# The Linux shell (commit 33d, docs/DESKTOP.md): the client core's sync
+# engine mounted with FUSE. `fuser` without its libfuse feature: pure Rust,
+# mounting through /dev/fuse (or fusermount3 when not root) — no C library
+# to build against.
+
+[package]
+name = "gorani-linux"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+gorani-client-core = { path = "../core" }
+fuser = { version = "0.15", default-features = false }
+libc = "0.2"
+serde_json = "1"
+base64 = "0.22"
+
+[[bin]]
+name = "gorani-mount"
+path = "src/main.rs"

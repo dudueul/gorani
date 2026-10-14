@@ -20,6 +20,31 @@ pub fn unlock(profile: &DeviceProfile, secret_text: &str) -> Result<Session, Err
 	Ok(Session { settings, root })
 }
 
+/// Whether this profile holds what a device unlock needs: an enrolled
+/// device (id + token) and the device secret.
+pub fn has_device_copy(profile: &DeviceProfile) -> bool {
+	!profile.device_id.is_empty() && !profile.token.is_empty() && profile.device_secret.as_deref().is_some_and(|s| s.len() == 64)
+}
+
+/// Open the vault with THIS computer's copy (docs/DESKTOP.md › Security
+/// model): the server releases the wrapped root only to the device's token,
+/// and only the device secret, which never leaves the machine, opens it.
+/// Neither half alone is the root. (Until commit 33d the client asked for
+/// a typed secret every time; its unlock call also dropped the salt.)
+pub fn unlock_device(profile: &DeviceProfile) -> Result<Session, Error> {
+	let client = api::Client::new(profile.clone());
+	let (key_id, wrapped, salt, settings) = client.unlock(&profile.device_id, &profile.token)?;
+	let secret = Zeroizing::new(decode_hex(profile.device_secret.as_deref().unwrap_or_default())?);
+	let root = gorani_formats::unlock::open_device_copy(&wrapped, &salt, &secret).map_err(|_| Error::Open("this computer's copy of the root does not open with its device secret"))?;
+	// The copy must be of THIS vault's root (a stale copy after a rotation
+	// opens, and would then fail on every record — say so here instead).
+	let opened = gorani_formats::formats::VaultPrivateKey::from_bytes(&root).map_err(|_| Error::Open("root bundle"))?;
+	if gorani_formats::formats::key_id(&gorani_formats::formats::public_of(&opened)) != settings.key_id || key_id != settings.key_id {
+		return Err(Error::Open("this computer's copy is of another root (rotated since?) — enrol it again"));
+	}
+	Ok(Session { settings, root })
+}
+
 /// Try every method of the matching kind (a vault may have several).
 fn unlock_root(settings: &api::VaultSettings, secret_text: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
 	let kinds: [(&str, fn(&str) -> Secret); 2] = [

@@ -15,7 +15,12 @@
 //! only while a command runs (`Zeroizing` everywhere, dropped at exit).
 
 pub mod api;
+pub mod area;
+pub mod cases;
+pub mod engine;
+pub mod identity;
 pub mod session;
+pub mod transfer;
 
 // Re-export the formats module at the crate root so bins can use
 // gorani_formats paths via the client's dependency.
@@ -66,8 +71,20 @@ pub struct DeviceProfile {
 	pub member: String,
 	pub device_id: String,
 	pub token: String,
-	/// Cloudflare Access service-token pair (docs/PRODUCTION.md › 2.5) —
-	/// sent as `CF-Access-Client-Id/Secret` on every request.
+	/// How this computer signs in as its MEMBER (commit 33a): a command that
+	/// prints the member's Cloudflare Access token — `cloudflared access
+	/// token -app=https://<host>` — run once per process; the token rides
+	/// every request as `cf-access-token`, so the Worker sees the member's
+	/// email and applies their rules (own area, case grants). The variable
+	/// `GORANI_ACCESS_TOKEN` takes precedence (a shell that already has one).
+	#[serde(default)]
+	pub access_token_cmd: Option<String>,
+	/// A Cloudflare Access service-token pair, sent as
+	/// `CF-Access-Client-Id/Secret`. NOT enough alone: a service token's JWT
+	/// carries no email, and the Worker takes identity from the email — it
+	/// passes an Access policy that requires one in front of the user token.
+	/// (Until commit 33a this was the documented way to sign in, and every
+	/// desktop request was refused in production — docs/DESKTOP.md.)
 	#[serde(default)]
 	pub access_id: Option<String>,
 	#[serde(default, rename = "accessClientSecret")]
@@ -98,6 +115,7 @@ impl std::fmt::Debug for DeviceProfile {
 			.field("member", &self.member)
 			.field("device_id", &self.device_id)
 			.field("token", &"[redacted]")
+			.field("access_token_cmd", &self.access_token_cmd)
 			.field("access_id", &self.access_id)
 			.field("access_secret", &redact(&self.access_secret))
 			.field("device_secret", &redact(&self.device_secret))
@@ -179,4 +197,15 @@ pub fn decode(s: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
 		.decode(s)
 		.map(Zeroizing::new)
 		.map_err(|_| Error::Format("bad base64"))
+}
+
+/// A fresh file or folder id, chosen before sealing (128 random bits,
+/// base64url — the Worker's id allow-list). The twin of `places.ts ›
+/// newItemId`: the name, type and key are sealed into places that NAME the
+/// id, so it must exist first.
+pub fn new_item_id() -> String {
+	use base64::Engine;
+	let mut b = [0u8; 16];
+	rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }

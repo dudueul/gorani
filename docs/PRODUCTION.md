@@ -122,9 +122,18 @@ memory.
 4. **Bypass for the public share surface**: the Access application needs an
    exception for `/s/*` (and `/s.html`) — the share pages authenticate with
    the link's fragment secret, not Access. Same for `/api/healthz`.
-5. Desktop clients (commit ⑬): give each computer an Access **service
-   token** with a Service Auth policy — the client sends
-   `CF-Access-Client-Id/Secret`; the Worker receives the resulting JWT.
+5. Desktop clients sign in as their **member** (commit 33a): install
+   `cloudflared` on the computer and set the profile's `accessTokenCmd` to
+   `cloudflared access token -app=https://<your gorani host>` (or export
+   `GORANI_ACCESS_TOKEN`). The client sends the member's short-lived token
+   as `cf-access-token`; Access validates it and the Worker receives the
+   member's JWT — email included. *(Commit 33a also fixed the Worker's
+   Access path itself, which panicked on every token — `std::time` on
+   wasm; see docs/DESKTOP.md › 33a. Until commit 33a this step said to
+   give each computer a service token: Access accepts one, but its JWT has
+   no email, so the Worker — which takes identity from the email — refused
+   every desktop request. A service token identifies a machine, not a
+   member.)*
 
 ## 3. Deploy
 

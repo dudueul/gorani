@@ -101,6 +101,7 @@ text      = "GV04:" + base64
 | `file.key` | file id | n | version n's content key |
 | `file.type` | file id | n | version n's MIME type |
 | `file.music` | file id | n | version n's tag summary |
+| `file.hash` | file id | n | version n's signed content hash (commit 29d, `content-hash.ts`) |
 | `folder.name` | folder id | — | a folder's name |
 | `share.name` | share id | — | the owner's copy of a link's name |
 | `store.secrets` | — | — | fingerprint + index keys |

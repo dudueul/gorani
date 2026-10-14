@@ -21,6 +21,7 @@ import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web
 import { importVaultKey, openSealedText } from "../../web/src/vault/vault-crypto.ts";
 import { buildTrust, certify, createIdentity, pin } from "../../web/src/vault/identity.ts";
 import { newCase, sealCaseGrant } from "../../web/src/vault/cases.ts";
+import { sha256Hex, signContentHash } from "../../web/src/vault/content-hash.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "./placed.mjs";
 
@@ -76,4 +77,11 @@ export async function openCase(dev, lead, id, title, grants = [], kind = "workin
 	}
 	const b64 = await openSealedText(lead.root, (await row()).grant.keySealed);
 	return { id, area: `case:${id}`, base: `/api/v1/cases/${id}`, b64, sealer: await storeSealer(fromBase64(b64), `case:${id}`) };
+}
+
+/** `who`'s signed content hash of `plain` as version `version` of file `id`
+ * in the area `sealer` seals for (commit 29d, content-hash.ts) — the `hash`
+ * form field an evidence upload must carry. */
+export async function signedHash(who, sealer, id, version, plain) {
+	return signContentHash(who.signer, sealer.priv, sealer.member, id, version, await sha256Hex(plain), plain.length);
 }

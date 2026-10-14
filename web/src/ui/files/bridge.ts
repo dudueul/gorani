@@ -16,11 +16,14 @@ import { areaPath } from "../../lib/area.ts";
 import { openWith, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
 import { places } from "../../vault/places.ts";
 import type { VaultSession } from "../../vault/session.ts";
+import type { Signer, Trust } from "../../vault/identity.ts";
 import { openChunkedStream } from "../../vault/chunked-file.ts";
 
 export interface FilesHooks {
 	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
 	toast(message: string): void;
+	/** The member's signer and trust, once the team context is open (model.ts › FilesBridge.identity). */
+	identity?(): { signer: Signer; trust: Trust } | null;
 }
 
 /**
@@ -65,6 +68,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 				ck: res.headers.get("x-gorani-ck") ?? "",
 				chunk: Number(res.headers.get("x-gorani-chunk")) || null,
 				version: servedVersion(res),
+				hash: res.headers.get("x-gorani-hash"),
 			};
 		},
 
@@ -75,12 +79,13 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 			const chunk = Number(res.headers.get("x-gorani-chunk")) || 0;
 			const served = servedVersion(res);
 			if (version !== undefined && served !== version) throw new Error("download failed: the server answered with another version");
+			const hash = res.headers.get("x-gorani-hash");
 			const storePriv = await store().then((s) => s.privateKey);
 			// The key opens only from the place of THIS file's THIS version (O6).
 			const key = await unwrapPlacedKey(storePriv, places.fileKey(memberId, id, served), ck);
 			if (!chunk || !res.body) {
 				await sink(await openWith(key, new Uint8Array(await res.arrayBuffer())));
-				return;
+				return { version: served, hash };
 			}
 			// Frames as they arrive: a multi-GB download never holds itself.
 			// GC01 frames are NOT GV02 values — this loop used `openWith` (the
@@ -90,6 +95,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 			const total = Number(res.headers.get("content-length"));
 			if (!total) throw new Error("download failed: the object's length is unknown");
 			await openChunkedStream(key, res.body, chunk, total, (plain) => sink(plain));
+			return { version: served, hash };
 		},
 
 		async putWhole(memberId, fields, sealed) {
@@ -125,6 +131,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 
 		confirmDuplicate: hooks.confirmDuplicate,
 		toast: hooks.toast,
+		identity: () => hooks.identity?.() ?? null,
 	};
 }
 

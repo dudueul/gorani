@@ -10,7 +10,9 @@
  *   opens what was uploaded → trash + restore → copy-paste duplicates via a
  *   NEW key (the original's history untouched) → the change feed advances →
  *   (commit 25, O6) names the server swapped between files show as
- *   UNVERIFIED, and a key moved to another file does not open.
+ *   UNVERIFIED, and a key moved to another file does not open → (commit
+ *   29d, D5.1) every upload carries its uploader's signed content hash, a
+ *   download checks it, and a record moved to another file does not verify.
  */
 
 import assert from "node:assert/strict";
@@ -18,6 +20,8 @@ import { generateHybridKey, importVaultKey, openWith, unwrapPlacedKey, isPlacedT
 import { openChunk } from "../../web/src/vault/chunked-file.ts";
 import { FilesModel, UNVERIFIED, type FilesBridge } from "../../web/src/ui/files/model.ts";
 import { places } from "../../web/src/vault/places.ts";
+import { createCodeVault } from "../../web/src/vault/keys.ts";
+import { buildTrust, createIdentity } from "../../web/src/vault/identity.ts";
 
 // ── the fake server: rows + objects, sealed like the real one ───────
 const store = await generateHybridKey();
@@ -25,7 +29,7 @@ const storePrivate = await importVaultKey(store.bundle);
 const objects = new Map<string, Uint8Array>();
 const rows = new Map<string, { id: string; folder: string | null; name: string; size: number; version: number; createdAt: string; updatedAt: string; trashedWith?: string | null }>();
 const folders = new Map<string, { id: string; parent: string | null; name: string; createdAt: string; updatedAt: string; deletedAt?: string | null }>();
-const versions = new Map<string, { ck: string; object: string; type: string | null; chunk: number | null }>();
+const versions = new Map<string, { ck: string; object: string; type: string | null; chunk: number | null; hash: string | null }>();
 let feedCursor = 0;
 const feed: { seq: number; kind: string; data: unknown }[] = [];
 let secretsSealed: string | null = null;
@@ -153,30 +157,32 @@ const bridge: FilesBridge = {
 		const version = rows.get(id)?.version ?? 1;
 		if (range) {
 			// range in the test = a whole-frame fetch (the preview path)
-			return { body: obj.subarray(range[0], range[1] + 1), ck: v.ck, chunk: v.chunk, version };
+			return { body: obj.subarray(range[0], range[1] + 1), ck: v.ck, chunk: v.chunk, version, hash: v.hash };
 		}
-		return { body: obj, ck: v.ck, chunk: v.chunk, version };
+		return { body: obj, ck: v.ck, chunk: v.chunk, version, hash: v.hash };
 	},
 	async fetchObjectStream(member, id, _version, sink) {
 		const v = versions.get(id)!;
 		const obj = objects.get(v.object)!;
-		const key = await unwrapPlacedKey(storePrivate, places.fileKey(member, id, rows.get(id)?.version ?? 1), v.ck);
+		const version = rows.get(id)?.version ?? 1;
+		const key = await unwrapPlacedKey(storePrivate, places.fileKey(member, id, version), v.ck);
 		const chunk = v.chunk ?? 0;
 		if (!chunk) {
 			await sink(await openWith(key, obj));
-			return;
+			return { version, hash: v.hash };
 		}
 		const frame = chunk + 28;
 		for (let at = 0; at < obj.length; at += frame) {
 			await sink(await openChunk(key, obj.subarray(at, Math.min(obj.length, at + frame)), at / frame, at + frame >= obj.length));
 		}
+		return { version, hash: v.hash };
 	},
 	async putWhole(_member, fields, sealed) {
 		const id = fields.file_id;
 		assert.ok(id && !rows.has(id), "a new file arrives with a fresh client-chosen id");
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
-		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk: null });
+		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk: null, hash: fields.hash ?? null });
 		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now() });
 		tags.set(id, fields.tag);
 		feedCursor++;
@@ -186,7 +192,7 @@ const bridge: FilesBridge = {
 		const id = fields.file_id;
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
-		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk });
+		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk, hash: fields.hash ?? null });
 		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now() });
 		tags.set(id, fields.tag);
 		feedCursor++;
@@ -196,8 +202,17 @@ const bridge: FilesBridge = {
 		dupAsked = count;
 		return dupAnswer;
 	},
-	toast: () => {},
+	toast: (m) => void toasts.push(m),
+	identity: () => me,
 };
+
+// The member's identity (commit 29d): its own entry, self-pinned, is all
+// the trust this test needs — the uploader verifies their own signature.
+const vault = await createCodeVault();
+const rootKey = await importVaultKey(vault.rootBundle.slice());
+const made = await createIdentity("jinu", rootKey, { ec: vault.publicKey, kem: vault.pqPublicKey });
+const me = { signer: made.signer, trust: await buildTrust("jinu", rootKey, made.record, [{ member: "jinu", ...made.registry, certs: [] }]) };
+const toasts: string[] = [];
 
 let dupAsked = 0;
 let dupAnswer: "skip" | "keep" | "version" | null = null;
@@ -240,10 +255,14 @@ await model.upload([new File([bytes as BlobPart], "beach copy.png", { type: "ima
 assert.equal(dupAsked, 1, "the fingerprint caught the twin");
 assert.equal(model.state.get().files.length, 2, "keep both → two files");
 
-// 5. Download round-trips the exact bytes.
+// 5. Download round-trips the exact bytes — and checks the uploader's
+// signed content hash on the way (commit 29d).
 let downloaded: Uint8Array | null = null;
+assert.ok(isPlacedText(versions.get(row.id)!.hash ?? ""), "the upload carried a sealed, signed content hash");
 await model.download(row.id, "beach.png");
 void downloaded;
+assert.match(toasts.at(-1) ?? "", /content verified — exactly the bytes jinu signed/);
+assert.equal((await model.verify(row.id)).status, "verified");
 
 // 6. Rename re-seals; the server's stored name changes shape but stays sealed.
 await model.rename("file", row.id, "sunset.png");
@@ -298,6 +317,21 @@ assert.equal(shown.find((f) => f.id === two)?.name, UNVERIFIED);
 assert.ok(shown.some((f) => f.name === "beach.png" || f.name === "beach copy.png"), "untouched rows still open normally");
 await assert.rejects(fresh.openBytes(one, undefined, () => {}), /not sealed here/, "the moved key does not open as this file's");
 fresh.dispose();
+
+// 12. D5.1 — a signed record the server moves to another file does not
+// verify there: it opens only in its own place (and names its own file).
+const [keyBack, hashOne] = [versions.get(two)!.ck, versions.get(one)!.hash];
+versions.get(two)!.ck = versions.get(one)!.ck;
+versions.get(one)!.ck = keyBack; // the keys back where they belong
+versions.get(two)!.hash = hashOne; // …but `one`'s record now under `two`
+const moved = await model.verify(two);
+assert.equal(moved.status, "invalid", JSON.stringify(moved));
+assert.equal((await model.verify(one)).status, "verified", "the record still verifies where it was signed");
+// No identity (the team context not open): a signature cannot be checked —
+// said as such, never "verified".
+const anonymous = new FilesModel({ ...bridge, identity: () => null }, "jinu");
+assert.equal((await anonymous.verify(one)).status, "untrusted");
+anonymous.dispose();
 
 model.dispose(); // stops the change-feed poll so the test process can exit
 

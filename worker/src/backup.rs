@@ -131,7 +131,7 @@ impl GoraniMemberDO {
 			.to_array()?;
 		let versions: Vec<VersionJsonRow> = self
 			.sql
-			.exec("SELECT v.file_id, v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.created_at FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.deleted_at IS NULL", None)?
+			.exec("SELECT v.file_id, v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.hash_sealed, v.created_at FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.deleted_at IS NULL", None)?
 			.to_array()?;
 		let secrets: Vec<KvRow> = self.sql.exec("SELECT v FROM files_secrets LIMIT 1", None)?.to_array()?;
 
@@ -206,7 +206,10 @@ impl GoraniMemberDO {
 		}
 		let mut missing = Vec::new();
 		for v in versions {
-			let mut entry = serde_json::json!({ "kind": "version", "file": v.file_id, "version": v.version, "key": v.content_key, "vaultKeyId": v.vault_key_id, "type": v.type_sealed, "size": v.size, "chunk": v.chunk_size, "createdAt": v.created_at });
+			// (`hash`: the uploader's signed content hash, still sealed — commit
+			// 29d. A restored evidence version keeps the claim that makes it
+			// evidence.)
+			let mut entry = serde_json::json!({ "kind": "version", "file": v.file_id, "version": v.version, "key": v.content_key, "vaultKeyId": v.vault_key_id, "type": v.type_sealed, "size": v.size, "chunk": v.chunk_size, "hash": v.hash_sealed, "createdAt": v.created_at });
 			let mut resp = crate::s3::stream_uncached(&self.env, &v.object_key).await?;
 			if resp.status_code() == 404 {
 				// Recorded, not fatal: the entry says so, and so does the run.
@@ -299,6 +302,7 @@ struct VersionJsonRow {
 	type_sealed: Option<String>,
 	size: i64,
 	chunk_size: Option<i64>,
+	hash_sealed: Option<String>,
 	created_at: String,
 }
 #[derive(serde::Deserialize)]
@@ -406,8 +410,8 @@ impl GoraniMemberDO {
 				if !crate::auth::valid_object_id(&file) {
 					return json_error(400, "restored version file ids must be ids");
 				}
-				if !gorani_formats::placed::is_placed_text(&ck) || get("type").is_some_and(|t| !gorani_formats::placed::is_placed_text(&t)) {
-					return json_error(400, "restored content keys and types must be placed sealed text (GV04)");
+				if !gorani_formats::placed::is_placed_text(&ck) || get("type").is_some_and(|t| !gorani_formats::placed::is_placed_text(&t)) || get("hash").is_some_and(|h| !gorani_formats::placed::is_placed_text(&h)) {
+					return json_error(400, "restored content keys, types and hashes must be placed sealed text (GV04)");
 				}
 				let version = v.get("version").and_then(|x| x.as_i64()).unwrap_or(1);
 				// Gap-filling: a version whose object still exists stays as it is.
@@ -425,7 +429,7 @@ impl GoraniMemberDO {
 				let object_key = format!("{}/{file_for_key}/r-{}", crate::area::key_prefix(member), crate::files_store::uuid());
 				self.sql
 					.exec(
-						"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'))) ON CONFLICT(file_id, version) DO UPDATE SET content_key = ?3, object_key = ?5, type_sealed = COALESCE(?6, type_sealed), size = ?7",
+						"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, created_at, hash_sealed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?10) ON CONFLICT(file_id, version) DO UPDATE SET content_key = ?3, object_key = ?5, type_sealed = COALESCE(?6, type_sealed), size = ?7, hash_sealed = COALESCE(?10, hash_sealed)",
 						Some(vec![
 							file.clone().into(),
 							version.into(),
@@ -436,6 +440,7 @@ impl GoraniMemberDO {
 							v.get("size").and_then(|x| x.as_i64()).unwrap_or(0).into(),
 							v.get("chunk").and_then(|x| x.as_i64()).into(),
 							bind(get("createdAt")),
+							bind(get("hash")),
 						]),
 					)
 					.map_err(|e| worker::Error::RustError(format!("restore version: {e}")))?;

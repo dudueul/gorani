@@ -24,7 +24,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 1 *(landed: commit 29, `api:audit`)* | D7 + D5.3 | the audit leaves the area database: an outbox ships each line to a per-area **audit Durable Object** that hash-chains it, keeps it 7 years with no line cap, and checkpoints daily to object storage; `…/audit/verify` |
 | 2 *(landed: commit 29b, `api:retention`)* | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
 | 3 *(landed: commit 29c, `api:objectlock`)* | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
-| 4 | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
+| 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
 | 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
@@ -182,3 +182,35 @@ any reader:          opens the record in its place, verifies the signature again
 - **Where it is required**: evidence cases (the Worker refuses an upload or
   a version without it). Elsewhere it is sent when the client can sign and
   verified when present.
+
+### Stage 4 as built
+
+- `web/src/vault/content-hash.ts` — `signContentHash` (the uploader:
+  statement `gorani-content-hash-v1 ‖ area ‖ file ‖ version ‖ SHA-256 ‖
+  size`, signed with the identity key, the record sealed into
+  `file.hash(area, file, version)`), `checkContentHash` (the reader: open
+  in this version's place, then the signer's trust, then the key id, then
+  the signature, then the bytes) and `sha256Stream` (hash-wasm, because a
+  chunked download never holds its plaintext whole).
+- What a check reports, and why each is separate: `verified`; `unsigned`
+  (no record); `invalid` (the record does not open here — moved — or its
+  signature fails: someone holding the case key re-sealed it); `untrusted`
+  (a signer this reader never verified, or a key that is not the signer's
+  current identity — re-enrolled since); `mismatch` (a trusted signer
+  vouched for OTHER bytes). Only a trusted signer can produce a mismatch.
+- The Worker (`files_store.rs › hash_refusal`): the form field `hash` on
+  every upload path (whole, multipart completion, new version); GV04 text
+  or a 400; required in an evidence store, checked before the first write
+  (the Worker then deletes the object it already put). Stored in
+  `file_versions.hash_sealed` (migration v12); handed back with the key
+  (`files/keys`) and with the bytes (`x-gorani-hash`, any version);
+  walked by a rotation (kind `hash`) and carried by backups and restores.
+- The web app: `model.ts` signs every upload while the member's identity
+  is open (the shell passes it in when the team context opens), checks the
+  record on every download (the toast says the result), offers "Verify
+  signature" in both explorers, and refuses to COPY a file whose own check
+  fails — the copier's fresh signature would launder altered bytes.
+- Not yet: the sync client (`clients/core`) works in the member's own
+  area only, where the hash is optional; when it gains cases it must sign
+  too. A re-enrolled member's earlier signatures read as `untrusted` until
+  the signed export (stage 7) carries signers' past keys.

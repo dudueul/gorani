@@ -35,7 +35,9 @@ import { openPlacedText, sealPlacedText, type VaultPrivateKey } from "./vault-cr
 import { places } from "./places.ts";
 import { areaPath } from "../lib/area.ts";
 
-export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets"] as const;
+// (`hash`: the uploaders' signed content hashes — commit 29d. Re-sealed like
+// the rest; the SIGNATURE inside does not change, it never named a key.)
+export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets", "hash"] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
 
 /** A JSON call against the API (the browser's bridge, or a test's helper). */
@@ -76,6 +78,8 @@ function placesOf(memberId: string, kind: SealedKind, it: SealedItem): [Uint8Arr
 			return [places.shareName(memberId, id), null];
 		case "secrets":
 			return [places.storeSecrets(memberId), null];
+		case "hash":
+			return [places.fileHash(memberId, id, version), null];
 	}
 }
 

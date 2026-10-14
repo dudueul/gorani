@@ -198,7 +198,7 @@ export class GoraniTeam extends LitElement {
 					}}>
 						<input class=${input} placeholder="case id (ir-2026-014)" .value=${this.newId} @input=${(e: InputEvent) => (this.newId = (e.target as HTMLInputElement).value)} data-test="case-id" />
 						<input class="${input} flex-1" placeholder="title (sealed)" .value=${this.newTitle} @input=${(e: InputEvent) => (this.newTitle = (e.target as HTMLInputElement).value)} data-test="case-title" />
-						<select class=${input} .value=${this.newKind} @change=${(e: Event) => (this.newKind = (e.target as HTMLSelectElement).value as CaseKind)}>
+						<select class=${input} .value=${this.newKind} @change=${(e: Event) => (this.newKind = (e.target as HTMLSelectElement).value as CaseKind)} data-test="case-kind">
 							<option value="working">working</option>
 							<option value="evidence">evidence</option>
 						</select>

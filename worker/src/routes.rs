@@ -783,7 +783,8 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	let form = req.form_data().await?;
 	// The known text fields; FormData has no iteration in workers-rs, so we
 	// ask for each by name (the upload contract is fixed anyway).
-	const KNOWN: [&str; 12] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta"];
+	// (`hash`: the uploader's signed content hash, sealed — commit 29d.)
+	const KNOWN: [&str; 13] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -863,6 +864,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"hash": form.fields.get("hash"),
 		"objectKey": object_key,
 		"bytesSealed": true,
 		"owner": actor.id,
@@ -900,6 +902,7 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"hash": form.fields.get("hash"),
 		"objectKey": object_key,
 	});
 	let resp = forward_member(&env, member_id, "POST", "files/versions", Some(body), &actor.email).await?;
@@ -1030,6 +1033,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"baseVersion": form.fields.get("base_version").and_then(|s| s.parse::<u64>().ok()),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"hash": form.fields.get("hash"),
 		"key": form.fields.get("key"),
 		// The Worker's attestation: the object added up to its declared size
 		// (size + frames × 28). GC01 frames carry no magic — their sealing is
@@ -1149,6 +1153,14 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 		if chunk > 0 {
 			headers.set("x-gorani-chunk", &chunk.to_string())?;
 		}
+	}
+	// The uploader's signed content hash (commit 29d, D5.1), sealed into
+	// this version's place: the reader opens it, checks the signature, and
+	// compares it with SHA-256 of what it decrypted. Like the key above,
+	// the server hands back a value it cannot read — and one moved here
+	// from another version does not open.
+	if let Some(h) = meta.get("hash").and_then(|x| x.as_str()) {
+		headers.set("x-gorani-hash", h)?;
 	}
 	if let Some(len) = s3_resp.headers().get("Content-Length")? {
 		headers.set("Content-Length", &len)?;

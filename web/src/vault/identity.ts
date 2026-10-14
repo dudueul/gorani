@@ -28,6 +28,7 @@
  * identity  "gorani-identity-v1" ‖ member ‖ identity key id ‖ root digest   (self-signed)
  * cert      "gorani-cert-v1"     ‖ member ‖ identity key id ‖ root digest   (by a certifier)
  * grant     "gorani-grant-v1"    ‖ case   ‖ case key digest ‖ grantee       (by the granter)
+ * content   "gorani-content-hash-v1" ‖ area ‖ file ‖ version ‖ SHA-256 ‖ size   (by the uploader; content-hash.ts)
  * ```
  *
  * Digests are FULL SHA-256 of the public halves (ec raw ‖ ML-KEM public):
@@ -80,6 +81,7 @@ export const statements = {
 	identity: (member: string, keyId: string, rootDigest: string) => stmt("gorani-identity-v1", member, keyId, rootDigest),
 	cert: (member: string, keyId: string, rootDigest: string) => stmt("gorani-cert-v1", member, keyId, rootDigest),
 	grant: (caseId: string, caseKeyDigest: string, grantee: string) => stmt("gorani-grant-v1", caseId, caseKeyDigest, grantee),
+	contentHash: (area: string, file: string, version: number, sha256: string, size: number) => stmt("gorani-content-hash-v1", area, file, String(version), sha256, String(size)),
 };
 
 // ── ids, digests, fingerprints ────────────────────────────────────────

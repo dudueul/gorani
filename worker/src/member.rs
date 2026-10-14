@@ -269,6 +269,12 @@ pub const MIGRATIONS: &[&str] = &[
 	// lock lands (the lock pass retries); 'bucket-rule' on R2, whose lock is
 	// a bucket rule, not a per-object call.
 	"ALTER TABLE file_versions ADD COLUMN locked_until TEXT",
+	// Migration v12 (commit 29d, docs/CUSTODY.md › Stage 4, D5.1): the
+	// uploader's signed content hash — { sha256 of the plaintext, size,
+	// signer, signature } sealed into the place `file.hash(area, file,
+	// version)`, so the server stores a claim it can neither read nor
+	// forge. Required on evidence (files_store.rs › hash_refusal).
+	"ALTER TABLE file_versions ADD COLUMN hash_sealed TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first

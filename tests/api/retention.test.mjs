@@ -16,7 +16,7 @@
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
-import { member, vouch, openCase } from "../lib/team.mjs";
+import { member, vouch, openCase, signedHash } from "../lib/team.mjs";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -28,15 +28,16 @@ async function post(who, path, fields, file) {
 	return { status: r.status, json: await r.json() };
 }
 
-/** A file with two versions in `base`, sealed by `sealer`. */
+/** A file with two versions in `base`, sealed by `sealer` — each version
+ * signed by `who` (evidence requires it, commit 29d; elsewhere it rides along). */
 async function twoVersions(who, base, sealer, name) {
 	const ck1 = newContentKey();
 	const f = await sealer.newFile(name, "text/plain", ck1);
 	const v1 = enc.encode("first");
-	assert.equal((await post(who, `${base}/files`, { ...f.fields, size: String(v1.length) }, await sealWith(await importContentKey(ck1), v1))).status, 200);
+	assert.equal((await post(who, `${base}/files`, { ...f.fields, size: String(v1.length), hash: await signedHash(who, sealer, f.id, 1, v1) }, await sealWith(await importContentKey(ck1), v1))).status, 200);
 	const ck2 = newContentKey();
 	const v2 = enc.encode("second");
-	const r = await post(who, `${base}/files/${f.id}/versions`, { ck: await sealer.fileKey(f.id, 2, ck2), type: await sealer.fileType(f.id, 2, "text/plain"), size: String(v2.length), base_version: "1" }, await sealWith(await importContentKey(ck2), v2));
+	const r = await post(who, `${base}/files/${f.id}/versions`, { ck: await sealer.fileKey(f.id, 2, ck2), type: await sealer.fileType(f.id, 2, "text/plain"), size: String(v2.length), base_version: "1", hash: await signedHash(who, sealer, f.id, 2, v2) }, await sealWith(await importContentKey(ck2), v2));
 	assert.equal(r.status, 200, JSON.stringify(r.json));
 	return f.id;
 }

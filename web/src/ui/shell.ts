@@ -176,6 +176,10 @@ export class GoraniShell extends LitElement {
 					? "keep"
 					: "skip",
 			toast: (m) => this.toast(m),
+			// Signs what this member uploads, checks what others did (commit
+			// 29d) — read at each use, so it works from the moment the team
+			// context opens, whichever finishes first.
+			identity: () => (this.team ? { signer: this.team.signer, trust: this.team.trust } : null),
 		}, openKey), area, own ? (this.index ?? undefined) : undefined);
 		this.area = area;
 		this.areaTitle = title;

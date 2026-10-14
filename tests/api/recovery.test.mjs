@@ -29,6 +29,7 @@ import { approveCeremony, combineCeremony, newCeremony, recoverCaseGrant, recove
 import { decode, encode } from "../../web/src/vault/shamir.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "../lib/placed.mjs";
+import { signedHash } from "../lib/team.mjs";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -72,7 +73,8 @@ async function upload(who, base, fields, file) {
 async function putFile(who, base, sealer, name) {
 	const ck = newContentKey();
 	const f = await sealer.newFile(name, "text/plain", ck);
-	const r = await upload(who, base, { ...f.fields, size: "4" }, await sealWith(await importContentKey(ck), enc.encode("data")));
+	// (Signed by the uploader: the case is evidence, commit 29d.)
+	const r = await upload(who, base, { ...f.fields, size: "4", hash: await signedHash(who, sealer, f.id, 1, enc.encode("data")) }, await sealWith(await importContentKey(ck), enc.encode("data")));
 	assert.equal(r.status, 200, JSON.stringify(r.json));
 	return f.id;
 }

@@ -12,7 +12,11 @@
  *   (commit 25, O6) names the server swapped between files show as
  *   UNVERIFIED, and a key moved to another file does not open → (commit
  *   29d, D5.1) every upload carries its uploader's signed content hash, a
- *   download checks it, and a record moved to another file does not verify.
+ *   download checks it, and a record moved to another file does not verify
+ *   → (commit 29e, D8) a sample uploaded as one, or marked later, is never
+ *   previewed, downloads as a ZipCrypto zip under "infected" (opened here
+ *   by Python's zipfile, an independent reader), and its copies stay
+ *   samples; a server that clears its flag cannot make it renderable.
  */
 
 import assert from "node:assert/strict";
@@ -22,12 +26,18 @@ import { FilesModel, UNVERIFIED, type FilesBridge } from "../../web/src/ui/files
 import { places } from "../../web/src/vault/places.ts";
 import { createCodeVault } from "../../web/src/vault/keys.ts";
 import { buildTrust, createIdentity } from "../../web/src/vault/identity.ts";
+import { isSampleType } from "../../web/src/vault/samples.ts";
+import { openPlacedText } from "../../web/src/vault/vault-crypto.ts";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // ── the fake server: rows + objects, sealed like the real one ───────
 const store = await generateHybridKey();
 const storePrivate = await importVaultKey(store.bundle);
 const objects = new Map<string, Uint8Array>();
-const rows = new Map<string, { id: string; folder: string | null; name: string; size: number; version: number; createdAt: string; updatedAt: string; trashedWith?: string | null }>();
+const rows = new Map<string, { id: string; folder: string | null; name: string; size: number; version: number; createdAt: string; updatedAt: string; trashedWith?: string | null; sample?: boolean }>();
 const folders = new Map<string, { id: string; parent: string | null; name: string; createdAt: string; updatedAt: string; deletedAt?: string | null }>();
 const versions = new Map<string, { ck: string; object: string; type: string | null; chunk: number | null; hash: string | null }>();
 let feedCursor = 0;
@@ -50,7 +60,7 @@ const server = {
 		if (p.endsWith("/files/list")) {
 			const folder = url.searchParams.get("folder") ?? "root";
 			return {
-				files: [...rows.values()].filter((r) => !r.trashedWith && (folder === "all" || (folder === "root" ? r.folder === null : r.folder === folder))).map((r) => ({ id: r.id, folder: r.folder, name: r.name, size: r.size, version: r.version, createdAt: r.createdAt, updatedAt: r.updatedAt })),
+				files: [...rows.values()].filter((r) => !r.trashedWith && (folder === "all" || (folder === "root" ? r.folder === null : r.folder === folder))).map((r) => ({ id: r.id, folder: r.folder, name: r.name, size: r.size, version: r.version, createdAt: r.createdAt, updatedAt: r.updatedAt, sample: r.sample === true })),
 				folders: [...folders.values()].filter((f) => !f.deletedAt && (folder === "root" ? f.parent === null : f.parent === folder)).map((f) => ({ id: f.id, parent: f.parent, name: f.name, createdAt: f.createdAt, updatedAt: f.updatedAt })),
 			};
 		}
@@ -71,6 +81,12 @@ const server = {
 			const size = url.searchParams.get("size");
 			return { files: [...rows.values()].filter((r) => String(r.size) === size && !r.trashedWith).map((r) => ({ id: r.id, tag: tags.get(r.id) ?? null })) };
 		}
+		if (p.endsWith("/files/sealed")) {
+			// (Only the one-file version walk the sample mark uses.)
+			const file = url.searchParams.get("file")!;
+			const v = versions.get(file);
+			return { items: v ? [{ row: 1, a: file, b: String(rows.get(file)?.version ?? 1), v1: v.ck, v2: v.type }] : [], next: null };
+		}
 		if (p.endsWith("/files/changes")) {
 			const since = Number(url.searchParams.get("since") ?? 0);
 			return { cursor: feedCursor, changes: feed.filter((c) => c.seq > since) };
@@ -86,7 +102,7 @@ const server = {
 			const out: Record<string, unknown> = {};
 			for (const id of body?.ids ?? []) {
 				const v = versions.get(id);
-				if (v) out[id] = { key: v.ck, chunk: v.chunk, type: v.type, version: rows.get(id)?.version ?? 1, size: rows.get(id)?.size ?? 0 };
+				if (v) out[id] = { key: v.ck, chunk: v.chunk, type: v.type, version: rows.get(id)?.version ?? 1, size: rows.get(id)?.size ?? 0, hash: v.hash, sample: rows.get(id)?.sample === true };
 			}
 			return { keys: out };
 		}
@@ -127,6 +143,14 @@ const server = {
 			const r = rows.get(id);
 			assert.ok(r, "file exists");
 			if (method === "PATCH") {
+				const mark = body as { sample?: boolean; types?: Record<string, string> };
+				if (mark.sample !== undefined) {
+					// The real store's rule: one way, every version's type re-sealed.
+					assert.equal(mark.sample, true, "a sample is never unmarked");
+					assert.deepEqual(Object.keys(mark.types ?? {}), [String(r.version)], "every version's type comes with the mark");
+					versions.get(id)!.type = mark.types![String(r.version)]!;
+					r.sample = true;
+				}
 				if (body!.name) r.name = body!.name;
 				if (body!.folderId !== undefined) r.folder = (body!.folderId as string | null) ?? null;
 				touch(id);
@@ -183,7 +207,7 @@ const bridge: FilesBridge = {
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
 		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk: null, hash: fields.hash ?? null });
-		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now() });
+		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now(), sample: fields.sample === "1" });
 		tags.set(id, fields.tag);
 		feedCursor++;
 		feed.push({ seq: feedCursor, kind: "file.put", data: { id } });
@@ -333,6 +357,65 @@ const anonymous = new FilesModel({ ...bridge, identity: () => null }, "jinu");
 assert.equal((await anonymous.verify(one)).status, "untrusted");
 anonymous.dispose();
 
+// 13. D8 — malware samples (commit 29e).
+const evil = new TextEncoder().encode("MZ\x90\x00 pretend this is a dropper");
+await model.upload([new File([evil as BlobPart], "dropper.png", { type: "image/png" })], { sample: true });
+const dropper = model.state.get().files.find((f) => f.name === "dropper.png")!;
+assert.equal(dropper.sample, true);
+assert.equal(dropper.kind, "sample", "listed as a sample, whatever its name says");
+assert.ok(isSampleType(await openPlacedText(storePrivate, places.fileType("jinu", dropper.id, 1), versions.get(dropper.id)!.type!)), "its sealed type carries the client's own mark");
+assert.equal(await model.preview(dropper.id), null, "a sample is never decrypted for a preview");
+const info = await model.info(dropper.id);
+assert.equal(info?.policy, "sample");
+assert.equal(info?.mime, null, "…nor given a mime to render with");
+assert.equal(info?.shownType, "image/png", "its original type is kept, for display only");
+// A server that clears its readable flag: the sealed mark still holds.
+rows.get(dropper.id)!.sample = false;
+await model.refresh();
+assert.equal(await model.preview(dropper.id), null, "the flag cleared by the server — still refused");
+assert.equal(await model.renderPolicy(dropper.id), "sample");
+// The download is a zip under "infected", opened here by an independent reader.
+await model.download(dropper.id, "dropper.png");
+assert.equal(model.lastSaved?.name, "dropper.png.zip");
+assert.match(toasts.at(-1) ?? "", /malware sample, zipped \(password: infected\); SHA-256 [0-9a-f]{64} — content verified/);
+const dir = mkdtempSync(join(tmpdir(), "gorani-zip-"));
+try {
+	writeFileSync(join(dir, "s.zip"), concatAll(model.lastSaved!.parts));
+	const py = spawnSync("python3", ["-I", "-c", "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); sys.stdout.buffer.write(z.read(z.namelist()[0], pwd=b'infected')); print(); print(z.namelist()[0])", join(dir, "s.zip")], { encoding: "latin1" });
+	if (py.error) console.log("  (python3 not found: the zip was not cross-checked by an independent reader)");
+	else {
+		assert.equal(py.status, 0, py.stderr);
+		const [bytes, entry] = [py.stdout.slice(0, evil.length), py.stdout.trim().split("\n").pop()];
+		assert.equal(bytes, Buffer.from(evil).toString("latin1"), "Python's zipfile opens it with 'infected' to the exact bytes");
+		assert.equal(entry, "dropper.png");
+		const wrong = spawnSync("python3", ["-I", "-c", "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).read('dropper.png', pwd=b'wrong')", join(dir, "s.zip")]);
+		assert.notEqual(wrong.status, 0, "…and refuses a wrong password");
+	}
+} finally {
+	rmSync(dir, { recursive: true, force: true });
+}
+// A copy of a sample is a sample.
+model.select({ kind: "file", id: dropper.id });
+model.copy();
+await model.paste();
+const copy = model.state.get().files.find((f) => f.name === "dropper copy.png")!;
+assert.equal(copy.sample, true, "copying never strips the mark");
+// Marking a normal file later: one way, its type re-sealed with the mark.
+const plainRow = model.state.get().files.find((f) => !f.sample && f.kind !== "sample")!;
+await model.markSample(plainRow.id);
+assert.equal(model.state.get().files.find((f) => f.id === plainRow.id)?.sample, true);
+assert.equal(await model.preview(plainRow.id), null);
+
 model.dispose(); // stops the change-feed poll so the test process can exit
 
 console.log("ok  explorer model: sealed listings, uploads+duplicates, downloads, trash, copies, feed");
+
+function concatAll(parts: Uint8Array[]): Uint8Array {
+	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+	let at = 0;
+	for (const p of parts) {
+		out.set(p, at);
+		at += p.length;
+	}
+	return out;
+}

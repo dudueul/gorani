@@ -783,8 +783,9 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	let form = req.form_data().await?;
 	// The known text fields; FormData has no iteration in workers-rs, so we
 	// ask for each by name (the upload contract is fixed anyway).
-	// (`hash`: the uploader's signed content hash, sealed — commit 29d.)
-	const KNOWN: [&str; 13] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash"];
+	// (`hash`: the uploader's signed content hash, sealed — commit 29d.
+	// `sample`: "1" uploads a malware sample — commit 29e.)
+	const KNOWN: [&str; 14] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -865,6 +866,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
+		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
 		"objectKey": object_key,
 		"bytesSealed": true,
 		"owner": actor.id,
@@ -1034,6 +1036,8 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
+		// (A new file only: a version of a sample is a sample already.)
+		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
 		"key": form.fields.get("key"),
 		// The Worker's attestation: the object added up to its declared size
 		// (size + frames × 28). GC01 frames carry no magic — their sealing is

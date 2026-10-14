@@ -26,7 +26,7 @@ import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
+import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -171,13 +171,15 @@ export class GoraniFinder extends LitElement {
 		e.stopPropagation();
 		if (!this.isSelected(kind, id)) this.model.select({ kind, id });
 		const many = this.selection().length > 1;
+		const sample = this.s().files.find((f) => f.id === id)?.sample === true;
 		const items: MenuItem[] = this.s().trashMode
 			? [{ label: "Put Back", run: () => void this.model.restore(this.selection().filter((x) => x.kind === "file").map((x) => x.id), this.selection().filter((x) => x.kind === "folder").map((x) => x.id)) }]
 			: [
 					{ label: kind === "folder" ? "Open" : "Quick Look", run: () => void this.openEntry(kind, id), disabled: many },
 					{ label: "Get Info", run: () => void this.getInfo(id), disabled: many || kind === "folder" },
 					{ separator: true, label: "" },
-					{ label: "Share…", run: () => this.openShare(id), disabled: kind === "folder" || many },
+					{ label: "Share…", run: () => this.openShare(id), disabled: kind === "folder" || many || sample },
+					{ label: "Mark as Malware Sample…", run: () => void markSample(this.model, id, name), disabled: kind === "folder" || many || sample },
 					{ label: "Duplicate", run: () => { this.model.copy(); void this.model.paste(); }, disabled: kind === "folder" || many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
 					{ label: "Verify Signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },

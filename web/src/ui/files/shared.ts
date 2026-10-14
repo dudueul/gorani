@@ -37,7 +37,7 @@ export function fmtDate(iso: string): string {
 const KIND_LABEL: Record<FileKind, string> = {
 	folder: "Folder", image: "Image", video: "Video", audio: "Audio", pdf: "PDF document",
 	doc: "Document", sheet: "Spreadsheet", slides: "Presentation", code: "Source code",
-	archive: "Archive", text: "Plain text", file: "File",
+	archive: "Archive", text: "Plain text", file: "File", sample: "Malware sample (never opened)",
 };
 
 export const kindLabel = (k: FileKind) => KIND_LABEL[k];
@@ -235,4 +235,19 @@ export function promptName(title: string, placeholder: string): Promise<string |
 		document.body.append(wrap);
 		input.focus();
 	});
+}
+
+/**
+ * "Mark as malware sample" (commit 29e): ONE WAY, so the person is asked
+ * first, in words that say what changes. The model re-seals every
+ * version's type with the mark and the server records it.
+ */
+export async function markSample(model: { markSample(id: string): Promise<void>; api: { toast(m: string): void } }, id: string, name: string): Promise<void> {
+	const ok = window.confirm(`Mark “${name}” as a malware sample?\n\nThis cannot be undone. It will never be previewed or shared by link again, and downloads arrive zipped (password: infected).`);
+	if (!ok) return;
+	try {
+		await model.markSample(id);
+	} catch (e) {
+		model.api.toast(`Not marked: ${e instanceof Error ? e.message : String(e)}`);
+	}
 }

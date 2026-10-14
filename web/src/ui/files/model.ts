@@ -31,6 +31,7 @@ import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
 import type { Signer, Trust } from "../../vault/identity.ts";
 import { checkContentHash, describeHashCheck, sha256Stream, signContentHash, type HashCheck } from "../../vault/content-hash.ts";
+import { SAMPLE_PASSWORD, isSampleType, originalType, sampleType, zipEncrypted } from "../../vault/samples.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
 
 /** What a name that does not open in its place is shown as (O6). */
@@ -58,6 +59,9 @@ export interface FileRow {
 	createdAt: string;
 	updatedAt: string;
 	trashedWith?: string | null;
+	/** A malware sample (commit 29e): the server's flag. The model also
+	 * honours the sealed type's mark (isSample) — either one counts. */
+	sample: boolean;
 }
 
 export interface Selection {
@@ -263,7 +267,8 @@ export class FilesModel {
 		return Promise.all(
 			rows.map(async (f) => {
 				const name = await this.openName(priv, places.fileName(this.memberId, f.id), f.id, f.name);
-				return { id: f.id, folder: f.folder, nameSealed: f.name, name, kind: kindOf(name), size: Number(f.size), version: f.version, createdAt: f.createdAt, updatedAt: f.updatedAt, trashedWith: f.trashedWith ?? null };
+				const sample = f.sample === true;
+				return { id: f.id, folder: f.folder, nameSealed: f.name, name, kind: sample ? "sample" : kindOf(name), size: Number(f.size), version: f.version, createdAt: f.createdAt, updatedAt: f.updatedAt, trashedWith: f.trashedWith ?? null, sample };
 			}),
 		);
 	}
@@ -381,8 +386,10 @@ export class FilesModel {
 		return created.id;
 	}
 
-	/** Upload: seal in the browser, fingerprint, ask about duplicates, send. */
-	async upload(files: File[]): Promise<void> {
+	/** Upload: seal in the browser, fingerprint, ask about duplicates, send.
+	 * `sample`: upload as malware samples (commit 29e) — marked from the
+	 * first byte, so nothing ever previews them in between. */
+	async upload(files: File[], { sample = false }: { sample?: boolean } = {}): Promise<void> {
 		await this.ensureSecrets();
 		const folderId = this.state.get().folderId;
 		for (const file of files) {
@@ -405,12 +412,12 @@ export class FilesModel {
 				// nothing new. (A dead `asVersion` parameter used to pretend
 				// otherwise; removed in commit 25.)
 			}
-			await this.uploadOne(file, plain, tag, folderId, hexOf(digest));
+			await this.uploadOne(file, plain, tag, folderId, hexOf(digest), sample);
 		}
 		await this.refresh();
 	}
 
-	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null, sha256: string): Promise<void> {
+	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null, sha256: string, sample = false): Promise<void> {
 		// The file id first: the name, the type and the content key are sealed
 		// INTO places that name it (O6) — so the server cannot move them to
 		// another file, and could not have made them up (it lacks the PSK).
@@ -420,14 +427,17 @@ export class FilesModel {
 		const ck = newContentKey();
 		const key = await importContentKey(ck);
 		const nameSealed = await sealPlacedText(priv, places.fileName(this.memberId, id), file.name);
-		const typeSealed = await sealPlacedText(priv, places.fileType(this.memberId, id, 1), file.type || "application/octet-stream");
+		// A sample's type is the client's own mark (samples.ts): sealed, so a
+		// server that clears its readable flag cannot make it renderable.
+		const typeSealed = await sealPlacedText(priv, places.fileType(this.memberId, id, 1), sample ? sampleType(file.type) : file.type || "application/octet-stream");
 		const ckSealed = await wrapPlacedKey(priv, places.fileKey(this.memberId, id, 1), ck);
 		ck.fill(0);
 		// Music metadata (docs/MUSIC.md): the tags exist only in plaintext we
 		// already hold, so parse them here and seal the summary — the library
 		// feed opens these blobs instead of ever re-reading the audio.
+		// (Never for a sample: a tag parser is attack surface too.)
 		let mmeta: string | undefined;
-		if (file.type.startsWith("audio/")) {
+		if (!sample && file.type.startsWith("audio/")) {
 			const meta = parseAudioMeta(plain);
 			if (meta) mmeta = await sealPlacedText(priv, places.fileMusic(this.memberId, id, 1), JSON.stringify(meta));
 		}
@@ -437,7 +447,7 @@ export class FilesModel {
 		// without one, so there the missing identity is said plainly.
 		const me = this.bridge.identity?.() ?? null;
 		const hash = me ? await signContentHash(me.signer, priv, this.memberId, id, 1, sha256, plain.length) : undefined;
-		const extra = { ...(mmeta ? { mmeta } : {}), ...(hash ? { hash } : {}), ...(folderId ? { folder_id: folderId } : {}) };
+		const extra = { ...(mmeta ? { mmeta } : {}), ...(hash ? { hash } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}) };
 		try {
 			if (plain.length > 48 * 1024 * 1024) {
 				const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
@@ -520,17 +530,109 @@ export class FilesModel {
 			h.update(plain);
 			size += plain.length;
 		});
-		const check = await this.checkHash(id, served, { sha256: h.hex(), size });
-		// The save itself is browser-only (the Node test collects bytes).
-		if (typeof document !== "undefined") {
-			const url = blobURL(new Blob(parts as BlobPart[], { type: "application/octet-stream" }));
-			const a = document.createElement("a");
-			a.href = url;
-			a.download = name;
-			a.click();
-			setTimeout(() => revokeBlobURL(url), 5000);
+		const sha256 = h.hex();
+		const check = await this.checkHash(id, served, { sha256, size });
+		// A sample (or a file whose type does not verify) leaves only zipped
+		// under "infected" (commit 29e, samples.ts) — never raw on disk.
+		const policy = await this.renderPolicy(id);
+		if (policy !== "normal") {
+			const zipped = zipEncrypted(name, concat(parts));
+			this.save(zipped, `${name}.zip`);
+			const why = policy === "sample" ? "a malware sample" : "its type does not verify, so it is treated as a sample";
+			this.bridge.toast(`Downloaded “${name}.zip” — ${why}, zipped (password: ${SAMPLE_PASSWORD}); SHA-256 ${sha256}${check.status === "unsigned" ? "" : ` — ${describeHashCheck(check)}`}`);
+			return;
 		}
+		this.save(parts, name);
 		this.bridge.toast(check.status === "unsigned" ? `Downloaded “${name}”` : `Downloaded “${name}” — ${describeHashCheck(check)}`);
+	}
+
+	/** The last download's parts — what a Node test can inspect (the browser saves them). */
+	lastSaved: { name: string; parts: Uint8Array[] } | null = null;
+
+	/** Save parts as one file. The save itself is browser-only (a Blob of
+	 * parts is not a copy); a Node test reads `lastSaved`. */
+	private save(parts: Uint8Array[], name: string): void {
+		this.lastSaved = { name, parts };
+		if (typeof document === "undefined") return;
+		const url = blobURL(new Blob(parts as BlobPart[], { type: "application/octet-stream" }));
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = name;
+		a.click();
+		setTimeout(() => revokeBlobURL(url), 5000);
+	}
+
+	// ── malware samples (commit 29e, docs/CUSTODY.md › stage 5) ─────────
+
+	/**
+	 * What may be RENDERED of a file: `normal`; `sample` — either mark says
+	 * so (the server's flag, or the sealed type); `unverified` — the type is
+	 * missing or does not open in its place. A server that wanted a sample
+	 * rendered would have to hide BOTH marks, and the only way it could
+	 * touch the sealed one (remove or garble it) lands here, refused like a
+	 * sample. Only `normal` is ever previewed, played or opened.
+	 */
+	async renderPolicy(id: string): Promise<"normal" | "sample" | "unverified"> {
+		if (this.rowOf(id)?.sample) return "sample";
+		const keys = await this.keysFor<{ keys: Record<string, { type: string | null; version: number; sample?: boolean }> }>(id);
+		const meta = keys.keys[id];
+		if (!meta) return "unverified";
+		return this.policyOf(meta, id, null);
+	}
+
+	private async policyOf(meta: { type: string | null; version: number; sample?: boolean }, id: string, opened: { mime: string | null; ok: boolean } | null): Promise<"normal" | "sample" | "unverified"> {
+		if (meta.sample || this.rowOf(id)?.sample) return "sample";
+		if (!meta.type) return "unverified";
+		const o = opened ?? (await this.openType(meta, id));
+		if (!o.ok) return "unverified";
+		return isSampleType(o.mime) ? "sample" : "normal";
+	}
+
+	private async openType(meta: { type: string | null; version: number }, id: string): Promise<{ mime: string | null; ok: boolean }> {
+		if (!meta.type) return { mime: null, ok: false };
+		try {
+			return { mime: await openPlacedText(await this.bridge.storePrivate(), places.fileType(this.memberId, id, meta.version), meta.type), ok: true };
+		} catch {
+			return { mime: null, ok: false };
+		}
+	}
+
+	private rowOf(id: string): FileRow | undefined {
+		const s = this.state.get();
+		return s.files.find((f) => f.id === id) ?? s.trashFiles.find((f) => f.id === id);
+	}
+
+	/**
+	 * Mark a file as a malware sample — ONE WAY (the server refuses to
+	 * unmark). Every version's type is re-sealed with the sample mark in
+	 * the same request, keeping the original type for display; the server
+	 * refuses a mark that leaves a version out.
+	 */
+	async markSample(id: string): Promise<void> {
+		const priv = await this.bridge.storePrivate();
+		const types: Record<string, string> = {};
+		let after = 0;
+		for (;;) {
+			const page = await this.bridge.apiGet<{ items: { row: number; a: string; b: string; v1: string; v2: string | null }[]; next: number | null }>(`${areaPath(this.memberId)}/files/sealed?kind=version&file=${encodeURIComponent(id)}&after=${after}&limit=500`);
+			for (const it of page.items) {
+				const version = Number(it.b);
+				const place = places.fileType(this.memberId, id, version);
+				let original: string | null = null;
+				if (it.v2) {
+					try {
+						original = await openPlacedText(priv, place, it.v2);
+					} catch {
+						original = null; // a type that does not open: marked anyway, its original unknown
+					}
+				}
+				types[String(version)] = await sealPlacedText(priv, place, original && isSampleType(original) ? original : sampleType(original));
+			}
+			if (page.next === null) break;
+			after = page.next;
+		}
+		await this.bridge.apiSend("PATCH", `${areaPath(this.memberId)}/files/${id}`, { sample: true, types });
+		await this.refresh();
+		this.bridge.toast(`“${this.names.get(id) ?? id}” is a malware sample now — never previewed, never shared by link, downloaded zipped (password: ${SAMPLE_PASSWORD})`);
 	}
 
 	/**
@@ -589,11 +691,15 @@ export class FilesModel {
 		const s = this.state.get();
 		const row = s.files.find((f) => f.id === id) ?? s.trashFiles.find((f) => f.id === id);
 		if (!row) return null;
-		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; type: string | null; version: number }> }>(id);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; type: string | null; version: number; sample?: boolean }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const priv = await this.bridge.storePrivate();
-		const mime = meta.type ? await openPlacedText(priv, places.fileType(this.memberId, id, meta.version), meta.type) : "application/octet-stream";
+		// Nothing is decrypted for rendering unless the type verifies and says
+		// "not a sample" (commit 29e).
+		const opened = await this.openType(meta, id);
+		if ((await this.policyOf(meta, id, opened)) !== "normal") return null;
+		const mime = opened.mime ?? "application/octet-stream";
 		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, meta.version), meta.key);
 		let plain: Uint8Array;
 		if (meta.chunk && meta.chunk > 0) {
@@ -617,9 +723,10 @@ export class FilesModel {
 	async mediaHandle(id: string, mime: string | null = null): Promise<{ url: string } | null> {
 		const worker = await controllingMediaWorker();
 		if (!worker) return null;
-		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number }> }>(id);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number; type: string | null; sample?: boolean }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
+		if ((await this.policyOf(meta, id, null)) !== "normal") return null; // never played (commit 29e)
 		const s = this.state.get();
 		const row = s.files.find((f) => f.id === id);
 		if (!row) return null;
@@ -677,7 +784,12 @@ export class FilesModel {
 			// sources copy; the copy says who vouches for it now.)
 			const check = await this.checkHash(id, served, { sha256: hexOf(digest), size: plain.length });
 			if (check.status === "mismatch" || check.status === "invalid") throw new Error(`not copying “${name}”: ${describeHashCheck(check)}`);
-			await this.uploadOne(new File([plain as BlobPart], copyName(name)), plain, await this.fingerprint(digest), folderId, hexOf(digest));
+			// A copy of a sample is a sample (commit 29e) — copying must never
+			// be the way a sample loses its mark. (An unverifiable type copies
+			// as a sample too: the careful side.)
+			const sample = (await this.renderPolicy(id)) !== "normal";
+			const original = sample ? (await this.info(id))?.shownType ?? "" : "";
+			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original }), plain, await this.fingerprint(digest), folderId, hexOf(digest), sample);
 		}
 		await this.refresh();
 		this.bridge.toast(`Duplicated ${clip.files.length} file${clip.files.length > 1 ? "s" : ""}`);
@@ -732,15 +844,17 @@ export class FilesModel {
 	}
 
 	/** Info for the Get Info / details pane: everything readable, opened. */
-	async info(id: string): Promise<{ name: string; kind: FileKind; size: number; version: number; createdAt: string; updatedAt: string; mime: string | null } | null> {
-		const keys = await this.keysFor<{ keys: Record<string, { key: string; version: number; type: string | null; size: number }> }>(id);
+	/** `mime` is what may be rendered: null unless `policy` is "normal" (commit
+	 * 29e). `shownType` is for display only — a sample's original type. */
+	async info(id: string): Promise<{ name: string; kind: FileKind; size: number; version: number; createdAt: string; updatedAt: string; mime: string | null; policy: "normal" | "sample" | "unverified"; shownType: string | null } | null> {
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; version: number; type: string | null; size: number; sample?: boolean }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
-		const priv = await this.bridge.storePrivate();
-		const mime = meta.type ? await openPlacedText(priv, places.fileType(this.memberId, id, meta.version), meta.type).catch(() => null) : null;
-		const s = this.state.get();
-		const row = s.files.find((f) => f.id === id) ?? s.trashFiles.find((f) => f.id === id);
-		return row ? { name: row.name, kind: row.kind, size: row.size, version: meta.version, createdAt: row.createdAt, updatedAt: row.updatedAt, mime } : null;
+		const opened = await this.openType(meta, id);
+		const policy = await this.policyOf(meta, id, opened);
+		const row = this.rowOf(id);
+		const shownType = opened.mime && isSampleType(opened.mime) ? originalType(opened.mime) : opened.mime;
+		return row ? { name: row.name, kind: row.kind, size: row.size, version: meta.version, createdAt: row.createdAt, updatedAt: row.updatedAt, mime: policy === "normal" ? opened.mime : null, policy, shownType } : null;
 	}
 
 	async refresh(): Promise<void> {
@@ -764,6 +878,7 @@ interface FileRowJson {
 	createdAt: string;
 	updatedAt: string;
 	trashedWith?: string | null;
+	sample?: boolean;
 }
 
 interface FolderJson {

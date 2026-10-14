@@ -275,6 +275,11 @@ pub const MIGRATIONS: &[&str] = &[
 	// version)`, so the server stores a claim it can neither read nor
 	// forge. Required on evidence (files_store.rs › hash_refusal).
 	"ALTER TABLE file_versions ADD COLUMN hash_sealed TEXT",
+	// Migration v13 (commit 29e, docs/CUSTODY.md › Stage 5, D8): a malware
+	// sample. Readable, because the SERVER enforces what follows from it (no
+	// share links; one way); the client's own mark is the sealed type
+	// (web/src/vault/samples.ts), which a server cannot clear.
+	"ALTER TABLE files ADD COLUMN sample INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first

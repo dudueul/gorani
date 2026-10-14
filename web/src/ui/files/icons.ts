@@ -8,7 +8,9 @@
  * files.
  */
 
-export type FileKind = "folder" | "image" | "video" | "audio" | "pdf" | "doc" | "sheet" | "slides" | "code" | "archive" | "text" | "file";
+// (`sample`: a malware sample, commit 29e — never decided by its name: the
+// model sets it from the file's marks, and nothing renders it.)
+export type FileKind = "folder" | "image" | "video" | "audio" | "pdf" | "doc" | "sheet" | "slides" | "code" | "archive" | "text" | "file" | "sample";
 
 export function kindOf(name: string, mime?: string | null): FileKind {
 	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
@@ -55,6 +57,7 @@ const GLYPHS: Record<FileKind, Shape[]> = {
 	code: [{ tag: "path", stroke: true, attrs: { d: "m9 8-4 4 4 4M15 8l4 4-4 4" } }],
 	archive: [{ tag: "rect", stroke: true, attrs: { x: "5", y: "3.5", width: "14", height: "17", rx: "1.5" } }, { tag: "path", stroke: true, attrs: { d: "M12 4v4M10 8h4M10 10.5h4M12 13.5v3" } }],
 	text: [{ tag: "path", stroke: true, attrs: { d: "M6 3.5h8l4 4V20a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 6 20V3.5Z" } }, { tag: "path", stroke: true, attrs: { d: "M14 3.5V8h4M9 12h6M9 15.5h4" } }],
+	sample: [{ tag: "path", stroke: true, attrs: { d: "M12 3.5 2.5 20h19Z" } }, { tag: "path", stroke: true, attrs: { d: "M12 9.5v5M12 17.2v.3" } }],
 	file: [{ tag: "path", stroke: true, attrs: { d: "M6 3.5h8l4 4V20a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 6 20V3.5Z" } }, { tag: "path", stroke: true, attrs: { d: "M14 3.5V8h4" } }],
 };
 

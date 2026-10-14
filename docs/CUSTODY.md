@@ -25,7 +25,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 2 *(landed: commit 29b, `api:retention`)* | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
 | 3 *(landed: commit 29c, `api:objectlock`)* | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
-| 5 | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
+| 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
 | 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
@@ -255,3 +255,35 @@ any reader:          sample = the flag OR the sealed type says so
   plaintext's SHA-256 is in the toast, for the reputation lookup.
 - **The sync client** (`gorani-sync pull`) refuses to write a sample to
   disk raw.
+
+### Stage 5 as built
+
+- `web/src/vault/samples.ts` — the mark (`sampleType`, `isSampleType`,
+  `originalType`) and `zipEncrypted`: CRC-32, ZipCrypto (keys advance on
+  the plaintext byte; the 12-byte header ends with the CRC's high byte, the
+  wrong-password check), stored, UTF-8 names. `unit:explorer` opens what it
+  writes with Python's `zipfile` — an independent reader — and checks a
+  wrong password is refused.
+- The Worker (`files_store.rs`): `files.sample` (migration v13), set by the
+  upload form field `sample=1`; in listings, `files/keys` and file rows;
+  `share_create` refuses a sample (409); `file_mark_sample` — one way,
+  every version's type re-sealed in the same request, validated whole
+  before anything is written; audited as `file.upload.sample` /
+  `file.sample`. `files/sealed?kind=version&file=<id>` lists one file's
+  versions (the mark's walk).
+- The model (`model.ts › renderPolicy`): `normal`, `sample` (the flag OR
+  the sealed type), or `unverified` (a type that is missing or does not
+  open in its place — refused like a sample, because garbling the sealed
+  mark is the one way a server could try to hide it). Only `normal` is
+  previewed, played (`mediaHandle`) or opened in the viewer, which shows a
+  refusal panel instead (`mode.ts › "refused"`). Downloads of anything not
+  `normal` are `<name>.zip` under "infected", the toast carries SHA-256 and
+  the signature check; uploads as samples skip the audio-tag parser; a copy
+  of a sample is a sample.
+- The explorers: "Upload malware samples…" (Windows skin), "Mark as
+  malware sample…" in both context menus (a confirm says it cannot be
+  undone), "Share…" disabled for samples.
+- `gorani-sync pull` refuses a sample (either mark) and writes nothing
+  (`api:client-live` › 4b).
+- Not yet: ZIP64 (samples over 4 GiB are refused, not zipped); the desktop
+  shells (docs/DESKTOP.md) must route their downloads through the same zip.

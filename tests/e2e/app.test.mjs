@@ -359,6 +359,17 @@ try {
 		await page.locator("text=case-note.txt").first().dblclick();
 		await page.locator("text=sealed under the case key").first().waitFor({ timeout: 30_000 });
 		await page.keyboard.press("Escape");
+		// A malware sample (commit 29e), uploaded through its own input: an
+		// HTML dropper the viewer must NOT open — the refusal panel shows
+		// instead, and the page stays violation-free.
+		await page.locator("gorani-win11 [data-upload-sample]").setInputFiles({ name: "dropper.html", mimeType: "text/html", buffer: Buffer.from("<script>alert('pwned')</script>") });
+		await page.locator("text=dropper.html").first().waitFor({ timeout: 60_000 });
+		const afterSample = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
+		assert.equal(afterSample.json.files.find((f) => f.sample)?.sample, true, "the server lists it as a sample");
+		await page.locator("text=dropper.html").first().dblclick();
+		await page.locator('[data-test="viewer-refused"]').waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator("text=pwned").count(), 0, "nothing of the sample is rendered");
+		await page.keyboard.press("Escape");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
 		await ctx.close();
 	}
@@ -384,7 +395,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, a sample refused by the viewer, re-enrol");
 } finally {
 	await dev.close();
 }

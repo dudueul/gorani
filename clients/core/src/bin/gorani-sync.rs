@@ -112,6 +112,16 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let chunk = keys["keys"][&id]["chunk"].as_u64();
 			let size = keys["keys"][&id]["size"].as_u64();
 			let version = keys["keys"][&id]["version"].as_i64().filter(|v| *v >= 1).ok_or(Error::Open("the server did not say which version this is"))?;
+			// A malware sample is never written to disk raw (D8, commit 29e;
+			// docs/CUSTODY.md › stage 5): desktop antivirus would quarantine it
+			// mid-investigation, or a double-click would run it. Either mark
+			// counts — the readable flag, or the sealed type the server cannot
+			// clear (`application/x-gorani-sample; original=…`).
+			let sealed_type = keys["keys"][&id]["type"].as_str().unwrap_or_default();
+			let typed_sample = open_name(&sess, &Place::file_type(&member, &id, version), sealed_type).is_some_and(|t| t.starts_with("application/x-gorani-sample"));
+			if keys["keys"][&id]["sample"].as_bool() == Some(true) || typed_sample {
+				return Err(Error::Open("this is a malware sample — gorani-sync never writes one to disk raw; download it zipped from the web app (password: infected)"));
+			}
 			let store = sess.files_store()?;
 			// The key opens only from THIS file's THIS version's place (O6).
 			let ck_key = gorani_formats::placed::unwrap_placed_key(&store, &Place::file_key(&member, &id, version), &ck).map_err(|_| Error::Open("content key (not sealed for this file and version)"))?;

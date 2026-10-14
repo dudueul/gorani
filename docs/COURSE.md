@@ -46,6 +46,7 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 25 | A CSP that is actually delivered | web/public/_headers, web/src/lib/trusted-types.ts, tests/e2e (24) | Who serves which bytes (assets vs. Worker); Trusted Types and a default policy; finding sinks by making them fail; watching for violations in the e2e |
 | 26 | Lock means locked | web/src/vault/session.ts, web/src/lib/blob-urls.ts, tests/unit/lock.test.ts (24) | A lock as a state, not a flush; ordering (delete the hold, then notify); decisions as pure functions; fake clocks in a browser test |
 | 27 | The second start | worker/src/schema.rs, tests/api/restart.test.mjs (25) | A constructor runs on every wake-up; idempotent vs. non-idempotent DDL; a migration ledger (append-only history); fail loudly, never hang; testing the restart nobody runs |
+| 28 | A value knows where it lives | web/src/vault/places.ts, crates/formats/src/placed.rs, tests/api/security.test.mjs › 9 (25) | Cut-and-paste attacks on envelope encryption; binding context as AAD without storing it; why public-key sealing cannot authenticate the sealer, and a PSK that can; choose ids before you seal; a decision revisited with its reasons |
 
 Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at

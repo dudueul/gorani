@@ -163,11 +163,34 @@ the bug, kept as its regression test. The lesson generalises: **a
 constructor is a code path that runs on every wake-up, not once** — test
 the second run.
 
+### O6, fixed in commit 25 — a value opens only where it was sealed, and only a key holder seals
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O6 | High (was Medium) | **Moving.** A sealed value carried no notion of where it belonged: the server could swap two files' content keys (each with its object) or names, so "invoice.pdf" opened a malware sample and evidence item A was shown as item B — every value still opened. | **GV04** (docs/ENCRYPTION.md › GV04): each store value is sealed into its *place* — store, kind, item id, version — bound as AAD and rebuilt by the opener, never read off the server. A key moved to another file or version, or a name moved to another file, fails to open. |
+| O6a | High | **Minting** (found while scoping O6 — the reason the severity rose). GV03 seals to a PUBLIC key and the server holds it: it could invent a file outright — make up a content key, encrypt bytes of its choosing, seal the key and a name — and the file appeared in the store as if a member had uploaded it. Binding ids alone would not have stopped this (the place is public information). | GV04's key schedule mixes in the **store PSK**, computable only from the store's private key (self-ECDH ‖ a hash of the ML-KEM secret — the record key's construction, now one shared helper). Sealing into a store needs what opening needs: there is no public-key path in any more — the bridge does not even keep the public half. |
+| O6b | — | The Worker minted file ids AFTER the upload, so nothing sealed could name its file. | Ids are client-chosen (128 random bits; `file_id`, multipart `newFileId`), shape-checked, and a taken id is a 409. `base_version` is required for versions (the key is sealed for `base + 1`). Downloads say which version they are (`x-gorani-version`): the key's place depends on it. |
+| O6c | Low | A refused music blob was checked after the file and version rows were inserted; the 400 made the Worker delete the object, leaving rows that pointed at nothing. | Every refusal before the first write (`files_store.rs › file_put / file_version_put`). |
+| O6d | — | The upload dialog's "add as a version" answer was a dead parameter (`asVersion`, never read): it stored a new file like "keep both". | Removed; the comment says what the answers do. |
+
+Proven, both directions and end to end:
+
+- `cargo test -p gorani-formats` (placed.rs): a value opens only in its place (another file, store, kind or version fails); GV03 and a foreign store's GV04 are refused; place encoding is unambiguous.
+- `unit:formats`: the cross-language vector — the browser seals a name and a key into places, Rust derives the same PSK and opens them (and nowhere else); Rust seals, the browser opens.
+- `api:security` block 9: the server-as-attacker swaps a malware sample's name and key into an invoice's rows through its own write path — both refuse to open as the invoice — and mints a file with GV03 (refused by the store) and with another store's PSK (stored, never opens).
+- `unit:explorer`: swapped names show as *unverified*, the listing does not crash, the moved key does not open.
+- `api:rotation`: the walk re-seals each value in its row's place; a value moved between rows stops the walk instead of being laundered into the wrong place under the new PSK.
+- `unit:family`: after a member leaves, a value they seal with the old key does not open under the new one — rotation revokes writing as well as reading.
+
+The limits, stated: GV04 proves "a holder of this store's key sealed this,
+here" — not *who* (per-member signatures over each upload are D5), and not
+*freshness* (the server can still serve an older row; it is at least
+consistently what it claims to be).
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |
 |---|---|---|---|
-| O6 | Medium | Content is not bound to its file id: the server can swap (key, object) pairs between files undetected. | Bind file id + version in the AAD (format v-next). |
 | O7 | Medium | GB1: header outside the AAD; nonce prefix not compared. | Hash the header into each segment's AAD; compare full nonce. |
 | O8 | Medium | Argon2 bounds: floor below OWASP (t=1 at 19 MiB), ceiling lets a server freeze a phone. | t ≥ 2 floor; ~256 MiB / t ≤ 10 ceiling; cap methods tried. |
 | O9 | Medium | The backup job is in memory and one missing object aborts the run. | Multipart streaming; record missing objects. |

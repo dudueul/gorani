@@ -84,11 +84,12 @@ sequenceDiagram
     participant D as MemberDO
     participant S as MinIO (S3)
 
+    B->>B: file id = 128 random bits (chosen FIRST — the places name it)
     B->>B: content key = 32 random bytes
     B->>B: object = GV02(key, bytes) — or GC01 frames if > 48 MB
-    B->>B: name/type = GV03(store pub); ck = GV03(store pub, key)
-    B->>W: POST files (multipart: sealed object + sealed names + wrapped key)
-    W->>W: CHECK: bytes start GV02 · names are sealed text · size honest
+    B->>B: name/type/ck = GV04(store key, place = file id [+ version 1])
+    B->>W: POST files (multipart: file_id + sealed object + placed name/type/key)
+    W->>W: CHECK: id shape · bytes start GV02 · names are GV04 · size honest
     W->>S: PutObject(files/<m>/<id>/v-<uuid>, ciphertext)
     W->>D: INSERT files + file_versions (owner = first uploader, contributors trail)
     D-->>D: triggers: journal ← file.put + version.put (one counter)

@@ -100,13 +100,27 @@ path, on the API and on the share page; records every
 `innerHTML` with a plain string is refused (and reported) — the policy is
 enforced, not just sent.
 
+### O2 + O4, fixed in commit 24 — Lock means locked
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O2 | Critical | **Lock did not lock.** `session.lock()` cleared a cache and called listeners nobody registered; the explorer stayed on screen, the bridge kept the opened store key, the media worker kept every content key, blob URLs of decrypted files stayed live. No idle lock while the tab was visible. | `lock()` is a state: `locked` is set synchronously, every later key request throws, the device hold is deleted, THEN listeners run (once). The shell subscribes and the app swaps in the lock screen; unmounting disposes the model and index, tells the media worker `media-forget-all`, revokes every tracked blob URL (`lib/blob-urls.ts`) and locks the session. The bridge refuses keys once locked. |
+| O2a | — | Auto-lock: hidden-only, 10 minutes, and its cleanup discarded (listeners stacked per session). | D15: **15 idle minutes or 5 hidden**, decided by a pure `autoLockDue()` (unit:lock, boundaries both ways) and driven by `watchAutoLock`, whose cleanup the shell calls. |
+| O4 | High | The device hold outlived its window on disk (`exp` was only checked, never acted on). | An expired, keyless or undecryptable hold is deleted the moment it is read; the window is 5 minutes (= the hidden lock) and fixed, not sliding (the doc claimed sliding). |
+| O2b | — | The viewer's "Close (esc)" never worked (the handler sat on an element nothing focused); downloads started one browser save per 8 MiB frame; the shell rendered the explorer twice. | Focus the overlay on open; collect frames into one Blob; one render. |
+
+Proven by unit:lock (the rule, idempotent lock, keys refused, listener
+order) and e2e:app: with a decrypted image open, Lock → the image's blob:
+URL no longer loads, the shell is unmounted, no hold remains; a faked clock
+shows 14 idle minutes open and 15 locked. (A side effect worth teaching:
+the CSP's `connect-src 'self'` already stops page scripts from `fetch`ing a
+blob: URL at all.)
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |
 |---|---|---|---|
-| O2 | Critical | **Lock does not lock.** `session.lock()` clears a cache; the shell stays mounted, the bridge keeps the store private key, the media worker keeps content keys. No idle lock while visible. | Lock unmounts the shell, disposes model/index, clears the bridge, messages the SW to forget, revokes blob URLs; idle timer; e2e presses Lock. |
 | O3 | High | **Store-key records are not authenticated.** A server that controls settings can give clients an attacker key pair (private half sealed to the victim's root — sealing needs only the public key). New uploads then seal to the attacker. Same for family public halves. | MAC (key derived from the root, like `deriveIndexKey`) over keyId + publics + sealed private; check public halves against the opened private; recompute key ids; refuse unsealed text where key material is expected. |
-| O4 | High | The "stay unlocked" device hold is not deleted at expiry — only on an explicit lock. | Purge expired holds on boot and on miss; schedule deletion at `exp`. |
 | O5 | High | **Member removal leaves old versions readable**: `files/reseal` re-wraps only the *current* version of each file; older versions stay wrapped to the old family key (docs/FAMILY.md claims otherwise). | Re-wrap every version row (or purge old versions on rotation). |
 | O6 | Medium | Content is not bound to its file id: the server can swap (key, object) pairs between files undetected. | Bind file id + version in the AAD (format v-next). |
 | O7 | Medium | GB1: header outside the AAD; nonce prefix not compared. | Hash the header into each segment's AAD; compare full nonce. |

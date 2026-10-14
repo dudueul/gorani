@@ -101,9 +101,11 @@ revoked device's chip opens nothing because the server's copy is gone.
   holds, and the next run finishes it.
 - `gorani-sync devices` lists every computer and what protects it;
   `gorani-sync revoke --device <id>` deletes a lost one's copy from any
-  other. **Found on the way:** the web app has no devices screen — this
-  document said "revoke … from the web app", and until now there was no
-  way to revoke a lost laptop but the raw API.
+  other. **Found on the way:** the web app had no devices screen — this
+  document said "revoke … from the web app", and there was no way to
+  revoke a lost laptop but the raw API. Commit 35 adds it: Team › Devices
+  lists the member's computers with what protects each (a file-held secret
+  flagged), when each was last seen, and Revoke.
 - Not yet: a TPM PIN (an authorization value the chip's lockout would
   protect) or sealing to the boot state (a PCR policy); attestation of the
   protection label (the server records the client's word).

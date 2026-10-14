@@ -31,7 +31,27 @@ import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
-type Tab = "people" | "cases" | "recovery";
+type Tab = "people" | "cases" | "recovery" | "devices";
+
+/** One of the member's computers, as `GET /api/v1/members/<id>/devices` lists it. */
+interface DeviceRow {
+	id: string;
+	name: string;
+	platform: string | null;
+	/** What holds its device secret, in the client's own words (commit 34): `tpm`, `keyring`, `tpm+keyring`, `file` — or null before then. */
+	protection: string | null;
+	createdAt: string;
+	lastSeen: string | null;
+	revoked: boolean;
+}
+
+/** A protection label for people (commit 34, clients/core/src/devicekey.rs). */
+function describeProtection(p: string | null): { text: string; weak: boolean } {
+	if (!p || p === "cli") return { text: "not recorded — enrolled before protection was tracked", weak: true };
+	if (p === "file") return { text: "a file — anyone who copies its profile, with your sign-in, can open this computer's copy", weak: true };
+	const names: Record<string, string> = { tpm: "the TPM", keyring: "the login keyring" };
+	return { text: p.split("+").map((k) => names[k] ?? k).join(" + "), weak: false };
+}
 
 const input = "rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-sm outline-none focus:border-accent";
 const button = "rounded-lg border border-neutral-700 px-2.5 py-1.5 text-xs hover:border-accent disabled:opacity-40";
@@ -61,6 +81,8 @@ export class GoraniTeam extends LitElement {
 	@state() private tsa: { configured: boolean; certs: TsaCert[] } | null = null;
 	@state() private tsaTrusted: TrustedTsas = new Map();
 	@state() private tsaProbe: TsaIdentity | null = null;
+	/** This member's computers (commit 34): what protects each, and revocation. */
+	@state() private devices: DeviceRow[] = [];
 	/** Ephemeral keys of the ceremonies THIS tab coordinates (memory only). */
 	private ephemerals = new Map<string, VaultPrivateKey>();
 	private caseKeys = new Map<string, VaultPrivateKey>();
@@ -102,6 +124,7 @@ export class GoraniTeam extends LitElement {
 			}
 		};
 		this.identities = (await quiet(() => this.call<{ identities: RegistryIdentity[] }>("GET", "/api/v1/family/identities"), { identities: [] })).identities;
+		this.devices = await quiet(() => this.call<DeviceRow[]>("GET", `/api/v1/members/${this.team.memberId}/devices`), []);
 		// Externals do not see the registry (stage 2): names fall back to ids.
 		this.members = (await quiet(() => this.call<{ members: Member[] }>("GET", "/api/v1/family"), { members: [] as Member[] })).members;
 		this.team = { ...this.team, identities: this.identities, trust: await buildTrust(this.team.memberId, this.session.root, this.team.settings.identity!, this.identities) };
@@ -154,7 +177,7 @@ export class GoraniTeam extends LitElement {
 	// ── render ────────────────────────────────────────────────────────
 
 	protected override render() {
-		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][]))];
+		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"]];
 		return html`
 			<div class="mx-auto flex h-full max-w-4xl flex-col gap-3 overflow-y-auto p-4 text-sm" data-test="team">
 				<nav class="flex gap-1">
@@ -163,8 +186,46 @@ export class GoraniTeam extends LitElement {
 				</nav>
 				${this.error ? html`<p class="rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-red-300" data-test="team-error">${this.error}</p>` : nothing}
 				${this.status ? html`<p class="text-xs text-neutral-400" data-test="team-status">${this.status}</p>` : nothing}
-				${this.tab === "people" ? this.renderPeople() : this.tab === "cases" ? this.renderCases() : this.renderRecovery()}
+				${this.tab === "people" ? this.renderPeople() : this.tab === "cases" ? this.renderCases() : this.tab === "devices" ? this.renderDevices() : this.renderRecovery()}
 			</div>
+		`;
+	}
+
+	// ── Devices (commit 34) ───────────────────────────────────────────
+
+	/**
+	 * The member's computers: what holds each one's device secret, when it
+	 * was last seen, and Revoke — which deletes the server's wrapped copy of
+	 * the root, so that computer never unlocks again whatever its TPM or
+	 * keyring hold. Until this tab, a lost laptop could only be revoked
+	 * through the API (or `gorani-sync revoke` from another computer).
+	 */
+	private renderDevices() {
+		const live = this.devices.filter((d) => !d.revoked);
+		return html`
+			<section class="rounded-xl border border-neutral-800 p-3">
+				<h3 class="font-medium">Your computers</h3>
+				<p class="mt-1 text-xs text-neutral-400">Each holds its own copy of your vault key, released only to it and opened only with a secret it keeps — in its TPM and login keyring where it has them. Revoke one you lost: its copy is deleted, and it never unlocks again. (What protects a computer is its own report, not checked by the server.)</p>
+				${live.length === 0 && this.devices.length === 0 ? html`<p class="mt-2 text-xs text-neutral-500">No computer is enrolled. Desktop sync: <code>gorani-sync setup</code>.</p>` : nothing}
+				<ul class="mt-2 divide-y divide-neutral-800">
+					${this.devices.map((d) => {
+						const p = describeProtection(d.protection);
+						return html`<li class="flex items-start gap-3 py-2" data-test="device-${d.id}">
+							<div class="min-w-0 flex-1">
+								<p class="${d.revoked ? "text-neutral-500 line-through" : ""}">${d.name} <span class="text-xs text-neutral-500">${d.platform ?? ""}</span></p>
+								<p class="text-xs ${p.weak && !d.revoked ? "text-amber-400" : "text-neutral-400"}" data-test="device-protection-${d.id}">${p.weak && !d.revoked ? "⚠ " : ""}Protected by ${p.text}</p>
+								<p class="text-xs text-neutral-500">Enrolled ${d.createdAt.slice(0, 10)} · last seen ${d.lastSeen ? d.lastSeen.slice(0, 16).replace("T", " ") : "never"}</p>
+							</div>
+							${d.revoked
+								? html`<span class="text-xs text-neutral-500" data-test="device-revoked-${d.id}">revoked</span>`
+								: html`<button class=${button} ?disabled=${this.busy} data-test="device-revoke-${d.id}" @click=${() => window.confirm(`Revoke “${d.name}”? Its copy of your vault key is deleted and it can never unlock again. Files already downloaded on it stay on it.`) && this.act(`Revoking ${d.name}`, async () => {
+										await this.call("DELETE", `/api/v1/members/${this.team.memberId}/devices/${d.id}`);
+										return `${d.name} is revoked — it can never unlock again`;
+									})}>Revoke</button>`}
+						</li>`;
+					})}
+				</ul>
+			</section>
 		`;
 	}
 

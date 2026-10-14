@@ -33,9 +33,9 @@
 //! as the user can ask the TPM and the keyring exactly as this client does.
 //! Protectors defeat copies (backups, a stolen disk, the profile file) and
 //! bind unlocking to this machine and this login; they do not stop malware
-//! already running in the session. Revoking the device (`gorani-sync revoke`
-//! from any other computer — the web app has no devices screen yet) deletes
-//! the server's copy — then no part opens anything.
+//! already running in the session. Revoking the device (the web app's Team ›
+//! Devices, or `gorani-sync revoke` from any other computer) deletes the
+//! server's copy — then no part opens anything.
 //!
 //! Mechanism: the TPM through `tpm2-tools` and the keyring through
 //! `secret-tool` (libsecret), as subprocesses — the clevis approach: no C

@@ -71,7 +71,7 @@ if (wantKind("api")) {
 			// until its own timeout. (Found the fun way: an accept queue of 1.)
 			const child = spawn(process.execPath, [path.join(ROOT, "tests/api", f)], {
 				cwd: ROOT,
-				env: { ...process.env, ...(ownServer ? {} : { GORANI_URL: dev.base }) },
+				env: { ...process.env, ...(ownServer ? {} : { GORANI_URL: dev.base, GORANI_S3: dev.s3 ?? "", GORANI_S3_ROOT: dev.s3Root ?? "" }) },
 			});
 			let out = "";
 			child.stdout.on("data", (d) => (out += d));

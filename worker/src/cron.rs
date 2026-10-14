@@ -39,7 +39,13 @@ async fn member_ids(env: &Env) -> Result<Vec<String>> {
 
 /// The pass itself. No identity exists at 03:17 UTC — the DOs see the system
 /// actor `cron`, which is exactly how their audit trail records it.
+/// The fan-out. Every member is visited even when one fails (one broken
+/// store must not starve the rest of their maintenance) — and then the pass
+/// FAILS if any did (commit 25, O10). It used to log a thrown error and
+/// ignore every answer: a member whose pass returned 500 every night, or
+/// whose deletes never reached S3, looked exactly like a healthy one.
 pub async fn run(env: Env) -> Result<()> {
+	let mut failures: Vec<String> = Vec::new();
 	for member in member_ids(&env).await? {
 		let namespace = env.durable_object("MEMBER")?;
 		let stub = namespace.id_from_name(&format!("member:{member}"))?.get_stub()?;
@@ -49,9 +55,21 @@ pub async fn run(env: Env) -> Result<()> {
 			"https://do.internal/cron",
 			&RequestInit { method: Method::Post, headers, body: Some(serde_json::json!({}).to_string().into()), ..Default::default() },
 		)?;
-		if let Err(e) = stub.fetch_with_request(req).await {
-			console_log!("gorani cron: member {member} failed: {e}");
+		match stub.fetch_with_request(req).await {
+			Ok(resp) if resp.status_code() < 300 => {}
+			Ok(mut resp) => {
+				let status = resp.status_code();
+				let body = resp.text().await.unwrap_or_default();
+				failures.push(format!("{member}: HTTP {status} {}", body.chars().take(300).collect::<String>()));
+			}
+			Err(e) => failures.push(format!("{member}: {e}")),
 		}
 	}
-	Ok(())
+	if failures.is_empty() {
+		return Ok(());
+	}
+	for f in &failures {
+		console_error!("gorani cron: {f}");
+	}
+	Err(Error::RustError(format!("{} member pass(es) failed — {}", failures.len(), failures.join("; "))))
 }

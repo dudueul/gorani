@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { suiteDev, api } from "./_dev.mjs";
+import { suiteDev, api, stubDelete } from "./_dev.mjs";
 import { generateHybridKey, sealWith, openWith, newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
 import { readBackup } from "../../web/src/vault/backup.ts";
@@ -169,7 +169,48 @@ try {
 	const original = files.find((f) => Buffer.from(f.bytes).equals(Buffer.from(gotPlain)));
 	assert.ok(original, "restored bytes match one of the uploads");
 
-	console.log("ok  api:backup — key file, run, download, decrypt, round trip, tamper, zero-trust, RESTORE");
+	// ── 7. O9: streamed, and honest about what it could not include ─────
+	// A 9 MiB file pushes the container past one 8 MiB part: the job streams
+	// rows and objects into a multipart upload (memory bounded by one part,
+	// whatever the store's size) instead of holding the whole backup. And an
+	// object removed behind the Worker's back (a lost disk, a bucket rule) is
+	// RECORDED — the run used to abort with nothing written.
+	const bigCk = newContentKey();
+	const bigPlain = new Uint8Array(9 * 1024 * 1024).map((_, i) => i % 251);
+	const big = await store.newFile("capture.pcap", "application/vnd.tcpdump.pcap", bigCk);
+	const bigSealed = await sealWith(await importContentKey(bigCk), bigPlain);
+	const boundary = `big${Date.now()}`;
+	const bigHead = new TextEncoder().encode([...Object.entries(big.fields), ["size", String(bigPlain.length)]].map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`).join("") + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`);
+	const bigUp = await fetch(`${dev.base}/api/v1/members/jinu/files`, { method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}`, "x-gorani-dev-email": "jinu@family.test" }, body: new Uint8Array([...bigHead, ...bigSealed, ...new TextEncoder().encode(`\r\n--${boundary}--\r\n`)]) });
+	assert.equal(bigUp.status, 200, await bigUp.text());
+	const lost = (await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" })).json.files.find((f) => f.id !== big.id && f.id !== victim.id);
+	const lostKey = (await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [lost.id] } })).json.keys[lost.id].object;
+	await stubDelete(dev, lostKey);
+
+	const run2 = await api(dev.base, "POST", "/api/v1/members/jinu/backup/run", { email: "jinu@family.test", body: {} });
+	assert.equal(run2.status, 200, `a missing object no longer aborts the run: ${run2.text.slice(0, 200)}`);
+	assert.equal(run2.json.missing.length, 1, "…it is listed");
+	assert.equal(run2.json.missing[0].file, lost.id);
+	assert.ok(run2.json.size > 8 * 1024 * 1024, "the container spans more than one 8 MiB part");
+	const manifest = (await api(dev.base, "GET", "/api/v1/members/jinu/backups", { email: "jinu@family.test" })).json.find((b) => b.stamp === run2.json.stamp);
+	assert.equal(manifest.missing, 1, "the manifest row counts it (the first column added under the migration ledger)");
+	const bytes2 = new Uint8Array(await (await fetch(`${dev.base}/api/v1/members/jinu/backups/${run2.json.stamp}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } })).arrayBuffer());
+	assert.equal(bytes2.length, run2.json.size);
+	const parsed2 = await readBackup(bytes2, keyFile);
+	const lostEntry = parsed2.entries.find((e) => e.json.kind === "version" && e.json.file === lost.id);
+	assert.equal(lostEntry.json.missing, true, "the entry says the object was missing when the backup ran");
+	assert.equal(lostEntry.object.length, 0);
+	const bigEntry = parsed2.entries.find((e) => e.json.kind === "version" && e.json.file === big.id);
+	assert.deepEqual(await openWith(await store.openFileKey(big.id, 1, String(bigEntry.json.key)), bigEntry.object), bigPlain, "the streamed 9 MiB object round-trips byte for byte");
+	// A restore never mints an empty object for a missing one: it says so.
+	const restore2 = await api(dev.base, "POST", "/api/v1/members/jinu/backup/restore", {
+		email: "jinu@family.test",
+		body: { folders: [], files: [], versions: parsed2.entries.filter((e) => e.json.kind === "version").map((e) => e.json), secrets: null },
+	});
+	assert.equal(restore2.status, 200, restore2.text);
+	assert.deepEqual(restore2.json.skipped.map((x) => x.file), [lost.id], "the missing version is skipped, by name");
+
+	console.log("ok  api:backup — key file, run, download, decrypt, round trip, tamper, zero-trust, RESTORE, streamed + missing recorded");
 } finally {
 	await dev.close();
 }

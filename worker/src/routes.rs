@@ -191,6 +191,9 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		("GET", ["members", id, "files", "meta"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/meta", &req, actor)).await,
 		("GET", ["members", id, "files", "secrets"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/secrets", None, actor)).await,
 		("GET", ["members", id, "files", "trash"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/trash", None, actor)).await,
+		// The deletion outbox (O10): what retention removed from the rows but
+		// storage has not confirmed deleting yet — keys, attempts, last error.
+		("GET", ["members", id, "storage", "pending"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "storage/pending", None, actor)).await,
 		("POST", ["members", id, "files", "trash", "restore"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await

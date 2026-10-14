@@ -460,6 +460,7 @@ name = "gorani-worker"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "futures-util",
  "getrandom",
  "gorani-formats",
  "gorani-s3",

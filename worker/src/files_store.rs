@@ -74,7 +74,6 @@ struct FolderSqlRow {
 
 #[derive(serde::Deserialize)]
 struct VersionSqlRow {
-	file_id: String,
 	version: i64,
 	content_key: String,
 	vault_key_id: Option<String>,
@@ -82,7 +81,6 @@ struct VersionSqlRow {
 	type_sealed: Option<String>,
 	size: i64,
 	chunk_size: Option<i64>,
-	tag: Option<String>,
 }
 
 impl GoraniMemberDO {
@@ -325,7 +323,7 @@ impl GoraniMemberDO {
 			let row: Option<VersionSqlRow> = self
 				.sql
 				.exec(
-					"SELECT v.file_id, v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.tag FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE v.file_id = ?1",
+					"SELECT v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE v.file_id = ?1",
 					Some(vec![id.clone().into()]),
 				)?
 				.to_array::<VersionSqlRow>()
@@ -1083,6 +1081,8 @@ struct ObjectRow {
 }
 #[derive(serde::Deserialize)]
 struct ExistsRow {
+	// Read for its existence only: a row came back, or none did.
+	#[allow(dead_code)]
 	one: i64,
 }
 #[derive(serde::Deserialize)]
@@ -1098,7 +1098,6 @@ struct KvRow {
 #[derive(serde::Deserialize)]
 struct ShareObjRow {
 	object_key: String,
-	s3_upload_id: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct ShareRow {

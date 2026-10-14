@@ -27,6 +27,7 @@ crate-type = ["cdylib"]
 [dependencies]
 gorani-formats = { version = "0.1.0", path = "../crates/formats" }
 gorani-s3 = { version = "0.1.0", path = "../crates/s3" }
+futures-util = "0.3" # StreamExt::next — the backup job reads objects as streams (O9)
 js-sys = "0.3"
 serde = "1.0.229"
 serde_json = "1.0.154"

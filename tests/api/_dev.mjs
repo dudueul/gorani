@@ -108,6 +108,11 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 	}
 	return {
 		base,
+		// The storage the Worker talks to: the stub's URL (suites reach it
+		// directly to remove an object or inject a fault — tests/lib/s3stub.mjs),
+		// or null against a real bucket.
+		s3: s3 ? null : `${s3endpoint}/${s3?.bucket ?? "gorani-test"}`,
+		s3Root: s3 ? null : s3endpoint,
 		close: async () => {
 			try {
 				process.kill(-child.pid, "SIGKILL"); // the whole group: workerd dies with wrangler
@@ -143,6 +148,18 @@ export async function api(base, method, path, { email = "mom@family.test", token
  * directly (node tests/api/…test.mjs) starts its own.
  */
 export async function suiteDev() {
-	if (process.env.GORANI_URL) return { base: process.env.GORANI_URL, close: async () => {} };
+	if (process.env.GORANI_URL) return { base: process.env.GORANI_URL, s3: process.env.GORANI_S3 || null, s3Root: process.env.GORANI_S3_ROOT || null, close: async () => {} };
 	return startDev();
+}
+
+/** Remove an object behind the Worker's back (a disk lost, a bucket rule). */
+export async function stubDelete(dev, key) {
+	const r = await fetch(`${dev.s3}/${key}`, { method: "DELETE" });
+	if (r.status !== 204) throw new Error(`stub delete ${key}: ${r.status}`);
+}
+
+/** Make the next `count` `method` requests under `prefix` fail with `status`. */
+export async function stubFault(dev, rule) {
+	const r = await fetch(`${dev.s3Root}/__fault`, { method: "POST", body: JSON.stringify(rule) });
+	if (!r.ok) throw new Error(`stub fault: ${r.status}`);
 }

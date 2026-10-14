@@ -2,17 +2,38 @@
 
 //! The backup job (⑫): one `.gbak` per run, written to S3 under
 //! `backups/<stamp>.gbak`, containing every folder/file/version row and the
-//! SEALED objects as stored — the GB1 container (crates/formats/src/backup.rs)
+//! SEALED objects as stored — the GB2 container (crates/formats/src/backup.rs)
 //! wraps it all under a per-run file key whose only unwrapped copy is sealed
 //! to the owner's backup PUBLIC key. The server writes backups it cannot
 //! open; the key file (the private bundle) never leaves the owner.
 //!
-//! v1 keeps the whole backup in memory before the S3 put — right for a
-//! family NAS's first full backup (documented limit); multipart streaming
-//! arrives with the restore commit.
+//! # Streaming (commit 25, docs/SECURITY-REVIEW.md › O9)
+//!
+//! v1 assembled the whole container in memory — every object read whole
+//! (`s3::get`), concatenated, then one PUT — so a store bigger than the
+//! isolate's memory (128 MB) could not be backed up at all, and ONE missing
+//! object aborted the run with nothing written. Now:
+//!
+//! ```text
+//! rows ─┐                                    ┌─▶ part 1 (≥ 8 MiB) ─┐
+//!       ├─▶ GB2 writer (1 MiB segments) ─▶ buffer ─▶ part 2 …     ├─▶ multipart complete
+//! objects (streamed, chunk by chunk) ─┘      └─▶ last part (any size) ─┘
+//! ```
+//!
+//! Memory is bounded by one part plus one segment, whatever the store's size.
+//! An object that is gone from storage is RECORDED — its entry says
+//! `"missing": true` with an empty object, the manifest row counts it, the
+//! response lists it — and the run carries on: a backup that silently skips
+//! is a lie, one that refuses to run is no backup at all; one that says what
+//! it could not include is the only honest kind. An object whose length
+//! changes mid-read (S3 said N bytes, the stream gave M) aborts the run: the
+//! entry format announces the length first, and a backup must never be wrong.
 
 use gorani_formats::backup::{self, BackupWriter, FileKey};
 use worker::{Response, Result};
+
+/// Each multipart part of a .gbak: the backends' 5 MiB minimum, with room.
+const PART: usize = 8 * 1024 * 1024;
 
 #[derive(serde::Deserialize)]
 struct KvRow {
@@ -116,82 +137,131 @@ impl GoraniMemberDO {
 
 		// The writer emits the prefix itself and binds its hash into every
 		// segment (GB2) — the stamp a restore trusts is the stamp that was sealed.
+		let object_key = format!("backups/{stamp}.gbak");
+		let mut sink = PartSink::start(&self.env, &object_key).await?;
 		let mut out: Vec<u8> = Vec::new();
 		let mut writer = BackupWriter::start(file_key, header.to_string().as_bytes(), &mut out);
+		let result = self.write_entries(&mut writer, &mut out, &mut sink, folders, files, secrets, versions).await;
+		let (entries, missing) = match result {
+			Ok(r) => r,
+			Err(e) => {
+				// Nothing half-written survives: the parts are freed.
+				sink.abort().await;
+				return Err(e);
+			}
+		};
+		writer.finish(&mut out);
+		let size = match sink.finish(out).await {
+			Ok(n) => n,
+			Err(e) => {
+				sink.abort().await;
+				return Err(e);
+			}
+		};
+		self.sql
+			.exec(
+				"INSERT INTO backups (stamp, kind, size, entries, created_at, missing) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?5)",
+				Some(vec![stamp.clone().into(), kind.into(), (size as i64).into(), (entries as i64).into(), (missing.len() as i64).into()]),
+			)
+			.map_err(|e| worker::Error::RustError(format!("backup record: {e}")))?;
+		let note = if missing.is_empty() { format!("entries: {entries}") } else { format!("entries: {entries}, MISSING objects: {}", missing.len()) };
+		self.audit(actor, "backup.run", &stamp, None, Some(&note)).await?;
+		Ok(Response::from_json(&serde_json::json!({ "stamp": stamp, "size": size, "entries": entries, "missing": missing }))?)
+	}
 
+	/// The entry stream: folders, files, secrets, then versions with their
+	/// sealed objects streamed in. Returns (entries, missing objects).
+	#[allow(clippy::too_many_arguments)]
+	async fn write_entries(
+		&self,
+		writer: &mut BackupWriter,
+		out: &mut Vec<u8>,
+		sink: &mut PartSink<'_>,
+		folders: Vec<FolderJsonRow>,
+		files: Vec<FileJsonRow>,
+		secrets: Vec<KvRow>,
+		versions: Vec<VersionJsonRow>,
+	) -> Result<(u64, Vec<serde_json::Value>)> {
 		let mut entries = 0u64;
-		let push_entry = |json: serde_json::Value, object: Option<Vec<u8>>, writer: &mut BackupWriter, out: &mut Vec<u8>| -> Result<()> {
+		// A row entry: jsonLen ‖ json ‖ objectLen (0) — no object follows.
+		let row = |json: serde_json::Value, writer: &mut BackupWriter, out: &mut Vec<u8>| {
 			let json_bytes = json.to_string().into_bytes();
 			writer.write(&(json_bytes.len() as u32).to_be_bytes(), out);
 			writer.write(&json_bytes, out);
-			let obj = object.unwrap_or_default();
-			writer.write(&(obj.len() as u64).to_be_bytes(), out);
-			writer.write(&obj, out);
-			Ok(())
+			writer.write(&0u64.to_be_bytes(), out);
 		};
-
 		for f in folders {
-			push_entry(
-				serde_json::json!({ "kind": "folder", "id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at }),
-				None,
-				&mut writer,
-				&mut out,
-			)?;
+			row(serde_json::json!({ "kind": "folder", "id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at }), writer, out);
 			entries += 1;
+			sink.drain(out).await?;
 		}
 		for f in files {
-			push_entry(
-				serde_json::json!({ "kind": "file", "id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size, "version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner }),
-				None,
-				&mut writer,
-				&mut out,
-			)?;
+			row(serde_json::json!({ "kind": "file", "id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size, "version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner }), writer, out);
 			entries += 1;
+			sink.drain(out).await?;
 		}
 		if let Some(s) = secrets.into_iter().next() {
-			push_entry(serde_json::json!({ "kind": "files-secrets", "sealed": s.v }), None, &mut writer, &mut out)?;
+			row(serde_json::json!({ "kind": "files-secrets", "sealed": s.v }), writer, out);
 			entries += 1;
 		}
+		let mut missing = Vec::new();
 		for v in versions {
-			let object = crate::s3::get(&self.env, &v.object_key).await?.ok_or_else(|| worker::Error::RustError(format!("missing object {}", v.object_key)))?;
-			push_entry(
-				serde_json::json!({ "kind": "version", "file": v.file_id, "version": v.version, "key": v.content_key, "vaultKeyId": v.vault_key_id, "type": v.type_sealed, "size": v.size, "chunk": v.chunk_size, "createdAt": v.created_at }),
-				Some(object),
-				&mut writer,
-				&mut out,
-			)?;
+			let mut entry = serde_json::json!({ "kind": "version", "file": v.file_id, "version": v.version, "key": v.content_key, "vaultKeyId": v.vault_key_id, "type": v.type_sealed, "size": v.size, "chunk": v.chunk_size, "createdAt": v.created_at });
+			let mut resp = crate::s3::stream_uncached(&self.env, &v.object_key).await?;
+			if resp.status_code() == 404 {
+				// Recorded, not fatal: the entry says so, and so does the run.
+				entry["missing"] = serde_json::json!(true);
+				row(entry, writer, out);
+				missing.push(serde_json::json!({ "file": v.file_id, "version": v.version, "object": v.object_key }));
+				entries += 1;
+				sink.drain(out).await?;
+				continue;
+			}
+			if resp.status_code() != 200 {
+				return Err(worker::Error::RustError(format!("backup: reading {} answered HTTP {}", v.object_key, resp.status_code())));
+			}
+			let announced: u64 = resp
+				.headers()
+				.get("Content-Length")?
+				.and_then(|l| l.parse().ok())
+				.ok_or_else(|| worker::Error::RustError(format!("backup: {} has no length", v.object_key)))?;
+			let json_bytes = entry.to_string().into_bytes();
+			writer.write(&(json_bytes.len() as u32).to_be_bytes(), out);
+			writer.write(&json_bytes, out);
+			writer.write(&announced.to_be_bytes(), out);
+			let mut seen = 0u64;
+			let mut body = resp.stream()?;
+			while let Some(chunk) = futures_util::StreamExt::next(&mut body).await {
+				let chunk = chunk?;
+				seen += chunk.len() as u64;
+				if seen > announced {
+					break;
+				}
+				writer.write(&chunk, out);
+				sink.drain(out).await?;
+			}
+			if seen != announced {
+				return Err(worker::Error::RustError(format!("backup: {} changed length mid-read ({announced} announced, {seen} read) — run again", v.object_key)));
+			}
 			entries += 1;
 		}
-		writer.finish(&mut out);
-
-		// One S3 object per run (memory-bound for now; multipart streaming is
-		// the restore commit's companion).
-		let object_key = format!("backups/{stamp}.gbak");
-		crate::s3::put(&self.env, &object_key, out.clone()).await?;
-		self.sql
-			.exec(
-				"INSERT INTO backups (stamp, kind, size, entries, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-				Some(vec![stamp.clone().into(), kind.into(), (out.len() as i64).into(), (entries as i64).into()]),
-			)
-			.map_err(|e| worker::Error::RustError(format!("backup record: {e}")))?;
-		self.audit(actor, "backup.run", &stamp, None, Some(&format!("entries: {entries}"))).await?;
-		Ok(Response::from_json(&serde_json::json!({ "stamp": stamp, "size": out.len(), "entries": entries }))?)
+		Ok((entries, missing))
 	}
 
 	pub(crate) async fn backups_list(&self) -> Result<Response> {
 		let rows: Vec<BackupRow> = self
 			.sql
-			.exec("SELECT stamp, kind, size, entries, created_at FROM backups ORDER BY created_at DESC", None)?
+			.exec("SELECT stamp, kind, size, entries, created_at, missing FROM backups ORDER BY created_at DESC", None)?
 			.to_array()?;
 		Ok(Response::from_json(&serde_json::Value::Array(
 			rows.into_iter()
-				.map(|r| serde_json::json!({ "stamp": r.stamp, "kind": r.kind, "size": r.size, "entries": r.entries, "createdAt": r.created_at }))
+				.map(|r| serde_json::json!({ "stamp": r.stamp, "kind": r.kind, "size": r.size, "entries": r.entries, "createdAt": r.created_at, "missing": r.missing.unwrap_or(0) }))
 				.collect(),
 		))?)
 	}
 
 	pub(crate) async fn backup_object(&self, stamp: &str) -> Result<Response> {
-		let rows: Vec<BackupRow> = self.sql.exec("SELECT stamp, kind, size, entries, created_at FROM backups WHERE stamp = ?1", Some(vec![stamp.into()]))?.to_array()?;
+		let rows: Vec<BackupRow> = self.sql.exec("SELECT stamp, kind, size, entries, created_at, missing FROM backups WHERE stamp = ?1", Some(vec![stamp.into()]))?.to_array()?;
 		// The manifest row only — the router streams the bytes (routes.rs ›
 		// backup_download). This used to download the whole .gbak into the
 		// DO's memory just to have the router discard it.
@@ -238,6 +308,7 @@ struct BackupRow {
 	size: i64,
 	entries: i64,
 	created_at: String,
+	missing: Option<i64>,
 }
 
 fn base64_of(b: &[u8]) -> String {
@@ -316,9 +387,17 @@ impl GoraniMemberDO {
 				self.contributor_add(&id, actor).await?;
 			}
 		}
+		let mut skipped: Vec<serde_json::Value> = Vec::new();
 		if let Some(versions) = body.get("versions").and_then(|v| v.as_array()) {
 			for v in versions {
 				let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+				// The backup recorded this object as missing when it ran (O9):
+				// there are no bytes to restore — say so, never mint an empty
+				// object for it.
+				if v.get("missing").and_then(|m| m.as_bool()) == Some(true) {
+					skipped.push(serde_json::json!({ "file": get("file"), "version": v.get("version"), "reason": "missing when the backup ran" }));
+					continue;
+				}
 				let Some(file) = get("file") else { continue };
 				let file_for_key = file.clone();
 				let Some(ck) = get("key") else { continue };
@@ -375,11 +454,63 @@ impl GoraniMemberDO {
 			self.sql.exec("INSERT INTO files_secrets (v) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM files_secrets)", Some(vec![sealed.into()]))?;
 		}
 		self.audit(actor, "backup.restore", "restore", None, Some(&format!("objects: {}", objects.len()))).await?;
-		Ok(Response::from_json(&serde_json::json!({ "objects": objects.into_iter().map(|(r, k)| serde_json::json!({ "ref": r, "objectKey": k })).collect::<Vec<_>>() }))?)
+		Ok(Response::from_json(&serde_json::json!({ "objects": objects.into_iter().map(|(r, k)| serde_json::json!({ "ref": r, "objectKey": k })).collect::<Vec<_>>(), "skipped": skipped }))?)
 	}
 }
 
 #[derive(serde::Deserialize)]
 struct ExistingObject {
 	object_key: String,
+}
+
+/// The .gbak's multipart upload: parts of at least `PART` bytes, the last
+/// one any size (S3, MinIO and R2 alike). At 8 MiB × 10 000 parts a single
+/// container tops out near 78 GiB — the honest ceiling of a copy-everything
+/// backup inside one isolate; beyond it, backups become manifests of object
+/// references (docs/DECISIONS.md › D12).
+struct PartSink<'a> {
+	env: &'a worker::Env,
+	key: String,
+	upload_id: String,
+	parts: Vec<(u32, String)>,
+	size: u64,
+}
+
+impl<'a> PartSink<'a> {
+	async fn start(env: &'a worker::Env, key: &str) -> Result<Self> {
+		let upload_id = crate::s3::multipart_init(env, key).await?;
+		Ok(Self { env, key: key.to_string(), upload_id, parts: Vec::new(), size: 0 })
+	}
+
+	/// Ship a part once the buffer holds enough for one.
+	async fn drain(&mut self, out: &mut Vec<u8>) -> Result<()> {
+		if out.len() >= PART {
+			self.ship(std::mem::take(out)).await?;
+		}
+		Ok(())
+	}
+
+	async fn ship(&mut self, bytes: Vec<u8>) -> Result<()> {
+		let n = self.parts.len() as u32 + 1;
+		if n > 10_000 {
+			return Err(worker::Error::RustError("backup: more than 10 000 parts — the store is past what one container can hold".into()));
+		}
+		self.size += bytes.len() as u64;
+		let etag = crate::s3::multipart_part(self.env, &self.key, &self.upload_id, n, bytes).await?;
+		self.parts.push((n, etag));
+		Ok(())
+	}
+
+	/// The last part (any size — possibly the only one), then complete.
+	async fn finish(&mut self, out: Vec<u8>) -> Result<u64> {
+		self.ship(out).await?;
+		crate::s3::multipart_complete(self.env, &self.key, &self.upload_id, &self.parts).await?;
+		Ok(self.size)
+	}
+
+	/// Free the parts of a run that failed (best effort: the housekeeping's
+	/// stale-upload sweep cannot see this upload — it has no bookkeeping row).
+	async fn abort(&self) {
+		let _ = crate::s3::multipart_abort(self.env, &self.key, &self.upload_id).await;
+	}
 }

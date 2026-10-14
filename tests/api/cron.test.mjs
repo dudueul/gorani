@@ -10,10 +10,13 @@
  *   9 backup manifests → the pass prunes to the newest 7 (rows + S3 objects)
  *   every member's audit gains a `cron.pass` line — even members who never
  *   unlocked a browser (the DO exists to be maintained)
+ *   (commit 25, O10) storage refuses the deletes → the rows still go, the
+ *   object keys wait in the deletion outbox (not orphaned), the pass is
+ *   reported failed; storage recovers → the next pass finishes the job
  */
 
 import assert from "node:assert/strict";
-import { suiteDev, api } from "./_dev.mjs";
+import { suiteDev, api, stubFault } from "./_dev.mjs";
 import { generateHybridKey, newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
@@ -80,6 +83,11 @@ try {
 	const stamps = new Set(after.json.map((b) => b.stamp));
 	assert.equal(stamps.size, 7);
 	assert.ok(!before.json.slice(-2).some((b) => stamps.has(b.stamp)), "the oldest two were the pruned ones");
+	// …and their OBJECTS are gone from storage, not just their rows.
+	for (const b of before.json.slice(-2)) {
+		assert.equal((await fetch(`${dev.s3}/backups/${b.stamp}.gbak`)).status, 404, `backups/${b.stamp}.gbak deleted`);
+	}
+	const fire = () => fetch(`${dev.base}/cdn-cgi/local/scheduled?cron=${encodeURIComponent("17 3 * * *")}`);
 
 	// ── 2. The audit trail: the system actor is visible and honest ──────
 	const audit = await api(dev.base, "GET", "/api/v1/members/jinu/audit", { email: "mom@family.test" });
@@ -93,7 +101,30 @@ try {
 	const soraAudit = await api(dev.base, "GET", "/api/v1/members/sora/audit", { email: "mom@family.test" });
 	assert.ok(soraAudit.json.some((a) => a.actor === "cron" && a.action === "cron.pass"), `sora's DO was maintained too: ${JSON.stringify(soraAudit.json).slice(0, 200)}`);
 
-	console.log("ok  api:cron — nightly pass: housekeeping + backup prune, fan-out over the registry, cron audit trail");
+	// ── 4. O10: storage refuses the deletes ─────────────────────────────
+	// Before commit 25 the rows went, the S3 deletes failed silently
+	// (`let _ =`), and the objects were orphaned forever — nothing pointed at
+	// them any more. Now the keys wait in the outbox and the pass fails.
+	for (let i = 0; i < 2; i++) assert.equal((await api(dev.base, "POST", "/api/v1/members/jinu/backup/run", { email: "jinu@family.test", body: {} })).status, 200);
+	const nine = (await api(dev.base, "GET", "/api/v1/members/jinu/backups", { email: "jinu@family.test" })).json;
+	assert.equal(nine.length, 9);
+	await stubFault(dev, { method: "DELETE", prefix: "backups/", status: 503, count: 100 });
+	assert.equal((await fire()).status, 200);
+	assert.equal((await api(dev.base, "GET", "/api/v1/members/jinu/backups", { email: "jinu@family.test" })).json.length, 7, "the manifest rows are pruned on schedule");
+	const pending = (await api(dev.base, "GET", "/api/v1/members/jinu/storage/pending", { email: "jinu@family.test" })).json.pending;
+	assert.equal(pending.length, 2, `two deletes wait in the outbox: ${JSON.stringify(pending)}`);
+	assert.ok(pending.every((p) => p.reason === "backup pruned" && p.attempts === 1 && /503/.test(p.lastError)), JSON.stringify(pending));
+	for (const p of pending) assert.equal((await fetch(`${dev.s3}/${p.key}`)).status, 200, `${p.key}: still in storage, and still known`);
+	const failedLine = (await api(dev.base, "GET", "/api/v1/members/jinu/audit", { email: "mom@family.test" })).json.find((a) => a.actor === "cron" && a.action === "cron.pass");
+	assert.match(JSON.stringify(failedLine), /deletesFailed:2/, "the audit says the pass could not finish");
+
+	// Storage recovers: the next night finishes the job.
+	await stubFault(dev, { method: "DELETE", prefix: "backups/", status: 503, count: 0 });
+	assert.equal((await fire()).status, 200);
+	assert.deepEqual((await api(dev.base, "GET", "/api/v1/members/jinu/storage/pending", { email: "jinu@family.test" })).json.pending, [], "the outbox is empty");
+	for (const p of pending) assert.equal((await fetch(`${dev.s3}/${p.key}`)).status, 404, `${p.key}: deleted on the retry`);
+
+	console.log("ok  api:cron — nightly pass: housekeeping + backup prune, fan-out over the registry, cron audit trail, the deletion outbox under a failing backend");
 } finally {
 	await dev.close();
 }

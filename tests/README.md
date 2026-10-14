@@ -2,18 +2,37 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 
-The harness grows with the code it tests; every commit is green. Runner:
-`node tests/run.mjs [group]`.
+The harness grows with the code it tests; every commit is green.
 
-| Group | Arrives | What it proves |
+```sh
+node tests/run.mjs            # everything: rust, unit, api, e2e
+node tests/run.mjs unit       # one group at a time
+node tests/run.mjs api
+```
+
+Groups:
+
+| Group | Runs | Needs |
 |---|---|---|
-| `unit:formats` | ② | Every GV* format round-trips; Rust (crates/formats) and the browser TS open each other's vectors — byte equality between languages |
-| `unit:chunked` | ③ | GC1 frames: reorder/drop/truncate fails to open |
-| `unit:family` | ④ | Parents open kids' keys; kids cannot open parents' or siblings'; rotations keep everything readable |
-| `api:s3` | ⑤ | The SigV4 adapter against a real MinIO container (put/get/range/multipart/abort) |
-| `api:files`, `api:vault`, `api:devices` | ⑥–⑧ | The Worker over miniflare: refusals of unsealed input, change feed, devices, shares |
-| `e2e:*` | ⑨+ | Playwright against `wrangler dev`: unlock, explorer, viewer, music, streaming, backups |
-| `client:*` | ⑬–⑭ | The Rust core's sync engine against the dev server, and platform smoke tests |
+| `rust` | `cargo test` on the pure crates (`gorani-formats`, `gorani-s3`) | a Rust toolchain |
+| `unit` | the browser-side modules under Node (`tests/unit/*.test.*`) | Node only |
+| `api` | the real Worker under `wrangler dev` + DOs + the S3 stub (`tests/api/*.test.*`) | wrangler; each suite gets a fresh server |
+| `e2e` | the real SPA in Playwright's chromium (`tests/e2e/*.test.*`) | `npm i -D playwright` — the suite **skips with a notice** when it is absent, so a browser-less checkout stays green |
 
-Principles (from the course): tests are part of the teaching material — each
-group's file header explains the attack or failure it exists to catch.
+Per-suite notes, the lesson each one teaches, and the house style live in
+[docs/TESTS.md](../docs/TESTS.md) — that file is the map; this one is just
+how to run it.
+
+Two details worth knowing before debugging a failure:
+
+- The api suites spawn async on purpose: the runner process owns the S3
+  stub's event loop, and a synchronous spawn would freeze it (the worker's
+  storage calls would starve — found the fun way, see commit 15).
+- workerd logs errors to observability traces, not stderr; suites that
+  need the reason query `/cdn-cgi/local/explorer/api/local/observability/query`
+  before their server exits (see `api:r2`'s failure path).
+
+Principles (from the course): tests are part of the teaching material —
+each suite's header explains the behavior it proves, walks the real path
+(no mocks of the tested layer), and asserts the refusal, not just the
+success.

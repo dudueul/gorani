@@ -1,7 +1,7 @@
 # Desktop: the native clients (Rust) — protocol and design
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
-> Status: the server side of this protocol is complete and tested (commits ⑧/⑦); the client port is the next commit.
+> Status: the protocol is implemented on both sides — the server (commits ⑦/⑧) and the Rust client core with the `gorani-sync` CLI (commit ⑬), live-proven against the real worker (the api suite `client-live`). What remains on this document: the platform shells (Windows Cloud Files API, Linux FUSE, macOS File Provider) that mount the same core.
 
 ## What the client is
 

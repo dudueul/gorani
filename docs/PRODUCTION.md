@@ -109,8 +109,6 @@ Object's SQLite size. Strategy: retention (built), the reserved
 
 ## 6. Known gaps
 
-- Password-protected share links: GS01's Argon2id path is built; the
-  packaged recipient page lands soon.
 - Worker request caps: uploads are chunked (8 MiB frames); a *restore* of
   very large backups is client-driven for the same reason.
 - The backup job buffers one container in memory — right for family scale;

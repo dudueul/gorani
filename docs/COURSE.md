@@ -34,7 +34,14 @@ The drawn version of lesson 1: [ARCHITECTURE-DEEP.md](ARCHITECTURE-DEEP.md) — 
 | 13 | Encrypted backups | crates/formats/backup.rs + worker/src/backup.rs (⑫) | GB1 containers; the key file; restore |
 | 14 | Shares and requests | GS01/GR01 + worker routes (⑪) | The fragment secret as credential; download counters |
 | 15 | Growth | worker housekeeping + docs/ARCHITECTURE.md › Growth (13) | Retention levers; the reserved GoraniFilesDO split; why not PlanetScale |
-| 16 | Native clients | clients/ (⑬–⑭, next) | docs/DESKTOP.md is the protocol contract |
+| 16 | Native clients | clients/ (⑬), docs/DESKTOP.md | The sync core + `gorani-sync`; the live suite drives the real binary |
+| 17 | Tests as teaching material | docs/TESTS.md (⑭c) | The exemplary pattern: name the behavior, walk the real path, assert the refusal |
+| 18 | Strict ownership | worker/src/files_store.rs (15) | First-uploader owner, the contributors trail, duplicate details |
+| 19 | Storage priority + the edge cache | worker/src/s3.rs + cache.rs (16/22) | R2 binding vs SigV4 at boot; span-keyed immutable entries |
+| 20 | Maintenance without an identity | worker/src/cron.rs (17) | The nightly pass; the `cron` actor; backup pruning |
+| 21 | Removing a member | docs/FAMILY.md › Removing a member (19) | The family-area rotation and why its order matters |
+| 22 | The music library | web/src/vault/music-meta.ts (21) | Tags parsed by whoever holds the plaintext; one sealed feed |
+| 23 | The product surface, watched | tests/e2e/app.test.mjs (20) | The SPA in a real browser — where four silent bugs were caught |
 
 Each lesson's commit passes `npm run typecheck`, its tests, and
 `cargo check --workspace` — try `git log --oneline` and re-read the tree at

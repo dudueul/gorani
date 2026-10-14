@@ -9,10 +9,13 @@ enough readable structure to sync and browse; object storage is any
 S3-compatible bucket (MinIO over public HTTPS). Family key hierarchy: a
 parents' master key opens the children's areas — never the reverse.
 
-**Status: commit ① (scaffold).** The build order is the lesson plan — see
-[docs/COURSE.md](docs/COURSE.md), the architecture map is in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and NOTICE lists the
-Apache-2.0-derived portions.
+**Status: built and self-proving** — 33 green commits from the scaffold
+through the vault, explorer, streaming, shares, backups, retention, native
+clients (live-tested), the family hierarchy, ownership, the R2-priority
+storage path, the nightly cron, the music library, and a browser e2e. The
+build order is the lesson plan — see [docs/COURSE.md](docs/COURSE.md), the
+architecture map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and
+NOTICE lists the Apache-2.0-derived portions.
 
 ## Stack
 
@@ -20,7 +23,7 @@ Apache-2.0-derived portions.
 |---|---|
 | Web | Lit 3, TypeScript, Tailwind v4, Vite — no framework, no SSR, Trusted Types enforced |
 | Worker | Rust (workers-rs, wasm32), Durable Object `GoraniMemberDO` (SQLite) |
-| Storage | Any S3-compatible endpoint (MinIO, B2, Wasabi, R2 S3 API) via SigV4 |
+| Storage | Priority: Cloudflare R2 via binding (no signing, no egress). Otherwise any S3-compatible endpoint (MinIO, B2, Wasabi) via SigV4 — chosen per deployment at boot |
 | Clients | Rust — Windows (Cloud Files API), Linux (FUSE), macOS (File Provider) |
 | Crypto | Hybrid post-quantum from day one: P-256 + ML-KEM-768, AES-256-GCM, Argon2id |
 

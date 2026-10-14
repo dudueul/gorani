@@ -396,3 +396,67 @@ custody, per evidence file:   custodian = the uploader, then each accepted trans
   evidence case gets an automatic intake naming its source; "Custody…" in
   both explorers shows the chain as this client verified it and offers
   the one action open to the member (accept, or hand over).
+
+## Stage 7 — export, re-verification, the SIEM, trusted time (D5.8 / D5.4 / D5.5), the design
+
+Three commits: **29h** the signed export package and re-verification;
+**29i** the SIEM feed; **29j** RFC 3161 timestamps.
+
+### 29h — the signed export, and re-verifying what is kept
+
+```text
+two leads   case.export approval (stage 6's rule: one asks, a second agrees)
+exporter    POST /cases/<id>/export { approval }  → the registry consumes it, once; audited
+            the exporter's browser: every file, every version — decrypted, re-hashed, each
+            signature, intake record and custody chain checked; the whole audit trail
+            manifest.json = { case, approval (both signatures), files, versions, hashes,
+                              records, custody, audit lines, the signers' public keys }
+            manifest.sig  = sign(stmt("gorani-export-v1", case, export id, SHA-256(manifest.json)))
+            package.zip   = manifest.json, manifest.sig, evidence/<file>/v<n>/<name>, VERIFY.txt
+anyone      tools/verify-export.mjs package.zip — Node only, no gorani code, no network
+```
+
+- **Plaintext, on purpose**: a package is for someone OUTSIDE the vault
+  (counsel, an insurer, a court). It carries the evidence decrypted, with
+  every hash a recipient can recompute with `sha256sum`, and every
+  signature verifiable with the public keys it names. Samples stay zipped
+  under "infected" inside it (stage 5).
+- **Why the export needs two people**: an export is the moment evidence
+  leaves the system's controls. The server cannot stop a grantee from
+  downloading files one by one — but only an approved, consumed export
+  produces a package bearing two leads' signatures.
+- **What the recipient decides**: whether the exporter's key is who it
+  claims — the manifest names the fingerprint, compared out of band. The
+  verifier reports every check; it trusts nothing it was not shown.
+- **Re-verification** (D5.8's second half): "Re-verify the case" re-hashes
+  every stored version against its signed hash, client-side, and records
+  the result in the case's audit (`case.reverify`, counts only). The
+  nightly pass flags evidence cases whose last re-verification is older
+  than `REVERIFY_DAYS` (default 30) — the server cannot re-hash (it has no
+  key), but it can notice nobody did.
+
+### 29i — the SIEM feed
+
+- Every line the audit DOs chain (stage 1) is also queued for the SIEM
+  when `SIEM_URL` is set; the queue drains after each append and in the
+  nightly pass, oldest first, with the chain's own hash on every event (a
+  SIEM can check continuity), retried until acknowledged.
+- Formats: `ndjson` (one JSON object per line — Elastic, Sentinel's data
+  collection endpoints, any log shipper) and `splunk-hec` (`{ "event": … }`
+  per line, `Authorization: Splunk <token>`). `SIEM_TOKEN` is a secret.
+- Sealed details never leave (they are sealed); readable fields do —
+  the same fields the audit view shows.
+
+### 29j — RFC 3161 timestamps
+
+- **What is stamped**: SHA-256 of each evidence version's SEALED hash
+  record and of each daily audit checkpoint — never the content hash
+  itself (a timestamp authority would learn the evidence's fingerprint).
+  The stamp proves the signed record existed at that time; the record
+  proves what it was.
+- The Worker asks `TSA_URL` (an RFC 3161 TimeStampReq over HTTP) after the
+  version is recorded, like the lock pass: retried until it lands, the
+  token stored beside the version.
+- Verification is the client's and the export's: parse the token
+  (CMS SignedData), check the message imprint, the TSA's signature, and
+  its certificate against a pinned TSA certificate.

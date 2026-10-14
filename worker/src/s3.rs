@@ -16,7 +16,7 @@
 //! sidecars, backup segments); the bucket is private and its keys are
 //! Worker secrets. Nothing here inspects content beyond sizes and statuses.
 
-use gorani_s3::{complete_multipart_body, sign_request, xml_val, S3Config, SignedRequest};
+use gorani_s3::{complete_multipart_body, md5, retention_xml, sign_request, xml_val, xml_vals, S3Config, SignedRequest};
 use worker::*;
 
 use crate::cache;
@@ -52,7 +52,10 @@ pub fn config(env: &Env) -> Result<S3Config> {
 	let secret = |name: &str| -> Result<String> {
 		env.secret(name).map(|v| v.to_string()).or_else(|_| var(name))
 	};
-	let endpoint = var("S3_ENDPOINT")?.trim_end_matches('/').to_string();
+	let raw = var("S3_ENDPOINT")?.trim_end_matches('/').to_string();
+	// A bare host (`s3.eu-central-1.idrivee2.com`, as provider consoles show
+	// it) means https — never http, which only `wrangler dev` may use.
+	let endpoint = if raw.contains("://") { raw } else { format!("https://{raw}") };
 	// TLS is part of the signing contract, not an option (security review,
 	// commit 23). The signer uses UNSIGNED-PAYLOAD — the body is NOT covered
 	// by the signature, only by the transport — so over plain http anyone
@@ -69,7 +72,8 @@ pub fn config(env: &Env) -> Result<S3Config> {
 		region: var("S3_REGION")?,
 		bucket: var("S3_BUCKET")?,
 		access_key: secret("S3_ACCESS_KEY_ID")?,
-		secret_key: secret("S3_SECRET_KEY")?,
+		// (`S3_SECRET_ACCESS_KEY`, the AWS-style name, is accepted too.)
+		secret_key: secret("S3_SECRET_KEY").or_else(|_| secret("S3_SECRET_ACCESS_KEY"))?,
 	})
 }
 
@@ -255,6 +259,89 @@ pub async fn delete(env: &Env, key: &str) -> Result<()> {
 	match resp.status_code() {
 		204 | 404 => Ok(()),
 		s => Err(Error::RustError(format!("S3 delete {key}: HTTP {s}"))),
+	}
+}
+
+/// Keys under a prefix (ListObjectsV2; R2's list), at most `max` — for
+/// small listings only: the audit checkpoints of one area (audit.rs). The
+/// verification reads the bucket's own word on which checkpoints exist,
+/// not the database it is checking.
+pub async fn list(env: &Env, prefix: &str, max: usize) -> Result<Vec<String>> {
+	let mut out: Vec<String> = Vec::new();
+	if let Some(bucket) = r2_bucket(env).await? {
+		let mut cursor: Option<String> = None;
+		loop {
+			let mut b = bucket.list().prefix(prefix.to_string());
+			if let Some(c) = cursor.take() {
+				b = b.cursor(c);
+			}
+			let objects = b.execute().await?;
+			out.extend(objects.objects().into_iter().map(|o| o.key()));
+			if !objects.truncated() || out.len() >= max {
+				break;
+			}
+			cursor = objects.cursor();
+			if cursor.is_none() {
+				break;
+			}
+		}
+		out.truncate(max);
+		return Ok(out);
+	}
+	let cfg = config(env)?;
+	let mut token: Option<String> = None;
+	loop {
+		let mut q = vec![("list-type".to_string(), "2".to_string()), ("prefix".to_string(), prefix.to_string())];
+		if let Some(t) = &token {
+			q.push(("continuation-token".to_string(), t.clone()));
+		}
+		let mut resp = fetch_signed(&cfg, "GET", "", &q, None, None, None).await?;
+		if resp.status_code() != 200 {
+			return Err(Error::RustError(format!("S3 list {prefix}: HTTP {}", resp.status_code())));
+		}
+		let xml = resp.text().await?;
+		out.extend(xml_vals(&xml, "Key"));
+		let truncated = xml_val(&xml, "IsTruncated").is_some_and(|t| t == "true");
+		token = xml_val(&xml, "NextContinuationToken");
+		if !truncated || token.is_none() || out.len() >= max {
+			break;
+		}
+	}
+	out.truncate(max);
+	Ok(out)
+}
+
+/// How an object's retention was applied.
+pub enum Lock {
+	/// COMPLIANCE retention set on the object itself.
+	Locked,
+	/// R2: no per-object retention through the binding — the bucket's lock
+	/// rules are the control (docs/PRODUCTION.md).
+	BucketRule,
+}
+
+/// `PUT <key>?retention`: COMPLIANCE until `until` (docs/CUSTODY.md ›
+/// Stage 3). Content-MD5 because S3 and MinIO demand an integrity check on
+/// a retention write; it is not signed (only x-amz-* headers must be).
+pub async fn put_retention(env: &Env, key: &str, until: &str) -> Result<Lock> {
+	if r2_bucket(env).await?.is_some() {
+		return Ok(Lock::BucketRule);
+	}
+	let cfg = config(env)?;
+	let body = retention_xml(until);
+	let SignedRequest { url, headers, .. } = sign_request(&cfg, "PUT", key, &[("retention".to_string(), String::new())], now_secs()).map_err(|e| Error::RustError(format!("signing: {e}")))?;
+	let wh = Headers::new();
+	for (k, v) in &headers {
+		wh.set(k, v)?;
+	}
+	use base64::Engine;
+	wh.set("Content-MD5", &base64::engine::general_purpose::STANDARD.encode(md5(&body)))?;
+	wh.set("Content-Type", "application/xml")?;
+	let req = Request::new_with_init(&url, &RequestInit { method: Method::Put, headers: wh, body: Some(body.into()), ..Default::default() })?;
+	let mut resp = Fetch::Request(req).send().await?;
+	match resp.status_code() {
+		200 | 204 => Ok(Lock::Locked),
+		s => Err(Error::RustError(format!("S3 retention {key}: HTTP {s} {}", resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()))),
 	}
 }
 

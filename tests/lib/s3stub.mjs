@@ -14,22 +14,31 @@
  *   PUT    /bucket/key?partNumber…  upload part → ETag header
  *   POST   /bucket/key?uploadId…    complete multipart (concatenate)
  *   GET    /bucket?list-type=2…     ListObjectsV2 (minimal XML)
+ *   PUT    /bucket/key?retention    Object Lock retention (commit 29c): the
+ *                                   body's Content-MD5 checked, COMPLIANCE
+ *                                   never shortened; a locked object
+ *                                   refuses DELETE (403), as a locked
+ *                                   version does in a real versioned bucket
+ *   GET    /bucket/key?retention    the retention, or 404
  *
  * And one test-only control route (commit 25), for the suites that must see
  * the Worker meet a FAILING storage backend (docs/SECURITY-REVIEW.md › O10):
  *
- *   POST   /__fault  { method, prefix, status, count }
+ *   POST   /__fault  { method, prefix, status, count, query? }
  *          the next `count` requests with that method on keys under
- *          `prefix` answer `status` instead (count 0 clears the rule)
+ *          `prefix` (and, with `query`, whose query string contains it)
+ *          answer `status` instead (count 0 clears the rule)
  *
  * Authorization headers are accepted and ignored here on purpose.
  */
 
 import http from "node:http";
+import { createHash } from "node:crypto";
 
 export function startS3Stub({ port = 0, host = "0.0.0.0" } = {}) {
 	const objects = new Map(); // key → Buffer
 	const uploads = new Map(); // uploadId → { key, parts: Map<n, Buffer> }
+	const retention = new Map(); // key → RetainUntilDate (ISO)
 	let nextUploadId = 1;
 	let faults = []; // { method, prefix, status, count }
 
@@ -48,15 +57,56 @@ export function startS3Stub({ port = 0, host = "0.0.0.0" } = {}) {
 			const q = url.searchParams;
 			if (url.pathname === "/__fault" && req.method === "POST") {
 				const rule = JSON.parse(body.toString() || "{}");
-				faults = faults.filter((f) => !(f.method === rule.method && f.prefix === rule.prefix));
+				faults = faults.filter((f) => !(f.method === rule.method && f.prefix === rule.prefix && f.query === rule.query));
 				if (rule.count > 0) faults.push(rule);
 				res.writeHead(200).end("{}");
 				return;
 			}
-			const fault = faults.find((f) => f.method === req.method && key.startsWith(f.prefix) && f.count > 0);
+			const fault = faults.find((f) => f.method === req.method && key.startsWith(f.prefix) && (f.query === undefined || url.search.includes(f.query)) && f.count > 0);
 			if (fault) {
 				fault.count--;
 				res.writeHead(fault.status).end();
+				return;
+			}
+			// Object Lock retention (COMPLIANCE).
+			if (q.has("retention")) {
+				if (req.method === "PUT") {
+					const md5 = createHash("md5").update(body).digest("base64");
+					if (req.headers["content-md5"] !== md5) {
+						res.writeHead(400, { "content-type": "application/xml" }).end("<Error><Code>InvalidDigest</Code></Error>");
+						return;
+					}
+					if (!objects.has(key)) {
+						res.writeHead(404).end();
+						return;
+					}
+					const until = /<RetainUntilDate>([^<]+)<\/RetainUntilDate>/.exec(body.toString())?.[1];
+					const mode = /<Mode>([^<]+)<\/Mode>/.exec(body.toString())?.[1];
+					if (!until || mode !== "COMPLIANCE") {
+						res.writeHead(400).end();
+						return;
+					}
+					const was = retention.get(key);
+					if (was && until < was) {
+						res.writeHead(403, { "content-type": "application/xml" }).end("<Error><Code>AccessDenied</Code><Message>a COMPLIANCE retention cannot be shortened</Message></Error>");
+						return;
+					}
+					retention.set(key, until);
+					res.writeHead(200).end();
+					return;
+				}
+				if (req.method === "GET") {
+					const until = retention.get(key);
+					if (!until) {
+						res.writeHead(404).end();
+						return;
+					}
+					res.writeHead(200, { "content-type": "application/xml" }).end(`<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>${until}</RetainUntilDate></Retention>`);
+					return;
+				}
+			}
+			if (req.method === "DELETE" && !q.has("uploadId") && retention.get(key) > new Date().toISOString()) {
+				res.writeHead(403, { "content-type": "application/xml" }).end("<Error><Code>AccessDenied</Code><Message>object is WORM protected</Message></Error>");
 				return;
 			}
 			// multipart create

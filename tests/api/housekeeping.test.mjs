@@ -3,7 +3,8 @@
 /**
  * api:housekeeping — the retention levers (the first layer of the
  * growth strategy, docs/ARCHITECTURE.md › Growth): forced clocks purge the
- * trash, dead share copies, the journal and the audit; the growth metric
+ * trash, dead share copies and the journal — and, since commit 29, NOT
+ * the audit (it moved to its chained trail, kept 7 years); the growth metric
  * (dbSize) is reported. Trash purge deletes the sealed objects from S3.
  */
 
@@ -53,7 +54,7 @@ try {
 	const stats = await api(dev.base, "GET", "/api/v1/members/jinu/vault-stats", { email: "jinu@family.test" }).catch(() => null);
 	void stats;
 
-	// Forced clocks: purge the trash NOW, prune the journal NOW, keep 2 audit lines.
+	// Forced clocks: purge the trash NOW, prune the journal NOW (auditKeep is ignored now).
 	const run = await api(dev.base, "POST", "/api/v1/members/jinu/housekeeping", {
 		email: "jinu@family.test",
 		body: { trashDays: 0, journalDays: 0, auditKeep: 2, shareDays: 0 },
@@ -69,17 +70,18 @@ try {
 	const list = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" });
 	assert.ok(list.json.files.some((f) => f.id === up2.json.id), "the kept file survives");
 
-	// The audit is capped.
+	// The audit is NOT capped any more (commit 29, D7): it lives in the
+	// area's chained trail for 7 years, and `auditKeep` is no knob at all —
+	// every line from the setup, uploads, trash and this run is still there.
 	const audit = await api(dev.base, "GET", "/api/v1/members/jinu/audit", { email: "jinu@family.test" });
-	console.error("AUDIT", JSON.stringify(run.json), JSON.stringify(audit.json.map((a) => a.action)));
-	// The run's own audit line is inserted after the prune — auditKeep + 1.
-	assert.ok(audit.json.length <= 3, `audit kept: ${audit.json.length}`);
+	assert.ok(audit.json.length > 3, `every line kept: ${audit.json.length}`);
+	assert.equal(run.json.auditPruned, 0, "housekeeping prunes no audit line");
 
 	// The journal: pruning keeps the cursor protocol intact (empty feed now).
 	const feed = await api(dev.base, "GET", "/api/v1/members/jinu/files/changes?since=0", { email: "jinu@family.test" });
 	assert.ok(feed.json.changes.length <= 1, `journal after prune: ${feed.json.changes.length}`);
 
-	console.log("ok  api:housekeeping — trash purge + S3, journal/audit bounds, dbSize metric");
+	console.log("ok  api:housekeeping — trash purge + S3, journal bounds, the audit untouched, dbSize metric");
 } finally {
 	await dev.close();
 }

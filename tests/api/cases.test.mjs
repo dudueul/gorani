@@ -40,6 +40,7 @@ import { buildTrust, certify, createIdentity, hybridDigest, pin, statements } fr
 import { opensAnything } from "../../web/src/vault/rotation.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "../lib/placed.mjs";
+import { signedHash } from "../lib/team.mjs";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -96,12 +97,13 @@ async function upload(who, fields, file) {
 	return { status: r.status, json: await r.json() };
 }
 
-/** A new sealed file in the case, uploaded by `who` holding `bundle`. */
+/** A new sealed file in the case, uploaded by `who` holding `bundle` — with
+ * `who`'s signed content hash, which an evidence case requires (29d). */
 async function putFile(who, sealer, name, text) {
 	const ck = newContentKey();
 	const f = await sealer.newFile(name, "text/plain", ck);
 	const plain = enc.encode(text);
-	const r = await upload(who, { ...f.fields, size: String(plain.length) }, await sealWith(await importContentKey(ck), plain));
+	const r = await upload(who, { ...f.fields, size: String(plain.length), hash: await signedHash(who, sealer, f.id, 1, plain) }, await sealWith(await importContentKey(ck), plain));
 	return { ...r, id: f.id, plain };
 }
 

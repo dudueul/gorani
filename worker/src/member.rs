@@ -264,6 +264,17 @@ pub const MIGRATIONS: &[&str] = &[
 		requests INTEGER NOT NULL,
 		PRIMARY KEY (actor, file_id, version, client, win)
 	)",
+	// Migration v11 (commit 29c, docs/CUSTODY.md › Stage 3, D6): when an
+	// evidence version's object got its COMPLIANCE retention. NULL until the
+	// lock lands (the lock pass retries); 'bucket-rule' on R2, whose lock is
+	// a bucket rule, not a per-object call.
+	"ALTER TABLE file_versions ADD COLUMN locked_until TEXT",
+	// Migration v12 (commit 29d, docs/CUSTODY.md › Stage 4, D5.1): the
+	// uploader's signed content hash — { sha256 of the plaintext, size,
+	// signer, signature } sealed into the place `file.hash(area, file,
+	// version)`, so the server stores a claim it can neither read nor
+	// forge. Required on evidence (files_store.rs › hash_refusal).
+	"ALTER TABLE file_versions ADD COLUMN hash_sealed TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -298,14 +309,124 @@ impl DurableObject for GoraniMemberDO {
 		if let Err(e) = &self.schema {
 			return json_error(500, &format!("member store schema: {e}"));
 		}
+		// Which area this database is (the Worker names it in
+		// `x-gorani-member`; remembered, because not every caller does — a
+		// device's token routes, the cron's knock).
+		let named = req.headers().get("x-gorani-member").ok().flatten();
 		// Errors become JSON with their message: an opaque 500 helps nobody,
 		// least of all the tests that must tell refusals from faults.
-		match self.dispatch(req).await {
+		let out = match self.dispatch(req).await {
 			Ok(r) => Ok(r),
 			Err(e) => json_error(500, &e.to_string()),
+		};
+		// Evidence versions recorded by this request (or left unlocked by an
+		// earlier one) get their write-once retention now (D6, commit 29c).
+		if let Err(e) = self.lock_pass().await {
+			worker::console_error!("gorani: evidence lock pass failed (retried next time): {e}");
 		}
+		// Ship this request's audit lines (and any a failed ship left) to the
+		// area's chained trail. Best effort: the outbox keeps what did not
+		// go, and the next request — or tonight's cron — sends it.
+		if let Some(area) = self.area(named.as_deref()) {
+			if let Err(e) = self.ship_audit(&area).await {
+				worker::console_error!("gorani: audit ship for {area} failed (kept in the outbox): {e}");
+			}
+		}
+		out
 	}
 
+}
+
+// ── Write-once evidence (commit 29c, docs/CUSTODY.md › Stage 3, D6) ─────
+
+/// What one lock pass did.
+pub(crate) struct LockReport {
+	pub locked: u64,
+	pub failed: u64,
+	pub pending: u64,
+}
+
+impl GoraniMemberDO {
+	/// Lock every evidence version whose object has no retention yet:
+	/// COMPLIANCE until its creation + EVIDENCE_RETAIN_DAYS (default 7
+	/// years). Nothing to do unless the deployment turned OBJECT_LOCK on
+	/// (a bucket created with Object Lock) and this store is evidence.
+	pub(crate) async fn lock_pass(&self) -> Result<LockReport> {
+		let none = LockReport { locked: 0, failed: 0, pending: 0 };
+		if self.env.var("OBJECT_LOCK").map(|v| v.to_string()).unwrap_or_default() != "on" || !self.is_evidence().await? {
+			return Ok(none);
+		}
+		let days: i64 = self.env.var("EVIDENCE_RETAIN_DAYS").ok().and_then(|v| v.to_string().parse().ok()).unwrap_or(2557).max(1);
+		#[derive(serde::Deserialize)]
+		struct Unlocked {
+			file_id: String,
+			version: i64,
+			object_key: String,
+			until: String,
+		}
+		let rows: Vec<Unlocked> = self
+			.sql
+			.exec(&format!("SELECT file_id, version, object_key, strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+{days} days') AS until FROM file_versions WHERE locked_until IS NULL ORDER BY created_at LIMIT 100"), None)?
+			.to_array()?;
+		let mut report = none;
+		for r in rows {
+			match crate::s3::put_retention(&self.env, &r.object_key, &r.until).await {
+				Ok(lock) => {
+					let mark = match lock {
+						crate::s3::Lock::Locked => r.until.clone(),
+						crate::s3::Lock::BucketRule => "bucket-rule".to_string(),
+					};
+					self.sql.exec("UPDATE file_versions SET locked_until = ?1 WHERE file_id = ?2 AND version = ?3", Some(vec![mark.into(), r.file_id.into(), r.version.into()]))?;
+					report.locked += 1;
+				}
+				Err(e) => {
+					worker::console_error!("gorani: lock {} failed: {e}", r.object_key);
+					report.failed += 1;
+				}
+			}
+		}
+		report.pending = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE locked_until IS NULL", None)?.one::<crate::files_store::TotalCount>()?.n as u64;
+		Ok(report)
+	}
+}
+
+// ── The audit outbox (commit 29, docs/CUSTODY.md › Stage 1) ─────────────
+//
+// `audit()` writes into the local `audit` table in the same database, in
+// the same request, as the action it records — the line exists if the
+// action did. That table is now an OUTBOX: lines leave for the area's
+// chained trail (audit.rs) and are deleted only once acknowledged.
+
+impl GoraniMemberDO {
+	/// The area's name, from this request's header (and remembered), or the
+	/// one remembered before.
+	fn area(&self, named: Option<&str>) -> Option<String> {
+		#[derive(serde::Deserialize)]
+		struct V {
+			v: String,
+		}
+		if let Some(a) = named.filter(|a| crate::area::valid_area(a)) {
+			let _ = self.sql.exec("INSERT INTO vault (k, v) VALUES ('area', ?1) ON CONFLICT(k) DO NOTHING", Some(vec![a.into()]));
+			return Some(a.to_string());
+		}
+		self.sql.exec("SELECT v FROM vault WHERE k = 'area'", None).ok()?.to_array::<V>().ok()?.into_iter().next().map(|r| r.v)
+	}
+
+	pub(crate) async fn ship_audit(&self, area: &str) -> Result<()> {
+		loop {
+			let rows: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed, details FROM audit ORDER BY id LIMIT 500", None)?.to_array()?;
+			if rows.is_empty() {
+				return Ok(());
+			}
+			let n = rows.len();
+			let lines: Vec<crate::audit::LineIn> = rows.into_iter().map(|a| crate::audit::LineIn { id: a.id, at: a.at, actor: a.actor, action: a.action, target: a.target, details: a.details, details_sealed: a.details_sealed }).collect();
+			let acked = crate::audit::ship(&self.env, area, &lines).await?;
+			self.sql.exec("DELETE FROM audit WHERE id <= ?1", Some(vec![acked.into()]))?;
+			if n < 500 {
+				return Ok(());
+			}
+		}
+	}
 }
 
 // The files operations live beside the core (worker/src/files_store.rs) —
@@ -332,11 +453,11 @@ impl GoraniMemberDO {
 				let body = req.json::<VaultPut>().await?;
 				self.vault_reroot(&actor, body).await
 			}
-			("GET", "audit") => self.get_audit().await,
+			("GET", "audit") => self.get_audit(Some(&member).filter(|m| !m.is_empty()).map(|m| m.as_str())).await,
 			("POST", "audit") => {
 				let body = req.json::<AuditPut>().await?;
 				self.audit(&actor, &body.action, &body.target, body.details_sealed.as_deref(), None).await?;
-				self.get_audit().await
+				self.get_audit(Some(&member).filter(|m| !m.is_empty()).map(|m| m.as_str())).await
 			}
 			("GET", "stats") => self.stats().await,
 			// ── Devices (worker/src/devices.rs) ──
@@ -554,21 +675,25 @@ impl GoraniMemberDO {
 		self.get_vault().await
 	}
 
-	async fn get_audit(&self) -> Result<Response> {
+	/// The newest lines: the chained trail's, after any not yet shipped
+	/// (those are listed first, with `"pending": true` — the outbox).
+	async fn get_audit(&self, area: Option<&str>) -> Result<Response> {
+		if let Some(a) = self.area(area) {
+			let _ = self.ship_audit(&a).await; // best effort; what stays is listed below
+			let pending: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed, details FROM audit ORDER BY id DESC LIMIT 200", None)?.to_array()?;
+			let mut out: Vec<serde_json::Value> = pending
+				.into_iter()
+				.map(|a| serde_json::json!({ "id": null, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "detailsSealed": a.details_sealed, "details": a.details, "pending": true }))
+				.collect();
+			out.extend(crate::audit::lines(&self.env, &a, 200).await?);
+			return Ok(Response::from_json(&out)?);
+		}
+		// An area that was never named has never shipped: its outbox is all.
 		// (`details` was missing from this SELECT until commit 25: every
 		// readable detail — retention outcomes, device names, backup counts —
 		// was written and then listed as null. Found by api:cron's O10 block.)
 		let rows: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed, details FROM audit ORDER BY id DESC LIMIT 200", None)?.to_array()?;
-		let lines: Vec<serde_json::Value> = rows
-			.into_iter()
-			.map(|a| {
-				serde_json::json!({
-					"id": a.id, "at": a.at, "actor": a.actor, "action": a.action,
-					"target": a.target, "detailsSealed": a.details_sealed, "details": a.details,
-				})
-			})
-			.collect();
-		Ok(Response::from_json(&lines)?)
+		Ok(Response::from_json(&rows.into_iter().map(|a| serde_json::json!({ "id": a.id, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "detailsSealed": a.details_sealed, "details": a.details })).collect::<Vec<_>>())?)
 	}
 
 	pub(crate) async fn audit(&self, actor: &str, action: &str, target: &str, details_sealed: Option<&str>, details: Option<&str>) -> Result<()> {
@@ -612,9 +737,13 @@ impl GoraniMemberDO {
 		let knob = |k: &str, default: i64| if dev { body.get(k).and_then(|v| v.as_i64()).unwrap_or(default) } else { default };
 		let trash_days = knob("trashDays", 30).max(0);
 		let journal_days = knob("journalDays", 180).max(0);
-		let audit_keep = knob("auditKeep", 500).max(1);
 		let share_days = knob("shareDays", 1).max(0);
 		let upload_days = knob("uploadDays", 2).max(0);
+		// D7 (commit 29b): a working area keeps a file's OLDER versions for a
+		// year; an evidence case keeps every version for its whole life (its
+		// files cannot even be trashed — files_store.rs › evidence_refusal).
+		let version_days = knob("versionDays", 365).max(0);
+		let evidence = self.is_evidence().await?;
 
 		// 1. Trash purge: sealed objects leave S3, rows leave (triggers
 		// journal the purge). Every object key goes into the deletion outbox
@@ -655,6 +784,31 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
+
+		// 1b. Version retention (D7), working areas only: versions older than
+		// the window that are NOT a file's current one. Objects into the
+		// outbox first, then the rows — the same order as the trash purge.
+		let mut n_versions_pruned = 0u64;
+		if !evidence {
+			#[derive(serde::Deserialize)]
+			struct OldVersion {
+				file_id: String,
+				version: i64,
+				object_key: String,
+			}
+			let old: Vec<OldVersion> = self
+				.sql
+				.exec(
+					&format!("SELECT v.file_id, v.version, v.object_key FROM file_versions v JOIN files f ON f.id = v.file_id WHERE v.version < f.version AND v.created_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{version_days} days')"),
+					None,
+				)?
+				.to_array()?;
+			for v in &old {
+				purged_objects.push(v.object_key.clone());
+				self.enqueue_delete(&v.object_key, None, "version retention")?;
+				n_versions_pruned += self.sql.exec("DELETE FROM file_versions WHERE file_id = ?1 AND version = ?2", Some(vec![v.file_id.clone().into(), v.version.into()]))?.rows_written() as u64;
+			}
+		}
 
 		// 2. Dead share copies: revoked or expired past the grace window.
 		let dead_shares: Vec<ShareObjRow> = self
@@ -711,13 +865,11 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
-		let audit_pruned = self
-			.sql
-			.exec(
-				&format!("DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT {audit_keep})"),
-				None,
-			)?
-			.rows_written();
+		// (The audit is no longer pruned here: since commit 29 it lives in the
+		// area's chained trail, kept 7 years with no line cap (D7) — the local
+		// table is only the outbox, and its lines leave when acknowledged.
+		// Pruning it here would delete lines before they were chained.)
+		let audit_pruned = 0;
 		// The read log keeps as long as the change journal (O14).
 		self.sql.exec(&format!("DELETE FROM read_log WHERE last_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{journal_days} days')"), None)?;
 		// Share download tokens: expired, or of a share that is gone (O12).
@@ -726,10 +878,10 @@ impl GoraniMemberDO {
 		// 4. Drain the outbox — this pass's keys and any earlier failures.
 		let drained = self.drain_deletes().await?;
 		if !purged_objects.is_empty() || n_files_purged + n_shares_purged > 0 || drained.failed > 0 {
-			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned},deleted:{},deletesPending:{}", drained.done, drained.pending))).await?;
+			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},versions:{n_versions_pruned},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned},deleted:{},deletesPending:{}", drained.done, drained.pending))).await?;
 		}
 		Ok(Response::from_json(&serde_json::json!({
-			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged,
+			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged, "versionsPruned": n_versions_pruned, "evidence": evidence,
 			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": drained.done,
 			"uploadsAborted": stale_uploads.len(), "deletesFailed": drained.failed, "deletesPending": drained.pending,
 		}))?)
@@ -810,9 +962,12 @@ impl GoraniMemberDO {
 		let house: serde_json::Value = house.json().await?;
 		let failed = house.get("deletesFailed").and_then(|v| v.as_u64()).unwrap_or(0);
 		let pending = house.get("deletesPending").and_then(|v| v.as_u64()).unwrap_or(0);
-		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending}"))).await?;
-		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending });
-		if failed > 0 {
+		// Evidence still without its write-once retention: a failure the pass
+		// reports (503), like a delete storage refused — never silence.
+		let locks = self.lock_pass().await?;
+		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending},locksFailed:{},locksPending:{}", locks.failed, locks.pending))).await?;
+		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending });
+		if failed > 0 || locks.failed > 0 {
 			return Ok(Response::from_json(&body)?.with_status(503));
 		}
 		Ok(Response::from_json(&body)?)

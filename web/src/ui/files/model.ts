@@ -29,6 +29,8 @@ import { areaPath } from "../../lib/area.ts";
 import { kindOf, type FileKind } from "./icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
+import type { Signer, Trust } from "../../vault/identity.ts";
+import { checkContentHash, describeHashCheck, sha256Stream, signContentHash, type HashCheck } from "../../vault/content-hash.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
 
 /** What a name that does not open in its place is shown as (O6). */
@@ -92,8 +94,10 @@ export interface FilesBridge {
 	storePrivate(): Promise<VaultPrivateKey>;
 	/** `version`: which version the bytes are (the `x-gorani-version` header) —
 	 * the place the content key opens from. */
-	fetchObject(memberId: string, id: string, version: number | undefined, range?: [number, number]): Promise<{ body: Uint8Array; ck: string; chunk: number | null; version: number }>;
-	fetchObjectStream(memberId: string, id: string, version: number | undefined, sink: (plain: Uint8Array) => Promise<void> | void): Promise<void>;
+	/** `hash`: the version's signed content hash, still sealed (the
+	 * `x-gorani-hash` header — commit 29d), or null when it has none. */
+	fetchObject(memberId: string, id: string, version: number | undefined, range?: [number, number]): Promise<{ body: Uint8Array; ck: string; chunk: number | null; version: number; hash: string | null }>;
+	fetchObjectStream(memberId: string, id: string, version: number | undefined, sink: (plain: Uint8Array) => Promise<void> | void): Promise<{ version: number; hash: string | null }>;
 	putWhole(memberId: string, fields: Record<string, string>, sealed: Uint8Array): Promise<void>;
 	/** Headers that identify this client to the API beyond its cookies (the
 	 * dev server's identity header; nothing in production) — for fetches
@@ -102,6 +106,12 @@ export interface FilesBridge {
 	putMultipart(memberId: string, fields: Record<string, string>, sealed: Uint8Array, chunk: number): Promise<void>;
 	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
 	toast(message: string): void;
+	/** The member's identity (commit 29d, docs/CUSTODY.md › stage 4): the
+	 * signer that vouches for what they upload, and the trust that checks
+	 * what others did. Null until the team context is open — the member's
+	 * own area works without it; an evidence case refuses an unsigned
+	 * upload. Optional, so a test bridge may leave it out. */
+	identity?(): { signer: Signer; trust: Trust } | null;
 }
 
 export type DuplicateAnswer = "skip" | "keep" | "version" | null;
@@ -377,7 +387,10 @@ export class FilesModel {
 		const folderId = this.state.get().folderId;
 		for (const file of files) {
 			const plain = new Uint8Array(await file.arrayBuffer());
-			const tag = await this.fingerprint(plain);
+			// One SHA-256, two uses: the duplicate tag (keyed, below) and the
+			// signed content hash (uploadOne).
+			const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", plain as BufferSource));
+			const tag = await this.fingerprint(digest);
 			// The duplicate check: same size on the server, compare tags locally.
 			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${plain.length}`);
 			const twins = same.files.filter((x) => x.tag && x.tag === tag);
@@ -392,12 +405,12 @@ export class FilesModel {
 				// nothing new. (A dead `asVersion` parameter used to pretend
 				// otherwise; removed in commit 25.)
 			}
-			await this.uploadOne(file, plain, tag, folderId);
+			await this.uploadOne(file, plain, tag, folderId, hexOf(digest));
 		}
 		await this.refresh();
 	}
 
-	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null): Promise<void> {
+	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null, sha256: string): Promise<void> {
 		// The file id first: the name, the type and the content key are sealed
 		// INTO places that name it (O6) — so the server cannot move them to
 		// another file, and could not have made them up (it lacks the PSK).
@@ -418,12 +431,24 @@ export class FilesModel {
 			const meta = parseAudioMeta(plain);
 			if (meta) mmeta = await sealPlacedText(priv, places.fileMusic(this.memberId, id, 1), JSON.stringify(meta));
 		}
-		if (plain.length > 48 * 1024 * 1024) {
-			const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
-			await this.bridge.putMultipart(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), chunk: String(DEFAULT_CHUNK), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}) }, chunked, DEFAULT_CHUNK);
-		} else {
-			const sealed = await sealWith(key, plain);
-			await this.bridge.putWhole(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}) }, sealed);
+		// The uploader's signature over SHA-256 of the plaintext (commit 29d,
+		// content-hash.ts) — sealed into version 1's place. Sent whenever the
+		// member's identity is open; an evidence case refuses an upload
+		// without one, so there the missing identity is said plainly.
+		const me = this.bridge.identity?.() ?? null;
+		const hash = me ? await signContentHash(me.signer, priv, this.memberId, id, 1, sha256, plain.length) : undefined;
+		const extra = { ...(mmeta ? { mmeta } : {}), ...(hash ? { hash } : {}), ...(folderId ? { folder_id: folderId } : {}) };
+		try {
+			if (plain.length > 48 * 1024 * 1024) {
+				const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
+				await this.bridge.putMultipart(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), chunk: String(DEFAULT_CHUNK), tag, ...extra }, chunked, DEFAULT_CHUNK);
+			} else {
+				const sealed = await sealWith(key, plain);
+				await this.bridge.putWhole(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), tag, ...extra }, sealed);
+			}
+		} catch (e) {
+			if (!hash && /signed content hash/.test(String(e))) throw new Error("this evidence case takes only signed uploads, and your identity is not open yet — wait for the team to open (or see Team › People), then try again");
+			throw e;
 		}
 	}
 
@@ -448,11 +473,13 @@ export class FilesModel {
 		return out.sort((x, y) => (x.artist ?? "").localeCompare(y.artist ?? "") || (x.album ?? "").localeCompare(y.album ?? "") || (x.title ?? "").localeCompare(y.title ?? ""));
 	}
 
-	private async fingerprint(plain: Uint8Array): Promise<string> {
+	/** The duplicate tag: HMAC(fp, SHA-256(plaintext)) — keyed, so the server
+	 * cannot compare it with a hash it knows. Takes the digest, which the
+	 * upload also signs. */
+	private async fingerprint(digest: Uint8Array): Promise<string> {
 		await this.ensureSecrets();
 		const { fp } = this.secrets!;
 		const subtle = crypto.subtle;
-		const digest = new Uint8Array(await subtle.digest("SHA-256", plain as BufferSource));
 		const hmac = await subtle.importKey("raw", fp as BufferSource, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
 		const sig = new Uint8Array(await subtle.sign("HMAC", hmac, digest as BufferSource));
 		return [...sig].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -484,9 +511,16 @@ export class FilesModel {
 	 * collected and saved as one Blob; a Blob of parts is not a copy.) */
 	async download(id: string, name: string): Promise<void> {
 		const parts: Uint8Array[] = [];
-		await this.openBytes(id, undefined, (plain) => {
+		// The signed content hash is checked on the way (commit 29d): the
+		// bytes pass through SHA-256 as they are collected, frame by frame.
+		const h = await sha256Stream();
+		let size = 0;
+		const served = await this.openBytes(id, undefined, (plain) => {
 			parts.push(plain);
+			h.update(plain);
+			size += plain.length;
 		});
+		const check = await this.checkHash(id, served, { sha256: h.hex(), size });
 		// The save itself is browser-only (the Node test collects bytes).
 		if (typeof document !== "undefined") {
 			const url = blobURL(new Blob(parts as BlobPart[], { type: "application/octet-stream" }));
@@ -496,26 +530,58 @@ export class FilesModel {
 			a.click();
 			setTimeout(() => revokeBlobURL(url), 5000);
 		}
-		this.bridge.toast(`Downloaded “${name}”`);
+		this.bridge.toast(check.status === "unsigned" ? `Downloaded “${name}”` : `Downloaded “${name}” — ${describeHashCheck(check)}`);
 	}
 
-	/** Open + decrypt; chunked objects stream frame by frame (never whole). */
-	async openBytes(id: string, version: number | undefined, sink: (plain: Uint8Array) => Promise<void> | void): Promise<void> {
+	/**
+	 * Verify a version's content against its uploader's signature: open it,
+	 * hash what decrypted, check the record (content-hash.ts). Reads every
+	 * byte — the claim is about all of them.
+	 */
+	async verify(id: string, version?: number): Promise<HashCheck> {
+		const h = await sha256Stream();
+		let size = 0;
+		const served = await this.openBytes(id, version, (plain) => {
+			h.update(plain);
+			size += plain.length;
+		});
+		return this.checkHash(id, served, { sha256: h.hex(), size });
+	}
+
+	/** `verify`, said to the person (the explorers' "Verify signature"). */
+	async verifyAndReport(id: string): Promise<HashCheck | null> {
+		const name = this.names.get(id) ?? id;
+		try {
+			const check = await this.verify(id);
+			this.bridge.toast(`“${name}”: ${describeHashCheck(check)}`);
+			return check;
+		} catch (e) {
+			this.bridge.toast(`“${name}”: could not verify — ${e instanceof Error ? e.message : String(e)}`);
+			return null;
+		}
+	}
+
+	private async checkHash(id: string, served: { version: number; hash: string | null }, actual: { sha256: string; size: number }): Promise<HashCheck> {
+		const me = this.bridge.identity?.() ?? null;
+		return checkContentHash(await this.bridge.storePrivate(), me?.trust ?? null, this.memberId, id, served.version, served.hash, actual);
+	}
+
+	/** Open + decrypt; chunked objects stream frame by frame (never whole).
+	 * Returns which version the bytes were and its sealed content hash. */
+	async openBytes(id: string, version: number | undefined, sink: (plain: Uint8Array) => Promise<void> | void): Promise<{ version: number; hash: string | null }> {
 		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) throw new Error("the file's key was not found");
 		const chunk = meta.chunk;
-		if (chunk && chunk > 0) {
-			await this.bridge.fetchObjectStream(this.memberId, id, version, sink);
-			return;
-		}
-		const { body, ck, version: served } = await this.bridge.fetchObject(this.memberId, id, version);
+		if (chunk && chunk > 0) return this.bridge.fetchObjectStream(this.memberId, id, version, sink);
+		const { body, ck, version: served, hash } = await this.bridge.fetchObject(this.memberId, id, version);
 		// The key opens only from the place of the version the bytes ARE (and,
 		// asked for a version, it must be that one).
 		if (version !== undefined && served !== version) throw new Error("the server answered with another version");
 		const priv = await this.bridge.storePrivate();
 		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, served), ck);
 		await sink(await openWith(key, body));
+		return { version: served, hash };
 	}
 
 	/** A decrypted slice for previews (first bytes only; nothing stored). */
@@ -599,12 +665,19 @@ export class FilesModel {
 		// file with a new content key — the original's history is untouched).
 		for (const id of clip.files) {
 			const plainParts: Uint8Array[] = [];
-			await this.openBytes(id, undefined, async (plain) => {
+			const served = await this.openBytes(id, undefined, async (plain) => {
 				plainParts.push(plain);
 			});
 			const plain = concat(plainParts);
 			const name = this.names.get(id) ?? "copy";
-			await this.uploadOne(new File([plain as BlobPart], copyName(name)), plain, await this.fingerprint(plain), folderId);
+			const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", plain as BufferSource));
+			// The copy is signed by whoever makes it — so a source whose own
+			// signature FAILS is not copied: that would launder altered bytes
+			// under a new, valid signature. (Unsigned or merely unverified
+			// sources copy; the copy says who vouches for it now.)
+			const check = await this.checkHash(id, served, { sha256: hexOf(digest), size: plain.length });
+			if (check.status === "mismatch" || check.status === "invalid") throw new Error(`not copying “${name}”: ${describeHashCheck(check)}`);
+			await this.uploadOne(new File([plain as BlobPart], copyName(name)), plain, await this.fingerprint(digest), folderId, hexOf(digest));
 		}
 		await this.refresh();
 		this.bridge.toast(`Duplicated ${clip.files.length} file${clip.files.length > 1 ? "s" : ""}`);
@@ -718,4 +791,9 @@ export function concat(parts: Uint8Array[]): Uint8Array {
 		at += p.length;
 	}
 	return out;
+}
+
+/** Lowercase hex of a digest. */
+function hexOf(bytes: Uint8Array): string {
+	return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

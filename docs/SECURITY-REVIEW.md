@@ -183,7 +183,9 @@ Proven, both directions and end to end:
 - `unit:family`: after a member leaves, a value they seal with the old key does not open under the new one — rotation revokes writing as well as reading.
 
 The limits, stated: GV04 proves "a holder of this store's key sealed this,
-here" — not *who* (per-member signatures over each upload are D5), and not
+here" — not *who* (per-member signatures over each upload are D5.1: since
+commit 29d each version may carry its uploader's signed content hash, and
+evidence must — `web/src/vault/content-hash.ts`, `api:hashes`), and not
 *freshness* (the server can still serve an older row; it is at least
 consistently what it claims to be).
 

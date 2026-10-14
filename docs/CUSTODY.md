@@ -21,10 +21,10 @@ rendered, delivered zipped under the industry's "infected" password).
 
 | Stage | Decision | What |
 |---|---|---|
-| 1 | D7 + D5.3 | the audit leaves the area database: an outbox ships each line to a per-area **audit Durable Object** that hash-chains it, keeps it 7 years with no line cap, and checkpoints daily to object storage; `…/audit/verify` |
-| 2 | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
-| 3 | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
-| 4 | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
+| 1 *(landed: commit 29, `api:audit`)* | D7 + D5.3 | the audit leaves the area database: an outbox ships each line to a per-area **audit Durable Object** that hash-chains it, keeps it 7 years with no line cap, and checkpoints daily to object storage; `…/audit/verify` |
+| 2 *(landed: commit 29b, `api:retention`)* | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
+| 3 *(landed: commit 29c, `api:objectlock`)* | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
+| 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
 | 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
@@ -61,3 +61,156 @@ area DO (member:<id>, case:<id>, the registry)
 - **Retention**: 7 years. Pruning older lines moves the chain's BASE
   (the hash of the last pruned line is kept), so the remaining chain still
   verifies.
+
+### Stage 1 as built
+
+- `worker/src/audit.rs` — `GoraniAuditDO`, the `canonical`/`link` pair (a
+  Rust unit test; `api:audit` recomputes the chain in JavaScript from the
+  API's lines, so the spelling is pinned across languages), checkpoints,
+  verification, the 7-year prune. `s3::list` reads the bucket's own word on
+  which checkpoints exist.
+- The outbox: `member.rs` and `family.rs` ship after every request (the
+  area's name is remembered from the Worker's `x-gorani-member`, since not
+  every caller sends it — a device token's routes, the cron's knock); a
+  read lists what is still pending first, marked `"pending": true`.
+- The housekeeping knob `auditKeep` is gone (ignored): the area database no
+  longer prunes its audit — it would delete lines before they were chained.
+- `GET …/audit/verify` for each area's audit audience; the registry's for
+  leads and auditors. Statuses per checkpoint: `ok`, `mismatch` (the chain
+  and the bucket disagree), `missing` (the bucket names lines the chain no
+  longer has), `pruned` (older than the retention).
+
+## Stage 2 — retention by kind, as built
+
+- The case's kind travels into its own store when it is opened
+  (`routes.rs › case_open` writes `{ case, kind }` into the case store's
+  settings); no route rewrites a case's settings afterwards, so the kind is
+  fixed for the case's life.
+- **Evidence** (`files_store.rs › evidence_refusal`): a file or folder is
+  never trashed — 409 — so the trash purge has nothing to purge; the
+  version retention skips the store entirely. Files still gain versions,
+  are renamed and moved, and the audit records each.
+- **Working** (members' own areas and working cases): `housekeeping`'s
+  version retention prunes versions older than the window (deployment
+  default 365 days; `versionDays` only under `GORANI_DEV`) that are not a
+  file's current version — objects into the deletion outbox first, then the
+  rows (the O10 order).
+- What stage 3 adds underneath: the evidence OBJECTS become write-once in
+  the bucket itself, so the rule holds even against a credential that
+  bypasses the Worker.
+
+## Stage 3 — write-once evidence (D6), the design
+
+```text
+evidence version recorded (upload, version, restore)
+   └─ the store's lock pass ── PUT <object>?retention (COMPLIANCE, created + EVIDENCE_RETAIN_DAYS)
+                                  ok  → file_versions.locked_until = that date
+                                  err → stays NULL; the next request / the nightly pass retries
+```
+
+- **Why after the write, not with it**: S3 can take the lock headers on the
+  PUT itself, but a multipart upload with Object Lock then needs a checksum
+  on every part and in the completion — a second upload protocol. One
+  `PutObjectRetention` after the object exists works for both paths; the
+  window between the write and the lock is one request, and a version
+  whose lock has not landed yet is visible (`locked_until` NULL) and
+  retried until it does.
+- **COMPLIANCE, not GOVERNANCE**: nobody — no Worker credential, no bucket
+  owner, no root — shortens or removes a COMPLIANCE retention before it
+  ends. That is the point (D6), and the reason it is opt-in:
+  `OBJECT_LOCK = "on"` only for a bucket created with Object Lock enabled.
+  Evidence opened while it is off is locked the moment it is turned on (the
+  pass locks every version still NULL).
+- **Content-MD5**: S3 and MinIO demand an integrity checksum on a retention
+  write. gorani computes MD5 for exactly that header (crates/s3, with the
+  RFC 1321 vectors) — an integrity check S3 asks for, never a security
+  primitive.
+- **R2** has no per-object retention through the Workers binding; its
+  bucket-lock rules (prefix `cases/`, age-based) are the equivalent, set
+  on the bucket (docs/PRODUCTION.md). The pass records `bucket-rule` for
+  such versions instead of retrying forever.
+- **Audit checkpoints** (stage 1) get the same retention, 7 years, when
+  `OBJECT_LOCK` is on.
+- **What a versioned bucket really does**: a DELETE without a version id
+  adds a delete marker — the locked version stays, recoverable, and an
+  overwrite adds a new version above it. The test stub models the part
+  that matters to gorani: a locked object cannot be deleted.
+
+### Stage 3 as built
+
+- `crates/s3`: `retention_xml` and `md5` (RFC 1321 vectors; the constant
+  table written out, not computed from `sin` — a platform's libm may round
+  differently). `worker/src/s3.rs › put_retention` (Content-MD5, unsigned;
+  R2 → `bucket-rule`).
+- `member.rs › lock_pass`: after every request to an evidence store, and in
+  the nightly pass (which fails loudly — 503 — while any lock is failing),
+  every version with `locked_until` NULL is locked until its creation +
+  `EVIDENCE_RETAIN_DAYS` (default 2557, seven years).
+- `audit.rs › checkpoint_area` locks each checkpoint for the audit's 7
+  years.
+- Opt-in: `OBJECT_LOCK = "on"` (wrangler.jsonc vars) — docs/PRODUCTION.md
+  says how to create the bucket so that it can be.
+- `tests/lib/s3stub.mjs` speaks `?retention` (checks the Content-MD5, never
+  shortens a COMPLIANCE date, refuses DELETE of a locked key) and fault
+  rules can match a query (`retention`), so a suite can fail the lock and
+  not the upload.
+
+## Stage 4 — the uploader signs what they uploaded (D5.1), the design
+
+```text
+uploader's browser:  h = SHA-256(plaintext)        (before sealing — what the evidence IS)
+                     s = sign(identity key, "gorani-content-hash-v1" ‖ area ‖ file ‖ version ‖ h ‖ size)
+                     record = { sha256: h, size, signer, signature: s }
+                     sealed into the place file.hash(area, file, version)   (GV04 — the server cannot read it)
+server:              stores it beside the version (file_versions.hash_sealed); an evidence
+                     upload WITHOUT one is refused
+any reader:          opens the record in its place, verifies the signature against an
+                     identity they trust (stage 4 of CASES.md), recomputes SHA-256 of what
+                     they decrypted, and compares
+```
+
+- **Why sealed, not readable**: a plaintext hash is a fingerprint of the
+  content — with it, the server could confirm "this case holds the file
+  with hash X" (a known document, a known sample) without the key.
+  Zero-trust means the server learns nothing it could not learn from
+  ciphertext lengths. An investigator who needs to look a hash up (a
+  malware sample in a reputation service) reads it from their own client.
+- **Why signed by a person, not the server**: the claim worth having in a
+  review is "Bo uploaded exactly these bytes" — only Bo's key can make it.
+  The record names the signer; it rides in exports (stage 7) for anyone
+  with the case key to verify independently.
+- **Where it is required**: evidence cases (the Worker refuses an upload or
+  a version without it). Elsewhere it is sent when the client can sign and
+  verified when present.
+
+### Stage 4 as built
+
+- `web/src/vault/content-hash.ts` — `signContentHash` (the uploader:
+  statement `gorani-content-hash-v1 ‖ area ‖ file ‖ version ‖ SHA-256 ‖
+  size`, signed with the identity key, the record sealed into
+  `file.hash(area, file, version)`), `checkContentHash` (the reader: open
+  in this version's place, then the signer's trust, then the key id, then
+  the signature, then the bytes) and `sha256Stream` (hash-wasm, because a
+  chunked download never holds its plaintext whole).
+- What a check reports, and why each is separate: `verified`; `unsigned`
+  (no record); `invalid` (the record does not open here — moved — or its
+  signature fails: someone holding the case key re-sealed it); `untrusted`
+  (a signer this reader never verified, or a key that is not the signer's
+  current identity — re-enrolled since); `mismatch` (a trusted signer
+  vouched for OTHER bytes). Only a trusted signer can produce a mismatch.
+- The Worker (`files_store.rs › hash_refusal`): the form field `hash` on
+  every upload path (whole, multipart completion, new version); GV04 text
+  or a 400; required in an evidence store, checked before the first write
+  (the Worker then deletes the object it already put). Stored in
+  `file_versions.hash_sealed` (migration v12); handed back with the key
+  (`files/keys`) and with the bytes (`x-gorani-hash`, any version);
+  walked by a rotation (kind `hash`) and carried by backups and restores.
+- The web app: `model.ts` signs every upload while the member's identity
+  is open (the shell passes it in when the team context opens), checks the
+  record on every download (the toast says the result), offers "Verify
+  signature" in both explorers, and refuses to COPY a file whose own check
+  fails — the copier's fresh signature would launder altered bytes.
+- Not yet: the sync client (`clients/core`) works in the member's own
+  area only, where the hash is optional; when it gains cases it must sign
+  too. A re-enrolled member's earlier signatures read as `untrusted` until
+  the signed export (stage 7) carries signers' past keys.

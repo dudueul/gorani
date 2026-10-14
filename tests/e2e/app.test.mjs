@@ -312,7 +312,9 @@ try {
 	// Mom unlocked once already (section 3), which created and registered
 	// her identity; this unlock must OPEN it (its MAC verifies under her
 	// root). Then a case, opened from the Team panel and entered through
-	// the area switcher, takes a browser upload sealed under the case key.
+	// the area switcher, takes a browser upload sealed under the case key —
+	// an EVIDENCE case, so the upload lands only if the browser signed its
+	// content hash with mom's identity (commit 29d).
 	{
 		const ctx = await guardedContext(browser, "mom@family.test");
 		const page = await ctx.newPage();
@@ -340,6 +342,7 @@ try {
 		await page.getByRole("button", { name: "Cases" }).click();
 		await page.locator('[data-test="case-id"]').fill("ir-e2e");
 		await page.locator('[data-test="case-title"]').fill("Browser case");
+		await page.locator('[data-test="case-kind"]').selectOption("evidence");
 		await page.locator('[data-test="case-open"]').click();
 		await page.locator('[data-test="case-enter-ir-e2e"]').waitFor({ timeout: 30_000 });
 		assert.ok((await page.locator('[data-test="case-ir-e2e"]').textContent()).includes("Browser case"), "the sealed title opens in the panel");
@@ -350,6 +353,8 @@ try {
 		await page.locator("text=case-note.txt").first().waitFor({ timeout: 60_000 });
 		const listed = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
 		assert.equal(listed.json.files.length, 1, "the upload landed in the CASE's store");
+		const keyed = await api(dev.base, "POST", "/api/v1/cases/ir-e2e/files/keys", { email: "mom@family.test", body: { ids: [listed.json.files[0].id] } });
+		assert.match(keyed.json.keys[listed.json.files[0].id].hash ?? "", /^GV04:/, "…carrying the browser's signed content hash, sealed (the evidence case requires it)");
 		assert.equal((await api(dev.base, "GET", "/api/v1/members/mom/files/list?folder=all", { email: "mom@family.test" })).json.files?.length ?? 0, 0, "…not in mom's own area");
 		await page.locator("text=case-note.txt").first().dblclick();
 		await page.locator("text=sealed under the case key").first().waitFor({ timeout: 30_000 });

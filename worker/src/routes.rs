@@ -347,7 +347,7 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 	Some(match (method, content) {
 		(_, ["files", "shares", ..]) => return None,
-		("GET", ["audit"] | ["reads"]) => None,
+		("GET", ["audit"] | ["reads"] | ["audit", "verify"]) => None,
 		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
@@ -368,16 +368,20 @@ async fn case_open(mut req: Request, env: Env, identity: &Identity) -> Result<Re
 	let Some(id) = body.get("id").and_then(|v| v.as_str()).filter(|i| crate::area::valid_case_id(i)).map(str::to_string) else {
 		return json_error(400, "case id: 2–40 of a–z, 0–9, dashes");
 	};
-	let created = forward_family(&env, &identity.email, "POST", "cases", Some(body)).await?;
+	let mut created = forward_family(&env, &identity.email, "POST", "cases", Some(body)).await?;
 	if created.status_code() != 200 {
 		return Ok(created);
 	}
-	let settings = serde_json::json!({ "settings": { "enabled": true, "case": id } });
+	let answer: serde_json::Value = created.json().await?;
+	// The kind travels into the case's own store (commit 29b): an evidence
+	// store refuses deletion and keeps every version without asking anyone.
+	let kind = answer.get("kind").and_then(|k| k.as_str()).unwrap_or("working");
+	let settings = serde_json::json!({ "settings": { "enabled": true, "case": id, "kind": kind } });
 	let stored = forward_member(&env, &format!("case:{id}"), "PUT", "vault", Some(settings), identity.email.clone()).await?;
 	if stored.status_code() >= 300 {
 		return Ok(stored);
 	}
-	Ok(created)
+	Response::from_json(&answer)
 }
 
 /// The member routes — a member's own area, or (rewritten by route_case) a
@@ -413,6 +417,10 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			forward_family(&env, &identity.email, "POST", format!("members/{id}/deactivate"), Some(serde_json::json!({}))).await
 		}
 		// ── Identities (commit 27, docs/CASES.md › Member identity keys) ──
+		("GET", ["family", "audit", "verify"]) => match actor_of(&env, &identity.email, None).await? {
+			Some(a) if a.role == "lead" || a.role == "auditor" => Response::from_json(&crate::audit::verify_area(&env, "registry").await?),
+			_ => json_error(403, "the registry's audit is verified by leads and auditors"),
+		},
 		("GET", ["family", "identities"]) => forward_family(&env, &identity.email, "GET", "identities", None).await,
 		("PUT", ["family", "identity"]) => {
 			let body = req.json::<serde_json::Value>().await?;
@@ -461,6 +469,12 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 				let body = req.json::<serde_json::Value>().await?;
 				forward_member(&env, id, "PUT", "vault", Some(body), actor.email).await
 			}
+			Err(resp) => Ok(resp),
+		},
+		// The trail verified (commit 29): the chain recomputed, every
+		// checkpoint the bucket holds compared — the same audience as the audit.
+		("GET", ["members", id, "audit", "verify"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(_) => Response::from_json(&crate::audit::verify_area(&env, id).await?),
 			Err(resp) => Ok(resp),
 		},
 		("GET", ["members", id, "audit"]) => match audit_ctx(&env, &identity, id).await {
@@ -769,7 +783,8 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	let form = req.form_data().await?;
 	// The known text fields; FormData has no iteration in workers-rs, so we
 	// ask for each by name (the upload contract is fixed anyway).
-	const KNOWN: [&str; 12] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta"];
+	// (`hash`: the uploader's signed content hash, sealed — commit 29d.)
+	const KNOWN: [&str; 13] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -849,6 +864,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"hash": form.fields.get("hash"),
 		"objectKey": object_key,
 		"bytesSealed": true,
 		"owner": actor.id,
@@ -886,6 +902,7 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"hash": form.fields.get("hash"),
 		"objectKey": object_key,
 	});
 	let resp = forward_member(&env, member_id, "POST", "files/versions", Some(body), &actor.email).await?;
@@ -1016,6 +1033,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"baseVersion": form.fields.get("base_version").and_then(|s| s.parse::<u64>().ok()),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"hash": form.fields.get("hash"),
 		"key": form.fields.get("key"),
 		// The Worker's attestation: the object added up to its declared size
 		// (size + frames × 28). GC01 frames carry no magic — their sealing is
@@ -1135,6 +1153,14 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 		if chunk > 0 {
 			headers.set("x-gorani-chunk", &chunk.to_string())?;
 		}
+	}
+	// The uploader's signed content hash (commit 29d, D5.1), sealed into
+	// this version's place: the reader opens it, checks the signature, and
+	// compares it with SHA-256 of what it decrypted. Like the key above,
+	// the server hands back a value it cannot read — and one moved here
+	// from another version does not open.
+	if let Some(h) = meta.get("hash").and_then(|x| x.as_str()) {
+		headers.set("x-gorani-hash", h)?;
 	}
 	if let Some(len) = s3_resp.headers().get("Content-Length")? {
 		headers.set("Content-Length", &len)?;

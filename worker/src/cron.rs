@@ -61,6 +61,7 @@ pub async fn run(env: Env) -> Result<()> {
 		let stub = namespace.id_from_name(&crate::area::do_name(&member))?.get_stub()?;
 		let headers = Headers::new();
 		headers.set("x-gorani-actor", "cron")?;
+		headers.set("x-gorani-member", &member)?;
 		let req = Request::new_with_init(
 			"https://do.internal/cron",
 			&RequestInit { method: Method::Post, headers, body: Some(serde_json::json!({}).to_string().into()), ..Default::default() },
@@ -73,6 +74,17 @@ pub async fn run(env: Env) -> Result<()> {
 				failures.push(format!("{member}: HTTP {status} {}", body.chars().take(300).collect::<String>()));
 			}
 			Err(e) => failures.push(format!("{member}: {e}")),
+		}
+	}
+	// Each area's audit trail, and the registry's: today's checkpoint to the
+	// bucket, then the 7-year retention (commit 29, docs/CUSTODY.md). After
+	// the passes above, so the checkpoint covers what they shipped.
+	for area in areas(&env).await?.into_iter().chain(std::iter::once("registry".to_string())) {
+		if let Err(e) = crate::audit::checkpoint_area(&env, &area).await {
+			failures.push(format!("{area}: audit checkpoint: {e}"));
+		}
+		if let Err(e) = crate::audit::prune_area(&env, &area).await {
+			failures.push(format!("{area}: audit retention: {e}"));
 		}
 	}
 	if failures.is_empty() {

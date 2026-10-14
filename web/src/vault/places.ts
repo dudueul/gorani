@@ -24,6 +24,7 @@
  * | `file.key` | member | file id | n | version n's content key |
  * | `file.type` | member | file id | n | version n's MIME type |
  * | `file.music` | member | file id | n | version n's tag summary |
+ * | `file.hash` | member | file id | n | version n's signed content hash (content-hash.ts) |
  * | `folder.name` | member | folder id | — | the folder's name |
  * | `share.name` | member | share id | — | the owner's copy of a link's name |
  * | `store.secrets` | member | — | — | fingerprint + index keys |
@@ -57,6 +58,7 @@ export const places = {
 	fileKey: (store: string, file: string, version: number) => place("file.key", store, file, version),
 	fileType: (store: string, file: string, version: number) => place("file.type", store, file, version),
 	fileMusic: (store: string, file: string, version: number) => place("file.music", store, file, version),
+	fileHash: (store: string, file: string, version: number) => place("file.hash", store, file, version),
 	folderName: (store: string, folder: string) => place("folder.name", store, folder),
 	shareName: (store: string, share: string) => place("share.name", store, share),
 	storeSecrets: (store: string) => place("store.secrets", store, ""),

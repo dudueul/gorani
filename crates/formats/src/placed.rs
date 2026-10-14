@@ -2,8 +2,9 @@
 
 //! GV04 — placed, store-authenticated sealing (commit 25,
 //! docs/SECURITY-REVIEW.md › O6). Everything a files store keeps sealed —
-//! file names, each version's content key and type, music tags, folder
-//! names, share names, the store's secrets — is GV04. The TypeScript twin
+//! file names, each version's content key, type and signed content hash,
+//! music tags, folder names, share names, the store's secrets — is GV04.
+//! The TypeScript twin
 //! is `web/src/vault/vault-crypto.ts › sealPlaced` + `places.ts`.
 //!
 //! # The two attacks it closes
@@ -99,6 +100,10 @@ impl Place {
 	}
 	pub fn file_music(store: &str, file: &str, version: i64) -> Self {
 		Self::new("file.music", store, file, Some(version))
+	}
+	/// Version n's signed content hash (commit 29d, docs/CUSTODY.md › stage 4).
+	pub fn file_hash(store: &str, file: &str, version: i64) -> Self {
+		Self::new("file.hash", store, file, Some(version))
 	}
 	pub fn folder_name(store: &str, folder: &str) -> Self {
 		Self::new("folder.name", store, folder, None)

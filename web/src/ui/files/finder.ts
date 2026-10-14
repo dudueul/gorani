@@ -180,6 +180,7 @@ export class GoraniFinder extends LitElement {
 					{ label: "Share…", run: () => this.openShare(id), disabled: kind === "folder" || many },
 					{ label: "Duplicate", run: () => { this.model.copy(); void this.model.paste(); }, disabled: kind === "folder" || many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
+					{ label: "Verify Signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },
 					{ separator: true, label: "" },
 					{ label: "Rename…", run: () => void this.renameSelection(), disabled: many },
 					{ label: "Move to Trash", run: () => void this.deleteSelection() },

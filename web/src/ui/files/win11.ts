@@ -207,6 +207,7 @@ export class GoraniWin11 extends LitElement {
 			: [
 					{ label: "Open", run: () => void this.openEntry(kind, id, name), disabled: many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
+					{ label: "Verify signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },
 					{ separator: true, label: "" },
 					{ label: "Cut", run: () => this.model.cut() },
 					{ label: "Copy", run: () => this.model.copy() },

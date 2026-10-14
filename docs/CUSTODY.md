@@ -287,3 +287,62 @@ any reader:          sample = the flag OR the sealed type says so
   (`api:client-live` › 4b).
 - Not yet: ZIP64 (samples over 4 GiB are refused, not zipped); the desktop
   shells (docs/DESKTOP.md) must route their downloads through the same zip.
+
+## Stage 6 — intake, custody transfers, the two-person rule (D5.6 / D5.7), the design
+
+Two commits: **29f** the two-person rule and the legal hold it releases;
+**29g** the intake record and signed custody transfers.
+
+### 29f — the two-person rule, and a legal hold
+
+```text
+requester (a manager of the case, or a lead)
+   POST /cases/<id>/approvals { id, action, signature }      s1 = sign(stmt("gorani-approval-v1", id, action, case, requester))
+second lead (not the requester)
+   POST /cases/<id>/approvals/<aid>/approve { signature }    s2 = sign(stmt("gorani-approve-v1", id, action, case, requester, approver))
+                                                              → the action runs in the same request, once
+```
+
+- **Which actions**: `case.close` for an EVIDENCE case (a working case
+  still closes with one manager), `hold.release`, and — stage 7 —
+  `case.export`. A direct `POST …/close` on an evidence case answers 409
+  and names the approval route.
+- **What the server enforces** (policy, like read-only grants): the
+  requester may request; the approver is a lead, active, and not the
+  requester; a request is approved once, executes once, and expires after
+  7 days; the requester may cancel. **What the signatures add**: who asked
+  and who agreed, verifiable by any client against its own trust — the
+  registry stores the signatures and, as everywhere since commit 27,
+  verifies none of them.
+- **Legal hold** (`POST /cases/<id>/hold`, a manager or a lead): placing a
+  hold is ONE person — adding protection never waits for a second; lifting
+  it is a `hold.release` approval. While a case is held its store refuses
+  trash (409), its housekeeping prunes no versions and purges nothing, and
+  the nightly pass does the same. The Worker tells the case store (an
+  internal call, like the kind at opening); the registry is the record.
+
+### 29g — intake and custody transfers
+
+```text
+evidence upload (version 1):  intake = { source, collector, method, collectedAt, notes }
+                              signed: stmt("gorani-intake-v1", area, file, source, collector, method, collectedAt, notes)
+                              sealed into file.intake(area, file)     — required on evidence, like the hash
+custody, per evidence file:   custodian = the uploader, then each accepted transfer's receiver
+   offer   (the custodian)    stmt("gorani-custody-offer-v1", area, file, seq, from, to, SHA-256(reason))
+   accept  (the receiver)     stmt("gorani-custody-accept-v1", area, file, seq, from, to)
+```
+
+- **The intake record** says where the item came from — the half of
+  provenance the content hash (stage 4) cannot: a disk imaged from which
+  host, by whom, with which tool, when. Sealed (it names hosts and
+  people), signed by the uploader, in its own place per file (it describes
+  the acquisition, not a version).
+- **Custody** is a chain per evidence file, kept in the case's store: one
+  pending offer at a time; only the current custodian offers, only the
+  named receiver (holding a grant on the case) accepts, both sign. The
+  reason is sealed (the case key); its digest is in the offer statement.
+  The chain verifies on any client: every link's two signatures, every
+  `from` the previous `to`.
+- **What it does not do**: custody here is a RECORD of responsibility, not
+  an access control — everyone granted on the case still reads the file.
+  That is what the read log (O14) and the grants are for.

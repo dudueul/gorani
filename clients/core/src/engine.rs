@@ -175,7 +175,16 @@ impl Engine {
 	/// An engine over `area`. A read-only reason makes every write answer
 	/// it (evidence is always read-only here; a read grant can be told).
 	pub fn new(client: Client, area: Area, accept_unverified: bool) -> Self {
-		let read_only = area.is_evidence().then(|| "an evidence case is read-only through the mount — an item needs its intake record: gorani-sync push --case … --source … --collector … --method … --collected-at …".to_string());
+		let read_grant = area.case.as_ref().and_then(|c| c.grant.as_ref()).is_some_and(|g| g.permission == "read");
+		let read_only = if area.is_evidence() {
+			Some("an evidence case is read-only through the mount — an item needs its intake record: gorani-sync push --case … --source … --collector … --method … --collected-at …".to_string())
+		} else if read_grant {
+			// (The server refuses the writes anyway; saying so at mount time
+			// beats a refusal at every save.)
+			Some("your grant on this case is read-only".to_string())
+		} else {
+			None
+		};
 		let mut nodes = BTreeMap::new();
 		nodes.insert(ROOT, Node { ino: ROOT, parent: ROOT, name: String::new(), kind: Kind::Dir, id: None, size: 0, version: 0, modified: 0, sample: false, local: false });
 		Self { client, area, nodes, by_id: HashMap::new(), next_ino: ROOT + 1, cursor: 0, listed: false, meta: HashMap::new(), cache: Vec::new(), verdicts: HashMap::new(), handles: HashMap::new(), next_fh: 1, accept_unverified, read_only }

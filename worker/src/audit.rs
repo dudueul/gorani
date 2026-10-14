@@ -141,7 +141,13 @@ impl GoraniAuditDO {
 			}
 			("GET", "lines") => {
 				let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(200).clamp(1, 1000);
-				self.list(limit)
+				// `after=<seq>`: the whole trail, oldest first, a page at a time
+				// (commit 29h: an export carries all of it). Without it: the
+				// newest `limit`, newest first (the audit view).
+				match q.get("after").and_then(|v| v.parse::<i64>().ok()) {
+					Some(after) => self.page(after, limit),
+					None => self.list(limit),
+				}
 			}
 			("GET", "verify") => {
 				let at: Vec<i64> = q.get("at").map(|v| v.split(',').filter_map(|s| s.parse().ok()).collect()).unwrap_or_default();
@@ -208,6 +214,19 @@ impl GoraniAuditDO {
 				.map(|a| serde_json::json!({ "id": a.seq, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "details": a.details, "detailsSealed": a.details_sealed, "hash": a.hash }))
 				.collect::<Vec<_>>(),
 		)
+	}
+
+	fn page(&self, after: i64, limit: i64) -> Result<Response> {
+		let rows: Vec<LineRow> = self.sql.exec("SELECT seq, at, actor, action, target, details, details_sealed, hash FROM lines WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2", Some(vec![after.into(), limit.into()]))?.to_array()?;
+		let next = (rows.len() as i64 == limit).then(|| rows.last().map(|r| r.seq)).flatten();
+		// The chain's base: what the first line links to (ZERO, or the hash
+		// of the last line a retention prune removed — stage 1).
+		let base = serde_json::json!({ "seq": self.meta("base_seq")?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0), "hash": self.meta("base_hash")?.unwrap_or_else(|| ZERO.into()) });
+		Response::from_json(&serde_json::json!({
+			"base": base,
+			"lines": rows.into_iter().map(|a| serde_json::json!({ "id": a.seq, "at": a.at, "actor": a.actor, "action": a.action, "target": a.target, "details": a.details, "detailsSealed": a.details_sealed, "hash": a.hash })).collect::<Vec<_>>(),
+			"next": next,
+		}))
 	}
 
 	/// Recompute the chain from the base. `at`: sequence numbers whose
@@ -303,6 +322,16 @@ pub(crate) async fn lines(env: &Env, area: &str, limit: i64) -> Result<Vec<serde
 	let mut resp = stub(env, area)?.fetch_with_request(req).await?;
 	if resp.status_code() != 200 {
 		return Err(Error::RustError(format!("audit lines {area}: HTTP {}", resp.status_code())));
+	}
+	resp.json().await
+}
+
+/// A page of an area's chained trail, oldest first, after `after` (commit 29h).
+pub(crate) async fn page(env: &Env, area: &str, after: i64, limit: i64) -> Result<serde_json::Value> {
+	let req = Request::new_with_init(&format!("https://do.internal/lines?after={after}&limit={limit}"), &RequestInit { method: Method::Get, ..Default::default() })?;
+	let mut resp = stub(env, area)?.fetch_with_request(req).await?;
+	if resp.status_code() != 200 {
+		return Err(Error::RustError(format!("audit page {area}: HTTP {}", resp.status_code())));
 	}
 	resp.json().await
 }

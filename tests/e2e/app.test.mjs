@@ -396,6 +396,13 @@ try {
 		assert.equal(await asked.locator('[data-test^="approve-"]').count(), 0, "no Agree for the person who asked");
 		const reqs = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/approvals", { email: "mom@family.test" });
 		assert.equal(reqs.json.approvals[0].status, "pending", "the case stays open until a second lead agrees");
+		// Re-verification (commit 29h), in the browser: both versions — the
+		// note and the sample — re-hashed against their signatures, and the
+		// run recorded where the nightly pass reads it.
+		await page.locator('[data-test="reverify-now-ir-e2e"]').click();
+		await page.locator("text=all 2 versions re-hashed and verified").first().waitFor({ timeout: 60_000 });
+		const rv = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/reverify", { email: "mom@family.test" });
+		assert.deepEqual([rv.json.overdue, rv.json.last?.checked, rv.json.last?.failed], [false, 2, 0], "the store recorded it");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
 		await ctx.close();
 	}
@@ -421,7 +428,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

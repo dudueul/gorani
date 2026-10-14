@@ -205,6 +205,13 @@ it until someone does. The lock protects versions, not the current
 pointer; `tests/api/s3-live.test.mjs` with `GORANI_LIVE_S3_LOCK=1` proves
 the version part against the real server.
 
+**Re-verification** (commit 29h): a client re-hashes an evidence case's
+files against their signatures ("Re-verify now" in Team › Cases); the
+nightly pass logs every evidence case not re-verified for `REVERIFY_DAYS`
+(a `wrangler.jsonc` var, default 30). **Exports** need a two-person
+approval and are checked by the recipient with `tools/verify-export.mjs`
+(Node only) — hand it to them with the package.
+
 ### Upgrading across commit 29 (the audit trails)
 
 `wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration

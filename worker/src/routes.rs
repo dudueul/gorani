@@ -337,6 +337,11 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 			}
 			return Response::from_json(&answer);
 		}
+		// The export (commit 29h): consumes an approved case.export, once.
+		("POST", [case, "export"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			return forward_family(&env, &identity.email, "POST", format!("case-export/{case}"), Some(body)).await;
+		}
 		("POST", [case, "hold"]) => {
 			let placed = forward_family(&env, &identity.email, "POST", format!("case-hold/{case}"), Some(serde_json::json!({}))).await?;
 			if placed.status_code() != 200 {
@@ -376,7 +381,9 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 	Some(match (method, content) {
 		(_, ["files", "shares", ..]) => return None,
-		("GET", ["audit"] | ["reads"] | ["audit", "verify"]) => None,
+		("GET", ["audit"] | ["reads"] | ["audit", "verify"] | ["audit", "lines"]) => None,
+		// Re-verifying is reading every file — and saying so (commit 29h).
+		("GET" | "POST", ["reverify"]) => Some(Need::Read),
 		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
@@ -528,6 +535,31 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			Ok(actor) => forward_member(&env, id, "GET", "audit", None, actor.email).await,
 			Err(resp) => Ok(resp),
 		},
+		// The whole chained trail, oldest first, a page at a time (commit
+		// 29h — what an export carries). The audit's audience, as above.
+		("GET", ["members", id, "audit", "lines"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(actor) => {
+				// Ship what is still in the outbox first, so the pages are whole.
+				let _ = forward_member(&env, id, "GET", "audit", None, actor.email).await?;
+				let q = crate::files_store::urlquery(req.url()?.query().unwrap_or(""));
+				let after = q.get("after").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0).max(0);
+				let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
+				Response::from_json(&crate::audit::page(&env, id, after, limit).await?)
+			}
+			Err(resp) => Ok(resp),
+		},
+		// Re-verification (commit 29h): a client re-hashed the store's
+		// evidence and reports the counts; the store records them.
+		("GET", ["members", id, "reverify"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "reverify", None, actor)).await,
+		("POST", ["members", id, "reverify"]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			let mut body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+			body["member"] = serde_json::json!(actor.id);
+			forward_member(&env, id, "POST", "reverify", Some(body), &actor.email).await
+		}
 		// A member's root PUBLIC halves — what a case manager seals a grant
 		// to (commit 26). Until stage 4's fingerprints, this is the server's
 		// word for whose key it is: the trust-on-first-use gap of O3, now

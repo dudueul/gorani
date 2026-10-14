@@ -386,6 +386,50 @@ impl GoraniMemberDO {
 	}
 }
 
+// ── Re-verification (commit 29h, docs/CUSTODY.md › Stage 7, D5.8) ───────
+
+impl GoraniMemberDO {
+	/// A client re-hashed this store's evidence: record WHO, WHEN and the
+	/// counts (the store cannot check them — it has no key; the audit line
+	/// is the record that someone did, and what they found).
+	async fn reverify_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		let n = |k: &str| body.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+		let (checked, failed) = (n("checked"), n("failed"));
+		let member = body.get("member").and_then(|v| v.as_str()).unwrap_or_default();
+		self.sql.exec(
+			"INSERT INTO vault (k, v) VALUES ('reverified', json_object('by', ?1, 'checked', ?2, 'failed', ?3, 'at', strftime('%Y-%m-%dT%H:%M:%fZ','now'))) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+			Some(vec![member.into(), (checked as i64).into(), (failed as i64).into()]),
+		)?;
+		self.audit(actor, "case.reverify", "evidence", None, Some(&format!("checked:{checked},failed:{failed}"))).await?;
+		Ok(Response::from_json(&self.reverify_state().await?)?)
+	}
+
+	/// The last re-verification, and whether one is owed: an evidence store
+	/// with files, never re-verified or last re-verified more than
+	/// REVERIFY_DAYS (default 30) ago.
+	pub(crate) async fn reverify_state(&self) -> Result<serde_json::Value> {
+		let days: i64 = self.env.var("REVERIFY_DAYS").ok().and_then(|v| v.to_string().parse().ok()).unwrap_or(30).max(1);
+		let last: Option<serde_json::Value> = self
+			.sql
+			.exec("SELECT v FROM vault WHERE k = 'reverified'", None)?
+			.to_array::<KvRow>()?
+			.into_iter()
+			.next()
+			.and_then(|r| serde_json::from_str(&r.v).ok());
+		let evidence = self.is_evidence().await?;
+		let files = self.sql.exec("SELECT COUNT(*) AS n FROM files", None)?.one::<crate::files_store::TotalCount>()?.n;
+		#[derive(serde::Deserialize)]
+		struct Old {
+			old: i64,
+		}
+		let stale = match last.as_ref().and_then(|l| l.get("at")).and_then(|a| a.as_str()) {
+			Some(at) => self.sql.exec(&format!("SELECT (?1 < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{days} days')) AS old"), Some(vec![at.into()]))?.one::<Old>()?.old != 0,
+			None => true,
+		};
+		Ok(serde_json::json!({ "last": last, "days": days, "overdue": evidence && files > 0 && stale }))
+	}
+}
+
 // ── Write-once evidence (commit 29c, docs/CUSTODY.md › Stage 3, D6) ─────
 
 /// What one lock pass did.
@@ -518,6 +562,11 @@ impl GoraniMemberDO {
 					}
 					_ => json_error(404, "custody/<file>[/<seq>/accept|cancel]"),
 				}
+			}
+			("GET", "reverify") => Response::from_json(&self.reverify_state().await?),
+			("POST", "reverify") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.reverify_put(&actor, body).await
 			}
 			("PUT", "case-hold") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -1046,8 +1095,14 @@ impl GoraniMemberDO {
 		// Evidence still without its write-once retention: a failure the pass
 		// reports (503), like a delete storage refused — never silence.
 		let locks = self.lock_pass().await?;
+		// Evidence nobody re-verified lately (commit 29h): the server cannot
+		// re-hash (it has no key) — it can notice nobody did, and say so.
+		let reverify = self.reverify_state().await?;
+		if reverify.get("overdue").and_then(|o| o.as_bool()) == Some(true) {
+			worker::console_error!("gorani: evidence store {} not re-verified for {} days or more (REVERIFY_DAYS) — a client must re-hash it", self.area(None).unwrap_or_default(), reverify["days"]);
+		}
 		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending},locksFailed:{},locksPending:{}", locks.failed, locks.pending))).await?;
-		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending });
+		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending, "locked": locks.locked, "locksFailed": locks.failed, "locksPending": locks.pending, "reverify": reverify });
 		if failed > 0 || locks.failed > 0 {
 			return Ok(Response::from_json(&body)?.with_status(503));
 		}

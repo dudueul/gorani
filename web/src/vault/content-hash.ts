@@ -103,6 +103,18 @@ function wellFormed(r: unknown): r is ContentHashRecord {
 	return !!x && x.v === 1 && typeof x.sha256 === "string" && HEX64.test(x.sha256) && Number.isSafeInteger(x.size) && (x.size as number) >= 0 && typeof x.signer === "string" && typeof x.keyId === "string" && HEX64.test(x.keyId) && typeof x.signature === "string";
 }
 
+/** Open a record in its place, without judging it (an export carries it;
+ * checkContentHash says what it is worth). Null when absent or unopenable. */
+export async function openContentHash(store: VaultPrivateKey, area: string, file: string, version: number, sealed: string | null | undefined): Promise<ContentHashRecord | null> {
+	if (!sealed) return null;
+	try {
+		const r = JSON.parse(await openPlacedText(store, places.fileHash(area, file, version), sealed));
+		return wellFormed(r) ? r : null;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * The reader's half: open the record in THIS version's place, check the
  * signature against the reader's own trust, then compare with what the

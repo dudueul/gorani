@@ -175,6 +175,10 @@ pub const MIGRATIONS: &[&str] = &[
 	)",
 	"ALTER TABLE cases ADD COLUMN hold_at TEXT",
 	"ALTER TABLE cases ADD COLUMN hold_by TEXT",
+	// Migration v7 (commit 29h, docs/CUSTODY.md › Stage 7): an approved
+	// case.export is CONSUMED by the export it allowed — once.
+	"ALTER TABLE approvals ADD COLUMN consumed_at TEXT",
+	"ALTER TABLE approvals ADD COLUMN consumed_by TEXT",
 ];
 
 /// The four roles (docs/CASES.md). (The family's parent/child were accepted
@@ -361,6 +365,10 @@ impl GoraniFamilyDO {
 			("POST", id) if id.starts_with("case-close/") => self.case_close(&actor, &id["case-close/".len()..]).await,
 			// ── The two-person rule and the legal hold (commit 29f, family/approvals.rs) ──
 			("POST", id) if id.starts_with("case-hold/") => self.case_hold(&actor, &id["case-hold/".len()..]).await,
+			("POST", id) if id.starts_with("case-export/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.case_export(&actor, &id["case-export/".len()..], body).await
+			}
 			("GET", id) if id.starts_with("case-approvals/") => self.approvals_list(&actor, &id["case-approvals/".len()..]).await,
 			("POST", id) if id.starts_with("case-approvals/") => {
 				let body = req.json::<serde_json::Value>().await?;

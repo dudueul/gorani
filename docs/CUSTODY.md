@@ -27,7 +27,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 *(landed: 29f `api:approvals`, 29g `api:custody`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
-| 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
+| 7 *(29h landed: `api:export`)* | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
 ## Stage 1 — the audit, tamper-evident
 
@@ -434,6 +434,34 @@ anyone      tools/verify-export.mjs package.zip — Node only, no gorani code, n
   nightly pass flags evidence cases whose last re-verification is older
   than `REVERIFY_DAYS` (default 30) — the server cannot re-hash (it has no
   key), but it can notice nobody did.
+
+#### 29h as built
+
+- The registry: `case.export` joins the two-person actions (approved like
+  the others; nothing runs at approval); `POST /cases/<id>/export
+  { approval }` spends it — once, within a week, run by one of the two
+  people who agreed — and audits `case.export` (migration v7:
+  `approvals.consumed_at/by`).
+- `web/src/vault/export.ts › buildExport`: walks every file and version
+  (decrypt, SHA-256, `checkContentHash`), every intake record and custody
+  chain, the whole audit trail (`GET …/audit/lines?after=` — new: oldest
+  first, a page at a time, with the chain's base), the identities named;
+  writes `manifest.json` (problems recorded, never hidden), signs it,
+  zips it with the evidence (`web/src/vault/zip.ts` — stored, now
+  multi-entry; samples nested under "infected") and `VERIFY.txt`.
+- `tools/verify-export.mjs` — a second implementation in plain Node: its
+  own zip reader and ZipCrypto, its own statement encoding, ECDSA through
+  `node:crypto`; reports every check and exits non-zero on any failure.
+- `reverifyCase` walks the same way and `POST …/reverify { checked,
+  failed }`; the store keeps the last run (`vault › reverified`) and the
+  audit line; `GET …/reverify` says whether one is overdue
+  (`REVERIFY_DAYS`, default 30), and the nightly pass logs every overdue
+  evidence store.
+- The Team panel: "Ask to export", "Export now" on an approved export for
+  the two people, "Re-verify now" with the last run's result per evidence
+  case.
+- Not yet: a package is built in memory (D12's large-file work will
+  stream it); ZIP64 (4 GiB) as everywhere.
 
 ### 29i — the SIEM feed
 

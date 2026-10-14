@@ -6,8 +6,13 @@
 //! 1. **Authenticate first** (auth.rs) — before reading a body, before
 //!    touching a DO.
 //! 2. **Member scope is resolved through the registry**: a member acts for
-//!    themselves; a **parent may act for any member** (the same one-way
-//!    hierarchy the keys give, enforced at the API layer too — docs/FAMILY.md).
+//!    their own area; a **lead may still act for any member** (the family's
+//!    parent rule, transitional until docs/CASES.md › stage 5 removes it);
+//!    an external has no own area; leads and auditors read every audit.
+//!    A **case** (`/api/v1/cases/<id>/…`, commit 26) is scoped by the
+//!    caller's grant instead — route_case checks read / write / manage once
+//!    and rewrites the request to the member routes for the area
+//!    `case:<id>` (area.rs).
 //!    The DOs re-check nothing about identity, only data rules; the routing
 //!    layer owns who-may-call-whose.
 //! 3. **Every error is JSON** `{ "error": … }` with an honest status.
@@ -55,23 +60,151 @@ struct Actor {
 /// upload paths used to make a second registry round trip just to learn
 /// the owner's id.
 async fn member_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<Actor, Response> {
+	scope_ctx(env, identity, id, false).await
+}
+
+/// The vault settings of a member: their root's public halves and sealed
+/// unlock methods. An external member has no own AREA, but they do have a
+/// ROOT — a case grant is sealed to it (commit 26) — so their own vault is
+/// theirs to set up and unlock, though no files live beside it.
+async fn vault_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<Actor, Response> {
+	scope_ctx(env, identity, id, true).await
+}
+
+async fn scope_ctx(env: &Env, identity: &Identity, id: &str, external_own_vault: bool) -> std::result::Result<Actor, Response> {
+	// A case area (`case:<id>`, commit 26): its scope is the caller's grant.
+	// The router already checked what THIS request needs (read, write,
+	// manage — route_case) and left the answer on the identity; asking the
+	// registry again would only double the round trips. (Member ids cannot
+	// hold ':', so no members/… URL reaches this branch without the router.)
+	if let Some(case) = crate::area::case_of(id) {
+		return match &identity.granted {
+			Some(g) if g.area == id => Ok(Actor { id: g.member.clone(), role: g.role.clone(), email: identity.email.clone(), target_exists: true, target_active: true }),
+			_ => case_scope(env, identity, case, Need::Read).await,
+		};
+	}
 	if !auth::valid_member_id(id) {
 		return Err(json_error_raw(400, "member id: 2–32 chars of a–z, 0–9, dashes"));
 	}
 	let actor = match actor_of(env, &identity.email, Some(id)).await {
 		Ok(Some(a)) => a,
 		// (No echo of the email: error bodies end up in logs and screenshots.)
-		Ok(None) => return Err(json_error_raw(403, "not a family member")),
+		Ok(None) => return Err(json_error_raw(403, "not a team member")),
 		Err(e) => return Err(json_error_raw(500, &e.to_string())),
 	};
 	if !actor.target_exists {
 		return Err(json_error_raw(404, "no such member"));
 	}
-	let allowed = actor.role == "parent" || (actor.id == id && actor.target_active);
+	// (Commit 26, docs/CASES.md › Roles: the four roles. A lead keeps the
+	// family parent's act-for rule until stage 5; an external member has
+	// no own area at all — their work lives in the cases they are granted.)
+	let own = actor.id == id && actor.target_active;
+	let allowed = actor.role == "lead" || (own && (actor.role != "external" || external_own_vault));
 	if allowed {
 		Ok(actor)
+	} else if actor.role == "external" {
+		Err(json_error_raw(403, "external members have no own area — only the cases they are granted"))
 	} else {
-		Err(json_error_raw(403, "children act only for themselves"))
+		Err(json_error_raw(403, "members act only for their own area"))
+	}
+}
+
+/// What a case request needs from the caller's grant.
+#[derive(Clone, Copy, PartialEq)]
+enum Need {
+	Read,
+	Write,
+	Manage,
+}
+
+/// The caller's standing on a case (docs/CASES.md › Roles): a live grant
+/// gives read / write / manage; a lead or auditor WITHOUT a grant may read
+/// the case's audit and read log only (they hold no key, so content would
+/// be ciphertext anyway — the refusal keeps it that way).
+async fn case_scope(env: &Env, identity: &Identity, case: &str, need: Need) -> std::result::Result<Actor, Response> {
+	if !crate::area::valid_case_id(case) {
+		return Err(json_error_raw(400, "case id: 2–40 of a–z, 0–9, dashes"));
+	}
+	let namespace = env.durable_object("FAMILY").map_err(|e| json_error_raw(500, &e.to_string()))?;
+	let stub = namespace.id_from_name("family").and_then(|i| i.get_stub()).map_err(|e| json_error_raw(500, &e.to_string()))?;
+	let headers = Headers::new();
+	let _ = headers.set("x-gorani-actor", &identity.email);
+	let _ = headers.set("x-gorani-case", case);
+	let request = Request::new_with_init("https://do.internal/case-access", &RequestInit { method: Method::Get, headers, ..Default::default() }).map_err(|e| json_error_raw(500, &e.to_string()))?;
+	let v: serde_json::Value = match stub.fetch_with_request(request).await {
+		Ok(mut r) => r.json().await.map_err(|e| json_error_raw(500, &e.to_string()))?,
+		Err(e) => return Err(json_error_raw(500, &e.to_string())),
+	};
+	if v.is_null() {
+		return Err(json_error_raw(403, "you are not on this case"));
+	}
+	let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+	let (role, permission) = (s("role"), s("permission"));
+	let allowed = match need {
+		Need::Read => permission != "audit",
+		Need::Write => (permission == "write" || permission == "manage") && role != "auditor",
+		Need::Manage => permission == "manage",
+	};
+	if !allowed {
+		return Err(json_error_raw(
+			403,
+			match (need, permission.as_str()) {
+				(_, "audit") => "leads and auditors read a case's audit, not its content — content needs a grant",
+				(Need::Manage, _) => "only a manager of this case may do this",
+				_ => "your grant on this case is read-only",
+			},
+		));
+	}
+	if need != Need::Read && v.get("closed").and_then(|c| c.as_bool()) == Some(true) {
+		return Err(json_error_raw(409, "the case is closed — read-only"));
+	}
+	Ok(Actor { id: s("id"), role, email: identity.email.clone(), target_exists: true, target_active: true })
+}
+
+/// A case's audit and read log: any standing on the case (a grant, or a
+/// lead's or auditor's audit view).
+async fn case_scope_audit(env: &Env, identity: &Identity, case: &str) -> std::result::Result<Actor, Response> {
+	match case_scope(env, identity, case, Need::Read).await {
+		Ok(a) => Ok(a),
+		// The one refusal Read gives a lead/auditor without a grant — the
+		// audit view is exactly what they are allowed.
+		Err(_) => {
+			let (id, role) = match actor_of(env, &identity.email, None).await {
+				Ok(Some(a)) => (a.id, a.role),
+				_ => return Err(json_error_raw(403, "you are not on this case")),
+			};
+			if role == "lead" || role == "auditor" {
+				Ok(Actor { id, role, email: identity.email.clone(), target_exists: true, target_active: true })
+			} else {
+				Err(json_error_raw(403, "you are not on this case"))
+			}
+		}
+	}
+}
+
+/// The audit and the read log of a member's area: the member, and every
+/// lead and auditor (docs/CASES.md › Roles — auditors read every audit).
+async fn audit_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<Actor, Response> {
+	// A case's audit: anyone with standing on the case (a grant, or a lead
+	// or auditor's audit view).
+	if let Some(case) = crate::area::case_of(id) {
+		return case_scope_audit(env, identity, case).await;
+	}
+	if !auth::valid_member_id(id) {
+		return Err(json_error_raw(400, "member id: 2–32 chars of a–z, 0–9, dashes"));
+	}
+	let actor = match actor_of(env, &identity.email, Some(id)).await {
+		Ok(Some(a)) => a,
+		Ok(None) => return Err(json_error_raw(403, "not a team member")),
+		Err(e) => return Err(json_error_raw(500, &e.to_string())),
+	};
+	if !actor.target_exists {
+		return Err(json_error_raw(404, "no such member"));
+	}
+	if actor.role == "lead" || actor.role == "auditor" || (actor.id == id && actor.role != "external") {
+		Ok(actor)
+	} else {
+		Err(json_error_raw(403, "a member's audit is theirs, their leads' and the auditors'"))
 	}
 }
 
@@ -118,7 +251,7 @@ fn json_error_raw(status: u16, message: &str) -> Response {
 	Response::from_json(&serde_json::json!({ "error": message })).unwrap().with_status(status)
 }
 
-pub async fn route(mut req: Request, env: Env) -> Result<Response> {
+pub async fn route(req: Request, env: Env) -> Result<Response> {
 	let path = req.path();
 	if path.starts_with("/s/") {
 		let segments: Vec<&str> = path.trim_start_matches("/s/").split('/').collect();
@@ -143,8 +276,110 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 	if let Some(bad) = segments.iter().find(|s| !auth::valid_object_id(s)) {
 		return json_error(400, &format!("bad path segment ({} chars) — ids are [A-Za-z0-9_-]", bad.len()));
 	}
+	if let Some(("cases", rest)) = segments.split_first().map(|(a, r)| (*a, r)) {
+		return route_case(req, env, identity, &method, rest).await;
+	}
+	dispatch(req, env, &identity, &method, &segments).await
+}
 
-	match (method.as_str(), segments.as_slice()) {
+/// `/api/v1/cases/…` (commit 26, docs/CASES.md › Areas and their keys).
+///
+/// Two kinds of route:
+///
+/// - **management** — open, list, grant, revoke, rotate, close: forwarded
+///   to the registry (family.rs › Cases and grants), which owns the policy;
+/// - **content** — `/cases/<id>/files/…`, `/audit`, `/reads`, backups: a
+///   case is a store exactly like a member's own (area.rs), so these are
+///   REWRITTEN to the member routes with the area `case:<id>` — after ONE
+///   check of what this request needs from the caller's grant.
+///
+/// What a case does NOT have, refused here as "no such route": devices and
+/// vault settings (a case has no root — its key lives in the grants), vault
+/// destruction (a case is closed, not destroyed), and public links (a case
+/// shares by grant; D11 decides later whether working cases get links).
+async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str, rest: &[&str]) -> Result<Response> {
+	match (method, rest) {
+		("GET", []) => return forward_family(&env, &identity.email, "GET", "cases", None).await,
+		("POST", []) => return case_open(req, env, &identity).await,
+		("PUT", [case, "grants", member]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			return forward_family(&env, &identity.email, "PUT", format!("case-grants/{case}/{member}"), Some(body)).await;
+		}
+		("DELETE", [case, "grants", member]) => return forward_family(&env, &identity.email, "DELETE", format!("case-grants/{case}/{member}"), None).await,
+		("PUT", [case, "key"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			return forward_family(&env, &identity.email, "PUT", format!("case-key/{case}"), Some(body)).await;
+		}
+		("POST", [case, "key", "done"]) => return forward_family(&env, &identity.email, "POST", format!("case-key-done/{case}"), Some(serde_json::json!({}))).await,
+		("POST", [case, "close"]) => return forward_family(&env, &identity.email, "POST", format!("case-close/{case}"), Some(serde_json::json!({}))).await,
+		_ => {}
+	}
+	let Some((case, content)) = rest.split_first() else { return json_error(404, "no such route") };
+	if !crate::area::valid_case_id(case) {
+		return json_error(400, "case id: 2–40 of a–z, 0–9, dashes");
+	}
+	let Some(need) = case_need(method, content) else {
+		return json_error(404, "no such case route — a case has files, audit, reads, storage and backups (no devices, no vault settings, no public links)");
+	};
+	let area = format!("case:{case}");
+	let identity = match need {
+		// The audit and the read log: audit_ctx decides (any standing on the
+		// case — a grant, or a lead's or auditor's audit view).
+		None => identity,
+		Some(need) => match case_scope(&env, &identity, case, need).await {
+			Ok(actor) => Identity { granted: Some(auth::Granted { area: area.clone(), member: actor.id, role: actor.role }), ..identity },
+			Err(resp) => return Ok(resp),
+		},
+	};
+	let mut segments = vec!["members", area.as_str()];
+	segments.extend_from_slice(content);
+	dispatch(req, env, &identity, method, &segments).await
+}
+
+/// What a case content route needs from the caller's grant: `Some(None)`
+/// for the audit views (audit_ctx decides), `None` for a route a case does
+/// not have. The default is WRITE: a route nobody classified is treated as
+/// the strongest ordinary need, never as a read.
+fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
+	Some(match (method, content) {
+		(_, ["files", "shares", ..]) => return None,
+		("GET", ["audit"] | ["reads"]) => None,
+		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
+		// The wrapped keys of named files: a read, although it is a POST.
+		("POST", ["files", "keys"]) => Some(Need::Read),
+		// Rotation's reseal walk, the backup key and runs, restores and
+		// retention: the case's managers.
+		("PUT", ["files", "reseal"] | ["backup-key"] | ["backup", "restore", "object"]) | ("GET", ["backup-key"]) | ("POST", ["backup", "run"] | ["backup", "restore"] | ["housekeeping"]) => Some(Need::Manage),
+		(_, ["files", ..]) => Some(Need::Write),
+		_ => return None,
+	})
+}
+
+/// Open a case: the registry row and the creator's grant first (the policy
+/// lives there), then the case's store — settings that say only "on" and
+/// whose store it is. A case has no root and no unlock methods: its key is
+/// in the grants, sealed to each grantee's own root.
+async fn case_open(mut req: Request, env: Env, identity: &Identity) -> Result<Response> {
+	let body = req.json::<serde_json::Value>().await?;
+	let Some(id) = body.get("id").and_then(|v| v.as_str()).filter(|i| crate::area::valid_case_id(i)).map(str::to_string) else {
+		return json_error(400, "case id: 2–40 of a–z, 0–9, dashes");
+	};
+	let created = forward_family(&env, &identity.email, "POST", "cases", Some(body)).await?;
+	if created.status_code() != 200 {
+		return Ok(created);
+	}
+	let settings = serde_json::json!({ "settings": { "enabled": true, "case": id } });
+	let stored = forward_member(&env, &format!("case:{id}"), "PUT", "vault", Some(settings), identity.email.clone()).await?;
+	if stored.status_code() >= 300 {
+		return Ok(stored);
+	}
+	Ok(created)
+}
+
+/// The member routes — a member's own area, or (rewritten by route_case) a
+/// case's. `segments` are already held to the id allow-list.
+async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str, segments: &[&str]) -> Result<Response> {
+	match (method, segments) {
 		// ── The family registry (GoraniFamilyDO) ────────────────────────
 		("GET", ["family"]) => forward_family(&env, &identity.email, "GET", "state", None).await,
 		("POST", ["family", "members"]) => {
@@ -179,12 +414,26 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		}
 
 		// ── Member vault (settings; devices arrive in commit ⑧) ─────────
-		("GET", ["members", id, "vault"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "vault", None, actor)).await,
-		("PUT", ["members", id, "vault"]) => {
-			let body = req.json::<serde_json::Value>().await?;
-			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "vault", Some(body), actor)).await
-		}
-		("GET", ["members", id, "audit"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "audit", None, actor)).await,
+		("GET", ["members", id, "vault"]) => match vault_ctx(&env, &identity, id).await {
+			Ok(actor) => forward_member(&env, id, "GET", "vault", None, actor.email).await,
+			Err(resp) => Ok(resp),
+		},
+		("PUT", ["members", id, "vault"]) => match vault_ctx(&env, &identity, id).await {
+			Ok(actor) => {
+				let body = req.json::<serde_json::Value>().await?;
+				forward_member(&env, id, "PUT", "vault", Some(body), actor.email).await
+			}
+			Err(resp) => Ok(resp),
+		},
+		("GET", ["members", id, "audit"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(actor) => forward_member(&env, id, "GET", "audit", None, actor.email).await,
+			Err(resp) => Ok(resp),
+		},
+		// A member's root PUBLIC halves — what a case manager seals a grant
+		// to (commit 26). Until stage 4's fingerprints, this is the server's
+		// word for whose key it is: the trust-on-first-use gap of O3, now
+		// named in docs/CASES.md › Member identity keys.
+		("GET", ["members", id, "root"]) => member_root(&env, &identity, id).await,
 		("GET", ["members", id, "vault-stats"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "stats", None, actor)).await,
 
 		// ── Files ───────────────────────────────────────────────────────
@@ -210,7 +459,10 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		// storage has not confirmed deleting yet — keys, attempts, last error.
 		("GET", ["members", id, "storage", "pending"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "storage/pending", None, actor)).await,
 		// The read log (O14): who read which file version, from what, when.
-		("GET", ["members", id, "reads"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "reads", &req, actor)).await,
+		("GET", ["members", id, "reads"]) => match audit_ctx(&env, &identity, id).await {
+			Ok(actor) => forward_member_qs(&env, id, "GET", "reads", &req, actor.email).await,
+			Err(resp) => Ok(resp),
+		},
 		("POST", ["members", id, "files", "trash", "restore"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await
@@ -314,6 +566,25 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 	}
 }
 
+/// The public halves of a member's vault root, for any active team member
+/// who is not an external (they never manage a case, so never seal grants).
+async fn member_root(env: &Env, identity: &Identity, id: &str) -> Result<Response> {
+	if !auth::valid_member_id(id) {
+		return json_error(400, "member id: 2–32 chars of a–z, 0–9, dashes");
+	}
+	match actor_of(env, &identity.email, Some(id)).await? {
+		Some(a) if a.role != "external" && a.target_exists && a.target_active => {}
+		Some(a) if a.role != "external" => return json_error(404, "no such active member"),
+		_ => return json_error(403, "not a team member"),
+	}
+	let mut vault = forward_member(env, id, "GET", "vault", None, "internal").await?;
+	let v: serde_json::Value = vault.json().await?;
+	let (Some(key_id), Some(public_key), Some(pq)) = (v.get("keyId"), v.get("publicKey"), v.get("pqPublicKey")) else {
+		return json_error(404, "this member has no vault yet — they set it up first");
+	};
+	Response::from_json(&serde_json::json!({ "member": id, "keyId": key_id, "publicKey": public_key, "pqPublicKey": pq }))
+}
+
 /// Run `f` with the acting email if the caller may act for this member.
 async fn member_call<F, Fut>(env: &Env, identity: &Identity, id: &str, f: F) -> Result<Response>
 where
@@ -376,7 +647,8 @@ async fn forward_family(env: &Env, actor: &str, method: &str, path: impl Into<St
 
 async fn forward_member(env: &Env, member_id: &str, method: &str, path: impl Into<String>, body: Option<serde_json::Value>, actor: impl Into<String>) -> Result<Response> {
 	let namespace = env.durable_object("MEMBER")?;
-	let stub = namespace.id_from_name(&format!("member:{member_id}"))?.get_stub()?;
+	// `member_id` is an AREA: a member id, or `case:<id>` (area.rs).
+	let stub = namespace.id_from_name(&crate::area::do_name(member_id))?.get_stub()?;
 	// The member DO is told whose database it is (`x-gorani-member`): a DO
 	// cannot read its own instance name, and code that needs it (the restore
 	// minting `files/<member>/…` keys) used to guess from the ACTOR — wrong
@@ -505,7 +777,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		return json_error(400, "file_id is required: the client chooses it ([A-Za-z0-9_-], ≤ 64) and seals into it");
 	};
 	let version_id = crate::files_store::uuid();
-	let object_key = format!("files/{member_id}/{file_id}/v-{version_id}");
+	let object_key = format!("{}/{file_id}/v-{version_id}", crate::area::key_prefix(member_id));
 	s3::put(&env, &object_key, form.file.clone().unwrap_or_default()).await?;
 	let body = serde_json::json!({
 		"id": file_id,
@@ -542,7 +814,7 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 	// (`file_id` is a path segment — the router's allow-list already held it
 	// to [A-Za-z0-9_-] before this key is built.)
 	let version_id = crate::files_store::uuid();
-	let object_key = format!("files/{member_id}/{file_id}/v-{version_id}");
+	let object_key = format!("{}/{file_id}/v-{version_id}", crate::area::key_prefix(member_id));
 	s3::put(&env, &object_key, form.file.clone().unwrap_or_default()).await?;
 	let body = serde_json::json!({
 		"fileId": file_id,
@@ -598,7 +870,7 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 		(None, None) => return json_error(400, "newFileId is required for a new file (the client chooses it and seals into it); fileId for a new version"),
 		_ => return json_error(400, "file ids are ids ([A-Za-z0-9_-], ≤ 64)"),
 	};
-	let object_key = format!("files/{member_id}/{file_id}/u-{}", crate::files_store::uuid());
+	let object_key = format!("{}/{file_id}/u-{}", crate::area::key_prefix(member_id), crate::files_store::uuid());
 	let started = forward_member(&env, member_id, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key, "fileId": version_of })), &actor.email).await?;
 	if started.status_code() >= 400 {
 		return Ok(started);
@@ -1154,7 +1426,8 @@ async fn backup_download(env: &Env, identity: &Identity, member_id: &str, stamp:
 ///
 /// Three gates, each closing a hole the review found (commit 23):
 ///
-/// 1. **Shape** — exactly `files/<this member>/<file id>/r-<id>`. The old
+/// 1. **Shape** — exactly `<area prefix>/<file id>/r-<id>` (the prefix is
+///    `files/<member>` or `cases/<case>`, area.rs). The old
 ///    check was `starts_with("files/<member>/")`, which admitted every LIVE
 ///    object (`…/v-<uuid>`): a member — or any parent — could overwrite a
 ///    file's bytes in place, bypassing versions and the Trash, and (the
@@ -1171,13 +1444,13 @@ async fn backup_object_fill(mut req: Request, env: Env, identity: &Identity, mem
 	let raw = crate::files_store::urlquery(url.query().unwrap_or("")).get("k").cloned().unwrap_or_default();
 	// (encodeURIComponent of a key in our alphabet only ever escapes '/'.)
 	let key = raw.replace("%2F", "/").replace("%2f", "/");
-	let parts: Vec<&str> = key.split('/').collect();
-	let minted_shape = matches!(parts.as_slice(), ["files", m, file, obj]
-		if *m == member_id && auth::valid_object_id(file) && obj.strip_prefix("r-").is_some_and(auth::valid_object_id));
+	let prefix = format!("{}/", crate::area::key_prefix(member_id));
+	let parts: Vec<&str> = key.strip_prefix(&prefix).map(|r| r.split('/').collect()).unwrap_or_default();
+	let minted_shape = matches!(parts.as_slice(), [file, obj] if auth::valid_object_id(file) && obj.strip_prefix("r-").is_some_and(auth::valid_object_id));
 	if !minted_shape {
-		return json_error(403, "only objects a restore minted (files/<member>/<file>/r-…) can be filled");
+		return json_error(403, "only objects a restore minted (<area>/<file>/r-…) can be filled");
 	}
-	let known = forward_member(&env, member_id, "GET", format!("restore-target/{}/{}", parts[2], parts[3]), None, "internal").await?;
+	let known = forward_member(&env, member_id, "GET", format!("restore-target/{}/{}", parts[0], parts[1]), None, "internal").await?;
 	if known.status_code() != 200 {
 		return json_error(403, "no restored version points at that key");
 	}

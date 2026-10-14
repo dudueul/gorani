@@ -12,6 +12,7 @@
 
 import type { FilesBridge } from "./model.ts";
 import { devIdentityHeaders } from "../../lib/api.ts";
+import { areaPath } from "../../lib/area.ts";
 import { openWith, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
 import { places } from "../../vault/places.ts";
 import type { VaultSession } from "../../vault/session.ts";
@@ -52,7 +53,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 			// `x-gorani-client`: the read log's "from what" (O14) — a label.
 			const headers: Record<string, string> = { ...devIdentityHeaders(), "x-gorani-client": "web" };
 			if (range) headers.Range = `bytes=${range[0]}-${range[1]}`;
-			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`, { headers });
+			const res = await fetch(`${areaPath(memberId)}/files/${id}${version ? `?version=${version}` : ""}`, { headers });
 			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
 			return {
 				body: new Uint8Array(await res.arrayBuffer()),
@@ -63,7 +64,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		},
 
 		async fetchObjectStream(memberId, id, version, sink) {
-			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web" } });
+			const res = await fetch(`${areaPath(memberId)}/files/${id}${version ? `?version=${version}` : ""}`, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web" } });
 			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
 			const ck = res.headers.get("x-gorani-ck") ?? "";
 			const chunk = Number(res.headers.get("x-gorani-chunk")) || 0;
@@ -88,19 +89,19 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 
 		async putWhole(memberId, fields, sealed) {
 			const form = formBody(fields, sealed);
-			const res = await fetch(`/api/v1/members/${memberId}/files`, { method: "POST", headers: { ...devIdentityHeaders(), "content-type": form.contentType }, body: form.body });
+			const res = await fetch(`${areaPath(memberId)}/files`, { method: "POST", headers: { ...devIdentityHeaders(), "content-type": form.contentType }, body: form.body });
 			await throwIfError(res);
 		},
 
 		async putMultipart(memberId, fields, sealed, chunk) {
 			// The new file's id was chosen (and sealed into) by the model.
 			const { file_id: newFileId, ...rest } = fields;
-			const start = await fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `/api/v1/members/${memberId}/files/uploads`, { size: Number(fields.size), chunk, newFileId });
+			const start = await fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `${areaPath(memberId)}/files/uploads`, { size: Number(fields.size), chunk, newFileId });
 			const frames = Math.ceil(sealed.length / (chunk + 28));
 			const parts: { partNumber: number; etag: string }[] = [];
 			for (let p = 1; p <= frames; p++) {
 				const frame = sealed.subarray((p - 1) * (chunk + 28), Math.min(sealed.length, p * (chunk + 28)));
-				const res = await fetch(`/api/v1/members/${memberId}/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, {
+				const res = await fetch(`${areaPath(memberId)}/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, {
 					method: "PUT",
 					headers: { ...devIdentityHeaders(), "content-type": "application/octet-stream" },
 					body: frame as unknown as BodyInit, // (TS 5.9 ArrayBufferLike vs ArrayBuffer — the bytes are the same)
@@ -109,7 +110,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 				parts.push((await res.json()) as { partNumber: number; etag: string });
 			}
 			const form = formBody({ ...rest, key: start.key, parts: JSON.stringify(parts) }, null);
-			const res = await fetch(`/api/v1/members/${memberId}/files/uploads/${start.uploadId}/complete`, {
+			const res = await fetch(`${areaPath(memberId)}/files/uploads/${start.uploadId}/complete`, {
 				method: "POST",
 				headers: { ...devIdentityHeaders(), "content-type": form.contentType },
 				body: form.body,

@@ -41,7 +41,7 @@ type ViewMode = "details" | "list" | "small" | "large";
 export class GoraniWin11 extends LitElement {
 	@property({ type: Object }) model!: FilesModel;
 	@property({ type: String }) memberName = "";
-	@property({ type: String }) memberRole = "parent";
+	@property({ type: String }) memberRole = "lead";
 
 	@state() private view: ViewMode = "details";
 	@state() private showPreview = true;

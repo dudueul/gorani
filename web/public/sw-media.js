@@ -84,7 +84,10 @@ self.addEventListener("fetch", (event) => {
 async function serveMedia(request, reg) {
 	const asked = resolveRange(request.headers.get("Range"), reg.size);
 	// The key was opened for ONE version; the bytes must be that version's.
-	const objectPath = `/api/v1/members/${reg.memberId}/files/${reg.fileId}?version=${reg.version}`;
+	// `memberId` is an AREA — a member id or `case:<id>` (web/src/lib/area.ts
+	// › areaPath; restated here because a service worker imports nothing).
+	const base = reg.memberId.startsWith("case:") ? `/api/v1/cases/${reg.memberId.slice(5)}` : `/api/v1/members/${reg.memberId}`;
+	const objectPath = `${base}/files/${reg.fileId}?version=${reg.version}`;
 	const headers = { "Content-Type": reg.type, "Accept-Ranges": "bytes", "Cache-Control": "no-store" };
 
 	// A whole-file object (GV02, no chunking): decrypt fully, cut the range.

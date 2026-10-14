@@ -120,7 +120,7 @@ export async function verifyRecord(recordKey: CryptoKey, name: string, rec: Stor
 }
 
 /** The opened private key must BE the record's key: same public halves, same id. */
-export async function checkRecordMatches(opened: VaultPrivateKey, rec: StoreRecord): Promise<void> {
+export async function checkRecordMatches(opened: VaultPrivateKey, rec: Pick<StoreRecord, "keyId" | "publicKey" | "pqPublicKey">): Promise<void> {
 	if (!isHybridPrivate(opened)) throw new Error("store keys are hybrid");
 	const ec = ecRawOfJwk(rec.publicKey);
 	const kem = kemPublicOf(opened.kem);

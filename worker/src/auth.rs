@@ -30,6 +30,20 @@ use worker::*;
 #[derive(Debug, Clone)]
 pub struct Identity {
 	pub email: String,
+	/// A case grant ALREADY CHECKED for this request (routes.rs ›
+	/// route_case, commit 26), so the member-scope code reuses it instead of
+	/// asking the registry a second time. Only the router sets it, from the
+	/// registry's answer — never from anything the client sent.
+	pub granted: Option<Granted>,
+}
+
+/// The registry's answer for one case and one caller.
+#[derive(Debug, Clone)]
+pub struct Granted {
+	/// The area (`case:<id>`) the check was for.
+	pub area: String,
+	pub member: String,
+	pub role: String,
 }
 
 /// One JWKS fetch, cached per isolate for ten minutes (a JWKS rotation
@@ -131,7 +145,7 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 	}
 	if dev_mode {
 		let email = req.headers().get("x-gorani-dev-email")?.ok_or_else(|| Error::RustError("dev mode: set x-gorani-dev-email".into()))?;
-		return Ok(Identity { email });
+		return Ok(Identity { email, granted: None });
 	}
 	if !access_configured {
 		// Fail closed: a production deployment without Access serves nothing.
@@ -183,7 +197,7 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 		return Err(Error::RustError("token expired".into()));
 	}
 	let email = t.claims.get("email").and_then(|v| v.as_str()).ok_or_else(|| Error::RustError("token has no email".into()))?.to_string();
-	Ok(Identity { email })
+	Ok(Identity { email, granted: None })
 }
 
 /// A member id as the registry names it: a short slug, lowercase, no tricks

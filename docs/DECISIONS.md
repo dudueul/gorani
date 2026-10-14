@@ -22,6 +22,8 @@ external responder. A case is a folder with its own key, sealed to each
 member granted on it: least privilege per incident. Replaces the
 parent/child hierarchy (which becomes a migration source, then goes).
 *Rejected:* mapping parent/child to lead/analyst (too coarse); a flat team.
+**Design: docs/CASES.md** (roles table, case keys, identity keys, the
+staged build).
 
 ## D3 — Sign-in
 
@@ -35,7 +37,8 @@ passkey-or-password step — signing in proves *who*, unlocking proves
 **M-of-N leads quorum** (Shamir secret sharing of the recovery key, e.g. 2
 of 3 leads). No single insider can open everyone's data; recovery still
 works with a lead away. *Rejected:* a single admin master (today's
-"parent"), KMS escrow, no recovery.
+"parent"), KMS escrow, no recovery. **Design: docs/CASES.md › Recovery**
+(the ceremony, and its honest limit: the shares meet in one browser).
 
 ## D5 — Chain of custody (evidence areas)
 

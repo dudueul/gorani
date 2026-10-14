@@ -27,6 +27,10 @@
  * | `folder.name` | member | folder id | — | the folder's name |
  * | `share.name` | member | share id | — | the owner's copy of a link's name |
  * | `store.secrets` | member | — | — | fingerprint + index keys |
+ * | `case.title` | `case:<id>` | — | — | a case's title (in the registry) |
+ *
+ * The `store` column is an AREA (lib/area.ts): a member id, or `case:<id>`
+ * for a case (commit 26) — the same kinds, in a different store.
  *
  * Names are bound to the file, not to a version: a rename re-seals into the
  * same place. A version's key and type are bound to the version, so version
@@ -56,6 +60,7 @@ export const places = {
 	folderName: (store: string, folder: string) => place("folder.name", store, folder),
 	shareName: (store: string, share: string) => place("share.name", store, share),
 	storeSecrets: (store: string) => place("store.secrets", store, ""),
+	caseTitle: (store: string) => place("case.title", store, ""),
 };
 
 /** A fresh client-chosen id (file, folder): 128 random bits, base64url — the

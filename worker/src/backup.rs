@@ -344,8 +344,10 @@ impl GoraniMemberDO {
 	///   ownership rule of commit 15); the files secrets are restored only
 	///   when absent.
 	pub(crate) async fn backup_restore(&self, actor: &str, member: &str, body: serde_json::Value) -> Result<Response> {
-		if !crate::auth::valid_member_id(member) {
-			return json_error(400, "restore needs the member id");
+		// (`member` is the AREA — a member id or `case:<id>` — whose
+		// prefix every minted key starts with.)
+		if !crate::area::valid_area(member) {
+			return json_error(400, "restore needs the area id");
 		}
 		let mut objects: Vec<(String, String)> = Vec::new(); // (versionRef, objectKey)
 		if let Some(folders) = body.get("folders").and_then(|v| v.as_array()) {
@@ -420,7 +422,7 @@ impl GoraniMemberDO {
 						continue;
 					}
 				}
-				let object_key = format!("files/{member}/{file_for_key}/r-{}", crate::files_store::uuid());
+				let object_key = format!("{}/{file_for_key}/r-{}", crate::area::key_prefix(member), crate::files_store::uuid());
 				self.sql
 					.exec(
 						"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'))) ON CONFLICT(file_id, version) DO UPDATE SET content_key = ?3, object_key = ?5, type_sealed = COALESCE(?6, type_sealed), size = ?7",

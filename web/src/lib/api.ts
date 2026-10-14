@@ -55,15 +55,20 @@ export const api = {
 	del: <T>(path: string) => call<T>("DELETE", path),
 };
 
-/** A family member as the registry reports it (readable structure by design). */
+/** A team member as the registry reports it (readable structure by design). */
 export interface Member {
 	id: string;
 	name: string;
-	role: "parent" | "child";
+	/** docs/CASES.md › Roles (the family's parent/child became lead/analyst). */
+	role: TeamRole;
 	emails: string[];
 	active: boolean;
 	createdAt: string;
+	/** External members only: when their access ends. */
+	expiresAt?: string | null;
 }
+
+export type TeamRole = "lead" | "analyst" | "auditor" | "external";
 
 export interface FamilyState {
 	members: Member[];

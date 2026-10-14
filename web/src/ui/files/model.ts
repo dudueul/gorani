@@ -20,6 +20,7 @@ import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { kindOf, type FileKind } from "./icons.ts";
+import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
 
@@ -440,18 +441,25 @@ export class FilesModel {
 
 	// ── download ────────────────────────────────────────────────────────
 
-	/** Open a file's current version and hand the bytes to a download. */
+	/** Open a file's current version and hand the bytes to ONE download.
+	 *
+	 * (Commit 24: the sink used to start a browser download per decrypted
+	 * frame — a 100 MB file arrived as thirteen 8 MiB pieces. The frames are
+	 * collected and saved as one Blob; a Blob of parts is not a copy.) */
 	async download(id: string, name: string): Promise<void> {
-		await this.openBytes(id, undefined, async (plain) => {
-			// The save itself is browser-only (the Node test collects bytes).
-			if (typeof document === "undefined") return;
-			const url = URL.createObjectURL(new Blob([plain as BlobPart]));
+		const parts: Uint8Array[] = [];
+		await this.openBytes(id, undefined, (plain) => {
+			parts.push(plain);
+		});
+		// The save itself is browser-only (the Node test collects bytes).
+		if (typeof document !== "undefined") {
+			const url = blobURL(new Blob(parts as BlobPart[], { type: "application/octet-stream" }));
 			const a = document.createElement("a");
 			a.href = url;
 			a.download = name;
 			a.click();
-			setTimeout(() => URL.revokeObjectURL(url), 5000);
-		});
+			setTimeout(() => revokeBlobURL(url), 5000);
+		}
 		this.bridge.toast(`Downloaded “${name}”`);
 	}
 

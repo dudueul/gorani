@@ -24,6 +24,13 @@ export interface FilesHooks {
 export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBridge {
 	let cached: { privateKey: VaultPrivateKey; publicKey: SealTarget } | null = null;
 	const store = async () => {
+		// A locked session hands out nothing — not even the store key this
+		// bridge already opened (an upload still in flight when Lock is
+		// pressed must not finish sealing with it).
+		if (session.locked) {
+			cached = null;
+			throw new Error("the vault is locked");
+		}
 		if (!cached) {
 			const opened = await session.openStoreKey("files");
 			// The store key's public half is hybrid (GV03) — seal with both halves.

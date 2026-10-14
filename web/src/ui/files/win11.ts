@@ -31,6 +31,7 @@ import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
+import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import "../viewer/viewer.ts";
 import "./share-dialog.ts";
 
@@ -133,12 +134,13 @@ export class GoraniWin11 extends LitElement {
 		const row = this.s().files.find((f) => f.id === id);
 		if (!row) return;
 		this.showPreview = true;
+		revokeBlobURL(this.previewFile?.url); // the previous preview's handle
 		this.previewFile = { id, name: row.name, kind: row.kind };
 		if (row.kind === "image" || row.kind === "text" || row.kind === "code") {
 			try {
 				const p = await this.model.preview(id);
 				if (p && this.previewFile?.id === id) {
-					if (row.kind === "image") this.previewFile.url = URL.createObjectURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
+					if (row.kind === "image") this.previewFile.url = blobURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
 					else this.previewFile.text = new TextDecoder().decode(p.bytes.subarray(0, 8192));
 				}
 			} catch {

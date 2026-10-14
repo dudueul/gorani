@@ -21,8 +21,16 @@
  * a fresh non-extractable AES-GCM device key in IndexedDB, the root bundle
  * encrypted under it (`hold`), this tab's copy in sessionStorage for reloads.
  * A relaunch inside the window decrypts and re-imports — the bundle exists as
- * bytes only for the instant of import. Expiry slides while the app is
- * visible. "Ask on relaunch" (the default) stores nothing at all.
+ * bytes only for the instant of import. The window is fixed (HOLD_MS from
+ * the unlock; it does not slide), and an expired hold is DELETED the moment
+ * anything looks at it. "Ask on relaunch" (the default) stores nothing.
+ *
+ * **Locking** (commit 24, docs/SECURITY-REVIEW.md › O2) is a state, not a
+ * cache flush: `lock()` marks the session locked (every later key use
+ * throws), drops the opened store keys, deletes the device hold, and only
+ * THEN tells its listeners — the shell, which unmounts everything that held
+ * plaintext or keys. Before, "Lock" cleared a cache and nothing listened:
+ * the explorer stayed on screen with every key still usable.
  *
  * | Threat | Answer |
  * |---|---|
@@ -55,17 +63,12 @@ export interface VaultSession {
 	/** The local search index's key, derived without the root's bytes. */
 	readonly indexKey: Promise<CryptoKey>;
 	openStoreKey(name: string): Promise<OpenedStoreKey>;
-	lock(): void;
-}
-
-/** Per-session store-key caches, kept out of the interface by a WeakMap. */
-const caches = new WeakMap<VaultSession, Map<string, OpenedStoreKey>>();
-const lockListeners = new Set<() => void>();
-
-/** Called when the session locks (the UI switches to the lock screen). */
-export function onLock(listener: () => void): () => void {
-	lockListeners.add(listener);
-	return () => lockListeners.delete(listener);
+	/** True once locked — for good: a locked session never unlocks again. */
+	readonly locked: boolean;
+	/** Lock: resolves after the device hold is gone and listeners ran. */
+	lock(): Promise<void>;
+	/** Subscribe to this session's lock; returns the unsubscribe. */
+	onLock(listener: () => void): () => void;
 }
 
 /** A session from an opened root bundle: import non-extractable, wire stores. */
@@ -73,13 +76,20 @@ export async function openSession(memberId: string, settings: VaultSettings, bun
 	const root = await importVaultKey(bundle);
 	bundle.fill(0); // the bytes are gone the instant the key exists
 	const cache = new Map<string, OpenedStoreKey>();
+	const listeners = new Set<() => void>();
+	let locked = false;
+	let locking: Promise<void> | null = null;
 	const session: VaultSession = {
 		memberId,
 		settings,
 		root,
 		rootKeyId: settings.keyId,
 		indexKey: deriveIndexKey(root, settings.publicKey),
+		get locked() {
+			return locked;
+		},
 		async openStoreKey(name: string) {
+			if (locked) throw new Error("the vault is locked");
 			const cached = cache.get(name);
 			if (cached) return cached;
 			const key = settings.stores[name];
@@ -90,19 +100,37 @@ export async function openSession(memberId: string, settings: VaultSettings, bun
 			return opened;
 		},
 		lock() {
-			void forgetOnDevice(memberId);
+			// Idempotent: the Lock button, the idle clock and an unmount may all
+			// ask; the work happens once and every caller awaits the same end.
+			if (locking) return locking;
+			locked = true;
 			cache.clear();
-			for (const l of [...lockListeners]) l();
+			// The hold is deleted BEFORE the listeners run: the app's next
+			// screen asks "is there a hold?" — answering yes would re-open the
+			// vault the user just locked.
+			locking = forgetOnDevice(memberId)
+				.catch(() => {})
+				.then(() => {
+					for (const l of [...listeners]) l();
+					listeners.clear();
+				});
+			return locking;
+		},
+		onLock(listener) {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
 		},
 	};
-	caches.set(session, cache);
 	return session;
 }
 
 // ── the device hold ─────────────────────────────────────────────────
 
 const DB = "gorani-vault-device";
-const HOLD_MS = 10 * 60 * 1000; // the auto-lock window
+/** The device-hold window — equal to the hidden-tab lock (docs/DECISIONS.md
+ * › D15): a reload or relaunch within it opens without the secret, never
+ * longer. */
+const HOLD_MS = 5 * 60 * 1000;
 
 /** The hold record: the root bundle encrypted under a non-extractable device key. */
 export interface DeviceHold {
@@ -169,13 +197,25 @@ export async function rememberOnDevice(memberId: string, bundle: Uint8Array, roo
 export async function heldBundle(memberId: string): Promise<{ bundle: Uint8Array; keyId: string } | null> {
 	const tab = sessionStorage.getItem(`gorani-hold:${memberId}`);
 	const hold = (await idbGet<DeviceHold>(`hold:${memberId}`)) ?? (tab ? (JSON.parse(tab) as DeviceHold) : undefined);
-	if (!hold || hold.exp < Date.now()) return null;
+	if (!hold) return null;
+	// An expired hold is not merely ignored — it is deleted, key and
+	// ciphertext both. `exp` is just a number in a JSON record: a hold left
+	// on disk past its window stays decryptable by anyone holding the
+	// profile (docs/SECURITY-REVIEW.md › O4 — it used to be left).
+	if (hold.exp < Date.now()) {
+		await forgetOnDevice(memberId);
+		return null;
+	}
 	const deviceKey = await idbGet<CryptoKey>(`key:${memberId}`);
-	if (!deviceKey) return null;
+	if (!deviceKey) {
+		await forgetOnDevice(memberId);
+		return null;
+	}
 	try {
 		const bundle = new Uint8Array(await subtle().decrypt({ name: "AES-GCM", iv: fromBase64(hold.iv) as BufferSource }, deviceKey, fromBase64(hold.ct) as BufferSource));
 		return { bundle, keyId: hold.keyId };
 	} catch {
+		await forgetOnDevice(memberId);
 		return null;
 	}
 }
@@ -187,20 +227,54 @@ export async function forgetOnDevice(memberId: string): Promise<void> {
 	await idbDel(`hold:${memberId}`);
 }
 
-/** The auto-lock clock: lock N minutes after the app is hidden (0 = at once,
- * with a 1.5 s grace so reloads pass; negative = never). The UI owns the
- * setting; this module owns the clock. */
-export function watchAutoLock(session: VaultSession, minutes: number): () => void {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const schedule = () => {
-		clearTimeout(timer);
-		if (minutes < 0) return;
-		timer = setTimeout(() => session.lock(), minutes === 0 ? 1500 : minutes * 60_000);
+// ── the auto-lock clock ─────────────────────────────────────────────
+
+/** docs/DECISIONS.md › D15: 15 idle minutes, or 5 minutes hidden. */
+export const AUTO_LOCK = { idleMinutes: 15, hiddenMinutes: 5 } as const;
+
+export interface AutoLockRules {
+	idleMinutes: number;
+	hiddenMinutes: number;
+}
+
+/**
+ * The lock decision as a PURE function (unit:session tests it with plain
+ * numbers — no browser, no timers): lock when the user has been idle too
+ * long, or the tab has been hidden too long. `hiddenSince` is null while
+ * the tab is visible.
+ */
+export function autoLockDue(now: number, lastActivity: number, hiddenSince: number | null, rules: AutoLockRules = AUTO_LOCK): boolean {
+	if (now - lastActivity >= rules.idleMinutes * 60_000) return true;
+	return hiddenSince !== null && now - hiddenSince >= rules.hiddenMinutes * 60_000;
+}
+
+/**
+ * Drive `autoLockDue` from the page: activity (pointer, keys, wheel, touch)
+ * resets the idle clock, `visibilitychange` starts/stops the hidden clock,
+ * and a once-a-second check locks the session. Returns the cleanup — the
+ * shell calls it on unmount (it used to be discarded, so every session
+ * change stacked another listener).
+ */
+export function watchAutoLock(session: VaultSession, rules: AutoLockRules = AUTO_LOCK): () => void {
+	let lastActivity = Date.now();
+	let hiddenSince: number | null = document.visibilityState === "hidden" ? Date.now() : null;
+	const activity = () => {
+		lastActivity = Date.now();
 	};
-	const onVisibility = () => (document.visibilityState === "hidden" ? schedule() : clearTimeout(timer));
-	document.addEventListener("visibilitychange", onVisibility);
+	const visibility = () => {
+		hiddenSince = document.visibilityState === "hidden" ? Date.now() : null;
+		if (hiddenSince === null) check();
+	};
+	const check = () => {
+		if (!session.locked && autoLockDue(Date.now(), lastActivity, hiddenSince, rules)) void session.lock();
+	};
+	const events = ["pointerdown", "keydown", "wheel", "touchstart"] as const;
+	for (const e of events) document.addEventListener(e, activity, { capture: true, passive: true });
+	document.addEventListener("visibilitychange", visibility);
+	const timer = setInterval(check, 1000);
 	return () => {
-		document.removeEventListener("visibilitychange", onVisibility);
-		clearTimeout(timer);
+		for (const e of events) document.removeEventListener(e, activity, { capture: true });
+		document.removeEventListener("visibilitychange", visibility);
+		clearInterval(timer);
 	};
 }

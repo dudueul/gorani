@@ -154,7 +154,40 @@ try {
 		// and decrypts in the page.
 		await page.locator("text=hello.txt").first().dblclick();
 		await page.locator("text=uploaded from the real browser").first().waitFor({ timeout: 30_000 });
+		await page.keyboard.press("Escape");
 		await assertNoViolations(page, "unlock → upload → open");
+
+		// ── Lock means locked (docs/SECURITY-REVIEW.md › O2) ───────────
+		// An image opened in the viewer is a blob: URL over DECRYPTED bytes.
+		// After Lock, that handle must stop resolving, the explorer must be
+		// gone (not hidden), and no device hold may remain.
+		const PNG_1x1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "pixel.png", mimeType: "image/png", buffer: PNG_1x1 });
+		await page.locator("text=pixel.png").first().waitFor({ timeout: 60_000 });
+		await page.locator("text=pixel.png").first().dblclick();
+		const img = page.locator("gorani-viewer img").first();
+		await img.waitFor({ timeout: 30_000 });
+		const src = (await img.getAttribute("src")) ?? "";
+		assert.match(src, /^blob:/, "the decrypted image is a blob: URL");
+		// Probe with an <img> load (img-src allows blob:). Not fetch(): the CSP's
+		// connect-src is 'self' only, so page scripts cannot read a blob: URL
+		// back at all — a welcome side effect of the policy.
+		const loads = (u) => page.evaluate((url) => new Promise((ok) => {
+			const probe = new Image();
+			probe.onload = () => ok(true);
+			probe.onerror = () => ok(false);
+			probe.src = url;
+		}), u);
+		assert.equal(await loads(src), true, "…which resolves while unlocked");
+		// Lock WITH the image still open — the case that matters (an idle or
+		// hidden-tab lock arrives while plaintext is on screen; the overlay
+		// covers the header, so the click is dispatched to the button).
+		await page.getByRole("button", { name: "Lock" }).dispatchEvent("click");
+		await page.getByPlaceholder(/Recovery code/).waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator("gorani-shell").count(), 0, "the explorer is unmounted, not hidden");
+		assert.equal(await loads(src), false, "the decrypted image's blob: URL no longer resolves");
+		assert.equal(await page.evaluate(() => Object.keys(sessionStorage).filter((k) => k.startsWith("gorani-hold:")).length), 0, "no device hold left in the tab");
+		await assertNoViolations(page, "lock");
 		await ctx.close();
 	}
 
@@ -162,6 +195,9 @@ try {
 	{
 		const ctx = await guardedContext(browser, "mom@family.test");
 		const page = await ctx.newPage();
+		// A controllable clock for the idle lock (Playwright fakes Date and
+		// timers; WebCrypto and the network are untouched).
+		await page.clock.install();
 		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
 		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
 		await page.goto(dev.base);
@@ -176,6 +212,13 @@ try {
 		await page.getByRole("button", { name: "Unlock" }).click();
 		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
 		await assertNoViolations(page, "wrong password → right password");
+		// The idle lock (D15: 15 minutes): no input for 15 minutes — the
+		// vault locks itself and the lock screen returns.
+		await page.clock.fastForward("14:00");
+		assert.equal(await page.locator("gorani-shell").count(), 1, "14 idle minutes: still open");
+		await page.clock.fastForward("01:05");
+		await page.locator('input[type="password"]').waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator("gorani-shell").count(), 0, "15 idle minutes: locked by itself");
 		await ctx.close();
 	}
 
@@ -228,7 +271,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, refusal, password share page");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page");
 } finally {
 	await dev.close();
 }

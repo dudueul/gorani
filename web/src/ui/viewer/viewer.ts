@@ -23,6 +23,7 @@ import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel } from "../files/model.ts";
 import { pickViewerMode, renderMime, TEXT_CAP, type ViewerMode } from "./mode.ts";
 import { icon, type FileKind } from "../files/icons.ts";
+import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
 
 export interface ViewerTarget {
@@ -51,12 +52,28 @@ export class GoraniViewer extends LitElement {
 	}
 
 	protected override async firstUpdated(): Promise<void> {
+		// Focus the overlay so its "Close (esc)" works at once — the key
+		// handler sits on this element, which nothing focused before.
+		this.querySelector<HTMLElement>("[data-viewer-root]")?.focus();
 		await this.load();
 	}
 
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
-		if (this.url && !this.streamed) URL.revokeObjectURL(this.url);
+		this.release();
+	}
+
+	/** Let go of the decrypted handle: revoke the blob URL, or tell the media
+	 * service worker to forget this file's content key (streamed media). */
+	private release(): void {
+		if (!this.url) return;
+		if (this.streamed) {
+			const url = this.url;
+			void navigator.serviceWorker?.getRegistration("/media/").then((reg) => reg?.active?.postMessage({ type: "media-forget", url }));
+		} else {
+			revokeBlobURL(this.url);
+		}
+		this.url = null;
 	}
 
 	private async load(): Promise<void> {
@@ -90,7 +107,7 @@ export class GoraniViewer extends LitElement {
 				}
 				const parts: Uint8Array[] = [];
 				await this.model.openBytes(id, this.target.version, (plain) => { parts.push(plain); });
-				this.url = URL.createObjectURL(new Blob([concat(parts) as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
+				this.url = blobURL(new Blob([concat(parts) as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
 			} else {
 				const parts: Uint8Array[] = [];
 				await this.model.openBytes(id, this.target.version, (plain) => {
@@ -98,8 +115,7 @@ export class GoraniViewer extends LitElement {
 					return Promise.resolve();
 				});
 				const whole = concat(parts);
-				const url = URL.createObjectURL(new Blob([whole as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
-				this.url = url;
+				this.url = blobURL(new Blob([whole as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
 			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
@@ -112,7 +128,7 @@ export class GoraniViewer extends LitElement {
 	protected override render(): TemplateResult {
 		const t = this.target;
 		return html`
-			<div class="fixed inset-0 z-50 flex flex-col bg-black/80" @keydown=${(e: KeyboardEvent) => e.key === "Escape" && this.close()}>
+			<div class="fixed inset-0 z-50 flex flex-col bg-black/80 outline-none" tabindex="-1" data-viewer-root @keydown=${(e: KeyboardEvent) => e.key === "Escape" && this.close()}>
 				<header class="flex items-center gap-3 border-b border-neutral-800 bg-neutral-900/95 px-4 py-2.5 text-sm">
 					${icon(t.kind, "h-5 w-5 text-neutral-400")}
 					<span class="min-w-0 flex-1 truncate text-neutral-100">${t.name}</span>
@@ -165,7 +181,7 @@ export class GoraniViewer extends LitElement {
 	}
 
 	close(): void {
-		if (this.url) URL.revokeObjectURL(this.url);
+		this.release();
 		this.dispatchEvent(new CustomEvent("closed", { bubbles: true, composed: true }));
 	}
 }

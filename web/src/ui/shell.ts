@@ -11,7 +11,8 @@
 import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { Member } from "../lib/api.ts";
-import { watchAutoLock, type VaultSession } from "../vault/session.ts";
+import { watchAutoLock, AUTO_LOCK, type VaultSession } from "../vault/session.ts";
+import { revokeAllBlobURLs } from "../lib/blob-urls.ts";
 import { FilesModel } from "./files/model.ts";
 import { sessionBridge } from "./files/bridge.ts";
 import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
@@ -32,13 +33,35 @@ export class GoraniShell extends LitElement {
 	private model: FilesModel | null = null;
 	private index: import("../vault/index.ts").LocalIndex | null = null;
 	@state() private viewer: ViewerTarget | null = null;
+	/** Cleanups for the current session's clock and lock subscription. */
+	private stopAutoLock: (() => void) | null = null;
+	private stopOnLock: (() => void) | null = null;
 
+	/**
+	 * Unmount = lock, and lock = unmount (docs/SECURITY-REVIEW.md › O2).
+	 * Everything that held plaintext or keys for this session ends here:
+	 *
+	 * - the model (decrypted names, its poll timer) and the bridge's opened
+	 *   store key go with it — nothing keeps a reference;
+	 * - the local index worker (decrypted names in its memory) closes after
+	 *   one last ENCRYPTED snapshot;
+	 * - the media service worker forgets every content key it was handed;
+	 * - every blob: URL minted for decrypted bytes is revoked;
+	 * - the session itself is locked, if it was not already.
+	 */
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
-		// Locking/unmounting: the index worker's memory (decrypted names)
-		// dies here, after one last encrypted snapshot to IndexedDB.
+		this.stopAutoLock?.();
+		this.stopOnLock?.();
+		this.stopAutoLock = this.stopOnLock = null;
+		this.model?.dispose();
+		this.model = null;
+		this.viewer = null;
 		void this.index?.close();
 		this.index = null;
+		revokeAllBlobURLs();
+		void forgetMediaKeys();
+		void this.session?.lock();
 	}
 
 	protected override createRenderRoot(): HTMLElement {
@@ -47,9 +70,14 @@ export class GoraniShell extends LitElement {
 
 	protected override updated(changed: Map<string, unknown>): void {
 		if (changed.has("session")) {
-			// The auto-lock clock: 10 minutes hidden — the same window the
-			// device hold promises.
-			watchAutoLock(this.session, 10);
+			this.stopAutoLock?.();
+			this.stopOnLock?.();
+			// The auto-lock clock (docs/DECISIONS.md › D15: 15 idle minutes,
+			// or 5 minutes hidden), and the one subscriber that turns "the
+			// session locked" into "the screen locked": the app-root swaps in
+			// the lock screen, which unmounts this element (see above).
+			this.stopAutoLock = watchAutoLock(this.session, AUTO_LOCK);
+			this.stopOnLock = this.session.onLock(() => this.dispatchEvent(new CustomEvent("locked", { bubbles: true, composed: true })));
 			void this.setupExplorer();
 		}
 	}
@@ -73,6 +101,9 @@ export class GoraniShell extends LitElement {
 			} catch (e) {
 				console.warn("local index unavailable:", e);
 			}
+			// Locked while the index was opening (the user pressed Lock early)?
+			// Then nothing more is built for a session that is already over.
+			if (this.session.locked) return;
 			// The explorer's model: bridge = the session's non-extractable keys.
 			this.model = new FilesModel(sessionBridge(this.session, {
 				confirmDuplicate: async (count) =>
@@ -120,7 +151,7 @@ export class GoraniShell extends LitElement {
 							<button class="px-2.5 py-1.5 ${this.mode === "macos" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="macOS Finder" @click=${() => this.switchMode("macos")}>Finder</button>
 							<button class="px-2.5 py-1.5 ${this.mode === "music" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="Music library" @click=${() => this.switchMode("music")}>Music</button>
 						</div>
-						<button class="rounded-lg border border-neutral-700 px-3 py-1.5 hover:border-accent" @click=${() => this.session.lock()}>
+						<button class="rounded-lg border border-neutral-700 px-3 py-1.5 hover:border-accent" @click=${() => void this.session.lock()}>
 							Lock
 						</button>
 					</div>
@@ -138,14 +169,6 @@ export class GoraniShell extends LitElement {
 						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
 				${this.viewer ? html`<gorani-viewer .model=${this.model} .target=${this.viewer} @closed=${() => (this.viewer = null)}></gorani-viewer>` : nothing}
-					${this.model
-						? this.mode === "win11"
-							? html`<gorani-win11 .model=${this.model} .memberName=${this.member.name} .memberRole=${this.member.role}></gorani-win11>`
-							: this.mode === "music"
-								? html`<gorani-music .model=${this.model} .memberName=${this.member.name}></gorani-music>`
-								: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
-						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
-				</main>
 				<div class="pointer-events-none fixed bottom-4 left-1/2 z-50 -translate-x-1/2 space-y-2">
 					${this.toasts.map((t) => html`<div class="rounded-xl border border-neutral-700 bg-neutral-900/95 px-4 py-2 text-sm text-neutral-200 shadow-xl">${t.text}</div>`)}
 				</div>
@@ -157,5 +180,16 @@ export class GoraniShell extends LitElement {
 declare global {
 	interface Window {
 		__goraniMember?: string;
+	}
+}
+
+/** Tell the media service worker to drop every content key it holds (lock). */
+async function forgetMediaKeys(): Promise<void> {
+	if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
+	try {
+		const reg = await navigator.serviceWorker.getRegistration("/media/");
+		reg?.active?.postMessage({ type: "media-forget-all" });
+	} catch {
+		// no worker registered — nothing to forget
 	}
 }

@@ -89,10 +89,35 @@ npm install && npm --prefix web install
 npm run deploy          # builds web/ + the Rust worker (worker-build)
 ```
 
-First-run bootstrap: sign in through Access, `POST /api/v1/family/members`
-with your parent member (the first member is created by any authenticated
-caller), `PUT /api/v1/family/master` with the generated master public half,
-then create each vault from the UI (commit ⑨'s setup screen).
+First-run bootstrap (commit 25, O18): set a one-time secret first —
+
+```sh
+openssl rand -base64 32 | npx wrangler secret put BOOTSTRAP_TOKEN
+```
+
+— then sign in through Access and `POST /api/v1/family/members` with your
+parent member and the header `x-gorani-bootstrap: <that token>`. Without the
+secret a production deployment refuses to bootstrap at all; without the
+header nobody becomes the first member (the race the token closes: whoever
+got through Access first used to become a parent). The first member must
+be a parent; after it exists the token is meaningless (delete the secret
+if you like). Then `PUT /api/v1/family/master` with the generated master
+public half, and create each vault from the UI (commit ⑨'s setup screen).
+
+**Rate limits** (O13) are in `wrangler.jsonc › ratelimits` (60/min per
+caller + share link, 30/min per caller + device). They are per Cloudflare
+location and approximate — add a WAF rate-limiting rule as the second,
+edge-wide layer, e.g. `http.request.uri.path wildcard "/s/f/*"` → 120
+requests / 1 minute per IP → block for 10 minutes; and the same for
+`/api/v1/members/*/devices/*`.
+
+**Share links on their own hostname** (O17, recommended for a SecOps
+deployment): the recipient page runs a stranger's password through code
+on the same origin as the vault. Give `/s/*` its own hostname (a second
+Worker route, e.g. `share.example.com/s/*`, with no Access application in
+front) and keep the vault's hostname behind Access with `/s/*` excluded
+from the app's links — the page's CSP already forbids framing and inline
+code, so the separation is about cookies and storage, not script.
 
 Schema changes ride the deploy: each Durable Object migrates itself on its
 next wake-up through an append-only ledger (`worker/src/schema.rs`). Add new

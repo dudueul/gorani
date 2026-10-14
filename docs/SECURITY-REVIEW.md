@@ -258,17 +258,36 @@ viewer closes the same URL is a 404; other requests are untouched) and
 `unit:media-frames` (exact cuts). The chunked (GC01, > 48 MB) path shares
 the frame math; an e2e over 48 MB is left to the live suite's budget.
 
-## Open findings (proposals — need a decision)
+### O12–O18, fixed in commit 25 — links, limits, reads, and the small ones
 
-| # | Sev | Finding | Proposal |
+| # | Sev | What | Fix |
 |---|---|---|---|
-| O12 | Medium | Share download limits are cooperative: `/data` does not decrement. | Claim returns a one-time data token. |
-| O13 | Medium | No rate limiting on device-token and share endpoints. | Cloudflare WAF rate-limiting rules on `/s/*` and `/devices/*`. |
-| O14 | Medium | Reads/downloads are not audited (only writes are). | Audit download/share-access events (see questions). |
-| O15 | Low | Passkey `rp.id` = last two host labels (`workers.dev` is a public suffix). | `location.hostname`. Latent: no caller yet. |
-| O16 | Low | `S3Config`/`DeviceProfile` derive `Debug` (secret printed by `{:?}`). | Manual `Debug` with redaction. |
-| O17 | Low | Share page on the vault's origin; vendored Argon2 without SRI or a recorded hash. | Separate share origin; SRI + hash in NOTICE. |
-| O18 | Low | Bootstrap: the first member is created by *any* authenticated caller (a race on a fresh deploy). | A one-time `BOOTSTRAP_TOKEN` secret. |
+| O12 | Medium | **Share limits were cooperative**: `/data` served the copy to anyone with the link — no claim needed, so "2 downloads" was the page's courtesy. | A claim spends one download and returns a token (256-bit, stored as SHA-256, one hour); `/data` serves only to a live token of that share (`x-gorani-share-token` — a header, not a URL). One claim = one download session (Range pieces included). Revoking the link kills its tokens. |
+| O12a | High | **A one-download link could never be downloaded**: `/data` re-ran the claim's own check (`downloads_left > 0`) after the claim had spent the last one. Every link's final download failed. | `/data` checks the token and the share's state, not the count. Found by writing O12's test. |
+| O13 | Medium | No rate limiting on the public share routes or the device-token checks. | The Workers rate-limiting binding (wrangler.jsonc › `ratelimits`): 60/min per caller + link on `/s/*`, 30/min per caller + device on token checks; 429 + `Retry-After`. It fails OPEN on a limiter error (a flood mitigation, not a security boundary — the secrets are) and is per-location and approximate, so the WAF rules in PRODUCTION.md are the second layer. |
+| O14 | Medium | Reads were not audited — only writes. | The read log (D10): the download route sends the READER to the DO, whose object lookup records one merged row per reader × version × client × 5 minutes — before the edge cache, so a cached read is still on record. `GET …/reads[?file=]`; the clients label themselves (`x-gorani-client`: web, media, cli). Share claims land in the owner's audit. |
+| O15 | Low | Passkey `rp.id` was "the last two host labels": `workers.dev` (a public suffix — no passkey could be created) on a workers.dev deploy, `co.uk` on others; and the unlock call used the browser's default (the hostname), so on any subdomain an enrolled passkey could never unlock. | `rp.id` = `location.hostname`, stated on both calls. |
+| O16 | Low | `S3Config` and `DeviceProfile` derived `Debug`: `{:?}` printed the S3 secret, the device token, the Access secret and the device secret. | Hand-written `Debug` with `[redacted]`; a test checks no key appears. |
+| O17 | Low | The share page ran a vendored Argon2 with no recorded provenance and no integrity check. | Subresource Integrity on the script tag; the sha256 in NOTICE; `unit:vendored` proves the file is hash-wasm 4.12.0's build byte for byte and that NOTICE, `s.html` and the built page agree. (The separate share *origin* is a deployment decision — PRODUCTION.md › Share links.) |
+| O18 | Low | The first member was created by any authenticated caller — a race on a fresh deploy. | A `BOOTSTRAP_TOKEN` secret, presented once (`x-gorani-bootstrap`): checked in the Worker (constant time), applied by the registry only while it is empty, and the first member must be a parent. Production without the secret refuses to bootstrap; the dev server without it bootstraps freely. A client-sent verdict is overwritten; a non-object body is a 400, not a panic. |
+
+Proven by: `api:shares` (no token / a forged token → 403; the claim's token
+serves data and Range; **the last download downloads**; a revoked link's
+token dies), `api:security` § 10 (the 71st request a minute on one link is
+429 with `Retry-After`, another link is untouched; device-token guessing is
+cut off), `api:files` / `api:cache` (two downloads in a window are one
+merged line; a parent's read is the parent's; a cache HIT is still a read
+on record), `api:bootstrap` (new, its own server with the secret set),
+`unit:vendored` (new), the Rust tests for `bootstrap_allowed` and the
+redacted `Debug`.
+
+## Still open
+
+None of the review's findings. What remains is the product roadmap in
+docs/DECISIONS.md (D2/D4 roles, cases and quorum recovery — which also close
+O3's trust-on-first-use gap — D5 custody, D6 Object Lock, D7 retention, D8
+samples, D11 partner sign-in, D12 large files) and the operational controls
+below.
 
 ## Operational controls (outside the code)
 

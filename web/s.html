@@ -47,8 +47,12 @@
 				</div>
 			</section>
 		</div>
-		<!-- Argon2id (hash-wasm, MIT — see NOTICE) sets globalThis.hashwasm. -->
-		<script src="/vendor/argon2.umd.min.js"></script>
+		<!-- Argon2id (hash-wasm 4.12.0, MIT — see NOTICE) sets globalThis.hashwasm.
+		     Pinned by Subresource Integrity (commit 25, O17): if the served file
+		     differs by one byte from the one recorded in NOTICE, the browser
+		     refuses to run it — the link's password never meets unknown code.
+		     tests/unit/vendored.test.mjs keeps file, NOTICE and this hash in step. -->
+		<script src="/vendor/argon2.umd.min.js" integrity="sha384-tP0Wy54CKmng7i9EoTlPySD0hBx6Octj0VS6MfwlnUu111MPa+JLm0CCbep6XJ1W" crossorigin="anonymous"></script>
 		<!-- The page's code lives in /s.js: the CSP (worker/src/routes.rs ›
 		     share page) allows scripts from 'self' only — no inline script, no
 		     inline style, no innerHTML (commit 24, docs/SECURITY-REVIEW.md › O1). -->

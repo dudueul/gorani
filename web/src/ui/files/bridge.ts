@@ -49,7 +49,8 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		identityHeaders: devIdentityHeaders,
 
 		async fetchObject(memberId, id, version, range) {
-			const headers: Record<string, string> = { ...devIdentityHeaders() };
+			// `x-gorani-client`: the read log's "from what" (O14) — a label.
+			const headers: Record<string, string> = { ...devIdentityHeaders(), "x-gorani-client": "web" };
 			if (range) headers.Range = `bytes=${range[0]}-${range[1]}`;
 			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`, { headers });
 			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
@@ -62,7 +63,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		},
 
 		async fetchObjectStream(memberId, id, version, sink) {
-			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`, { headers: devIdentityHeaders() });
+			const res = await fetch(`/api/v1/members/${memberId}/files/${id}${version ? `?version=${version}` : ""}`, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web" } });
 			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
 			const ck = res.headers.get("x-gorani-ck") ?? "";
 			const chunk = Number(res.headers.get("x-gorani-chunk")) || 0;

@@ -37,7 +37,7 @@ export function r2Twin() {
  * (tests/api/s3-live.test.mjs) uses it. The credentials go only into the
  * gitignored .dev.vars, exactly where `wrangler dev` reads secrets from.
  */
-export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3, keepState = false } = {}) {
+export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3, keepState = false, vars = {} } = {}) {
 	if (!fs.existsSync(path.join(ROOT, "web/dist/index.html"))) {
 		const b = spawnSync("npm", ["--prefix", "web", "run", "build"], { cwd: ROOT, encoding: "utf8" });
 		if (b.status !== 0) throw new Error(`web build failed:\n${b.stdout}\n${b.stderr}`);
@@ -67,6 +67,9 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 			`S3_SECRET_KEY=${s3?.secretKey ?? "test"}`,
 			"CACHE_MAX_OBJECT_MB=6",
 			"VAULT_DESTROY_ENABLED=1",
+			// Extra vars a suite needs on its own server (api:bootstrap's
+			// BOOTSTRAP_TOKEN) — never secrets of a real deployment.
+			...Object.entries(vars).map(([k, v]) => `${k}=${v}`),
 			"",
 		].join("\n"),
 	);

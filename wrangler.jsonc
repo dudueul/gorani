@@ -93,6 +93,18 @@
 		{ "tag": "v1", "new_sqlite_classes": ["GoraniFamilyDO", "GoraniMemberDO"] }
 	],
 
+	// Rate limits (commit 25, docs/SECURITY-REVIEW.md › O13) — the Workers
+	// rate-limiting binding: per caller (CF-Connecting-IP) and target, per
+	// minute. The public share routes are the only ones reachable without
+	// signing in; device-token checks are behind Access but each is a DO
+	// round trip. Generous for people, tight for scripts. (namespace_id: any
+	// account-unique integer; the WAF rules in docs/PRODUCTION.md add a
+	// second, edge-wide layer.)
+	"ratelimits": [
+		{ "name": "SHARE_LIMITER", "namespace_id": "4201", "simple": { "limit": 60, "period": 60 } },
+		{ "name": "DEVICE_LIMITER", "namespace_id": "4202", "simple": { "limit": 30, "period": 60 } }
+	],
+
 	"observability": {
 		"enabled": true
 	},

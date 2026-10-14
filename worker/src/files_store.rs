@@ -398,14 +398,43 @@ impl GoraniMemberDO {
 	/// The `files-object/:id` route: the object's location + wrapped key, for
 	/// the Worker to stream from S3. Metadata only — no name, no key material
 	/// beyond the wrapped one the client will open.
-	pub(crate) async fn file_object_route(&self, file_id: &str, version: Option<i64>) -> Result<Response> {
+	/// The object of a version, for the Worker's download route — and the
+	/// read audit (O14): every download passes here BEFORE the edge cache, so
+	/// a read served from cache is still a read on record. One merged row per
+	/// reader × version × client × 5 minutes (a seek is many requests).
+	pub(crate) async fn file_object_route(&self, file_id: &str, version: Option<i64>, reader: &str, client: Option<&str>) -> Result<Response> {
 		match self.file_object(file_id, version).await? {
+			Some(o) if reader != "internal" => {
+				// (Sanitised: the client kind is a short label the caller picks.)
+				let client: String = client.unwrap_or("unknown").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == ':').take(64).collect();
+				self.sql.exec(
+					"INSERT INTO read_log (actor, file_id, version, client, win, first_at, last_at, requests) VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER) / 300, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), 1) ON CONFLICT (actor, file_id, version, client, win) DO UPDATE SET last_at = excluded.last_at, requests = requests + 1",
+					Some(vec![reader.into(), file_id.into(), o.version.into(), client.into()]),
+				)?;
+				Ok(Response::from_json(&serde_json::json!({
+					"objectKey": o.object_key, "ck": o.content_key, "vaultKeyId": o.vault_key_id,
+					"chunk": o.chunk_size, "size": o.size, "version": o.version,
+				}))?)
+			}
 			Some(o) => Ok(Response::from_json(&serde_json::json!({
 				"objectKey": o.object_key, "ck": o.content_key, "vaultKeyId": o.vault_key_id,
 				"chunk": o.chunk_size, "size": o.size, "version": o.version,
 			}))?),
 			None => json_error(404, "no such file"),
 		}
+	}
+
+	/// The read log (`GET …/reads[?file=]`): who read which version, from
+	/// what kind of client, when — newest first. Structure only, like the
+	/// rest of this DO; readable to the member and their parents.
+	pub(crate) async fn read_log(&self, file: Option<&str>) -> Result<Response> {
+		let rows: Vec<ReadRow> = match file {
+			Some(f) => self.sql.exec("SELECT actor, file_id, version, client, first_at, last_at, requests FROM read_log WHERE file_id = ?1 ORDER BY last_at DESC LIMIT 500", Some(vec![f.into()]))?.to_array()?,
+			None => self.sql.exec("SELECT actor, file_id, version, client, first_at, last_at, requests FROM read_log ORDER BY last_at DESC LIMIT 500", None)?.to_array()?,
+		};
+		Ok(Response::from_json(&serde_json::json!({
+			"reads": rows.into_iter().map(|r| serde_json::json!({ "actor": r.actor, "file": r.file_id, "version": r.version, "client": r.client, "firstAt": r.first_at, "lastAt": r.last_at, "requests": r.requests })).collect::<Vec<_>>(),
+		}))?)
 	}
 
 	/// Does a version row point at `files/<member>/<file>/<obj>`? The
@@ -722,7 +751,7 @@ impl GoraniMemberDO {
 	async fn share_public_check(&self, id: &str) -> std::result::Result<ShareRow2, Response> {
 		let rows: Vec<ShareRow2> = match self
 			.sql
-			.exec("SELECT meta_sealed, kdf, expires_at, downloads_left, object_key, ready, revoked_at, expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') AS expired FROM shares WHERE id = ?1", Some(vec![id.into()]))
+			.exec("SELECT meta_sealed, kdf, expires_at, downloads_left, ready, revoked_at, expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') AS expired FROM shares WHERE id = ?1", Some(vec![id.into()]))
 		{
 			Ok(c) => match c.to_array() {
 				Ok(rows) => rows,
@@ -757,21 +786,67 @@ impl GoraniMemberDO {
 	}
 
 	/// One download: decrement the counter (0 and below stay refused above).
+	/// Spend one download and hand back the token that /data asks for
+	/// (commit 25, docs/SECURITY-REVIEW.md › O12).
+	///
+	/// Before: the claim decremented a counter and /data served the copy to
+	/// anyone holding the link — no claim needed, so "2 downloads" meant
+	/// "as many as you like, if you skip the button". And /data re-ran the
+	/// claim's own check (`downloads_left > 0`), so the claim that spent the
+	/// LAST download was followed by a refused /data: a one-download link
+	/// could never be downloaded at all.
+	///
+	/// Now one claim = one download session: a random token (only its
+	/// SHA-256 is stored), valid for an hour — long enough for a large copy
+	/// fetched in Range pieces, short enough that a token found later in a
+	/// history file is dead.
 	pub(crate) async fn share_claim(&self, id: &str) -> Result<Response> {
 		match self.share_public_check(id).await {
 			Ok(r) => {
 				let left = r.downloads_left - 1;
 				self.sql.exec("UPDATE shares SET downloads_left = ?1 WHERE id = ?2", Some(vec![left.into(), id.into()]))?;
-				Ok(Response::from_json(&serde_json::json!({ "downloadsLeft": left }))?)
+				let mut raw = [0u8; 32];
+				OsRng.fill_bytes(&mut raw);
+				let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+				self.sql.exec(
+					"INSERT INTO share_tokens (hash, share_id, expires_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 hour'))",
+					Some(vec![token_hash(&token).into(), id.into()]),
+				)?;
+				// The owner's audit records each download of their link (O14).
+				self.audit("share-link", "share.claim", id, None, Some(&format!("downloadsLeft:{left}"))).await?;
+				Ok(Response::from_json(&serde_json::json!({ "downloadsLeft": left, "token": token, "tokenExpiresIn": 3600 }))?)
 			}
 			Err(resp) => Ok(resp),
 		}
 	}
 
-	pub(crate) async fn share_public_object(&self, id: &str) -> std::result::Result<String, Response> {
-		match self.share_public_check(id).await {
-			Ok(r) => Ok(r.object_key),
-			Err(resp) => Err(resp),
+	/// The sealed copy's object key — for a LIVE token of this share, on a
+	/// share that is still live (ready, not revoked, not expired). The
+	/// download count is NOT checked here: the claim that minted the token
+	/// already spent its download.
+	pub(crate) async fn share_public_object(&self, id: &str, token: &str) -> std::result::Result<String, Response> {
+		let live = !token.is_empty()
+			&& self
+				.sql
+				.exec(
+					"SELECT 1 AS one FROM share_tokens WHERE hash = ?1 AND share_id = ?2 AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+					Some(vec![token_hash(token).into(), id.into()]),
+				)
+				.ok()
+				.and_then(|c| c.to_array::<ExistsRow>().ok())
+				.is_some_and(|r| !r.is_empty());
+		if !live {
+			return Err(json_error_raw(403, "claim a download first (the link's data needs the token a claim returns)"));
+		}
+		let rows: Vec<ShareLive> = self
+			.sql
+			.exec("SELECT object_key, ready, revoked_at, expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') AS expired FROM shares WHERE id = ?1", Some(vec![id.into()]))
+			.and_then(|c| c.to_array())
+			.map_err(|e| json_error_raw(500, &e.to_string()))?;
+		match rows.into_iter().next() {
+			Some(r) if r.ready != 0 && r.revoked_at.is_none() && r.expired == 0 => Ok(r.object_key),
+			Some(r) if r.expired == 1 => Err(json_error_raw(410, "this link has expired")),
+			_ => Err(json_error_raw(404, "no such share")),
 		}
 	}
 
@@ -1096,6 +1171,32 @@ struct KvRow {
 	v: String,
 }
 #[derive(serde::Deserialize)]
+struct ReadRow {
+	actor: String,
+	file_id: String,
+	version: i64,
+	client: String,
+	first_at: String,
+	last_at: String,
+	requests: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct ShareLive {
+	object_key: String,
+	ready: i64,
+	revoked_at: Option<String>,
+	expired: i64,
+}
+
+/// A share token as stored: SHA-256, base64url. (The token itself is a
+/// 256-bit random secret, so a plain hash — not a slow KDF — is the right
+/// tool: there is nothing to brute-force.)
+fn token_hash(token: &str) -> String {
+	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(gorani_formats::unlock::sha256(&[token.as_bytes()]))
+}
+
+#[derive(serde::Deserialize)]
 struct ShareObjRow {
 	object_key: String,
 }
@@ -1122,7 +1223,6 @@ struct ShareRow2 {
 	kdf: Option<String>,
 	expires_at: String,
 	downloads_left: i64,
-	object_key: String,
 	ready: i64,
 	revoked_at: Option<String>,
 	expired: i64,

@@ -211,3 +211,48 @@ pub fn valid_object_id(id: &str) -> bool {
 pub fn sha256_hex(data: &[u8]) -> String {
 	hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data))
 }
+
+/// May THIS request create the family's first member? (commit 25,
+/// docs/SECURITY-REVIEW.md › O18.)
+///
+/// Before: the first member was created by ANY authenticated caller — on a
+/// fresh deploy, whoever got through Access first became a parent (a race
+/// an attacker with any allowed identity, or a misconfigured Access policy,
+/// would win). Now the operator sets a `BOOTSTRAP_TOKEN` secret and presents
+/// it once (`x-gorani-bootstrap`); after the first member exists the token
+/// is irrelevant — only parents add members.
+///
+/// - token configured: the presented value must match (constant time);
+/// - not configured, dev server: allowed (the suites bootstrap freely);
+/// - not configured, production: REFUSED — fail closed, with the fix named.
+pub fn bootstrap_allowed(configured: Option<&str>, presented: Option<&str>, dev: bool) -> Result<(), &'static str> {
+	match (configured.filter(|c| !c.is_empty()), presented) {
+		(Some(c), Some(p)) if constant_time_eq(c.as_bytes(), p.as_bytes()) => Ok(()),
+		(Some(_), _) => Err("the first member needs the bootstrap token (x-gorani-bootstrap)"),
+		(None, _) if dev => Ok(()),
+		(None, _) => Err("set the BOOTSTRAP_TOKEN secret (wrangler secret put BOOTSTRAP_TOKEN), then create the first parent with it"),
+	}
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+	use super::bootstrap_allowed;
+
+	#[test]
+	fn the_first_member_needs_the_token() {
+		assert!(bootstrap_allowed(Some("s3cret-token"), Some("s3cret-token"), false).is_ok());
+		assert!(bootstrap_allowed(Some("s3cret-token"), Some("wrong"), false).is_err());
+		assert!(bootstrap_allowed(Some("s3cret-token"), None, false).is_err());
+		assert!(bootstrap_allowed(Some("s3cret-token"), None, true).is_err(), "a configured token binds the dev server too");
+		assert!(bootstrap_allowed(None, None, true).is_ok(), "the dev server without a token bootstraps freely");
+		assert!(bootstrap_allowed(None, Some("anything"), false).is_err(), "production without a token is closed");
+		assert!(bootstrap_allowed(Some(""), None, false).is_err(), "an empty secret is no secret");
+	}
+}

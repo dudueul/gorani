@@ -18,6 +18,8 @@
  *   9. (commit 25, O6) a sealed value opens only in its place, and only a
  *      holder of the store key can seal one — the server can neither move
  *      a key or a name to another file nor mint a file of its own
+ *  10. (commit 25, O13) the public share routes and the device-token checks
+ *      are rate limited per caller and target
  */
 
 import assert from "node:assert/strict";
@@ -115,7 +117,8 @@ try {
 	assert.equal((await meta.json()).metaSealed, a.metaSealed, "the public link still resolves to the original owner's share");
 
 	// ── 4. The public data route honours the exact Range ───────────────
-	const ranged = await fetch(`${dev.base}/s/f/${id}/data`, { headers: { Range: "bytes=2-9" } });
+	const token = (await (await fetch(`${dev.base}/s/f/${id}/claim`, { method: "POST" })).json()).token; // O12: data needs a claim
+	const ranged = await fetch(`${dev.base}/s/f/${id}/data`, { headers: { Range: "bytes=2-9", "x-gorani-share-token": token } });
 	assert.equal(ranged.status, 206);
 	const slice = new Uint8Array(await ranged.arrayBuffer());
 	assert.deepEqual(slice, copy.slice(2, 10), "bytes=2-9 is eight bytes starting at offset 2 (an inclusive end, not a length)");
@@ -218,7 +221,26 @@ try {
 	assert.equal(mint.status, 200, "the shape is right, so an honest-looking server stores it…");
 	await assert.rejects(jinu.store.openFileName(minted, foreign), /not sealed here/, "…but the minted name never opens in jinu's store");
 
-	console.log("ok  api:security — registry scope, id validation, share-id ownership, exact Range, device-token reports, write-once restore, quiet health, O6 moving + minting");
+	// ── 10. O13: rate limits on what a script would hammer ──────────────
+	// The share routes are public; a script could loop on one link (its
+	// claims, its owner's bucket egress). Per caller + link, 60 a minute.
+	const hammered = newShareId();
+	const statuses = [];
+	for (let i = 0; i < 70; i++) statuses.push((await fetch(`${dev.base}/s/f/${hammered}/meta`)).status);
+	assert.ok(statuses.slice(0, 50).every((s) => s === 404), "a person's requests are untouched (an unknown link is an honest 404)");
+	const limited = await fetch(`${dev.base}/s/f/${hammered}/meta`);
+	assert.equal(limited.status, 429, `the 71st request in a minute is refused (${statuses.slice(-5)})`);
+	assert.equal(limited.headers.get("retry-after"), "60");
+	assert.equal((await fetch(`${dev.base}/s/f/${newShareId()}/meta`)).status, 404, "another link is not affected");
+	// Device-token checks: 30 a minute per caller + device.
+	let deviceLimited = false;
+	for (let i = 0; i < 40 && !deviceLimited; i++) {
+		const r = await fetch(`${dev.base}/api/v1/members/jinu/devices/no-such-device/check`, { method: "POST", headers: { "content-type": "application/json", "x-gorani-dev-email": "jinu@family.test", "x-gorani-device-token": "guess" }, body: "{}" });
+		deviceLimited = r.status === 429;
+	}
+	assert.ok(deviceLimited, "token guessing against one device is cut off");
+
+	console.log("ok  api:security — registry scope, id validation, share-id ownership, exact Range, device-token reports, write-once restore, quiet health, O6 moving + minting, O13 rate limits");
 } finally {
 	await dev.close();
 }

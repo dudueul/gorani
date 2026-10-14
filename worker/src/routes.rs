@@ -148,7 +148,22 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		// ── The family registry (GoraniFamilyDO) ────────────────────────
 		("GET", ["family"]) => forward_family(&env, &identity.email, "GET", "state", None).await,
 		("POST", ["family", "members"]) => {
-			let body = req.json::<serde_json::Value>().await?;
+			// The bootstrap proof (O18) — decided here, where the secret is;
+			// the registry applies it only while it has no members.
+			let configured = env.secret("BOOTSTRAP_TOKEN").ok().map(|s| s.to_string()).or_else(|| env.var("BOOTSTRAP_TOKEN").ok().map(|v| v.to_string()));
+			let presented = req.headers().get("x-gorani-bootstrap")?;
+			let dev = env.var("GORANI_DEV").map(|v| v.to_string() == "1").unwrap_or(false);
+			let proof = match auth::bootstrap_allowed(configured.as_deref(), presented.as_deref(), dev) {
+				Ok(()) => "ok".to_string(),
+				Err(why) => why.to_string(),
+			};
+			let mut body = req.json::<serde_json::Value>().await?;
+			// (An object, or nothing: `body[..] =` on a JSON array or string
+			// PANICS in serde_json — and a panicking wasm Worker hangs, O19.)
+			let Some(fields) = body.as_object_mut() else { return json_error(400, "a member is a JSON object") };
+			// Always the Worker's own verdict: a client-sent `__bootstrap`
+			// is overwritten, never trusted.
+			fields.insert("__bootstrap".into(), serde_json::json!(proof));
 			forward_family(&env, &identity.email, "POST", "members", Some(body)).await
 		}
 		("PATCH", ["family", "members", id]) => {
@@ -194,6 +209,8 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 		// The deletion outbox (O10): what retention removed from the rows but
 		// storage has not confirmed deleting yet — keys, attempts, last error.
 		("GET", ["members", id, "storage", "pending"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "storage/pending", None, actor)).await,
+		// The read log (O14): who read which file version, from what, when.
+		("GET", ["members", id, "reads"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "reads", &req, actor)).await,
 		("POST", ["members", id, "files", "trash", "restore"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await
@@ -315,6 +332,12 @@ where
 /// touch member B), and in production the perimeter is an Access service
 /// token, not a member email.
 async fn device_call(env: &Env, _identity: &Identity, member_id: &str, device: &str, what: &str, mut req: Request) -> Result<Response> {
+	// Token checks are rate limited per caller and device (O13): a device
+	// token is a 256-bit secret, so guessing is hopeless — but each guess
+	// costs a DO round trip, and an unbounded loop of them is a cheap DoS.
+	if let Some(limited) = rate_limited(env, "DEVICE_LIMITER", format!("device:{}:{member_id}:{device}", client_ip(&req))).await {
+		return Ok(limited);
+	}
 	// The token decides — but only for a member the registry has (otherwise
 	// any Access identity could conjure `member:<anything>` DOs here).
 	if !auth::valid_member_id(member_id) || !member_exists(env, member_id).await? {
@@ -716,12 +739,18 @@ async fn upload_meta(env: &Env, member_id: &str, upload_id: &str) -> std::result
 /// chunk size (if chunked) in `x-gorani-chunk`. The Worker never holds a key
 /// that opens it.
 async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &str, file_id: &str) -> Result<Response> {
-	match member_ctx(&env, identity, member_id).await {
-		Ok(_) => {}
+	let actor = match member_ctx(&env, identity, member_id).await {
+		Ok(a) => a,
 		Err(resp) => return Ok(resp),
-	}
+	};
 	let version = crate::files_store::urlquery(req.url()?.query().unwrap_or("")).get("version").and_then(|v| v.parse::<i64>().ok());
-	let meta = forward_member(&env, member_id, "GET", &format!("files-object/{file_id}?version={}", version.map(|v| v.to_string()).unwrap_or_default()), None, "internal").await;
+	// The reader goes to the DO as the actor (O14, D10): the lookup records
+	// one merged read event per reader × version × client × 5 minutes —
+	// BEFORE the cache, so a cached read is still a read on record. The
+	// client kind is a label the caller sets (`x-gorani-client`: web, media,
+	// cli…); it describes, it does not authenticate.
+	let client = req.headers().get("x-gorani-client")?.unwrap_or_else(|| "unknown".into());
+	let meta = forward_member(&env, member_id, "GET", &format!("files-object/{file_id}?version={}&client={}", version.map(|v| v.to_string()).unwrap_or_default(), urlencode(&client)), None, &actor.email).await;
 	let meta = match meta {
 		Ok(mut r) if r.status_code() == 200 => r.json::<serde_json::Value>().await?,
 		Ok(r) => return Ok(r),
@@ -790,8 +819,9 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 // ── Public share routes (GS01) ──────────────────────────────────────────────
 // /s/f/<id>          the sealed share page (served from the asset s.html)
 // /s/f/<id>/meta     { metaSealed, kdf, expiresAt, downloadsLeft }
-// /s/f/<id>/claim    one download — decrements the counter
-// /s/f/<id>/data     the sealed copy (GC1 frames under the link's data key)
+// /s/f/<id>/claim    one download — decrements the counter, returns a token
+// /s/f/<id>/data     the sealed copy (GC1 frames under the link's data key),
+//                    for the claim's token only (x-gorani-share-token, O12)
 //
 // Everything here is unauthenticated BY DESIGN: the link's fragment secret
 // is the credential, the server holds only sealed bytes, and the owner's
@@ -801,6 +831,13 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 	let id = id.to_string();
 	if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
 		return http_text(404, "no such share").await;
+	}
+	// The only routes anyone on the internet can call without signing in
+	// (O13): per caller and link, so a script hammering one link — draining
+	// its claims, or its owner's bucket egress — is cut off, while the
+	// recipient's handful of requests never notice.
+	if let Some(limited) = rate_limited(&env, "SHARE_LIMITER", format!("share:{}:{id}", client_ip(&req))).await {
+		return Ok(limited);
 	}
 	let member = {
 		let namespace = env.durable_object("FAMILY")?;
@@ -881,8 +918,11 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 			Ok(Response::from_json(&v)?.with_status(status))
 		}
 		Some(&"data") => {
-			// State check via the DO, then stream the sealed object from S3.
-			let resp = do_call(format!("shares/{id}/public-object"), Some(serde_json::json!({}))).await?;
+			// The claim's token (O12) and the share's state, checked by the DO;
+			// then the sealed object streams from S3. A header, not a query
+			// parameter: URLs end up in logs and histories, headers do not.
+			let token = req.headers().get("x-gorani-share-token")?.unwrap_or_default();
+			let resp = do_call(format!("shares/{id}/public-object"), Some(serde_json::json!({ "token": token }))).await?;
 			let mut resp = resp;
 			let status = resp.status_code();
 			if status >= 400 {
@@ -1147,4 +1187,36 @@ async fn backup_object_fill(mut req: Request, env: Env, identity: &Identity, mem
 	let bytes = req.bytes().await?;
 	s3::put(&env, &key, bytes.to_vec()).await?;
 	Response::from_json(&serde_json::json!({ "ok": true }))
+}
+
+/// The caller's address as Cloudflare saw it (`CF-Connecting-IP`; absent
+/// on the dev server, where every caller is "local").
+fn client_ip(req: &Request) -> String {
+	req.headers().get("CF-Connecting-IP").ok().flatten().unwrap_or_else(|| "local".into())
+}
+
+/// A 429 when `key` is over its limiter's budget (wrangler.jsonc ›
+/// ratelimits), or None to proceed.
+///
+/// Fails OPEN — a missing binding or a limiter error lets the request
+/// through — on purpose: the limiter is a mitigation against floods, not a
+/// security boundary (that is the link secret, the claim token, the device
+/// token). Cloudflare's limiter is also per location and eventually
+/// consistent, so it bounds a flood, it does not count exactly; the WAF
+/// rules in docs/PRODUCTION.md are the second layer.
+async fn rate_limited(env: &Env, binding: &str, key: String) -> Option<Response> {
+	let limiter = env.rate_limiter(binding).ok()?;
+	match limiter.limit(key).await {
+		Ok(outcome) if !outcome.success => {
+			let resp = Response::from_json(&serde_json::json!({ "error": "too many requests — wait a minute" })).ok()?.with_status(429);
+			let _ = resp.headers().set("Retry-After", "60");
+			Some(resp)
+		}
+		_ => None,
+	}
+}
+
+/// Percent-encode a query value (only what the read log's `client` needs).
+fn urlencode(v: &str) -> String {
+	v.bytes().map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b':' { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }

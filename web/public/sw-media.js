@@ -54,7 +54,8 @@ self.addEventListener("message", (event) => {
 			type: msg.mime || "application/octet-stream",
 			// The dev server's identity header (the page's localStorage is out
 			// of reach here); `{}` in production, where the Access cookie rides.
-			headers: msg.headers && typeof msg.headers === "object" ? msg.headers : {},
+			// + the read log's client label (O14): media streaming is a read too.
+			headers: { ...(msg.headers && typeof msg.headers === "object" ? msg.headers : {}), "x-gorani-client": "media" },
 		});
 		event.ports?.[0]?.postMessage({ ok: true }); // the page may wait for this
 	}

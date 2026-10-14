@@ -69,6 +69,10 @@ try {
 	assert.deepEqual(first.body, sealed, "the sealed bytes, untouched by the cache");
 	const second = await get(fileId);
 	assert.equal(second.cache, "hit", `the second read is served from cache (${second.cache})`);
+	// …and a read served from the edge is still a read on record (O14, D10:
+	// the Worker audits BEFORE the cache lookup).
+	const reads = (await api(dev.base, "GET", `/api/v1/members/jinu/reads?file=${fileId}`, { email: "jinu@family.test" })).json.reads;
+	assert.equal(reads.reduce((n, r) => n + r.requests, 0), 2, `the miss and the hit are both on record: ${JSON.stringify(reads)}`);
 	assert.deepEqual(second.body, sealed, "the cached copy is byte-identical");
 
 	// ── 2. Range over a cached entry: the platform slices it ───────────

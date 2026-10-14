@@ -239,6 +239,29 @@ pub const MIGRATIONS: &[&str] = &[
 		attempts INTEGER NOT NULL DEFAULT 0,
 		last_error TEXT
 	)",
+	// Migration v9 (commit 25): share download tokens (O12). A claim — which
+	// spends one download — returns a token; /data serves only to a live
+	// token. Stored as SHA-256: a leaked table cannot be replayed.
+	"CREATE TABLE IF NOT EXISTS share_tokens (
+		hash TEXT PRIMARY KEY,
+		share_id TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	)",
+	// Migration v10 (commit 25): the read log (O14, docs/DECISIONS.md › D10).
+	// One MERGED row per reader × file version × client × 5-minute window —
+	// a video seek is dozens of range requests, a custody record needs one
+	// line: "who read evidence item F, version 3, from what, when".
+	"CREATE TABLE IF NOT EXISTS read_log (
+		actor TEXT NOT NULL,
+		file_id TEXT NOT NULL,
+		version INTEGER NOT NULL,
+		client TEXT NOT NULL,
+		win INTEGER NOT NULL,
+		first_at TEXT NOT NULL,
+		last_at TEXT NOT NULL,
+		requests INTEGER NOT NULL,
+		PRIMARY KEY (actor, file_id, version, client, win)
+	)",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -367,7 +390,9 @@ impl GoraniMemberDO {
 				self.share_claim(&id["shares/".len()..id.len() - "/claim".len()]).await
 			}
 			("POST", id) if id.starts_with("shares/") && id.ends_with("/public-object") => {
-				match self.share_public_object(&id["shares/".len()..id.len() - "/public-object".len()]).await {
+				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+				let token = body.get("token").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+				match self.share_public_object(&id["shares/".len()..id.len() - "/public-object".len()], &token).await {
 					Ok(object) => Ok(Response::from_json(&serde_json::json!({ "objectKey": object }))?),
 					Err(resp) => Ok(resp),
 				}
@@ -383,6 +408,10 @@ impl GoraniMemberDO {
 			}
 			("GET", "backups") => self.backups_list().await,
 			("GET", "storage/pending") => self.pending_deletes().await,
+			("GET", "reads") => {
+				let q = req.url()?.query().map(urlquery).unwrap_or_default();
+				self.read_log(q.get("file").map(String::as_str)).await
+			}
 			("GET", id) if id.starts_with("backups/") => self.backup_object(&id["backups/".len()..]).await,
 			("POST", "backup/restore") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -407,8 +436,13 @@ impl GoraniMemberDO {
 				// one, so the old `split_once('?')` on the path never matched
 				// and `?version=n` downloads silently served the CURRENT
 				// version (commit 23).
-				let version = req.url()?.query().map(urlquery).and_then(|q| q.get("version").and_then(|x| x.parse::<i64>().ok()));
-				self.file_object_route(&id["files-object/".len()..], version).await
+				let q = req.url()?.query().map(urlquery).unwrap_or_default();
+				let version = q.get("version").and_then(|x| x.parse::<i64>().ok());
+				// The Worker sends the READER as the actor and the client kind
+				// in `client` (O14): this lookup is where every download —
+				// browser, media worker, CLI — passes before the edge cache.
+				let client = q.get("client").cloned();
+				self.file_object_route(&id["files-object/".len()..], version, &actor, client.as_deref()).await
 			}
 			("GET", id) if id.starts_with("restore-target/") => match id["restore-target/".len()..].split_once('/') {
 				Some((file_id, obj)) => self.restore_target(&member, file_id, obj).await,
@@ -664,6 +698,10 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
+		// The read log keeps as long as the change journal (O14).
+		self.sql.exec(&format!("DELETE FROM read_log WHERE last_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{journal_days} days')"), None)?;
+		// Share download tokens: expired, or of a share that is gone (O12).
+		self.sql.exec("DELETE FROM share_tokens WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') OR share_id NOT IN (SELECT id FROM shares)", None)?;
 
 		// 4. Drain the outbox — this pass's keys and any earlier failures.
 		let drained = self.drain_deletes().await?;

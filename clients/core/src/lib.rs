@@ -54,7 +54,12 @@ impl From<std::io::Error> for Error {
 
 /// The persisted device profile (the CLI keeps it in a JSON file next to
 /// its state; platform shells put it in their credential stores).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// `Debug` by hand (O16): the device token, the Access service secret and
+/// the device secret print as `[redacted]` — the derived impl printed all
+/// three for any `{:?}`, and the device secret plus the server's copy IS
+/// the root key.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceProfile {
 	pub server: String,
@@ -83,6 +88,22 @@ pub struct DeviceProfile {
 	/// Dev-mode identity (wrangler dev only; production uses Access).
 	#[serde(default)]
 	pub dev_email: Option<String>,
+}
+
+impl std::fmt::Debug for DeviceProfile {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let redact = |o: &Option<String>| if o.is_some() { "[redacted]" } else { "None" };
+		f.debug_struct("DeviceProfile")
+			.field("server", &self.server)
+			.field("member", &self.member)
+			.field("device_id", &self.device_id)
+			.field("token", &"[redacted]")
+			.field("access_id", &self.access_id)
+			.field("access_secret", &redact(&self.access_secret))
+			.field("device_secret", &redact(&self.device_secret))
+			.field("dev_email", &self.dev_email)
+			.finish()
+	}
 }
 
 /// The unlocked session: the root bundle (bytes, Zeroizing) + the settings.

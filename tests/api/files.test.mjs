@@ -139,6 +139,17 @@ try {
 	const opened = await store.openFileKey(fileId, 1, dl.headers.get("x-gorani-ck"));
 	assert.equal(dec.decode(await openWith(opened, got)), dec.decode(plain));
 
+	// The read is on record (O14, D10): one merged row per reader × version ×
+	// client × 5 minutes — a second download in the window adds a request,
+	// not a line; a parent's read is the parent's line.
+	await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
+	await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "mom@family.test", "x-gorani-client": "web" } });
+	const reads = (await api(dev.base, "GET", `/api/v1/members/jinu/reads?file=${fileId}`, { email: "jinu@family.test" })).json.reads;
+	const jinuRead = reads.find((r) => r.actor === "jinu@family.test");
+	assert.equal(jinuRead.requests, 2, `two downloads, one merged line: ${JSON.stringify(reads)}`);
+	assert.equal(jinuRead.version, 1);
+	assert.ok(reads.some((r) => r.actor === "mom@family.test" && r.client === "web"), "the parent's read is the parent's line, with its client");
+
 	// ── 4. Folders: create, rename, move the file in ──────────────────
 	const folderId = store.newId();
 	const folder = await api(dev.base, "POST", "/api/v1/members/jinu/files/folders", { email: "jinu@family.test", body: { id: folderId, name: await store.folderName(folderId, "Photos") } });

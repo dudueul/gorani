@@ -146,7 +146,8 @@ try {
 	assert.equal(part.status, 200);
 	const fin = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${shareId}/complete`, { email, body: { parts: [{ partNumber: 1, etag: (await part.json()).etag }], size: plain.length } });
 	assert.equal(fin.status, 200, JSON.stringify(fin.json));
-	const pub = await fetch(`${dev.base}/s/f/${shareId}/data`);
+	const claimed = await (await fetch(`${dev.base}/s/f/${shareId}/claim`, { method: "POST" })).json(); // O12: data needs a claim's token
+	const pub = await fetch(`${dev.base}/s/f/${shareId}/data`, { headers: { "x-gorani-share-token": claimed.token } });
 	assert.equal(pub.status, 200);
 	assert.deepEqual(new Uint8Array(await pub.arrayBuffer()), copy, "the recipient receives the exact sealed copy");
 

@@ -185,7 +185,7 @@ try {
 	assert.notEqual(refused.status, 0, "push with a swapped store record is refused");
 	assert.match(refused.out, /failed authentication/, `the refusal names the reason: ${refused.out}`);
 
-	console.log("ok  live:client — enrol, push, ls, pull, round trip, a sample refused by pull, zero-trust, a swapped store record refused");
+	console.log("ok  live:client — enrol, push, ls, pull, round trip, a 60 MiB file in GC01 frames stopped after 3 parts and resumed from part 4, pulled streamed and byte-equal, a sample refused by pull, zero-trust, a swapped store record refused");
 } finally {
 	await dev.close();
 }

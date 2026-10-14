@@ -93,7 +93,7 @@ before starting (commit 33, after D11/D12) found:
 | Stage | What |
 |---|---|
 | 33a *(landed)* | **Sign in as the member.** The core sends a user Access token (`cf-access-token`, from `cloudflared access token -app=<server>` or the `GORANI_ACCESS_TOKEN` variable) — short-lived and bound to the member's SSO/MFA, so the Worker sees the member's email and every rule (own area, case grants) applies unchanged. The device token stays what it is: the release of this computer's wrapped root copy. |
-| 33b | **Large files.** `push` streams from disk in GC01 frames at `chunk_for(size)`, parts with retry, and a resume journal on disk (sealed fields only, like the browser's); `pull` streams frame windows to disk and checks the signed hash. |
+| 33b *(landed)* | **Large files.** `push` streams from disk in GC01 frames at `chunk_for(size)`, parts with retry, and a resume journal on disk (sealed fields only, like the browser's); `pull` streams frame windows to disk and checks the signed hash. |
 | 33c | **Cases.** Open a granted case's key from its grant; list, pull, push into it; on an evidence case, sign the content hash (and send the stamp imprint) with the member's identity key, and carry an intake record. |
 | 33d | **The Linux shell** (`clients/linux`, FUSE): the engine first, against `wrangler dev` with an in-memory file system as the doc's testing pattern says; a real mount where the machine allows FUSE. |
 | — | Windows (Cloud Files) and macOS (File Provider) need their platforms to build and test — not this repository's CI machine. |
@@ -117,6 +117,30 @@ before starting (commit 33, after D11/D12) found:
   service token's (no email) is refused, as the desktop's used to be; and
   missing, foreign-audience, expired, foreign-issuer, forged, unknown-key,
   non-ES256 and edited-after-signing tokens are each refused by name.
+
+### 33b as built
+
+- `clients/core/src/transfer.rs`: `push_frames` reads one frame from disk,
+  seals it (GC01 at `chunk_for(size)`, the formats crate's own
+  `seal_chunk`), PUTs it — three tries, 1 s then 4 s apart, for a dropped
+  connection, a 5xx or a 429, none for any other refusal — and journals
+  the part before reading the next. Memory is one chunk, whatever the file.
+- **The journal** (`<profile>.uploads/<key>.json`, written then renamed):
+  only what the server already holds — ids, the object key, the sealed
+  completion fields, the parts' ETags. Its key is a length-prefixed
+  SHA-256 of the member, the name, the size, the modified time and the
+  file's SHA-256: no name in the clear, and a different file (or the same
+  name with other bytes) never resumes into a stranger's upload. A resumed
+  push opens the journalled content key in its place (O6), so the frames
+  it adds are sealed under the SAME key as those already stored.
+- `pull_frames` fetches 32 MiB windows by Range, opens every frame in its
+  position (a reordered, altered or cut-short object fails), writes the
+  plaintext to `<out>.part` while hashing it, checks the size and renames
+  onto `--out` only then — a failed pull leaves nothing that looks done.
+- `api:client-live` stops a 60 MiB push after 3 of 8 parts (a debug-build
+  fault hook, `GORANI_TEST_STOP_AFTER_PARTS`), resumes it "from part 4 of
+  8", checks the journal names no file, pulls it back streamed and compares
+  bytes and SHA-256.
 
 ## Testing (the pattern the port follows)
 

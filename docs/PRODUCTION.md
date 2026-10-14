@@ -212,6 +212,32 @@ nightly pass logs every evidence case not re-verified for `REVERIFY_DAYS`
 approval and are checked by the recipient with `tools/verify-export.mjs`
 (Node only) — hand it to them with the package.
 
+### The SIEM feed (commit 29i, D5.4)
+
+Set `SIEM_URL` (and `SIEM_FORMAT`) in `wrangler.jsonc` and the token as a
+secret — `wrangler secret put SIEM_TOKEN` — and every audit line is POSTed
+there as it is chained:
+
+- **Elastic / OpenSearch / a log shipper** (Vector, Fluent Bit, Logstash's
+  `http` input): `SIEM_FORMAT = "ndjson"`, one event per line,
+  `Authorization: Bearer <token>`.
+- **Splunk**: `SIEM_FORMAT = "splunk-hec"`, `SIEM_URL =
+  "https://<host>:8088/services/collector"`, a HEC token;
+  sourcetype `gorani:audit`, source `gorani:<area>`.
+- **Microsoft Sentinel**: a Logs Ingestion data collection endpoint needs
+  an Entra token, not a static one — put a shipper in front (ndjson in,
+  the DCR API out).
+
+What arrives: `@timestamp`, `actor`, `action`, `target`, the readable
+`details`, `sealed` (whether the line had sealed details — never their
+value), and `gorani { area, seq, hash }`. Delivery is at least once:
+dedupe on `(gorani.area, gorani.seq)`, and alert on a gap in `seq` — the
+chain has none, so a gap means lines were lost on the way or dropped by
+retention. A collector that is down loses nothing: each trail retries with
+backoff (up to an hour), and the nightly pass logs every area still
+behind (`<area>: SIEM: … not yet delivered`). The first deploy with
+`SIEM_URL` set sends every trail from the start of its retained chain.
+
 ### Upgrading across commit 29 (the audit trails)
 
 `wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration

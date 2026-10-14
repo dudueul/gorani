@@ -27,7 +27,7 @@ rendered, delivered zipped under the industry's "infected" password).
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
 | 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
 | 6 *(landed: 29f `api:approvals`, 29g `api:custody`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
-| 7 *(29h landed: `api:export`)* | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
+| 7 *(29h landed: `api:export`; 29i: `api:siem`)* | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
 ## Stage 1 — the audit, tamper-evident
 
@@ -474,6 +474,37 @@ anyone      tools/verify-export.mjs package.zip — Node only, no gorani code, n
   per line, `Authorization: Splunk <token>`). `SIEM_TOKEN` is a secret.
 - Sealed details never leave (they are sealed); readable fields do —
   the same fields the audit view shows.
+
+#### 29i as built
+
+- The trail is the queue. Each audit DO keeps a cursor (`meta ›
+  siem_cursor`, never below the chain's base) naming the last line the
+  collector acknowledged; nothing is copied into a second table that could
+  disagree with the first.
+- Delivery is the DO's own **alarm**: an append arms it (1 s) unless one is
+  set, so a burst of lines goes in one batch and a failing collector's
+  backoff (1 s doubling to an hour, `meta › siem_backoff`) is never cut
+  short by new lines. Each run sends up to 20 batches of 500 lines, oldest
+  first, and re-arms at once while lines remain. The cursor moves only on
+  a 2xx, and only forward — the alarm and the nightly pass may both be
+  sending (a DO takes other events while it awaits a fetch), so a line can
+  arrive twice, never zero times. The `gorani.seq` on every event is how
+  the SIEM drops the second.
+- The nightly pass (`cron.rs`) also drains every area and the registry,
+  and reports an area whose lines are still undelivered as a failure, like
+  a lock or a delete.
+- An event: `@timestamp`, `gorani { area, seq, hash }`, `actor`, `action`,
+  `target`, `details`, and `sealed` (true when the line had sealed
+  details — their value never leaves). `splunk-hec` wraps each in `{ time,
+  host: "gorani", source: "gorani:<area>", sourcetype: "gorani:audit",
+  event }` with `Authorization: Splunk <token>`; `ndjson` sends
+  `Authorization: Bearer <token>` when a token is set.
+- The trail's area is learned from the append (`ship` names it) or from
+  the nightly pass, so trails whose lines predate 29i are delivered with
+  their names too — from the base of the chain, the whole retained trail.
+- Not yet: no per-area opt-out, and no SIEM-side checker for the hash
+  chain (a SIEM rule over `gorani.seq` gaps is the cheap version; the
+  checkpoints in the bucket remain the proof).
 
 ### 29j — RFC 3161 timestamps
 

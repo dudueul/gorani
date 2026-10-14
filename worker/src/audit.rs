@@ -59,6 +59,9 @@ pub const RETENTION_DAYS: i64 = 7 * 365 + 2;
 pub struct GoraniAuditDO {
 	sql: SqlStorage,
 	schema: std::result::Result<(), String>,
+	/// (commit 29i) The alarm that drains the SIEM queue, and the vars it reads.
+	state: State,
+	env: Env,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -74,8 +77,8 @@ pub(crate) struct LineIn {
 	pub details_sealed: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct LineRow {
+#[derive(serde::Deserialize, Clone)]
+pub(crate) struct LineRow {
 	seq: i64,
 	at: String,
 	actor: String,
@@ -112,10 +115,10 @@ pub(crate) fn link(prev: &str, line: &[u8]) -> String {
 }
 
 impl DurableObject for GoraniAuditDO {
-	fn new(state: State, _env: Env) -> Self {
+	fn new(state: State, env: Env) -> Self {
 		let sql = state.storage().sql();
 		let schema = crate::schema::migrate(&sql, MIGRATIONS);
-		Self { sql, schema }
+		Self { sql, schema, state, env }
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
@@ -127,6 +130,29 @@ impl DurableObject for GoraniAuditDO {
 			Err(e) => json_error(500, &e.to_string()),
 		}
 	}
+
+	/// The SIEM queue drains here (commit 29i), on its own clock: no
+	/// request ever waits on a SIEM. A failed delivery re-arms with backoff
+	/// (1 s, doubling, at most an hour); the lines stay — the chained trail
+	/// IS the queue — and the cursor moves only on the collector's 2xx.
+	async fn alarm(&self) -> Result<Response> {
+		match self.siem_drain().await {
+			Ok(d) => {
+				self.set_meta("siem_backoff", "0")?;
+				if d.pending > 0 {
+					self.state.storage().set_alarm(100i64).await?;
+				}
+			}
+			Err(e) => {
+				let prev: i64 = self.meta("siem_backoff")?.and_then(|v| v.parse().ok()).unwrap_or(0);
+				let next = (prev * 2).clamp(1_000, 3_600_000);
+				self.set_meta("siem_backoff", &next.to_string())?;
+				console_error!("gorani: SIEM delivery for {} failed, retrying in {next} ms: {e}", self.meta("area")?.unwrap_or_default());
+				self.state.storage().set_alarm(next).await?;
+			}
+		}
+		Response::ok("")
+	}
 }
 
 impl GoraniAuditDO {
@@ -137,7 +163,29 @@ impl GoraniAuditDO {
 		match (req.method().to_string().as_str(), path.as_str()) {
 			("POST", "append") => {
 				let body = req.json::<AppendBody>().await?;
-				self.append(body.lines)
+				// Which area this trail is (the SIEM's events name it).
+				if let Some(area) = body.area.as_deref().filter(|a| !a.is_empty()) {
+					if self.meta("area")?.as_deref() != Some(area) {
+						self.set_meta("area", area)?;
+					}
+				}
+				let resp = self.append(body.lines)?;
+				self.arm_siem().await?;
+				Ok(resp)
+			}
+			// The nightly pass's drain (cron.rs): now, and say what is left.
+			// It names the area too — a trail whose lines all predate 29i
+			// never had an append tell it.
+			("POST", "siem") => {
+				if let Some(area) = q.get("area").filter(|a| !a.is_empty()) {
+					if self.meta("area")?.as_deref() != Some(area.as_str()) {
+						self.set_meta("area", area)?;
+					}
+				}
+				match self.siem_drain().await {
+					Ok(d) => Response::from_json(&serde_json::json!({ "configured": siem_config(&self.env).is_some(), "delivered": d.delivered, "pending": d.pending })),
+					Err(e) => json_error(502, &format!("SIEM delivery failed: {e}")),
+				}
 			}
 			("GET", "lines") => {
 				let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(200).clamp(1, 1000);
@@ -295,7 +343,135 @@ impl GoraniAuditDO {
 
 #[derive(serde::Deserialize)]
 struct AppendBody {
+	#[serde(default)]
+	area: Option<String>,
 	lines: Vec<LineIn>,
+}
+
+// ── The SIEM feed (commit 29i, docs/CUSTODY.md › Stage 7, D5.4) ──────────
+//
+// The chained trail is the queue: a cursor (`meta › siem_cursor`) names the
+// last line the collector acknowledged; delivery is at-least-once, and every
+// event carries the line's sequence number and hash, so a SIEM can drop a
+// duplicate and check continuity. Sealed details never leave — they are
+// sealed; an event says only that the line had some.
+
+/// Where and how to ship: SIEM_URL (unset: no feed), SIEM_FORMAT
+/// (`ndjson` | `splunk-hec`), SIEM_TOKEN (a secret).
+pub(crate) struct SiemConfig {
+	url: String,
+	format: String,
+	token: Option<String>,
+}
+
+pub(crate) fn siem_config(env: &Env) -> Option<SiemConfig> {
+	let var = |k: &str| env.var(k).ok().map(|v| v.to_string()).filter(|v| !v.is_empty());
+	let url = var("SIEM_URL")?;
+	let format = var("SIEM_FORMAT").unwrap_or_else(|| "ndjson".into());
+	let token = env.secret("SIEM_TOKEN").ok().map(|v| v.to_string()).or_else(|| var("SIEM_TOKEN")).filter(|v| !v.is_empty());
+	Some(SiemConfig { url, format, token })
+}
+
+/// One audit line as a SIEM event — readable fields only.
+pub(crate) fn siem_event(area: &str, l: &LineRow) -> serde_json::Value {
+	serde_json::json!({
+		"@timestamp": l.at,
+		"gorani": { "area": area, "seq": l.seq, "hash": l.hash },
+		"actor": l.actor, "action": l.action, "target": l.target, "details": l.details,
+		"sealed": l.details_sealed.is_some(),
+	})
+}
+
+/// A batch, as the collector's format wants it: one event per line.
+pub(crate) fn siem_body(format: &str, area: &str, rows: &[LineRow]) -> String {
+	let mut out = String::new();
+	for l in rows {
+		let e = siem_event(area, l);
+		let line = match format {
+			// Splunk's HTTP Event Collector: an envelope per event.
+			"splunk-hec" => serde_json::json!({ "time": epoch_seconds(&l.at), "host": "gorani", "source": format!("gorani:{area}"), "sourcetype": "gorani:audit", "event": e }),
+			_ => e,
+		};
+		out.push_str(&line.to_string());
+		out.push('\n');
+	}
+	out
+}
+
+/// `2026-10-14T16:50:58.973Z` → seconds since the epoch (Splunk's `time`).
+pub(crate) fn epoch_seconds(at: &str) -> Option<f64> {
+	let (date, time) = at.trim_end_matches('Z').split_once('T')?;
+	let mut d = date.split('-').map(|p| p.parse::<i64>());
+	let (y, m, dd) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+	let mut t = time.split(':');
+	let (h, mi) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+	let s: f64 = t.next()?.parse().ok()?;
+	// Days from the civil date (Howard Hinnant's algorithm).
+	let y2 = if m <= 2 { y - 1 } else { y };
+	let era = y2.div_euclid(400);
+	let yoe = y2 - era * 400;
+	let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + dd - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	let days = era * 146_097 + doe - 719_468;
+	Some((days * 86_400 + h * 3_600 + mi * 60) as f64 + s)
+}
+
+pub(crate) struct Drained {
+	delivered: i64,
+	pending: i64,
+}
+
+impl GoraniAuditDO {
+	/// Lines arrived: wake the drain soon, unless it is already set (a
+	/// failing collector's backoff is never shortened by new lines).
+	async fn arm_siem(&self) -> Result<()> {
+		if siem_config(&self.env).is_some() && self.state.storage().get_alarm().await?.is_none() {
+			self.state.storage().set_alarm(1_000i64).await?;
+		}
+		Ok(())
+	}
+
+	/// Deliver what the collector has not acknowledged, oldest first, up to
+	/// 20 batches of 500 per run (the alarm re-arms for the rest).
+	async fn siem_drain(&self) -> Result<Drained> {
+		let Some(cfg) = siem_config(&self.env) else { return Ok(Drained { delivered: 0, pending: 0 }) };
+		let area = self.meta("area")?.unwrap_or_else(|| "unknown".into());
+		let base: i64 = self.meta("base_seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+		let mut cursor: i64 = self.meta("siem_cursor")?.and_then(|s| s.parse().ok()).unwrap_or(0).max(base);
+		let mut delivered = 0;
+		for _ in 0..20 {
+			let rows: Vec<LineRow> = self.sql.exec("SELECT seq, at, actor, action, target, details, details_sealed, hash FROM lines WHERE seq > ?1 ORDER BY seq ASC LIMIT 500", Some(vec![cursor.into()]))?.to_array()?;
+			let Some(last) = rows.last().map(|r| r.seq) else { break };
+			let headers = Headers::new();
+			let (content_type, auth) = match cfg.format.as_str() {
+				"splunk-hec" => ("application/json", cfg.token.as_ref().map(|t| format!("Splunk {t}"))),
+				_ => ("application/x-ndjson", cfg.token.as_ref().map(|t| format!("Bearer {t}"))),
+			};
+			headers.set("Content-Type", content_type)?;
+			if let Some(a) = auth {
+				headers.set("Authorization", &a)?;
+			}
+			let req = Request::new_with_init(&cfg.url, &RequestInit { method: Method::Post, headers, body: Some(siem_body(&cfg.format, &area, &rows).into()), ..Default::default() })?;
+			let status = Fetch::Request(req).send().await?.status_code();
+			if !(200..300).contains(&status) {
+				return Err(Error::RustError(format!("the collector answered HTTP {status}")));
+			}
+			// The alarm and the nightly pass can both be mid-delivery (a DO
+			// takes other events while it awaits a fetch): the cursor only
+			// ever moves forward. A line both sent arrives twice — the event's
+			// seq is how the SIEM drops it — never zero times.
+			let stored: i64 = self.meta("siem_cursor")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+			cursor = last.max(stored);
+			self.set_meta("siem_cursor", &cursor.to_string())?;
+			delivered += rows.len() as i64;
+		}
+		#[derive(serde::Deserialize)]
+		struct N {
+			n: i64,
+		}
+		let pending = self.sql.exec("SELECT COUNT(*) AS n FROM lines WHERE seq > ?1", Some(vec![cursor.into()]))?.one::<N>()?.n;
+		Ok(Drained { delivered, pending })
+	}
 }
 
 /// The stub of an area's audit DO (`audit:<area>`; `registry` for the registry).
@@ -307,7 +483,7 @@ pub(crate) fn stub(env: &Env, area: &str) -> Result<Stub> {
 pub(crate) async fn ship(env: &Env, area: &str, lines: &[LineIn]) -> Result<i64> {
 	let headers = Headers::new();
 	headers.set("Content-Type", "application/json")?;
-	let req = Request::new_with_init("https://do.internal/append", &RequestInit { method: Method::Post, headers, body: Some(serde_json::json!({ "lines": lines }).to_string().into()), ..Default::default() })?;
+	let req = Request::new_with_init("https://do.internal/append", &RequestInit { method: Method::Post, headers, body: Some(serde_json::json!({ "area": area, "lines": lines }).to_string().into()), ..Default::default() })?;
 	let mut resp = stub(env, area)?.fetch_with_request(req).await?;
 	if resp.status_code() != 200 {
 		return Err(Error::RustError(format!("audit ship {area}: HTTP {}", resp.status_code())));
@@ -392,6 +568,21 @@ pub(crate) async fn checkpoint_area(env: &Env, area: &str) -> Result<()> {
 	Ok(())
 }
 
+/// Drain an area's SIEM queue now (the nightly pass): an error while lines
+/// stay undelivered — the pass fails loudly, as for a lock or a delete. (An
+/// area is a member id, `case:<id>` or `registry`: nothing a query needs
+/// escaped.)
+pub(crate) async fn siem_drain(env: &Env, area: &str) -> Result<()> {
+	if siem_config(env).is_none() {
+		return Ok(());
+	}
+	let v = call(env, area, Method::Post, &format!("siem?area={area}")).await?;
+	match v.get("pending").and_then(|p| p.as_i64()).unwrap_or(0) {
+		0 => Ok(()),
+		n => Err(Error::RustError(format!("{n} audit line(s) not yet delivered to the SIEM"))),
+	}
+}
+
 /// The 7-year retention (D7): drop older lines, moving the chain's base.
 pub(crate) async fn prune_area(env: &Env, area: &str) -> Result<()> {
 	call(env, area, Method::Post, "prune").await.map(|_| ())
@@ -460,5 +651,43 @@ mod tests {
 		// A missing details and an empty one are the same spelling (by design:
 		// the column is optional; the hash does not distinguish NULL from "").
 		assert_eq!(canonical(1, "a", "b", "c", "d", None, None), canonical(1, "a", "b", "c", "d", Some(""), None));
+	}
+}
+
+#[cfg(test)]
+mod siem_tests {
+	use super::*;
+
+	fn row(seq: i64, at: &str, sealed: bool) -> LineRow {
+		LineRow { seq, at: at.into(), actor: "bo@team.test".into(), action: "file.upload".into(), target: "f1".into(), details: Some("v1".into()), details_sealed: sealed.then(|| "GV04:secret".into()), hash: format!("{seq:064x}") }
+	}
+
+	#[test]
+	fn epoch_seconds_matches_known_instants() {
+		assert_eq!(epoch_seconds("1970-01-01T00:00:00Z"), Some(0.0));
+		assert_eq!(epoch_seconds("2000-03-01T00:00:00Z"), Some(951_868_800.0), "the day after a leap day in a century leap year");
+		assert_eq!(epoch_seconds("2026-10-14T16:50:58.5Z"), Some(1_791_996_658.5));
+		assert_eq!(epoch_seconds("yesterday"), None);
+	}
+
+	#[test]
+	fn ndjson_is_one_event_per_line_and_never_the_sealed_value() {
+		let body = siem_body("ndjson", "case:ir-7", &[row(1, "2026-10-14T00:00:00Z", false), row(2, "2026-10-14T00:00:01Z", true)]);
+		let lines: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+		assert_eq!(lines.len(), 2);
+		assert_eq!(lines[0]["gorani"]["seq"], 1);
+		assert_eq!(lines[1]["gorani"]["area"], "case:ir-7");
+		assert_eq!(lines[1]["sealed"], true);
+		assert!(!body.contains("GV04:"), "a sealed value never leaves");
+	}
+
+	#[test]
+	fn splunk_hec_wraps_each_event() {
+		let body = siem_body("splunk-hec", "registry", &[row(7, "1970-01-01T00:01:00Z", false)]);
+		let e: serde_json::Value = serde_json::from_str(body.trim_end()).unwrap();
+		assert_eq!(e["time"], 60.0);
+		assert_eq!(e["source"], "gorani:registry");
+		assert_eq!(e["sourcetype"], "gorani:audit");
+		assert_eq!(e["event"]["gorani"]["seq"], 7);
 	}
 }

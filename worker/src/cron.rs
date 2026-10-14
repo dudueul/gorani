@@ -94,6 +94,10 @@ pub async fn run(env: Env) -> Result<()> {
 		if let Err(e) = crate::audit::prune_area(&env, &area).await {
 			failures.push(format!("{area}: audit retention: {e}"));
 		}
+		// The SIEM (commit 29i): whatever the alarm has not delivered yet.
+		if let Err(e) = crate::audit::siem_drain(&env, &area).await {
+			failures.push(format!("{area}: SIEM: {e}"));
+		}
 	}
 	if failures.is_empty() {
 		return Ok(());

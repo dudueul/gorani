@@ -72,7 +72,17 @@
 		// retention nobody can shorten. Off, nothing is locked — and evidence
 		// opened meanwhile is locked the moment it is turned on.
 		"OBJECT_LOCK": "off",
-		"EVIDENCE_RETAIN_DAYS": "2557"
+		"EVIDENCE_RETAIN_DAYS": "2557",
+
+		// ── The SIEM feed (docs/CUSTODY.md › Stage 7, 29i) ─────────────────
+		// Empty: no feed. Set, every chained audit line is POSTed there by
+		// its trail's own Durable Object (an alarm — no request waits on the
+		// SIEM), retried with backoff until a 2xx. "ndjson" (Elastic, a data
+		// collection endpoint, any log shipper) or "splunk-hec" (the URL is
+		// then …/services/collector). The token is a SECRET:
+		// `wrangler secret put SIEM_TOKEN`.
+		"SIEM_URL": "",
+		"SIEM_FORMAT": "ndjson"
 	},
 
 	// ── Storage priority: Cloudflare R2 ──────────────────────────────────

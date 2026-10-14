@@ -57,7 +57,7 @@ pub fn url(key: &str, span: Option<(u64, u64)>) -> String {
 /// platform slices cached WHOLE entries itself; span lookups are asked
 /// plain — their bytes are the requested span, framed by [`serve`].
 pub fn request_of(url: &str, range: Option<(u64, u64)>) -> Result<Request> {
-	let mut headers = Headers::new();
+	let headers = Headers::new();
 	if let Some((off, len)) = range {
 		headers.set("Range", &format!("bytes={off}-{}", off + len - 1))?;
 	}
@@ -87,7 +87,7 @@ pub fn mark(mut resp: Response, label: &str) -> Result<Response> {
 /// a rebuild that copies what matters (length, type, range).
 pub fn serve(mut resp: Response, range: Option<(u64, u64)>, span: bool, label: &str) -> Result<Response> {
 	let status = resp.status_code();
-	let mut headers = Headers::new();
+	let headers = Headers::new();
 	for name in ["Content-Length", "Content-Type", "Content-Range", "ETag"] {
 		if let Ok(Some(v)) = resp.headers().get(name) {
 			headers.set(name, &v)?;
@@ -102,20 +102,4 @@ pub fn serve(mut resp: Response, range: Option<(u64, u64)>, span: bool, label: &
 	let stream = resp.stream()?;
 	let out = Response::from_stream(stream)?.with_status(if span { 206 } else { status });
 	Ok(out.with_headers(headers))
-}
-
-/// Make an origin response cacheable in place: the Cache API stores only
-/// responses carrying a Cache-Control max-age, never a 206 (span fetches
-/// arrive as one — they are re-framed 200, bytes unchanged), and always
-/// with an explicit Content-Length (the platform's Range slicing reads it).
-pub fn finish_cacheable(mut resp: Response, len: Option<u64>, force_200: bool, env: &Env) -> Result<Response> {
-	if force_200 {
-		resp = resp.with_status(200);
-	}
-	resp.headers_mut().set("Cache-Control", &format!("public, max-age={}, immutable", max_age(env)))?;
-	if let Some(l) = len {
-		resp.headers_mut().set("Content-Length", &l.to_string())?;
-	}
-	resp.headers_mut().set("Content-Type", "application/octet-stream")?;
-	Ok(resp)
 }

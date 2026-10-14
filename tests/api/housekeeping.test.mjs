@@ -41,11 +41,11 @@ try {
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
 	const sealed = await sealWith(key, enc.encode("to be purged from the trash"));
-	const up1 = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "purge-me.txt"), type: await sealText(storePublic, "text/plain"), size: "36" }, sealed);
+	const up1 = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "purge-me.txt"), type: await sealText(storePublic, "text/plain"), size: String(sealed.length - 32) }, sealed); // plaintext length (GV02 = +32)
 	assert.equal(up1.status, 200);
 	const ck2 = newContentKey();
 	const key2 = await importContentKey(ck2);
-	const up2 = await uploadFile({ ck: await wrapContentKey(storePublic, ck2), name: await sealText(storePublic, "keep-me.txt"), type: await sealText(storePublic, "text/plain"), size: "36" }, await sealWith(key2, enc.encode("stays in the vault")));
+	const up2 = await uploadFile({ ck: await wrapContentKey(storePublic, ck2), name: await sealText(storePublic, "keep-me.txt"), type: await sealText(storePublic, "text/plain"), size: String(enc.encode("stays in the vault").length) }, await sealWith(key2, enc.encode("stays in the vault")));
 	assert.equal(up2.status, 200);
 	await api(dev.base, "DELETE", `/api/v1/members/jinu/files/${up1.json.id}`, { email: "jinu@family.test" });
 	const trashBefore = await api(dev.base, "GET", "/api/v1/members/jinu/files/trash", { email: "jinu@family.test" });

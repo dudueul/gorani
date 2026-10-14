@@ -18,7 +18,6 @@
 
 use rand_core::{OsRng, RngCore};
 use base64::Engine;
-use serde::Deserialize;
 use worker::{Error, Request, Response, Result};
 
 use crate::family::json_error;
@@ -39,27 +38,6 @@ pub(crate) fn bind(v: Option<String>) -> worker::SqlStorageValue {
 		Some(s) => worker::SqlStorageValue::String(s),
 		None => worker::SqlStorageValue::Null,
 	}
-}
-
-/// A file row as lists return it (no keys — keys come in batches, docs/APPS.md).
-#[derive(serde::Serialize)]
-struct FileListRow {
-	id: String,
-	folder: Option<String>,
-	name: String,
-	size: i64,
-	version: i64,
-	created_at: String,
-	updated_at: String,
-}
-
-#[derive(serde::Serialize)]
-struct FolderListRow {
-	id: String,
-	parent: Option<String>,
-	name: String,
-	created_at: String,
-	updated_at: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -406,6 +384,18 @@ impl GoraniMemberDO {
 		}
 	}
 
+	/// Does a version row point at `files/<member>/<file>/<obj>`? The
+	/// restore fill (routes.rs › backup_object_fill) writes only to keys a
+	/// restore minted — this is how it asks.
+	pub(crate) async fn restore_target(&self, member: &str, file_id: &str, obj: &str) -> Result<Response> {
+		let key = format!("files/{member}/{file_id}/{obj}");
+		let n = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE file_id = ?1 AND object_key = ?2", Some(vec![file_id.into(), key.into()]))?.one::<TotalCount>()?.n;
+		if n == 0 {
+			return json_error(404, "no such restore target");
+		}
+		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
+	}
+
 	/// The object of a version, for the Worker to stream from S3 with its
 	/// wrapped key in a header.
 	async fn file_object(&self, file_id: &str, version: Option<i64>) -> Result<Option<ObjectRow>> {
@@ -596,7 +586,13 @@ impl GoraniMemberDO {
 	/// Create a share row. The route has already opened the S3 multipart
 	/// upload for the sealed copy (object `shares/<id>`) and hands its id in.
 	pub(crate) async fn share_create(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
-		self.vault_gate().await?;
+		// (Commit 23: this line was `self.vault_gate().await?;` — the `?` only
+		// propagates a SQL *error*; the refusal message in the Ok(Some(..))
+		// was dropped on the floor, so a paused or absent vault could still
+		// mint share links. A gate whose answer nobody reads is not a gate.)
+		if let Some(msg) = self.vault_gate().await? {
+			return json_error(400, &msg);
+		}
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let id = get("id").ok_or_else(|| worker::Error::RustError("missing id".into()))?;
 		if !(22..=64).contains(&id.len()) || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {

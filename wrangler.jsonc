@@ -51,17 +51,21 @@
 		// MinIO: your reverse-proxied (TLS) address; region can be any string MinIO accepts.
 		"S3_ENDPOINT": "https://minio.example.com",
 		"S3_REGION": "us-east-1",
-		"S3_BUCKET": "gorani"
-	},
+		"S3_BUCKET": "gorani",
 
-	// ── Object caching (worker/src/cache.rs) ─────────────────────────────
-	// Whole-object and frame-span entries of encrypted blobs, keyed by
-	// STORAGE span (shared by every member and share link — ciphertext is
-	// recipient-independent). Object keys are version-unique, so entries
-	// are immutable; a month of TTL needs no invalidation, and deleted
-	// content's stale entries open to nothing (crypto-shredding).
-	"CACHE_MAX_OBJECT_MB": "256",
-	"CACHE_TTL_DAYS": "30",
+		// ── Object caching (worker/src/cache.rs) ──────────────────────────
+		// (These two lived at the TOP level of this file until commit 23,
+		// where wrangler ignores unknown keys with only a warning — so they
+		// never reached the Worker and the code ran on its built-in
+		// defaults. Configuration that silently doesn't apply is a bug.)
+		// Whole-object and frame-span entries of encrypted blobs, keyed by
+		// STORAGE span (shared by every member and share link — ciphertext is
+		// recipient-independent). Object keys are version-unique, so entries
+		// are immutable; a month of TTL needs no invalidation, and deleted
+		// content's stale entries open to nothing (crypto-shredding).
+		"CACHE_MAX_OBJECT_MB": "256",
+		"CACHE_TTL_DAYS": "30"
+	},
 
 	// ── Storage priority: Cloudflare R2 ──────────────────────────────────
 	// Uncomment this block to bind an R2 bucket, and the Worker routes EVERY

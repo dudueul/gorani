@@ -54,19 +54,16 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-	// Liveness for the deploy and for tests. The S3 line says whether the
-	// storage backend is *configured* — never what is in it, and never a key.
+	// Liveness for the deploy and for tests. This route is PUBLIC (the Access
+	// bypass in docs/PRODUCTION.md), so it says only whether storage is
+	// configured — one bit. It used to name the bucket and echo the config
+	// error ("missing S3_SECRET_KEY…"): reconnaissance for free, and the
+	// kind of detail that belongs in observability logs, not on the open
+	// internet (security review, commit 23).
 	match (req.method(), req.path().as_str()) {
 		(Method::Get, "/api/healthz") => {
-			let s3 = s3::config(&env);
-			Response::from_json(&serde_json::json!({
-				"ok": true,
-				"service": "gorani",
-				"s3": match &s3 {
-					Ok(cfg) => serde_json::json!({ "configured": true, "bucket": cfg.bucket }),
-					Err(e) => serde_json::json!({ "configured": false, "error": e.to_string() }),
-				},
-			}))
+			let configured = env.bucket("R2BUCKET").is_ok() || s3::config(&env).is_ok();
+			Response::from_json(&serde_json::json!({ "ok": true, "service": "gorani", "storage": { "configured": configured } }))
 		}
 		// /api/v1 is authenticated+routed in routes.rs; /s/* is the PUBLIC
 		// share surface (the link's fragment secret is the credential).

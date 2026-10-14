@@ -142,8 +142,25 @@ try {
 	// No parts uploaded yet: the meta must refuse (still being prepared).
 	const early = await fetch(`${dev.base}/s/f/${id2}/meta`);
 	assert.equal(early.status, 404, "not ready yet");
-	const c2 = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${id2}/complete`, { email: "jinu@family.test", body: { parts: [], size: 4 } });
-	assert.equal(c2.status, 200);
+	// Completing with NO parts used to mark a share ready — a public link
+	// whose copy object did not exist. Since commit 23 the copy must add up
+	// to its declared size: the refusal on a throwaway share first…
+	const idEmpty = newShareId();
+	const metaEmpty = await sealShareMeta((await shareKeys(idEmpty, newShareSecret())).meta, idEmpty, { name: "x.txt", type: null, size: 4, modified: null });
+	const sEmpty = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
+		email: "jinu@family.test",
+		body: { id: idEmpty, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: metaEmpty, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
+	});
+	assert.equal(sEmpty.status, 200);
+	const empty = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${idEmpty}/complete`, { email: "jinu@family.test", body: { parts: [], size: 4 } });
+	assert.notEqual(empty.status, 200, "a share with no copy bytes is never marked ready");
+	assert.equal((await fetch(`${dev.base}/s/f/${idEmpty}/meta`)).status, 404, "…and its link stays 'being prepared'");
+	// …then the honest path: a real 4-byte copy, one part, and it adds up.
+	const copy2 = await sealChunked(keys2.data, enc.encode("four"), DEFAULT_CHUNK);
+	const part2 = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${id2}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": "jinu@family.test" }, body: copy2 });
+	assert.equal(part2.status, 200);
+	const c2 = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${id2}/complete`, { email: "jinu@family.test", body: { parts: [{ partNumber: 1, etag: (await part2.json()).etag }], size: 4 } });
+	assert.equal(c2.status, 200, JSON.stringify(c2.json));
 	const ready = await fetch(`${dev.base}/s/f/${id2}/meta`);
 	assert.equal(ready.status, 200);
 	const revoke = await api(dev.base, "DELETE", `/api/v1/members/jinu/files/shares/${id2}`, { email: "mom@family.test" });
@@ -162,7 +179,10 @@ try {
 		email: "jinu@family.test",
 		body: { id: id3, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: meta3, expiresAt: new Date(Date.now() - 1000).toISOString(), downloadsLeft: 5, size: 4 },
 	});
-	await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${id3}/complete`, { email: "jinu@family.test", body: { parts: [], size: 4 } });
+	// (A real 4-byte copy: completion must add up since commit 23.)
+	const part3 = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${id3}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": "jinu@family.test" }, body: await sealChunked(keys3.data, enc.encode("aged"), DEFAULT_CHUNK) });
+	const done3 = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${id3}/complete`, { email: "jinu@family.test", body: { parts: [{ partNumber: 1, etag: (await part3.json()).etag }], size: 4 } });
+	assert.equal(done3.status, 200, JSON.stringify(done3.json));
 	const expired = await fetch(`${dev.base}/s/f/${id3}/meta`);
 	assert.equal(expired.status, 410, `expired: ${expired.status} ${await expired.text()}`);
 

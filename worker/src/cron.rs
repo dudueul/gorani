@@ -13,24 +13,28 @@
 
 use worker::*;
 
-/// The active member ids from the family registry (GoraniFamilyDO › state).
+/// The active member ids from the family registry (GoraniFamilyDO ›
+/// `member-ids`, an internal route — the Worker never exposes it).
+///
+/// This used to read `GET state`, the members' own registry view. When the
+/// security review (commit 23) made that view members-only, the cron — which
+/// has no member identity — got a 403 body, parsed it as "no members", and
+/// the nightly pass quietly did nothing. The lesson is in the shape: a
+/// system job reads a system answer, and an answer it cannot parse is an
+/// error, not an empty list.
 async fn member_ids(env: &Env) -> Result<Vec<String>> {
 	let namespace = env.durable_object("FAMILY")?;
 	let stub = namespace.id_from_name("family")?.get_stub()?;
-	let req = Request::new_with_init("https://do.internal/state", &RequestInit { method: Method::Get, ..Default::default() })?;
+	let req = Request::new_with_init("https://do.internal/member-ids", &RequestInit { method: Method::Get, ..Default::default() })?;
 	let mut resp = stub.fetch_with_request(req).await?;
-	let state: serde_json::Value = resp.json().await?;
-	Ok(state
-		.get("members")
+	if resp.status_code() != 200 {
+		return Err(Error::RustError(format!("registry member-ids: HTTP {}", resp.status_code())));
+	}
+	let body: serde_json::Value = resp.json().await?;
+	body.get("ids")
 		.and_then(|m| m.as_array())
-		.map(|members| {
-			members
-				.iter()
-				.filter(|m| m.get("active").and_then(|v| v.as_bool()).unwrap_or(false))
-				.filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
-				.collect()
-		})
-		.unwrap_or_default())
+		.map(|ids| ids.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+		.ok_or_else(|| Error::RustError("registry member-ids: no ids".into()))
 }
 
 /// The pass itself. No identity exists at 03:17 UTC — the DOs see the system

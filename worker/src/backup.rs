@@ -12,7 +12,7 @@
 //! arrives with the restore commit.
 
 use gorani_formats::backup::{self, BackupWriter, FileKey};
-use worker::{Env, Headers, Request, RequestInit, Response, Result};
+use worker::{Response, Result};
 
 #[derive(serde::Deserialize)]
 struct KvRow {
@@ -23,7 +23,6 @@ use crate::family::json_error;
 use crate::files_store::bind;
 use crate::member::GoraniMemberDO;
 
-const STAMP_LEN: usize = 16;
 
 fn stamp() -> String {
 	let mut b = [0u8; 8];
@@ -112,7 +111,7 @@ impl GoraniMemberDO {
 		out.extend_from_slice(header.to_string().as_bytes());
 
 		let mut entries = 0u64;
-		let mut push_entry = |json: serde_json::Value, object: Option<Vec<u8>>, writer: &mut BackupWriter, out: &mut Vec<u8>| -> Result<()> {
+		let push_entry = |json: serde_json::Value, object: Option<Vec<u8>>, writer: &mut BackupWriter, out: &mut Vec<u8>| -> Result<()> {
 			let json_bytes = json.to_string().into_bytes();
 			writer.write(&(json_bytes.len() as u32).to_be_bytes(), out);
 			writer.write(&json_bytes, out);
@@ -184,12 +183,11 @@ impl GoraniMemberDO {
 
 	pub(crate) async fn backup_object(&self, stamp: &str) -> Result<Response> {
 		let rows: Vec<BackupRow> = self.sql.exec("SELECT stamp, kind, size, entries, created_at FROM backups WHERE stamp = ?1", Some(vec![stamp.into()]))?.to_array()?;
-		let Some(_row) = rows.into_iter().next() else { return json_error(404, "no such backup") };
-		let bytes = crate::s3::get(&self.env, &format!("backups/{stamp}.gbak")).await?.ok_or_else(|| worker::Error::RustError("backup object missing".into()))?;
-		let mut headers = worker::Headers::new();
-		headers.set("Content-Type", "application/octet-stream")?;
-		headers.set("Content-Disposition", &format!("attachment; filename=\"gorani-{stamp}.gbak\""))?;
-		Ok(Response::from_bytes(bytes)?.with_headers(headers))
+		// The manifest row only — the router streams the bytes (routes.rs ›
+		// backup_download). This used to download the whole .gbak into the
+		// DO's memory just to have the router discard it.
+		let Some(r) = rows.into_iter().next() else { return json_error(404, "no such backup") };
+		Ok(Response::from_json(&serde_json::json!({ "stamp": r.stamp, "kind": r.kind, "size": r.size, "entries": r.entries, "createdAt": r.created_at }))?)
 	}
 }
 
@@ -251,14 +249,33 @@ use rand_core::RngCore as _RngCore;
 // stores what it cannot read, exactly like any upload).
 
 impl GoraniMemberDO {
-	pub(crate) async fn backup_restore(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
-		let member = actor_to_member_prefix(&self.env, actor).await?;
+	/// Replay a decrypted backup's rows. The rules (security review, commit 23):
+	///
+	/// - **Object keys use the member whose DO this is** (`member`, from the
+	///   router), not the actor. They used to be built from the ACTOR's id,
+	///   so a parent restoring a child minted `files/<parent>/…` keys inside
+	///   the child's database — keys the fill route (correctly) refused.
+	/// - **Ids are ids**: every id that becomes a key segment passes the
+	///   router's allow-list (`auth::valid_object_id`).
+	/// - **A restore fills gaps; it does not rewrite history.** A version row
+	///   that already exists keeps its object unless that object is gone
+	///   from storage (the real disaster case); ownership is never
+	///   reassigned (`COALESCE(owner, ?)`, first uploader wins — the
+	///   ownership rule of commit 15); the files secrets are restored only
+	///   when absent.
+	pub(crate) async fn backup_restore(&self, actor: &str, member: &str, body: serde_json::Value) -> Result<Response> {
+		if !crate::auth::valid_member_id(member) {
+			return json_error(400, "restore needs the member id");
+		}
 		let mut objects: Vec<(String, String)> = Vec::new(); // (versionRef, objectKey)
 		if let Some(folders) = body.get("folders").and_then(|v| v.as_array()) {
 			for f in folders {
 				let get = |k: &str| f.get(k).and_then(|v| v.as_str()).map(str::to_string);
 				let Some(id) = get("id") else { continue };
 				let Some(name) = get("name") else { continue };
+				if !crate::auth::valid_object_id(&id) || get("parent").is_some_and(|p| !crate::auth::valid_object_id(&p)) {
+					return json_error(400, "restored folder ids must be ids");
+				}
 				if !gorani_formats::formats::is_sealed_text(&name) {
 					return json_error(400, "restored folder names must be sealed text");
 				}
@@ -275,12 +292,15 @@ impl GoraniMemberDO {
 				let get = |k: &str| f.get(k).and_then(|v| v.as_str()).map(str::to_string);
 				let Some(id) = get("id") else { continue };
 				let Some(name) = get("name") else { continue };
+				if !crate::auth::valid_object_id(&id) {
+					return json_error(400, "restored file ids must be ids");
+				}
 				if !gorani_formats::formats::is_sealed_text(&name) {
 					return json_error(400, "restored file names must be sealed text");
 				}
 				self.sql
 					.exec(
-						"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7) ON CONFLICT(id) DO UPDATE SET folder_id = ?2, name_sealed = ?3, size = ?4, deleted_at = NULL, trashed_with = NULL, owner = COALESCE(?7, owner), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+						"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7) ON CONFLICT(id) DO UPDATE SET folder_id = ?2, name_sealed = ?3, size = ?4, deleted_at = NULL, trashed_with = NULL, owner = COALESCE(owner, ?7), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
 						Some(vec![id.clone().into(), bind(get("folder")), name.into(), f.get("size").and_then(|v| v.as_i64()).unwrap_or(0).into(), f.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(), bind(get("createdAt")), bind(get("owner"))]),
 					)
 					.map_err(|e| worker::Error::RustError(format!("restore file: {e}")))?;
@@ -293,10 +313,25 @@ impl GoraniMemberDO {
 				let Some(file) = get("file") else { continue };
 				let file_for_key = file.clone();
 				let Some(ck) = get("key") else { continue };
+				if !crate::auth::valid_object_id(&file) {
+					return json_error(400, "restored version file ids must be ids");
+				}
 				if !gorani_formats::formats::is_sealed_text(&ck) {
 					return json_error(400, "restored content keys must be sealed text");
 				}
 				let version = v.get("version").and_then(|x| x.as_i64()).unwrap_or(1);
+				// Gap-filling: a version whose object still exists stays as it is.
+				let existing: Option<ExistingObject> = self
+					.sql
+					.exec("SELECT object_key FROM file_versions WHERE file_id = ?1 AND version = ?2", Some(vec![file.clone().into(), version.into()]))?
+					.to_array::<ExistingObject>()?
+					.into_iter()
+					.next();
+				if let Some(e) = existing {
+					if crate::s3::head(&self.env, &e.object_key).await?.is_some() {
+						continue;
+					}
+				}
 				let object_key = format!("files/{member}/{file_for_key}/r-{}", crate::files_store::uuid());
 				self.sql
 					.exec(
@@ -326,28 +361,16 @@ impl GoraniMemberDO {
 			if !gorani_formats::formats::is_sealed_text(&sealed) {
 				return json_error(400, "restored secrets must be sealed text");
 			}
-			self.sql.exec("DELETE FROM files_secrets", None)?;
-			self.sql.exec("INSERT INTO files_secrets (v) VALUES (?1)", Some(vec![sealed.into()]))?;
+			// Only into an empty slot: the secrets (fingerprint + index keys)
+			// a live vault already uses are never swapped by a restore.
+			self.sql.exec("INSERT INTO files_secrets (v) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM files_secrets)", Some(vec![sealed.into()]))?;
 		}
 		self.audit(actor, "backup.restore", "restore", None, Some(&format!("objects: {}", objects.len()))).await?;
 		Ok(Response::from_json(&serde_json::json!({ "objects": objects.into_iter().map(|(r, k)| serde_json::json!({ "ref": r, "objectKey": k })).collect::<Vec<_>>() }))?)
 	}
 }
 
-/// The member id from the actor email (the restore route is member-scoped
-/// and parents may act for children; the prefix guards object keys).
-async fn actor_to_member_prefix(env: &Env, actor_email: &str) -> Result<String> {
-	let namespace = env.durable_object("FAMILY")?;
-	let stub = namespace.id_from_name("family")?.get_stub()?;
-	let mut headers = Headers::new();
-	headers.set("x-gorani-actor", actor_email)?;
-	let request = Request::new_with_init("https://do.internal/actor", &RequestInit { method: worker::Method::Get, headers, ..Default::default() })?;
-	let resp = stub.fetch_with_request(request).await?;
-	let mut resp = resp;
-	let v: serde_json::Value = resp.json().await?;
-	let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-	if id.is_empty() {
-		return Err(worker::Error::RustError("actor is not a member".into()));
-	}
-	Ok(id)
+#[derive(serde::Deserialize)]
+struct ExistingObject {
+	object_key: String,
 }

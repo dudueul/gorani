@@ -98,3 +98,40 @@ area DO (member:<id>, case:<id>, the registry)
 - What stage 3 adds underneath: the evidence OBJECTS become write-once in
   the bucket itself, so the rule holds even against a credential that
   bypasses the Worker.
+
+## Stage 3 — write-once evidence (D6), the design
+
+```text
+evidence version recorded (upload, version, restore)
+   └─ the store's lock pass ── PUT <object>?retention (COMPLIANCE, created + EVIDENCE_RETAIN_DAYS)
+                                  ok  → file_versions.locked_until = that date
+                                  err → stays NULL; the next request / the nightly pass retries
+```
+
+- **Why after the write, not with it**: S3 can take the lock headers on the
+  PUT itself, but a multipart upload with Object Lock then needs a checksum
+  on every part and in the completion — a second upload protocol. One
+  `PutObjectRetention` after the object exists works for both paths; the
+  window between the write and the lock is one request, and a version
+  whose lock has not landed yet is visible (`locked_until` NULL) and
+  retried until it does.
+- **COMPLIANCE, not GOVERNANCE**: nobody — no Worker credential, no bucket
+  owner, no root — shortens or removes a COMPLIANCE retention before it
+  ends. That is the point (D6), and the reason it is opt-in:
+  `OBJECT_LOCK = "on"` only for a bucket created with Object Lock enabled.
+  Evidence opened while it is off is locked the moment it is turned on (the
+  pass locks every version still NULL).
+- **Content-MD5**: S3 and MinIO demand an integrity checksum on a retention
+  write. gorani computes MD5 for exactly that header (crates/s3, with the
+  RFC 1321 vectors) — an integrity check S3 asks for, never a security
+  primitive.
+- **R2** has no per-object retention through the Workers binding; its
+  bucket-lock rules (prefix `cases/`, age-based) are the equivalent, set
+  on the bucket (docs/PRODUCTION.md). The pass records `bucket-rule` for
+  such versions instead of retrying forever.
+- **Audit checkpoints** (stage 1) get the same retention, 7 years, when
+  `OBJECT_LOCK` is on.
+- **What a versioned bucket really does**: a DELETE without a version id
+  adds a delete marker — the locked version stays, recoverable, and an
+  overwrite adds a new version above it. The test stub models the part
+  that matters to gorani: a locked object cannot be deleted.

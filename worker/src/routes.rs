@@ -195,6 +195,9 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await
 		}
+		// The rotation walk's input: every value sealed to the files store
+		// key, by kind, paged (files_store.rs › sealed_page).
+		("GET", ["members", id, "files", "sealed"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/sealed", &req, actor)).await,
 		("PUT", ["members", id, "files", "reseal"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "files/reseal", Some(body), actor)).await

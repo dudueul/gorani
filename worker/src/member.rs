@@ -372,6 +372,7 @@ impl GoraniMemberDO {
 				self.cron_pass(&actor, body).await
 			}
 			("GET", "music/feed") => self.music_feed().await,
+			("GET", "files/sealed") => self.sealed_page(req).await,
 			("PUT", "files/reseal") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.files_reseal(&actor, body).await

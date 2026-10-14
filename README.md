@@ -12,6 +12,8 @@ parents' master key opens the children's areas — never the reverse.
 **Status: built, self-proving — and reviewed.** The commit-23 security
 review ([docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md)) fixed 32
 findings and lists the open ones with proposals; read it before deploying.
+The SecOps product decisions that follow from it are in
+[docs/DECISIONS.md](docs/DECISIONS.md).
 34 green commits from the scaffold
 through the vault, explorer, streaming, shares, backups, retention, native
 clients (live-tested), the family hierarchy, ownership, the R2-priority

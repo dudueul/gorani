@@ -171,7 +171,8 @@ old CHECK constraint allowed only parent/child.
    (landed: commit 27c — the master key, guardian copies, the family's
    role aliases and the act-for rule removed; every suite ported, shared
    work modelled as a case — `api:ownership`).
-6. **UI** — the case list, grant dialog, ceremony screens.
+6. **UI** — the case list, grant dialog, ceremony screens. Designed below
+   in **Stage 6, the screens**.
 
 ## Stage 3 as built
 
@@ -290,6 +291,22 @@ the registry's role column is still the server's word (who is a lead), which
 is why trust flows from pins, not from roles. The family area's store
 records keep their trust-on-first-use pin until stage 5 replaces the family
 area with a case.
+
+## Stage 6, the screens
+
+Every screen is a thin client of the modules stages 3–5 built (cases.ts,
+identity.ts, recovery.ts); no screen holds a key the session does not
+already hold, and every refusal those modules throw is shown, verbatim, to
+the person — they are the security checks, not errors to hide.
+
+| Where | What it does | The check a person sees |
+|---|---|---|
+| **first unlock** | creates the member's identity (if missing) and registers it; seals or refreshes their own area's recovery copy (if the team has a recovery key and the copy is missing or stale) | the fingerprint to read to a lead |
+| **area switcher** (shell header) | "My files" and every case the member is granted; choosing a case opens the same explorer over `case:<id>` with the case key | "signed by X, whom you have not verified" — the copy is refused until they pin X or a lead they pinned certified X |
+| **Team › People** | each member's fingerprint; "I compared it — trust" (pin); leads: "Certify" | the fingerprint, eight groups, side by side with "read it to them" |
+| **Team › Cases** | open (leads), grant (managers: member, permission, expiry for externals), revoke, rotate (owed after a revoke or an ended grant; resumes an interrupted walk), close | "rotation required" until it is done |
+| **Team › Recovery** (leads; auditors read) | set up / rotate (M of every lead); coverage; ceremonies: open (target, reason), approve (after the signature check), complete (coordinator) | for a member target, the coordinator types the fingerprint the member reads aloud; a mismatch refuses |
+| **unlock screen › "Lost every method?"** | re-enrol: a new root, methods and identity, posted as a draft | the new root's fingerprint, to read to the coordinating lead |
 
 ## What this does NOT change
 

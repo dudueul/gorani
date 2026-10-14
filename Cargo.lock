@@ -446,6 +446,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "gorani-formats",
+ "hkdf",
  "hmac",
  "p256",
  "rand_core",

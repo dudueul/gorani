@@ -17,6 +17,7 @@
 pub mod api;
 pub mod area;
 pub mod cases;
+pub mod devicekey;
 pub mod engine;
 pub mod identity;
 pub mod session;
@@ -100,8 +101,23 @@ pub struct DeviceProfile {
 	/// one secret the device design keeps on the device. Old profiles named
 	/// the field `accessSecret` and always meant the device secret by it;
 	/// the alias reads them into the right slot.
-	#[serde(default, alias = "accessSecret")]
+	///
+	/// Commit 34: kept only for profiles made before protectors, and for
+	/// `--device-secret` (dev and CI). A new enrolment keeps its secret in
+	/// `device_protectors` instead — the TPM and/or the login keyring — and
+	/// `gorani-sync protect` moves an old one there.
+	#[serde(default, alias = "accessSecret", skip_serializing_if = "Option::is_none")]
 	pub device_secret: Option<String>,
+	/// Where the parts of the device secret are held (devicekey.rs): what
+	/// the profile keeps is useless without this machine's TPM and/or the
+	/// user's login keyring.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub device_protectors: Vec<devicekey::Protector>,
+	/// A `protect` run in flight: the new protectors, written down BEFORE
+	/// the server's copy is re-wrapped under them, so a run that dies in
+	/// between still opens whichever copy the server ended up holding.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pending_protectors: Vec<devicekey::Protector>,
 	/// Dev-mode identity (wrangler dev only; production uses Access).
 	#[serde(default)]
 	pub dev_email: Option<String>,
@@ -119,6 +135,7 @@ impl std::fmt::Debug for DeviceProfile {
 			.field("access_id", &self.access_id)
 			.field("access_secret", &redact(&self.access_secret))
 			.field("device_secret", &redact(&self.device_secret))
+			.field("device_protectors", &devicekey::label(&self.device_protectors))
 			.field("dev_email", &self.dev_email)
 			.finish()
 	}

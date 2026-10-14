@@ -26,6 +26,8 @@ sha2 = "0.10" # streamed SHA-256 for large files (transfer.rs, commit 33b)
 # formats crate already builds on.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 hmac = "0.12"
+# The device secret from its parts (devicekey.rs, commit 34).
+hkdf = "0.12"
 
 [[bin]]
 name = "gorani-sync"

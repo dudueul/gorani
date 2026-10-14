@@ -234,6 +234,31 @@ impl Client {
 		))
 	}
 
+	/// The member's devices (`GET …/devices`): name, platform, protection, last seen.
+	pub fn devices(&self) -> Result<Value, Error> {
+		self.json("GET", "/devices", None)
+	}
+
+	/// Revoke a device: its wrapped copy is deleted, so it never unlocks
+	/// again. The member's sign-in is enough — a lost laptop is revoked from
+	/// any other one.
+	pub fn revoke_device(&self, device_id: &str) -> Result<(), Error> {
+		self.json("DELETE", &format!("/devices/{device_id}"), None).map(|_| ())
+	}
+
+	/// Replace this device's wrapped copy (after a root rotation, or when
+	/// its secret moves to new protectors — commit 34). Only to its token.
+	pub fn rekey(&self, device_id: &str, token: &str, key_id: &str, wrapped: &str, salt: &str, protection: &str) -> Result<(), Error> {
+		self.req("PUT", &self.url(&format!("/devices/{device_id}/key")))
+			.set("x-gorani-device-token", token)
+			.send_json(json!({ "keyId": key_id, "wrapped": wrapped, "salt": salt, "protection": protection }))
+			.map_err(|e| match e {
+				ureq::Error::Status(code, resp) => Error::Http(code, resp.into_string().unwrap_or_default()),
+				other => Error::Config(other.to_string()),
+			})?;
+		Ok(())
+	}
+
 	// ── files ───────────────────────────────────────────────────────────
 
 	pub fn changes(&self, since: u64) -> Result<(u64, Vec<Value>), Error> {

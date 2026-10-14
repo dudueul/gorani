@@ -40,6 +40,7 @@ A test in gorani is an **argument that runs**. Three rules make it teach:
 | `unit:records` | Authenticated store records, written as the attack: substitution, swapped halves, mismatched pairs, unsealed keys, foreign MACs — each refused; first-use pinning | how a MAC under a root-derived key stops "seal to my key instead" |
 | `api:rotation` | A store rotation that leaves nothing behind: the old key opens 0 of 9 sealed values after the walk, the new key all 9, an old version still decrypts, a second walk is a no-op | proving a revocation instead of asserting it |
 | `api:security` | The review's regression suite (docs/SECURITY-REVIEW.md): registry scope, id validation before S3, write-once share ids, exact Range, device-token reports, write-once restore fill, a quiet health line | how a security fix earns its keep: the test fails on the old code |
+| `api:restart` | State survives a restart and so does the code that opens it: write through both DOs, stop, start twice more on the same SQLite directory, read and write again | a constructor is a code path that runs on every wake-up — test the second run |
 | `api:s3-live` | **Opt-in** (`GORANI_LIVE_S3=1` + `S3_*`): the same contract against a REAL bucket — private-bucket check, signed round trips, exact Range, multipart + size refusal, share copy, purge | what the stub cannot prove: a real server checking SigV4 and the part rules |
 
 ## Writing the next suite (the house style)

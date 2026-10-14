@@ -147,6 +147,22 @@ folder, tags, secrets, a share) — the old key opens 9 values before and
 original bytes (via `?version=1`, the S17 fix); a second walk re-seals
 nothing; the old form and unsealed values are refused.
 
+### O19, fixed in commit 25 — the store that hung after a restart
+
+Found while preparing O6, by asking what the suites never do: **restart**.
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O19 | Critical | **Every member store hung after its first wake-up.** Both Durable Objects ran their whole `MIGRATIONS` list in the constructor, every time, with `.expect(..)`. `CREATE TABLE IF NOT EXISTS` repeats harmlessly; `ALTER TABLE … ADD COLUMN` does not — the second run fails ("duplicate column name"), the `expect` panics, and a panicking wasm Worker never answers: the runtime cancels the request as hung. A DO is constructed again after every eviction (idle, deploy, host move), so in production each member store would stop answering minutes after first use. The registry survived only because its list has no `ADD COLUMN` yet. | `worker/src/schema.rs`: a **migration ledger** (`schema_ledger(n)`) — each statement runs once, recorded by its index, so the lists are append-only history. A store from before the ledger is recognised by the one forgivable error (`ADD COLUMN` meeting its own column); anything else stops the migration. A failed migration no longer panics: the DO keeps the error and answers every request with a 500 that names it. |
+
+Why no test saw it: every suite starts from a fresh SQLite directory and
+keeps one dev server for its whole run, so each DO was constructed exactly
+once. `api:restart` now writes through both DOs, stops the server, and
+starts a second (and a third) on the same directory — the probe that found
+the bug, kept as its regression test. The lesson generalises: **a
+constructor is a code path that runs on every wake-up, not once** — test
+the second run.
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |

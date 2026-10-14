@@ -94,6 +94,13 @@ with your parent member (the first member is created by any authenticated
 caller), `PUT /api/v1/family/master` with the generated master public half,
 then create each vault from the UI (commit ⑨'s setup screen).
 
+Schema changes ride the deploy: each Durable Object migrates itself on its
+next wake-up through an append-only ledger (`worker/src/schema.rs`). Add new
+statements at the END of `MIGRATIONS`, never edit or reorder a shipped one.
+A store whose migration fails answers every request with a 500 naming the
+failed statement (it does not hang) — look for `member store schema:` in
+the Worker's logs.
+
 ## 4. Backups
 
 1. In the app, generate the backup key pair and **download the key file** —

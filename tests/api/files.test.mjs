@@ -15,11 +15,11 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { newContentKey, importContentKey, sealWith, openWith, sealText, generateHybridKey } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith, openWith, generateHybridKey } from "../../web/src/vault/vault-crypto.ts";
 import { sealChunked, FRAME_OVERHEAD, sealedSize } from "../../web/src/vault/chunked-file.ts";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
-import { wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
-import { toBase64 } from "../../web/src/lib/encoding.ts";
+import { sealText } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 
 const dev = await suiteDev();
 const dec = new TextDecoder();
@@ -90,43 +90,71 @@ try {
 	assert.equal(clash.status, 409);
 
 	// ── 1. A whole upload, sealed under a fresh content key ────────────
+	// Since commit 25 (GV04): the CLIENT picks the file id, and the name,
+	// type and content key are sealed into places that name it — with the
+	// store's private key (tests/lib/placed.mjs).
+	const store = await storeSealer(filesStore.bundle, "jinu");
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
-	const ckSealed = await wrapContentKey(storePublic, ck);
 	const plain = enc.encode("a letter to the family");
 	const sealed = await sealWith(key, plain);
-	const name = await sealText(storePublic, "letter.txt");
-	const typeSealed = await sealText(storePublic, "text/plain");
-	const up = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ck: ckSealed, name, type: typeSealed, size: String(plain.length) }, sealed);
+	const { id: fileId, fields: first } = await store.newFile("letter.txt", "text/plain", ck);
+	const { name, type: typeSealed, ck: ckSealed } = first;
+	const up = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...first, size: String(plain.length) }, sealed);
 	assert.equal(up.status, 200, `up: ${JSON.stringify(up.json)}`);
-	const fileId = up.json.id;
+	assert.equal(up.json.id, fileId, "the file has the id the client chose (and sealed into)");
 	assert.equal(up.json.version, 1);
 
 	// The same upload with a plaintext name is refused before anything stores.
-	const plainName = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ck: ckSealed, name: "letter.txt", type: typeSealed, size: String(plain.length) }, sealed);
+	const plainName = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...first, file_id: store.newId(), name: "letter.txt", size: String(plain.length) }, sealed);
 	assert.equal(plainName.status, 400);
+	// So is the older format (GV03, sealed to the PUBLIC key — movable and
+	// mintable): a files store takes placed values only (the clean break).
+	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	const gv03 = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...first, file_id: store.newId(), name: await sealText(storePublic, "letter.txt"), size: String(plain.length) }, sealed);
+	assert.equal(gv03.status, 400, "GV03 names are refused by a files store");
+	// No id, no upload (the server no longer mints one after the sealing),
+	// and an id already taken is a conflict — never a silent overwrite.
+	const { file_id: _unused, ...noId } = first;
+	void _unused;
+	assert.equal((await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...noId, size: String(plain.length) }, sealed)).status, 400);
+	assert.equal((await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...first, size: String(plain.length) }, sealed)).status, 409);
 
 	// ── 2. Listing without keys; keys in a batch ───────────────────────
 	const list = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=root", { email: "jinu@family.test" });
 	assert.equal(list.status, 200);
 	assert.equal(list.json.files.length, 1);
-	assert.ok(list.json.files[0].name.startsWith("GV03:"), "the name is sealed in the listing");
+	assert.ok(list.json.files[0].name.startsWith("GV04:"), "the name is sealed in the listing");
+	assert.equal(await store.openFileName(fileId, list.json.files[0].name), "letter.txt", "and opens in its place");
 	assert.equal(list.json.files[0].key, undefined, "listings carry no keys");
 	const keys = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [fileId] } });
-	assert.ok(keys.json.keys[fileId].key.startsWith("GV03:"), "the wrapped key arrives sealed");
+	assert.ok(keys.json.keys[fileId].key.startsWith("GV04:"), "the wrapped key arrives sealed");
 
 	// ── 3. Download: the bytes come back with the wrapped key header ──
 	const dl = await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
 	assert.equal(dl.status, 200);
-	assert.ok(dl.headers.get("x-gorani-ck").startsWith("GV03:"));
+	assert.ok(dl.headers.get("x-gorani-ck").startsWith("GV04:"));
+	assert.equal(dl.headers.get("x-gorani-version"), "1", "the download says which version it is — the key's place");
 	const got = new Uint8Array(await dl.arrayBuffer());
-	assert.equal(dec.decode(await openWith(key, got)), dec.decode(plain));
+	const opened = await store.openFileKey(fileId, 1, dl.headers.get("x-gorani-ck"));
+	assert.equal(dec.decode(await openWith(opened, got)), dec.decode(plain));
+
+	// The read is on record (O14, D10): one merged row per reader × version ×
+	// client × 5 minutes — a second download in the window adds a request,
+	// not a line; a parent's read is the parent's line.
+	await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
+	await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "mom@family.test", "x-gorani-client": "web" } });
+	const reads = (await api(dev.base, "GET", `/api/v1/members/jinu/reads?file=${fileId}`, { email: "jinu@family.test" })).json.reads;
+	const jinuRead = reads.find((r) => r.actor === "jinu@family.test");
+	assert.equal(jinuRead.requests, 2, `two downloads, one merged line: ${JSON.stringify(reads)}`);
+	assert.equal(jinuRead.version, 1);
+	assert.ok(reads.some((r) => r.actor === "mom@family.test" && r.client === "web"), "the parent's read is the parent's line, with its client");
 
 	// ── 4. Folders: create, rename, move the file in ──────────────────
-	const folder = await api(dev.base, "POST", "/api/v1/members/jinu/files/folders", { email: "jinu@family.test", body: { name: await sealText(storePublic, "Photos") } });
+	const folderId = store.newId();
+	const folder = await api(dev.base, "POST", "/api/v1/members/jinu/files/folders", { email: "jinu@family.test", body: { id: folderId, name: await store.folderName(folderId, "Photos") } });
 	assert.equal(folder.status, 200);
-	const folderId = folder.json.id;
+	assert.equal(folder.json.id, folderId);
 	const moved = await api(dev.base, "PATCH", `/api/v1/members/jinu/files/${fileId}`, { email: "jinu@family.test", body: { folderId } });
 	assert.equal(moved.status, 200);
 	assert.equal(moved.json.folder, folderId);
@@ -143,14 +171,22 @@ try {
 	assert.equal(again.json.changes.length, 0);
 
 	// ── 6. A new version, and the base_version conflict ───────────────
+	// A fresh content key per version, sealed into version 2's place (the
+	// client knows the number: base_version + 1, which is why base_version
+	// is now required).
+	const v2ck = newContentKey();
+	const v2key = await importContentKey(v2ck);
 	const v2plain = enc.encode("a letter to the family, revised");
-	const v2sealed = await sealWith(key, v2plain);
-	const v2 = await upload(dev.base, "jinu@family.test", "jinu", `/files/${fileId}/versions`, { ck: ckSealed, base_version: "1", type: typeSealed, size: String(v2plain.length) }, v2sealed);
+	const v2sealed = await sealWith(v2key, v2plain);
+	const v2fields = { ck: await store.fileKey(fileId, 2, v2ck), type: await store.fileType(fileId, 2, "text/plain"), size: String(v2plain.length) };
+	const v2 = await upload(dev.base, "jinu@family.test", "jinu", `/files/${fileId}/versions`, { ...v2fields, base_version: "1" }, v2sealed);
 	assert.equal(v2.status, 200, JSON.stringify(v2.json));
 	assert.equal(v2.json.version, 2);
-	const stale = await upload(dev.base, "jinu@family.test", "jinu", `/files/${fileId}/versions`, { ck: ckSealed, base_version: "1", type: typeSealed, size: String(v2plain.length) }, v2sealed);
+	const stale = await upload(dev.base, "jinu@family.test", "jinu", `/files/${fileId}/versions`, { ...v2fields, base_version: "1" }, v2sealed);
 	assert.equal(stale.status, 409);
 	assert.equal(stale.json.version, 2, "the conflict says where the file is now");
+	const unbased = await upload(dev.base, "jinu@family.test", "jinu", `/files/${fileId}/versions`, v2fields, v2sealed);
+	assert.equal(unbased.status, 400, "no base_version, no guess: the key was sealed for a specific number");
 
 	// ── 7. A chunked upload in parts, then a Range read in the middle ──
 	// The chunk is the multipart part size, and the backends (S3, MinIO, R2
@@ -160,13 +196,18 @@ try {
 	const chunk = 5 * 1024 * 1024;
 	const bigPlain = new Uint8Array(2 * chunk);
 	for (let i = 0; i < bigPlain.length; i++) bigPlain[i] = i % 251;
-	const bigSealed = await sealChunked(key, bigPlain, chunk);
-	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: bigPlain.length, chunk } });
+	const bigCk = newContentKey();
+	const bigSealed = await sealChunked(await importContentKey(bigCk), bigPlain, chunk);
+	const bigFile = await store.newFile("photo.dat", "application/octet-stream", bigCk);
+	// No id at all is refused: a new file's id is the client's (newFileId).
+	const noNewId = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: bigPlain.length, chunk } });
+	assert.equal(noNewId.status, 400);
+	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: bigPlain.length, chunk, newFileId: bigFile.id } });
 	assert.equal(start.status, 200, JSON.stringify(start.json));
 	assert.equal(start.json.parts, 2);
 	// The honest refusal: a chunk below the backends' minimum part size is
 	// rejected at init — before a single part is uploaded.
-	const tiny = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: 200, chunk: 64 } });
+	const tiny = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: 200, chunk: 64, newFileId: store.newId() } });
 	assert.equal(tiny.status, 400);
 	const partEtags = [];
 	for (let p = 1; p <= 2; p++) {
@@ -179,18 +220,18 @@ try {
 		assert.equal(r.status, 200, `part ${p}`);
 		partEtags.push({ partNumber: p, etag: (await r.json()).etag });
 	}
-	const bigName = await sealText(storePublic, "photo.dat");
 	const done = await upload(dev.base, "jinu@family.test", "jinu", `/files/uploads/${start.json.uploadId}/complete`, {
 		key: start.json.key,
 		size: String(bigPlain.length),
 		chunk: String(chunk),
-		ck: ckSealed,
-		name: bigName,
-		type: typeSealed,
+		ck: bigFile.fields.ck,
+		name: bigFile.fields.name,
+		type: bigFile.fields.type,
 		parts: JSON.stringify(partEtags),
 	}, null);
 	assert.equal(done.status, 200, JSON.stringify(done.json));
 	const bigId = done.json.id;
+	assert.equal(bigId, bigFile.id, "the multipart file has the id it was started (and sealed) with");
 
 	// A Range read in the middle. The contract (the Rust clients live by it):
 	// the caller computes the *ciphertext* span of the frames it needs and
@@ -205,7 +246,7 @@ try {
 	assert.equal(sealedSize(bigPlain.length, chunk), bigSealed.length, "the server checked the object adds up");
 
 	// ── 8. Rename, trash, duplicates ───────────────────────────────────
-	const renamed = await api(dev.base, "PATCH", `/api/v1/members/jinu/files/${fileId}`, { email: "jinu@family.test", body: { name: await sealText(storePublic, "letter (1).txt") } });
+	const renamed = await api(dev.base, "PATCH", `/api/v1/members/jinu/files/${fileId}`, { email: "jinu@family.test", body: { name: await store.fileName(fileId, "letter (1).txt") } });
 	assert.equal(renamed.status, 200);
 	const match = await api(dev.base, "GET", `/api/v1/members/jinu/files/match?size=${v2plain.length}`, { email: "jinu@family.test" });
 	assert.ok(match.json.files.some((f) => f.id === fileId));
@@ -215,7 +256,7 @@ try {
 	assert.ok(!afterTrash.json.files.some((f) => f.id === fileId), "trashed files leave the lists");
 
 	// ── 9. Secrets, stored sealed ──────────────────────────────────────
-	const secrets = await sealText(storePublic, JSON.stringify({ fp: "x".repeat(43), idx: "y".repeat(43) }));
+	const secrets = await store.secrets(JSON.stringify({ fp: "x".repeat(43), idx: "y".repeat(43) }));
 	const putS = await api(dev.base, "PUT", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test", body: { sealed: secrets } });
 	assert.equal(putS.status, 200);
 	const getS = await api(dev.base, "GET", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test" });
@@ -232,7 +273,7 @@ try {
 	assert.equal(kidOther.status, 403, "the child cannot open the parent's area");
 
 	// Unsealed content is refused at the boundary (the store never sees it).
-	const bad = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ck: ckSealed, name, type: typeSealed, size: String(plain.length) }, enc.encode("plaintext bytes!!"));
+	const bad = await upload(dev.base, "jinu@family.test", "jinu", "/files", { file_id: store.newId(), ck: ckSealed, name, type: typeSealed, size: String(plain.length) }, enc.encode("plaintext bytes!!"));
 	assert.equal(bad.status, 400);
 
 	console.log("ok  api:files — upload/list/keys/download/folders/changes/versions/chunked+range/trash/duplicates/secrets/refusals/family");

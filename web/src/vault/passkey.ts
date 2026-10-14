@@ -34,15 +34,21 @@ export interface CreatedPasskey {
 	prfSalt: string; // base64
 }
 
-/** The registrable domain (passkeys are bound to it, so they survive a move between subdomains): app.at.day → at.day. */
-export function registrableDomain(host: string): string {
-	const parts = host.split(".");
-	if (parts.length <= 2) return host;
-	// A heuristic suffix list would be overkill here: treat the last two
-	// labels as the domain unless the host is under a known second-level
-	// public suffix we actually deploy on (none today).
-	return parts.slice(-2).join(".");
-}
+/**
+ * The relying-party id a passkey is bound to: this page's exact hostname
+ * (commit 25, docs/SECURITY-REVIEW.md › O15).
+ *
+ * It used to be "the last two labels" — a guess at the registrable domain
+ * so a passkey would survive a move between subdomains. The guess is wrong
+ * exactly where it matters: on `gorani.family.workers.dev` it yields
+ * `workers.dev`, a PUBLIC SUFFIX the browser refuses as an rp.id (no passkey
+ * could be created at all), and on `vault.example.co.uk` it yields `co.uk`.
+ * A wider rp.id is also a wider blast radius: every sibling subdomain could
+ * ask for the same credential. The hostname is always valid and never
+ * wider than the app. (Moving hosts means enrolling passkeys again — the
+ * password and recovery methods are unaffected.)
+ */
+export const relyingPartyId = (): string => location.hostname;
 
 const subtle = () => globalThis.crypto.subtle;
 
@@ -65,7 +71,7 @@ export async function createPasskey(memberId: string, memberName: string): Promi
 	const cred = (await navigator.credentials.create({
 		publicKey: {
 			challenge: challenge(),
-			rp: { id: registrableDomain(location.hostname), name: "Gorani" },
+			rp: { id: relyingPartyId(), name: "Gorani" },
 			user: { id: userHandle, name: memberName, displayName: `${memberName} (Gorani)` },
 			pubKeyCredParams: [
 				{ type: "public-key", alg: -7 }, // ES256 — every authenticator has it
@@ -90,6 +96,11 @@ export async function prfOutput(credentialId: string, prfSaltB64: string): Promi
 	const assertion = (await navigator.credentials.get({
 		publicKey: {
 			challenge: challenge(),
+			// The SAME rp id as at creation, said explicitly. (Before commit
+			// 25 creation used "the last two labels" while this call took the
+			// browser's default — the hostname — so on any subdomain the two
+			// disagreed and an enrolled passkey could never unlock.)
+			rpId: relyingPartyId(),
 			allowCredentials: [{ id: fromB64Url(credentialId), type: "public-key" }],
 			userVerification: "required",
 			extensions: { prf: { eval: { first: fromBase64(prfSaltB64) } } },

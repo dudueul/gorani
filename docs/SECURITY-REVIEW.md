@@ -147,23 +147,147 @@ folder, tags, secrets, a share) — the old key opens 9 values before and
 original bytes (via `?version=1`, the S17 fix); a second walk re-seals
 nothing; the old form and unsealed values are refused.
 
-## Open findings (proposals — need a decision)
+### O19, fixed in commit 25 — the store that hung after a restart
 
-| # | Sev | Finding | Proposal |
+Found while preparing O6, by asking what the suites never do: **restart**.
+
+| # | Sev | What | Fix |
 |---|---|---|---|
-| O6 | Medium | Content is not bound to its file id: the server can swap (key, object) pairs between files undetected. | Bind file id + version in the AAD (format v-next). |
-| O7 | Medium | GB1: header outside the AAD; nonce prefix not compared. | Hash the header into each segment's AAD; compare full nonce. |
-| O8 | Medium | Argon2 bounds: floor below OWASP (t=1 at 19 MiB), ceiling lets a server freeze a phone. | t ≥ 2 floor; ~256 MiB / t ≤ 10 ceiling; cap methods tried. |
-| O9 | Medium | The backup job is in memory and one missing object aborts the run. | Multipart streaming; record missing objects. |
-| O10 | Medium | Cron ignores non-2xx and S3-delete failures (manifest row removed, `.gbak` orphaned). | Collect failures, fail the pass, delete rows only after the object. |
-| O11 | Medium | Media service worker: keys never forgotten, scope cannot control `/`, wrong AAD on the whole-object path. | Scope `/` (handle `/media/` only), forget on close/lock, fix AAD. |
-| O12 | Medium | Share download limits are cooperative: `/data` does not decrement. | Claim returns a one-time data token. |
-| O13 | Medium | No rate limiting on device-token and share endpoints. | Cloudflare WAF rate-limiting rules on `/s/*` and `/devices/*`. |
-| O14 | Medium | Reads/downloads are not audited (only writes are). | Audit download/share-access events (see questions). |
-| O15 | Low | Passkey `rp.id` = last two host labels (`workers.dev` is a public suffix). | `location.hostname`. Latent: no caller yet. |
-| O16 | Low | `S3Config`/`DeviceProfile` derive `Debug` (secret printed by `{:?}`). | Manual `Debug` with redaction. |
-| O17 | Low | Share page on the vault's origin; vendored Argon2 without SRI or a recorded hash. | Separate share origin; SRI + hash in NOTICE. |
-| O18 | Low | Bootstrap: the first member is created by *any* authenticated caller (a race on a fresh deploy). | A one-time `BOOTSTRAP_TOKEN` secret. |
+| O19 | Critical | **Every member store hung after its first wake-up.** Both Durable Objects ran their whole `MIGRATIONS` list in the constructor, every time, with `.expect(..)`. `CREATE TABLE IF NOT EXISTS` repeats harmlessly; `ALTER TABLE … ADD COLUMN` does not — the second run fails ("duplicate column name"), the `expect` panics, and a panicking wasm Worker never answers: the runtime cancels the request as hung. A DO is constructed again after every eviction (idle, deploy, host move), so in production each member store would stop answering minutes after first use. The registry survived only because its list has no `ADD COLUMN` yet. | `worker/src/schema.rs`: a **migration ledger** (`schema_ledger(n)`) — each statement runs once, recorded by its index, so the lists are append-only history. A store from before the ledger is recognised by the one forgivable error (`ADD COLUMN` meeting its own column); anything else stops the migration. A failed migration no longer panics: the DO keeps the error and answers every request with a 500 that names it. |
+
+Why no test saw it: every suite starts from a fresh SQLite directory and
+keeps one dev server for its whole run, so each DO was constructed exactly
+once. `api:restart` now writes through both DOs, stops the server, and
+starts a second (and a third) on the same directory — the probe that found
+the bug, kept as its regression test. The lesson generalises: **a
+constructor is a code path that runs on every wake-up, not once** — test
+the second run.
+
+### O6, fixed in commit 25 — a value opens only where it was sealed, and only a key holder seals
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O6 | High (was Medium) | **Moving.** A sealed value carried no notion of where it belonged: the server could swap two files' content keys (each with its object) or names, so "invoice.pdf" opened a malware sample and evidence item A was shown as item B — every value still opened. | **GV04** (docs/ENCRYPTION.md › GV04): each store value is sealed into its *place* — store, kind, item id, version — bound as AAD and rebuilt by the opener, never read off the server. A key moved to another file or version, or a name moved to another file, fails to open. |
+| O6a | High | **Minting** (found while scoping O6 — the reason the severity rose). GV03 seals to a PUBLIC key and the server holds it: it could invent a file outright — make up a content key, encrypt bytes of its choosing, seal the key and a name — and the file appeared in the store as if a member had uploaded it. Binding ids alone would not have stopped this (the place is public information). | GV04's key schedule mixes in the **store PSK**, computable only from the store's private key (self-ECDH ‖ a hash of the ML-KEM secret — the record key's construction, now one shared helper). Sealing into a store needs what opening needs: there is no public-key path in any more — the bridge does not even keep the public half. |
+| O6b | — | The Worker minted file ids AFTER the upload, so nothing sealed could name its file. | Ids are client-chosen (128 random bits; `file_id`, multipart `newFileId`), shape-checked, and a taken id is a 409. `base_version` is required for versions (the key is sealed for `base + 1`). Downloads say which version they are (`x-gorani-version`): the key's place depends on it. |
+| O6c | Low | A refused music blob was checked after the file and version rows were inserted; the 400 made the Worker delete the object, leaving rows that pointed at nothing. | Every refusal before the first write (`files_store.rs › file_put / file_version_put`). |
+| O6d | — | The upload dialog's "add as a version" answer was a dead parameter (`asVersion`, never read): it stored a new file like "keep both". | Removed; the comment says what the answers do. |
+
+Proven, both directions and end to end:
+
+- `cargo test -p gorani-formats` (placed.rs): a value opens only in its place (another file, store, kind or version fails); GV03 and a foreign store's GV04 are refused; place encoding is unambiguous.
+- `unit:formats`: the cross-language vector — the browser seals a name and a key into places, Rust derives the same PSK and opens them (and nowhere else); Rust seals, the browser opens.
+- `api:security` block 9: the server-as-attacker swaps a malware sample's name and key into an invoice's rows through its own write path — both refuse to open as the invoice — and mints a file with GV03 (refused by the store) and with another store's PSK (stored, never opens).
+- `unit:explorer`: swapped names show as *unverified*, the listing does not crash, the moved key does not open.
+- `api:rotation`: the walk re-seals each value in its row's place; a value moved between rows stops the walk instead of being laundered into the wrong place under the new PSK.
+- `unit:family`: after a member leaves, a value they seal with the old key does not open under the new one — rotation revokes writing as well as reading.
+
+The limits, stated: GV04 proves "a holder of this store's key sealed this,
+here" — not *who* (per-member signatures over each upload are D5), and not
+*freshness* (the server can still serve an older row; it is at least
+consistently what it claims to be).
+
+### O7 + O8, fixed in commit 25 — the backup's label, and what a stored KDF may ask
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O7 | Medium | **GB1 authenticated the segments, not the header** — and the header is what a restore believes (`stamp`, `kind`). Anyone holding the bytes (the bucket, a download folder, an offline copy) could relabel one backup as another and nothing failed. The header did not even say *when* it was made. | **GB2** (`crates/formats/src/backup.rs`, `web/src/vault/backup.ts`): H = SHA-256(magic ‖ headerLen ‖ header) ends every segment's AAD; the writer emits the prefix itself so H is of exactly the bytes written; the header carries a sealed `createdAt`. Change one header byte and nothing opens. |
+| O7a | Medium | **A backup cut down to its header parsed as a valid, EMPTY backup** in both readers (zero segments, zero entries, no error). | The writer always emits a final segment; both readers require one. |
+| O7b | Low | The Rust reader compared the last 8 bytes of each stored nonce and rebuilt the rest: 4 bytes per segment were free to change. | All 12 bytes are compared against the counter nonce (both readers). |
+| O8 | Medium | **Argon2 bounds**: the floor allowed one pass at 19 MiB (below OWASP's 19 MiB / 2 passes); the ceiling allowed 1 GiB, 20 passes, 16 lanes — and every password method was tried, so a server serving a padded settings row (or a share link's `kdf`) could freeze a phone for minutes. Salts had no length check. | `web/src/vault/kdf-bounds.ts` (+ the Rust twin in `unlock.rs`): m 19–256 MiB, t 2–10, p 1–8; salts 16–64 bytes; at most 4 password methods tried per unlock (`MAX_PASSWORD_METHODS`). Vault methods, device copies and share links all pass through it; the module has no imports so the share page carries it cheaply. |
+
+The honest scope of O7: the **Worker writes backups** (it holds the
+backup public key, by design: the server writes backups and never opens
+them), so a malicious *server* could still write a whole false backup with
+any header it likes. What GB2 adds is integrity at rest — against whoever
+can change bytes but cannot run the Worker. A forged backup's contents are
+still bounded by O6: it can only replay genuine placed values, never mint
+new ones (that takes the store's PSK). Per-member signatures over backups
+are D5.
+
+Proven by: `cargo test -p gorani-formats` (relabelled header, header-only
+truncation, a flipped nonce byte — each refused; an honestly empty backup
+still round-trips; the bounds both ways; a real method in 5th place is
+never reached, inside the cap it opens), `api:backup` (the browser reader
+refuses a relabelled `createdAt` and a header-only file from the real
+Worker), `unit:kdf-bounds` (the same bounds and cap in TypeScript, plus a
+share link's `kdf`).
+
+Upgrade note: backups written before commit 25 are GB1 and hold GV03
+values, which a GV04 store refuses — restore them with the release that
+wrote them, then take a fresh backup (docs/PRODUCTION.md › Backups).
+
+### O9 + O10, fixed in commit 25 — a backup that streams and tells the truth; retention that cannot orphan
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O9 | Medium | **The backup job held the whole backup in memory** — every object read whole (`s3::get`), the container concatenated, one PUT — so a store larger than the isolate (128 MB) could not be backed up at all; and **one missing object aborted the run** with nothing written. | The job streams (`worker/src/backup.rs`): rows and objects (read chunk by chunk via `stream_uncached`) feed the GB2 writer, whose output ships as 8 MiB multipart parts — memory is one part plus one segment, whatever the store's size. A missing object is **recorded**: its entry says `"missing": true`, the manifest counts it (`backups.missing`, the first column added under the O19 ledger), the response lists it, the audit says so — and a restore skips it by name instead of minting an empty object. An object whose length changes mid-read aborts the run (the entry format announces the length first; a backup must never be wrong) and frees its parts. `s3::get` is gone. |
+| O10 | Medium | **Retention could orphan objects.** Housekeeping and the backup prune deleted the rows FIRST — the only pointers to the objects — then the S3 deletes, every result discarded (`let _ =`). A failed delete left an object nothing would ever find again. And the cron fan-out ignored every answer: a member whose pass returned 500 nightly looked healthy. | A **deletion outbox** (`pending_deletes`, migration v8): each object key (or multipart upload) is queued in the same pass that removes its row, and leaves the queue only when storage confirms (204, or 404 — already gone). Failures stay queued with attempts and the error, retried every night, visible at `GET …/storage/pending`. A pass with failed deletes answers 503; the fan-out visits every member regardless, then fails the scheduled event naming each failure (`console_error!`). |
+| O10a | Low | The audit listing never selected the `details` column: every readable detail (retention outcomes, device names, backup counts) was written and then listed as null. | Selected. Found by the O10 test asking the audit what happened. |
+
+Proven by `api:backup` § 7 (a 9 MiB file pushes the container past one
+part; an object removed behind the Worker's back is listed, counted,
+marked in its entry, and skipped by the restore; the streamed object
+round-trips byte for byte) and `api:cron` § 4 (the stub refuses DELETE
+with 503: the manifest rows are pruned on schedule, both keys wait in the
+outbox with the error, the objects are still in storage, the audit says
+`deletesFailed:2`; storage recovers and the next pass empties the outbox).
+The stub gained a fault-injection route for it (`POST /__fault`,
+tests/lib/s3stub.mjs).
+
+The honest ceiling: one container is at most 10 000 parts × 8 MiB ≈ 78
+GiB. Past that — and for D12's 255 GB files — backups must become
+manifests of object references rather than copies (a decision, recorded
+in DECISIONS.md › D12).
+
+### O11, fixed in commit 25 — the media worker, which had never worked
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O11 | Medium | **Scope**: registered at "/media/"; a service worker receives the fetches of the pages it controls, and the app page is "/" — `<video src=/media/…>` never reached it. Streaming had never worked; large videos fetched a path the Worker does not serve. | Scope "/" (`web/src/lib/media-worker.ts`); the fetch handler claims only `/media/` paths and returns without `respondWith` for everything else (no pass-through); an unregistered `/media/` path is a 404, never a fall-through to the app's HTML. The old "/media/" registration is retired on upgrade. |
+| O11a | Medium | The worker begins with an `import` but was registered as a classic worker: the script failed to evaluate and the worker never installed. | `type: "module"`; where module service workers are unsupported, the registration fails and the viewer falls back to a decrypted blob. |
+| O11b | Medium | **Wrong AAD** on the whole-file path: the magic alone (4 bytes) instead of GV02's 16-byte header — no whole-file media could ever decrypt. | `sealed.subarray(0, 16)`, plus a size check. |
+| O11c | Low | Answers were the whole frame span (starting before the requested offset) and always `video/mp4`; the worker fetched the CURRENT version, not the one its key was opened for. | `cutToRange` (unit-tested) serves exactly the asked bytes with an honest Content-Range; the file's own type; `?version=` from the registration. The page waits for the worker's acknowledgement before the player's first request. |
+| O11d | — | The worker's fetches carried no identity on the dev server (a service worker cannot read the page's localStorage). | The bridge's `identityHeaders()` ride the registration — empty in production, where Access's cookie rides every same-origin fetch. |
+
+Keys are forgotten on viewer close and on Lock (commit 24, O2). Proven by
+`e2e:app` (a 9 MiB video plays through the worker: the page is
+controlled, `bytes=1000-1999` comes back as exactly those decrypted bytes
+with `Content-Range: bytes 1000-1999/9437184` and `video/mp4`; after the
+viewer closes the same URL is a 404; other requests are untouched) and
+`unit:media-frames` (exact cuts). The chunked (GC01, > 48 MB) path shares
+the frame math; an e2e over 48 MB is left to the live suite's budget.
+
+### O12–O18, fixed in commit 25 — links, limits, reads, and the small ones
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O12 | Medium | **Share limits were cooperative**: `/data` served the copy to anyone with the link — no claim needed, so "2 downloads" was the page's courtesy. | A claim spends one download and returns a token (256-bit, stored as SHA-256, one hour); `/data` serves only to a live token of that share (`x-gorani-share-token` — a header, not a URL). One claim = one download session (Range pieces included). Revoking the link kills its tokens. |
+| O12a | High | **A one-download link could never be downloaded**: `/data` re-ran the claim's own check (`downloads_left > 0`) after the claim had spent the last one. Every link's final download failed. | `/data` checks the token and the share's state, not the count. Found by writing O12's test. |
+| O13 | Medium | No rate limiting on the public share routes or the device-token checks. | The Workers rate-limiting binding (wrangler.jsonc › `ratelimits`): 60/min per caller + link on `/s/*`, 30/min per caller + device on token checks; 429 + `Retry-After`. It fails OPEN on a limiter error (a flood mitigation, not a security boundary — the secrets are) and is per-location and approximate, so the WAF rules in PRODUCTION.md are the second layer. |
+| O14 | Medium | Reads were not audited — only writes. | The read log (D10): the download route sends the READER to the DO, whose object lookup records one merged row per reader × version × client × 5 minutes — before the edge cache, so a cached read is still on record. `GET …/reads[?file=]`; the clients label themselves (`x-gorani-client`: web, media, cli). Share claims land in the owner's audit. |
+| O15 | Low | Passkey `rp.id` was "the last two host labels": `workers.dev` (a public suffix — no passkey could be created) on a workers.dev deploy, `co.uk` on others; and the unlock call used the browser's default (the hostname), so on any subdomain an enrolled passkey could never unlock. | `rp.id` = `location.hostname`, stated on both calls. |
+| O16 | Low | `S3Config` and `DeviceProfile` derived `Debug`: `{:?}` printed the S3 secret, the device token, the Access secret and the device secret. | Hand-written `Debug` with `[redacted]`; a test checks no key appears. |
+| O17 | Low | The share page ran a vendored Argon2 with no recorded provenance and no integrity check. | Subresource Integrity on the script tag; the sha256 in NOTICE; `unit:vendored` proves the file is hash-wasm 4.12.0's build byte for byte and that NOTICE, `s.html` and the built page agree. (The separate share *origin* is a deployment decision — PRODUCTION.md › Share links.) |
+| O18 | Low | The first member was created by any authenticated caller — a race on a fresh deploy. | A `BOOTSTRAP_TOKEN` secret, presented once (`x-gorani-bootstrap`): checked in the Worker (constant time), applied by the registry only while it is empty, and the first member must be a parent. Production without the secret refuses to bootstrap; the dev server without it bootstraps freely. A client-sent verdict is overwritten; a non-object body is a 400, not a panic. |
+
+Proven by: `api:shares` (no token / a forged token → 403; the claim's token
+serves data and Range; **the last download downloads**; a revoked link's
+token dies), `api:security` § 10 (the 71st request a minute on one link is
+429 with `Retry-After`, another link is untouched; device-token guessing is
+cut off), `api:files` / `api:cache` (two downloads in a window are one
+merged line; a parent's read is the parent's; a cache HIT is still a read
+on record), `api:bootstrap` (new, its own server with the secret set),
+`unit:vendored` (new), the Rust tests for `bootstrap_allowed` and the
+redacted `Debug`.
+
+## Still open
+
+None of the review's findings. What remains is the product roadmap in
+docs/DECISIONS.md (D2/D4 roles, cases and quorum recovery — which also close
+O3's trust-on-first-use gap — D5 custody, D6 Object Lock, D7 retention, D8
+samples, D11 partner sign-in, D12 large files) and the operational controls
+below.
 
 ## Operational controls (outside the code)
 

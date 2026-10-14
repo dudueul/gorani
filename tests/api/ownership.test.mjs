@@ -14,7 +14,8 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { newContentKey, importContentKey, sealText, sealWith, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 
 const dev = await suiteDev();
@@ -41,23 +42,23 @@ try {
 	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian } } });
 	assert.equal(saved.status, 200);
 
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	// (A parent opens the child's store with the guardian copy — the same
+	// private key — so Mom seals into Jinu's places exactly as Jinu does.)
+	const store = await storeSealer(filesStore.bundle, "jinu");
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
 	const plain = enc.encode("the family bread recipe");
 	const sealed = await sealWith(key, plain);
-	const ckSealed = await wrapContentKey(storePublic, ck);
-	const nameSealed = await sealText(storePublic, "bread.txt");
-	const typeSealed = await sealText(storePublic, "text/plain");
+	const bread = await store.newFile("bread.txt", "text/plain", ck);
 
 	// ── 1. Jinu uploads: owner jinu, contributor jinu ───────────────────
-	const up = await uploadFile("jinu@family.test", "jinu", { ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length) }, sealed);
+	const up = await uploadFile("jinu@family.test", "jinu", { ...bread.fields, size: String(plain.length) }, sealed);
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const list = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" });
 	assert.equal(list.json.files[0].owner, "jinu", "strict ownership: first uploader");
 
 	// ── 2. Mom uploads the SAME bytes (a twin) → the match names her ───
-	const up2 = await uploadFile("mom@family.test", "jinu", { ck: ckSealed, name: await sealText(storePublic, "bread copy.txt"), type: typeSealed, size: String(plain.length) }, sealed);
+	const up2 = await uploadFile("mom@family.test", "jinu", { ...(await store.newFile("bread copy.txt", "text/plain", ck)).fields, size: String(plain.length) }, sealed);
 	assert.equal(up2.status, 200);
 	const match = await api(dev.base, "GET", `/api/v1/members/jinu/files/match?size=${plain.length}`, { email: "mom@family.test" });
 	assert.ok(match.json.files.length >= 2);
@@ -74,9 +75,8 @@ try {
 	const boundary = `v${Math.random().toString(16).slice(2)}`;
 	const vhead = new TextEncoder().encode(
 		[
-			["ck", ckSealed],
-			["name", nameSealed],
-			["type", typeSealed],
+			["ck", await store.fileKey(bread.id, 2, ck)],
+			["type", await store.fileType(bread.id, 2, "text/plain")],
 			["size", String(plain.length)],
 			["base_version", "1"],
 		]

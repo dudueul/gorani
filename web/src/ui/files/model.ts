@@ -5,9 +5,13 @@
  * the model never touches the DOM; the views never touch fetch or crypto).
  *
  * Everything the server sends is *structure*: ids, sizes, times, and SEALED
- * names (`GV03:…`). This model decrypts names into an in-memory cache the
- * moment a listing arrives — plaintext exists only in this tab, only while
- * unlocked, and dies with the session.
+ * names (`GV04:…`, each sealed into its place — the file it names). This
+ * model decrypts names into an in-memory cache the moment a listing arrives
+ * — plaintext exists only in this tab, only while unlocked, and dies with
+ * the session. A name that does not open where the server put it (moved
+ * from another file, or minted without the store's key — O6) is shown as
+ * UNVERIFIED rather than hidden or crashing the view: tampering should be
+ * visible.
  *
  * Selection, clipboard, history and the change feed live here too, so both
  * platform simulations (Windows 11 and macOS Finder) are two skins over one
@@ -15,7 +19,9 @@
  */
 
 import { store, type Store } from "../../lib/store.ts";
-import { newContentKey, importContentKey, sealText, openText, sealWith, openWith, wrapContentKey, unwrapContentKey, type VaultPrivateKey, type SealTarget } from "../../vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith, openWith, sealPlacedText, openPlacedText, wrapPlacedKey, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
+import { places, newItemId } from "../../vault/places.ts";
+import { controllingMediaWorker, registerMedia } from "../../lib/media-worker.ts";
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
@@ -23,6 +29,9 @@ import { kindOf, type FileKind } from "./icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
+
+/** What a name that does not open in its place is shown as (O6). */
+export const UNVERIFIED = "⚠ unverified — not sealed here";
 
 export interface FolderRow {
 	id: string;
@@ -76,11 +85,19 @@ export interface FilesState {
 export interface FilesBridge {
 	apiGet<T>(path: string): Promise<T>;
 	apiSend<T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<T>;
+	/** The files store's private key. It also SEALS (GV04: a store seals to
+	 * itself, with a secret only its key computes) — there is no public-key
+	 * path into a store any more (commit 25). */
 	storePrivate(): Promise<VaultPrivateKey>;
-	storePublic(): Promise<SealTarget>;
-	fetchObject(memberId: string, id: string, version: number | undefined, range?: [number, number]): Promise<{ body: Uint8Array; ck: string; chunk: number | null }>;
+	/** `version`: which version the bytes are (the `x-gorani-version` header) —
+	 * the place the content key opens from. */
+	fetchObject(memberId: string, id: string, version: number | undefined, range?: [number, number]): Promise<{ body: Uint8Array; ck: string; chunk: number | null; version: number }>;
 	fetchObjectStream(memberId: string, id: string, version: number | undefined, sink: (plain: Uint8Array) => Promise<void> | void): Promise<void>;
 	putWhole(memberId: string, fields: Record<string, string>, sealed: Uint8Array): Promise<void>;
+	/** Headers that identify this client to the API beyond its cookies (the
+	 * dev server's identity header; nothing in production) — for fetches
+	 * made outside the bridge, i.e. by the media service worker. */
+	identityHeaders(): Record<string, string>;
 	putMultipart(memberId: string, fields: Record<string, string>, sealed: Uint8Array, chunk: number): Promise<void>;
 	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
 	toast(message: string): void;
@@ -123,11 +140,23 @@ export class FilesModel {
 		return this.bridge;
 	}
 
-	/** Seal a value to the files store's public key (owner-side displays:
-	 * share link names in the owner's list). */
-	async sealForOwner(text: string): Promise<string> {
-		const pub = await this.bridge.storePublic();
-		return sealText(pub, text);
+	/** A share link's name for the owner's list, sealed into the share's place. */
+	async sealShareName(shareId: string, text: string): Promise<string> {
+		return sealPlacedText(await this.bridge.storePrivate(), places.shareName(this.memberId, shareId), text);
+	}
+
+	/** Open a name where the server put it; a name that will not open there
+	 * becomes a visible warning (never cached — the next listing tries again). */
+	private async openName(priv: VaultPrivateKey, place: Uint8Array, id: string, sealed: string): Promise<string> {
+		const cached = this.names.get(id);
+		if (cached !== undefined) return cached;
+		try {
+			const name = await openPlacedText(priv, place, sealed);
+			this.names.set(id, name);
+			return name;
+		} catch {
+			return UNVERIFIED;
+		}
 	}
 
 	private set(patch: Partial<FilesState>): void {
@@ -212,8 +241,7 @@ export class FilesModel {
 		const priv = await this.bridge.storePrivate();
 		return Promise.all(
 			rows.map(async (f) => {
-				const name = this.names.get(f.id) ?? (await openText(priv, f.name));
-				this.names.set(f.id, name);
+				const name = await this.openName(priv, places.folderName(this.memberId, f.id), f.id, f.name);
 				return { id: f.id, parent: f.parent, nameSealed: f.name, name, createdAt: f.createdAt, updatedAt: f.updatedAt, deletedAt: f.deletedAt ?? null, trashedWith: f.trashedWith ?? null };
 			}),
 		);
@@ -223,8 +251,7 @@ export class FilesModel {
 		const priv = await this.bridge.storePrivate();
 		return Promise.all(
 			rows.map(async (f) => {
-				const name = this.names.get(f.id) ?? (await openText(priv, f.name));
-				this.names.set(f.id, name);
+				const name = await this.openName(priv, places.fileName(this.memberId, f.id), f.id, f.name);
 				return { id: f.id, folder: f.folder, nameSealed: f.name, name, kind: kindOf(name), size: Number(f.size), version: f.version, createdAt: f.createdAt, updatedAt: f.updatedAt, trashedWith: f.trashedWith ?? null };
 			}),
 		);
@@ -301,8 +328,8 @@ export class FilesModel {
 
 	async rename(kind: "file" | "folder", id: string, newName: string): Promise<void> {
 		if (!newName.trim()) return;
-		const pub = await this.bridge.storePublic();
-		const sealed = await sealText(pub, newName.trim());
+		const priv = await this.bridge.storePrivate();
+		const sealed = await sealPlacedText(priv, kind === "file" ? places.fileName(this.memberId, id) : places.folderName(this.memberId, id), newName.trim());
 		const path = kind === "file" ? `/api/v1/members/${this.memberId}/files/${id}` : `/api/v1/members/${this.memberId}/files/folders/${id}`;
 		await this.bridge.apiSend("PATCH", path, kind === "file" ? { name: sealed } : { name: sealed });
 		this.names.set(id, newName.trim());
@@ -335,9 +362,10 @@ export class FilesModel {
 	}
 
 	async newFolder(parentId: string | null, name: string): Promise<string> {
-		const pub = await this.bridge.storePublic();
-		const sealed = await sealText(pub, name.trim());
-		const created = await this.bridge.apiSend<{ id: string }>("POST", `/api/v1/members/${this.memberId}/files/folders`, { name: sealed, parentId });
+		// The id first, then the name sealed into it (the place names the folder).
+		const id = newItemId();
+		const sealed = await sealPlacedText(await this.bridge.storePrivate(), places.folderName(this.memberId, id), name.trim());
+		const created = await this.bridge.apiSend<{ id: string }>("POST", `/api/v1/members/${this.memberId}/files/folders`, { id, name: sealed, parentId });
 		await this.refresh();
 		return created.id;
 	}
@@ -358,36 +386,44 @@ export class FilesModel {
 					this.bridge.toast(`Skipped “${file.name}” (already here)`);
 					continue;
 				}
-				void answer;
+				// "keep" and "version" both store the bytes again as a new file:
+				// identical bytes as a new VERSION of the twin would record
+				// nothing new. (A dead `asVersion` parameter used to pretend
+				// otherwise; removed in commit 25.)
 			}
-			await this.uploadOne(file, plain, tag, folderId, twins.length ? ("version" as const) : undefined);
+			await this.uploadOne(file, plain, tag, folderId);
 		}
 		await this.refresh();
 	}
 
-	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null, asVersion?: "version"): Promise<void> {
-		const pub = await this.bridge.storePublic();
+	private async uploadOne(file: File, plain: Uint8Array, tag: string, folderId: string | null): Promise<void> {
+		// The file id first: the name, the type and the content key are sealed
+		// INTO places that name it (O6) — so the server cannot move them to
+		// another file, and could not have made them up (it lacks the PSK).
+		// A new file is version 1.
+		const priv = await this.bridge.storePrivate();
+		const id = newItemId();
 		const ck = newContentKey();
 		const key = await importContentKey(ck);
-		const nameSealed = await sealText(pub, file.name);
-		const typeSealed = await sealText(pub, file.type || "application/octet-stream");
-		const ckSealed = await wrapContentKey(pub, ck);
+		const nameSealed = await sealPlacedText(priv, places.fileName(this.memberId, id), file.name);
+		const typeSealed = await sealPlacedText(priv, places.fileType(this.memberId, id, 1), file.type || "application/octet-stream");
+		const ckSealed = await wrapPlacedKey(priv, places.fileKey(this.memberId, id, 1), ck);
+		ck.fill(0);
 		// Music metadata (docs/MUSIC.md): the tags exist only in plaintext we
 		// already hold, so parse them here and seal the summary — the library
 		// feed opens these blobs instead of ever re-reading the audio.
 		let mmeta: string | undefined;
 		if (file.type.startsWith("audio/")) {
 			const meta = parseAudioMeta(plain);
-			if (meta) mmeta = await sealText(pub, JSON.stringify(meta));
+			if (meta) mmeta = await sealPlacedText(priv, places.fileMusic(this.memberId, id, 1), JSON.stringify(meta));
 		}
 		if (plain.length > 48 * 1024 * 1024) {
 			const chunked = await sealChunked(key, plain, DEFAULT_CHUNK);
-			await this.bridge.putMultipart(this.memberId, { ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), chunk: String(DEFAULT_CHUNK), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}), ...(asVersion ? {} : {}) }, chunked, DEFAULT_CHUNK);
+			await this.bridge.putMultipart(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), chunk: String(DEFAULT_CHUNK), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}) }, chunked, DEFAULT_CHUNK);
 		} else {
 			const sealed = await sealWith(key, plain);
-			await this.bridge.putWhole(this.memberId, { ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}) }, sealed);
+			await this.bridge.putWhole(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(plain.length), tag, ...(mmeta ? { mmeta } : {}), ...(folderId ? { folder_id: folderId } : {}) }, sealed);
 		}
-		void asVersion;
 	}
 
 	/**
@@ -402,10 +438,10 @@ export class FilesModel {
 		const out: (AudioMeta & { id: string; version: number; size: number })[] = [];
 		for (const t of feed.tracks) {
 			try {
-				const meta = JSON.parse(await openText(priv, t.blobSealed)) as AudioMeta;
+				const meta = JSON.parse(await openPlacedText(priv, places.fileMusic(this.memberId, t.id, t.version), t.blobSealed)) as AudioMeta;
 				out.push({ ...meta, id: t.id, version: t.version, size: t.size });
 			} catch {
-				void 0; // a blob from a key this member no longer holds
+				void 0; // a blob from a key this member no longer holds, or not from here
 			}
 		}
 		return out.sort((x, y) => (x.artist ?? "").localeCompare(y.artist ?? "") || (x.album ?? "").localeCompare(y.album ?? "") || (x.title ?? "").localeCompare(y.title ?? ""));
@@ -427,14 +463,13 @@ export class FilesModel {
 		const priv = await this.bridge.storePrivate();
 		const existing = await this.bridge.apiGet<{ sealed: string | null }>(`/api/v1/members/${this.memberId}/files/secrets`);
 		if (existing.sealed) {
-			const json = JSON.parse(await openText(priv, existing.sealed)) as { fp: string; idx: string };
+			const json = JSON.parse(await openPlacedText(priv, places.storeSecrets(this.memberId), existing.sealed)) as { fp: string; idx: string };
 			this.secrets = { fp: fromBase64(json.fp), idx: fromBase64(json.idx) };
 			return;
 		}
 		const fp = crypto.getRandomValues(new Uint8Array(32));
 		const idx = crypto.getRandomValues(new Uint8Array(32));
-		const pub = await this.bridge.storePublic();
-		const sealed = await sealText(pub, JSON.stringify({ fp: toBase64(fp), idx: toBase64(idx) }));
+		const sealed = await sealPlacedText(priv, places.storeSecrets(this.memberId), JSON.stringify({ fp: toBase64(fp), idx: toBase64(idx) }));
 		await this.bridge.apiSend("PUT", `/api/v1/members/${this.memberId}/files/secrets`, { sealed });
 		this.secrets = { fp, idx };
 	}
@@ -473,9 +508,12 @@ export class FilesModel {
 			await this.bridge.fetchObjectStream(this.memberId, id, version, sink);
 			return;
 		}
-		const { body, ck } = await this.bridge.fetchObject(this.memberId, id, version);
+		const { body, ck, version: served } = await this.bridge.fetchObject(this.memberId, id, version);
+		// The key opens only from the place of the version the bytes ARE (and,
+		// asked for a version, it must be that one).
+		if (version !== undefined && served !== version) throw new Error("the server answered with another version");
 		const priv = await this.bridge.storePrivate();
-		const key = await unwrapContentKey(priv, ck);
+		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, served), ck);
 		await sink(await openWith(key, body));
 	}
 
@@ -484,19 +522,19 @@ export class FilesModel {
 		const s = this.state.get();
 		const row = s.files.find((f) => f.id === id) ?? s.trashFiles.find((f) => f.id === id);
 		if (!row) return null;
-		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; type: string | null }> }>(id);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; type: string | null; version: number }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const priv = await this.bridge.storePrivate();
-		const mime = meta.type ? await openText(priv, meta.type) : "application/octet-stream";
-		const key = await unwrapContentKey(priv, meta.key);
+		const mime = meta.type ? await openPlacedText(priv, places.fileType(this.memberId, id, meta.version), meta.type) : "application/octet-stream";
+		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, meta.version), meta.key);
 		let plain: Uint8Array;
 		if (meta.chunk && meta.chunk > 0) {
 			// The first frame only: previews never pull a whole video in.
-			const { body } = await this.bridge.fetchObject(this.memberId, id, undefined, [0, Math.min(meta.chunk, maxBytes) + 28 - 1]);
+			const { body } = await this.bridge.fetchObject(this.memberId, id, meta.version, [0, Math.min(meta.chunk, maxBytes) + 28 - 1]);
 			plain = await openChunk(key, body, 0, false);
 		} else {
-			const { body } = await this.bridge.fetchObject(this.memberId, id, undefined);
+			const { body } = await this.bridge.fetchObject(this.memberId, id, meta.version);
 			plain = await openWith(key, body);
 		}
 		return { bytes: plain.subarray(0, maxBytes), name: row.name, mime };
@@ -509,22 +547,24 @@ export class FilesModel {
 	 * plaintext (the content key is handed over as a cloned, still
 	 * non-extractable CryptoKey). Returns null where service workers are
 	 * unavailable — the viewer falls back to the decrypted blob. */
-	async mediaHandle(id: string): Promise<{ url: string } | null> {
-		if (typeof navigator === "undefined" || !navigator.serviceWorker) return null;
-		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null }> }>(id);
+	async mediaHandle(id: string, mime: string | null = null): Promise<{ url: string } | null> {
+		const worker = await controllingMediaWorker();
+		if (!worker) return null;
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const s = this.state.get();
 		const row = s.files.find((f) => f.id === id);
 		if (!row) return null;
 		const priv = await this.bridge.storePrivate();
-		const key = await unwrapContentKey(priv, meta.key);
+		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, meta.version), meta.key);
 		const url = `/media/${id}`;
-		await navigator.serviceWorker.ready;
-		const reg = await navigator.serviceWorker.getRegistration("/media/");
-		const target = reg?.active ?? (await navigator.serviceWorker.ready).active;
-		if (!target) return null;
-		target.postMessage({ type: "media", url, memberId: this.memberId, fileId: id, key, chunk: meta.chunk, size: row.size });
+		// The version rides along: the worker fetches exactly the version
+		// this key was opened for (a newer one would not open with it).
+		// (`headers`: the dev server's identity header — a service worker cannot
+		// read the page's localStorage. Empty in production, where Access's
+		// cookie rides every same-origin fetch, the worker's included.)
+		await registerMedia(worker, { url, memberId: this.memberId, fileId: id, version: meta.version, key, chunk: meta.chunk, size: row.size, mime, headers: this.bridge.identityHeaders() });
 		return { url };
 	}
 
@@ -623,7 +663,7 @@ export class FilesModel {
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const priv = await this.bridge.storePrivate();
-		const mime = meta.type ? await openText(priv, meta.type) : null;
+		const mime = meta.type ? await openPlacedText(priv, places.fileType(this.memberId, id, meta.version), meta.type).catch(() => null) : null;
 		const s = this.state.get();
 		const row = s.files.find((f) => f.id === id) ?? s.trashFiles.find((f) => f.id === id);
 		return row ? { name: row.name, kind: row.kind, size: row.size, version: meta.version, createdAt: row.createdAt, updatedAt: row.updatedAt, mime } : null;

@@ -2,7 +2,7 @@
 
 /**
  * Backups, the browser side: the key file (the ONLY copy of the private
- * bundle) and the GB1 reader that verifies/opens a downloaded .gbak in the
+ * bundle) and the GB2 reader that verifies/opens a downloaded .gbak in the
  * tab — the Rust twin is crates/formats/src/backup.rs; the vectors keep
  * them byte-identical.
  *
@@ -44,9 +44,15 @@ export function downloadKeyFile(keyFile: BackupKeyFile): void {
 	setTimeout(() => revokeBlobURL(url), 5000);
 }
 
-// ── the GB1 reader (mirrors crates/formats/src/backup.rs) ───────────
+// ── the GB2 reader (mirrors crates/formats/src/backup.rs) ───────────
+//
+// GB2 (commit 25, docs/SECURITY-REVIEW.md › O7): every segment's AAD ends
+// with H = SHA-256(magic ‖ headerLen ‖ header), so the header — the stamp
+// and kind a restore believes — is authenticated, not just the segments.
+// The header is parsed first (it carries the sealed file key) but nothing
+// in it is acted on until the segments have opened under its hash.
 
-const MAGIC = "GBAK1\n";
+const MAGIC = "GBAK2\n";
 const SEG_SIZE = 1024 * 1024;
 const TAG = 16;
 
@@ -60,13 +66,14 @@ export interface ParsedBackup {
 	entries: BackupEntry[];
 }
 
-function aad(seg: number, finalSeg: boolean): Uint8Array {
-	const a = new Uint8Array(16);
-	a.set(new TextEncoder().encode("GBAK1"), 0);
-	a[5] = "1".charCodeAt(0);
+function aad(seg: number, finalSeg: boolean, headerHash: Uint8Array): Uint8Array {
+	const a = new Uint8Array(48);
+	a.set(new TextEncoder().encode("GBAK2"), 0);
+	a[5] = "2".charCodeAt(0);
 	a[6] = "A".charCodeAt(0);
 	a[7] = finalSeg ? 1 : 0;
 	new DataView(a.buffer).setBigUint64(8, BigInt(seg));
+	a.set(headerHash, 16);
 	return a;
 }
 
@@ -79,18 +86,20 @@ function nonce(seg: number): Uint8Array {
 /** Parse + decrypt a whole .gbak with the file key from the key file. */
 export async function readBackup(bytes: Uint8Array, keyFile: BackupKeyFile): Promise<ParsedBackup> {
 	const priv = await importVaultKey(fromBase64(keyFile.key));
-	const header = parseHeader(bytes);
+	const { header, prefixLen } = parseHeader(bytes);
 	const fileKey = await unwrapFileKey(priv, String(header.wrapped ?? ""));
-	return { header, ...(await decryptEntries(bytes, 6 + 4 + (header.__headerLen as number), fileKey)) };
+	const headerHash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.subarray(0, prefixLen) as BufferSource));
+	return { header, ...(await decryptEntries(bytes, prefixLen, fileKey, headerHash)) };
 }
 
-function parseHeader(bytes: Uint8Array): Record<string, unknown> {
+function parseHeader(bytes: Uint8Array): { header: Record<string, unknown>; prefixLen: number } {
 	const magic = new TextDecoder().decode(bytes.subarray(0, 6));
-	if (magic !== MAGIC) throw new Error("Not a gorani backup");
+	if (magic !== MAGIC) throw new Error(magic === "GBAK1\n" ? "A GB1 backup (before commit 25): its header is not authenticated and its contents predate placed sealing — restore it with the release that wrote it" : "Not a gorani backup");
+	if (bytes.length < 10) throw new Error("Backup header is cut short");
 	const len = new DataView(bytes.buffer, bytes.byteOffset + 6, 4).getUint32(0);
-	const header = JSON.parse(new TextDecoder().decode(bytes.subarray(10, 10 + len))) as Record<string, unknown> & { __headerLen?: number };
-	header.__headerLen = len;
-	return header;
+	if (bytes.length < 10 + len) throw new Error("Backup header is cut short");
+	const header = JSON.parse(new TextDecoder().decode(bytes.subarray(10, 10 + len))) as Record<string, unknown>;
+	return { header, prefixLen: 10 + len };
 }
 
 async function unwrapFileKey(priv: VaultPrivateKey, wrapped: string): Promise<CryptoKey> {
@@ -98,20 +107,29 @@ async function unwrapFileKey(priv: VaultPrivateKey, wrapped: string): Promise<Cr
 	return importContentKey(raw);
 }
 
-async function decryptEntries(bytes: Uint8Array, at: number, fileKey: CryptoKey): Promise<{ entries: BackupEntry[] }> {
+async function decryptEntries(bytes: Uint8Array, at: number, fileKey: CryptoKey, headerHash: Uint8Array): Promise<{ entries: BackupEntry[] }> {
+	// Zero segments is a truncation (the writer always emits a final one).
+	if (at >= bytes.length) throw new Error("Backup has no segments (cut short after the header)");
 	const stream = new Uint8Array(bytes.length - at);
 	let seg = 0;
 	let written = 0;
 	for (let pos = at; pos < bytes.length; ) {
 		const remaining = bytes.length - pos;
+		if (remaining < 12 + TAG) throw new Error("Backup segment is cut short");
 		const [payloadLen, finalSeg] = remaining <= 12 + SEG_SIZE + TAG ? [remaining - 12 - TAG, true] : [SEG_SIZE, false];
-		const claimed = new DataView(bytes.buffer, bytes.byteOffset + pos + 4, 8).getBigUint64(0);
-		if (claimed !== BigInt(seg)) throw new Error("Backup segments are out of order");
-		const plain = new Uint8Array(await crypto.subtle.decrypt(
-			{ name: "AES-GCM", iv: bytes.subarray(pos, pos + 12) as BufferSource, additionalData: aad(seg, finalSeg) as BufferSource },
-			fileKey,
-			bytes.subarray(pos + 12, pos + 12 + payloadLen + TAG) as BufferSource,
-		));
+		// All twelve nonce bytes must be the counter nonce (the reorder check too).
+		const expected = nonce(seg);
+		if (!bytes.subarray(pos, pos + 12).every((b, i) => b === expected[i])) throw new Error("Backup segments are out of order (or a nonce was altered)");
+		let plain: Uint8Array;
+		try {
+			plain = new Uint8Array(await crypto.subtle.decrypt(
+				{ name: "AES-GCM", iv: expected as BufferSource, additionalData: aad(seg, finalSeg, headerHash) as BufferSource },
+				fileKey,
+				bytes.subarray(pos + 12, pos + 12 + payloadLen + TAG) as BufferSource,
+			));
+		} catch {
+			throw new Error("Wrong backup key, or the backup (header or segments) was altered");
+		}
 		stream.set(plain, written);
 		written += plain.length;
 		pos += 12 + payloadLen + TAG;

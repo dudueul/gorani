@@ -15,8 +15,8 @@
 //! | Column | Readable? |
 //! |---|---|
 //! | file sizes, version numbers, times, folder *shape*, ids | yes (structure) |
-//! | file names, types, folder names, extracted text, dates inside documents | **no** — sealed text (`GV01:`/`GV02:`/`GV03:`) |
-//! | content keys | stored **wrapped** to a store key; the server cannot open them |
+//! | file names, types, folder names, extracted text, dates inside documents | **no** — placed sealed text (`GV04:`, commit 25) |
+//! | content keys | stored **sealed into their place** (GV04) under the store key; the server can neither open them nor make new ones |
 //! | vault settings | public halves + wrapped private copies only |
 //!
 //! # The change feed (docs/DESKTOP.md's cursor)
@@ -40,6 +40,8 @@ use crate::family::json_error;
 use crate::devices::EnrolBody;
 use crate::files_store::urlquery;
 
+/// APPEND-ONLY: a statement's index is its identity in the schema ledger
+/// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
 pub const MIGRATIONS: &[&str] = &[
 	// Vault settings: one row. The JSON carries public halves, unlock methods
 	// (wrapped private copies), store keys, and the family links
@@ -221,6 +223,45 @@ pub const MIGRATIONS: &[&str] = &[
 	)",
 	"ALTER TABLE shares ADD COLUMN ready INTEGER DEFAULT 0",
 	"ALTER TABLE shares ADD COLUMN size INTEGER",
+	// Migration v7 (commit 25): a backup records the objects it could not
+	// include (O9). The first ADD COLUMN written under the ledger
+	// (schema.rs) — it runs once per store, then never again.
+	"ALTER TABLE backups ADD COLUMN missing INTEGER DEFAULT 0",
+	// Migration v8 (commit 25): the deletion outbox (O10). An object key is
+	// queued in the same pass that removes the row pointing at it, and leaves
+	// the queue only once storage confirms the delete — so a failed delete
+	// is retried every night instead of orphaning the object for good.
+	"CREATE TABLE IF NOT EXISTS pending_deletes (
+		key TEXT PRIMARY KEY,
+		upload_id TEXT,
+		reason TEXT NOT NULL,
+		since TEXT NOT NULL,
+		attempts INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT
+	)",
+	// Migration v9 (commit 25): share download tokens (O12). A claim — which
+	// spends one download — returns a token; /data serves only to a live
+	// token. Stored as SHA-256: a leaked table cannot be replayed.
+	"CREATE TABLE IF NOT EXISTS share_tokens (
+		hash TEXT PRIMARY KEY,
+		share_id TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	)",
+	// Migration v10 (commit 25): the read log (O14, docs/DECISIONS.md › D10).
+	// One MERGED row per reader × file version × client × 5-minute window —
+	// a video seek is dozens of range requests, a custody record needs one
+	// line: "who read evidence item F, version 3, from what, when".
+	"CREATE TABLE IF NOT EXISTS read_log (
+		actor TEXT NOT NULL,
+		file_id TEXT NOT NULL,
+		version INTEGER NOT NULL,
+		client TEXT NOT NULL,
+		win INTEGER NOT NULL,
+		first_at TEXT NOT NULL,
+		last_at TEXT NOT NULL,
+		requests INTEGER NOT NULL,
+		PRIMARY KEY (actor, file_id, version, client, win)
+	)",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -237,18 +278,24 @@ pub const MIGRATIONS: &[&str] = &[
 pub struct GoraniMemberDO {
 	pub(crate) sql: worker::SqlStorage,
 	pub(crate) env: Env,
+	/// A failed migration, kept instead of panicking (schema.rs): every
+	/// request is answered with it until a fixed deploy migrates cleanly.
+	schema: std::result::Result<(), String>,
 }
 
 impl DurableObject for GoraniMemberDO {
 	fn new(state: State, env: Env) -> Self {
 		let sql = state.storage().sql();
-		for stmt in MIGRATIONS {
-			sql.exec(stmt, None).expect("member migration");
-		}
-		Self { sql, env }
+		// Ledgered (commit 25): the constructor runs on EVERY wake-up, and
+		// re-running an ADD COLUMN panicked the second one (schema.rs).
+		let schema = crate::schema::migrate(&sql, MIGRATIONS);
+		Self { sql, env, schema }
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
+		if let Err(e) = &self.schema {
+			return json_error(500, &format!("member store schema: {e}"));
+		}
 		// Errors become JSON with their message: an opaque 500 helps nobody,
 		// least of all the tests that must tell refusals from faults.
 		match self.dispatch(req).await {
@@ -343,7 +390,9 @@ impl GoraniMemberDO {
 				self.share_claim(&id["shares/".len()..id.len() - "/claim".len()]).await
 			}
 			("POST", id) if id.starts_with("shares/") && id.ends_with("/public-object") => {
-				match self.share_public_object(&id["shares/".len()..id.len() - "/public-object".len()]).await {
+				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+				let token = body.get("token").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+				match self.share_public_object(&id["shares/".len()..id.len() - "/public-object".len()], &token).await {
 					Ok(object) => Ok(Response::from_json(&serde_json::json!({ "objectKey": object }))?),
 					Err(resp) => Ok(resp),
 				}
@@ -358,6 +407,11 @@ impl GoraniMemberDO {
 				self.backup_run(&actor, body).await
 			}
 			("GET", "backups") => self.backups_list().await,
+			("GET", "storage/pending") => self.pending_deletes().await,
+			("GET", "reads") => {
+				let q = req.url()?.query().map(urlquery).unwrap_or_default();
+				self.read_log(q.get("file").map(String::as_str)).await
+			}
 			("GET", id) if id.starts_with("backups/") => self.backup_object(&id["backups/".len()..]).await,
 			("POST", "backup/restore") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -382,8 +436,13 @@ impl GoraniMemberDO {
 				// one, so the old `split_once('?')` on the path never matched
 				// and `?version=n` downloads silently served the CURRENT
 				// version (commit 23).
-				let version = req.url()?.query().map(urlquery).and_then(|q| q.get("version").and_then(|x| x.parse::<i64>().ok()));
-				self.file_object_route(&id["files-object/".len()..], version).await
+				let q = req.url()?.query().map(urlquery).unwrap_or_default();
+				let version = q.get("version").and_then(|x| x.parse::<i64>().ok());
+				// The Worker sends the READER as the actor and the client kind
+				// in `client` (O14): this lookup is where every download —
+				// browser, media worker, CLI — passes before the edge cache.
+				let client = q.get("client").cloned();
+				self.file_object_route(&id["files-object/".len()..], version, &actor, client.as_deref()).await
 			}
 			("GET", id) if id.starts_with("restore-target/") => match id["restore-target/".len()..].split_once('/') {
 				Some((file_id, obj)) => self.restore_target(&member, file_id, obj).await,
@@ -476,7 +535,10 @@ impl GoraniMemberDO {
 	}
 
 	async fn get_audit(&self) -> Result<Response> {
-		let rows: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed FROM audit ORDER BY id DESC LIMIT 200", None)?.to_array()?;
+		// (`details` was missing from this SELECT until commit 25: every
+		// readable detail — retention outcomes, device names, backup counts —
+		// was written and then listed as null. Found by api:cron's O10 block.)
+		let rows: Vec<AuditRow> = self.sql.exec("SELECT id, at, actor, action, target, details_sealed, details FROM audit ORDER BY id DESC LIMIT 200", None)?.to_array()?;
 		let lines: Vec<serde_json::Value> = rows
 			.into_iter()
 			.map(|a| {
@@ -535,7 +597,10 @@ impl GoraniMemberDO {
 		let upload_days = knob("uploadDays", 2).max(0);
 
 		// 1. Trash purge: sealed objects leave S3, rows leave (triggers
-		// journal the purge).
+		// journal the purge). Every object key goes into the deletion outbox
+		// BEFORE its row goes (commit 25, O10): the row was the only pointer
+		// to the object, and the S3 delete that used to follow could fail —
+		// `let _ =` — leaving an object nothing would ever find again.
 		let mut purged_objects: Vec<String> = Vec::new();
 		let purged_files: Vec<ObjRow> = self
 			.sql
@@ -546,6 +611,7 @@ impl GoraniMemberDO {
 			.to_array()?;
 		for r in &purged_files {
 			purged_objects.push(r.object_key.clone());
+			self.enqueue_delete(&r.object_key, None, "trash purge")?;
 		}
 		let n_files_purged = self
 			.sql
@@ -581,6 +647,7 @@ impl GoraniMemberDO {
 		let mut stale_multipart: Vec<(String, String)> = Vec::new();
 		for r in &dead_shares {
 			purged_objects.push(r.object_key.clone());
+			self.enqueue_delete(&r.object_key, None, "dead share copy")?;
 			// A share that never completed holds an open multipart upload:
 			// its parts are billed storage until someone aborts it.
 			if let Some(u) = r.s3_upload_id.as_ref().filter(|u| !u.is_empty()) {
@@ -599,6 +666,13 @@ impl GoraniMemberDO {
 			if u.s3_upload_id != "pending" {
 				stale_multipart.push((u.object_key.clone(), u.s3_upload_id.clone()));
 			}
+		}
+		// Aborts ride the same outbox (an upload id is all that frees the
+		// parts — once its bookkeeping row is gone, nothing else knows it).
+		for (key, upload) in &stale_multipart {
+			self.enqueue_delete(&format!("{key}#upload:{upload}"), Some(upload), "stale multipart upload")?;
+		}
+		for u in &stale_uploads {
 			self.sql.exec("DELETE FROM uploads WHERE id = ?1", Some(vec![u.id.clone().into()]))?;
 		}
 		let n_shares_purged = self
@@ -624,20 +698,66 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
+		// The read log keeps as long as the change journal (O14).
+		self.sql.exec(&format!("DELETE FROM read_log WHERE last_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{journal_days} days')"), None)?;
+		// Share download tokens: expired, or of a share that is gone (O12).
+		self.sql.exec("DELETE FROM share_tokens WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') OR share_id NOT IN (SELECT id FROM shares)", None)?;
 
-		for (key, upload) in &stale_multipart {
-			let _ = crate::s3::multipart_abort(&self.env, key, upload).await;
-		}
-		for key in &purged_objects {
-			let _ = crate::s3::delete(&self.env, key).await;
-		}
-		if !purged_objects.is_empty() || n_files_purged + n_shares_purged > 0 {
-			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned}"))).await?;
+		// 4. Drain the outbox — this pass's keys and any earlier failures.
+		let drained = self.drain_deletes().await?;
+		if !purged_objects.is_empty() || n_files_purged + n_shares_purged > 0 || drained.failed > 0 {
+			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned},deleted:{},deletesPending:{}", drained.done, drained.pending))).await?;
 		}
 		Ok(Response::from_json(&serde_json::json!({
 			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged,
-			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": purged_objects.len(),
-			"uploadsAborted": stale_uploads.len(),
+			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": drained.done,
+			"uploadsAborted": stale_uploads.len(), "deletesFailed": drained.failed, "deletesPending": drained.pending,
+		}))?)
+	}
+
+	/// Queue an object (or, with `upload_id`, a multipart upload) for
+	/// deletion. Idempotent: a key already queued keeps its history.
+	fn enqueue_delete(&self, key: &str, upload_id: Option<&str>, reason: &str) -> Result<()> {
+		self.sql.exec(
+			"INSERT OR IGNORE INTO pending_deletes (key, upload_id, reason, since) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+			Some(vec![key.into(), crate::files_store::bind(upload_id.map(str::to_string)), reason.into()]),
+		)?;
+		Ok(())
+	}
+
+	/// Try every queued delete; a key leaves the queue only when storage
+	/// confirmed it (S3's 204, or 404 — already gone counts as done). A
+	/// failure stays queued with its attempt count and the error, for the
+	/// next pass and for whoever reads `storage/pending`.
+	async fn drain_deletes(&self) -> Result<Drained> {
+		let rows: Vec<PendingDelete> = self.sql.exec("SELECT key, upload_id FROM pending_deletes ORDER BY since LIMIT 500", None)?.to_array()?;
+		let (mut done, mut failed) = (0u64, 0u64);
+		for r in rows {
+			let outcome = match &r.upload_id {
+				Some(u) => crate::s3::multipart_abort(&self.env, r.key.split("#upload:").next().unwrap_or_default(), u).await,
+				None => crate::s3::delete(&self.env, &r.key).await,
+			};
+			match outcome {
+				Ok(()) => {
+					self.sql.exec("DELETE FROM pending_deletes WHERE key = ?1", Some(vec![r.key.into()]))?;
+					done += 1;
+				}
+				Err(e) => {
+					self.sql.exec("UPDATE pending_deletes SET attempts = attempts + 1, last_error = ?2 WHERE key = ?1", Some(vec![r.key.into(), e.to_string().into()]))?;
+					failed += 1;
+				}
+			}
+		}
+		let pending = self.sql.exec("SELECT COUNT(*) AS n FROM pending_deletes", None)?.one::<TotalCount>()?.n as u64;
+		Ok(Drained { done, failed, pending })
+	}
+
+	/// What is waiting to be deleted, and why (`GET …/storage/pending`) —
+	/// object keys and errors only: structure, like the rest of this DO.
+	pub(crate) async fn pending_deletes(&self) -> Result<Response> {
+		let rows: Vec<PendingDeleteRow> = self.sql.exec("SELECT key, reason, since, attempts, last_error FROM pending_deletes ORDER BY since", None)?.to_array()?;
+		Ok(Response::from_json(&serde_json::json!({
+			"pending": rows.into_iter().map(|r| serde_json::json!({ "key": r.key, "reason": r.reason, "since": r.since, "attempts": r.attempts, "lastError": r.last_error })).collect::<Vec<_>>(),
 		}))?)
 	}
 
@@ -647,22 +767,35 @@ impl GoraniMemberDO {
 	/// rows and their S3 objects go. Backups are CREATED by the browser flow
 	/// (docs/PRODUCTION.md › Backups): the in-memory GB1 job is sized for
 	/// that, so the cron only tends the museum, it doesn't fire the kiln.
+	///
+	/// A pass that could not finish its deletions FAILS (503, commit 25 —
+	/// O10): the fan-out (cron.rs) reports it, the outbox keeps the keys, and
+	/// the next night retries. It used to answer 200 whatever S3 said.
 	async fn cron_pass(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
 		let keep = body.get("keep").and_then(|v| v.as_i64()).unwrap_or(7).clamp(1, 100);
-		let mut house = self.housekeeping(actor, serde_json::json!({})).await?;
-		let house: serde_json::Value = house.json().await?;
 		let stale: Vec<BackupStamp> = self
 			.sql
 			.exec(&format!("SELECT stamp FROM backups ORDER BY created_at DESC, stamp DESC LIMIT -1 OFFSET {keep}"), None)?
 			.to_array()?;
 		let mut pruned = 0u64;
 		for r in &stale {
-			let _ = crate::s3::delete(&self.env, &format!("backups/{}.gbak", r.stamp)).await;
+			// The object into the outbox first, then the manifest row (which
+			// was the only pointer to the object).
+			self.enqueue_delete(&format!("backups/{}.gbak", r.stamp), None, "backup pruned")?;
 			self.sql.exec("DELETE FROM backups WHERE stamp = ?1", Some(vec![r.stamp.clone().into()]))?.rows_written();
 			pruned += 1;
 		}
-		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned}"))).await?;
-		Ok(Response::from_json(&serde_json::json!({ "housekeeping": house, "backupsPruned": pruned }))?)
+		// Housekeeping drains the outbox — this pass's backups included.
+		let mut house = self.housekeeping(actor, serde_json::json!({})).await?;
+		let house: serde_json::Value = house.json().await?;
+		let failed = house.get("deletesFailed").and_then(|v| v.as_u64()).unwrap_or(0);
+		let pending = house.get("deletesPending").and_then(|v| v.as_u64()).unwrap_or(0);
+		self.audit(actor, "cron.pass", "retention", None, Some(&format!("backupsPruned:{pruned},deletesFailed:{failed},deletesPending:{pending}"))).await?;
+		let body = serde_json::json!({ "housekeeping": house, "backupsPruned": pruned, "deletesFailed": failed, "deletesPending": pending });
+		if failed > 0 {
+			return Ok(Response::from_json(&body)?.with_status(503));
+		}
+		Ok(Response::from_json(&body)?)
 	}
 
 	async fn stats(&self) -> Result<Response> {
@@ -727,4 +860,25 @@ struct AuditPut {
 	target: String,
 	#[serde(default)]
 	details_sealed: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PendingDelete {
+	key: String,
+	upload_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PendingDeleteRow {
+	key: String,
+	reason: String,
+	since: String,
+	attempts: i64,
+	last_error: Option<String>,
+}
+
+struct Drained {
+	done: u64,
+	failed: u64,
+	pending: u64,
 }

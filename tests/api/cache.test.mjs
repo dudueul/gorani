@@ -16,7 +16,8 @@
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
 import { sealChunked, FRAME_OVERHEAD } from "../../web/src/vault/chunked-file.ts";
-import { sealText, sealWith, newContentKey, importContentKey, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { sealWith, newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 
 const dev = await suiteDev();
@@ -47,12 +48,12 @@ try {
 	const guardian = await sealStoreKeyToMaster(filesStore, master);
 	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian } } });
 	assert.equal(saved.status, 200);
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	const store = await storeSealer(filesStore.bundle, "jinu");
 
 	const plain = enc.encode("the cache holds ciphertext — the key stays with the family");
 	const ck = newContentKey();
 	const sealed = new Uint8Array(await sealWith(await importContentKey(ck), plain));
-	const up = await uploadWhole({ ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "letter.txt"), type: await sealText(storePublic, "text/plain"), size: String(plain.length) }, sealed);
+	const up = await uploadWhole({ ...(await store.newFile("letter.txt", "text/plain", ck)).fields, size: String(plain.length) }, sealed);
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const fileId = up.json.id;
 
@@ -68,6 +69,10 @@ try {
 	assert.deepEqual(first.body, sealed, "the sealed bytes, untouched by the cache");
 	const second = await get(fileId);
 	assert.equal(second.cache, "hit", `the second read is served from cache (${second.cache})`);
+	// …and a read served from the edge is still a read on record (O14, D10:
+	// the Worker audits BEFORE the cache lookup).
+	const reads = (await api(dev.base, "GET", `/api/v1/members/jinu/reads?file=${fileId}`, { email: "jinu@family.test" })).json.reads;
+	assert.equal(reads.reduce((n, r) => n + r.requests, 0), 2, `the miss and the hit are both on record: ${JSON.stringify(reads)}`);
 	assert.deepEqual(second.body, sealed, "the cached copy is byte-identical");
 
 	// ── 2. Range over a cached entry: the platform slices it ───────────
@@ -84,7 +89,7 @@ try {
 	const ck2 = newContentKey();
 	// `size` is the PLAINTEXT length — the worker checks it against the sealed
 	// bytes (sealed − 32) since commit 23; this used to send the sealed length.
-	const bigUp = await uploadWhole({ ck: await wrapContentKey(storePublic, ck2), name: await sealText(storePublic, "big.bin"), type: await sealText(storePublic, "application/octet-stream"), size: String(bigPlainLength) }, big);
+	const bigUp = await uploadWhole({ ...(await store.newFile("big.bin", "application/octet-stream", ck2)).fields, size: String(bigPlainLength) }, big);
 	assert.equal(bigUp.status, 200, JSON.stringify(bigUp.json));
 	const b1 = await get(bigUp.json.id);
 	assert.equal(b1.status, 200);
@@ -101,7 +106,8 @@ try {
 	const mediaCk = newContentKey();
 	const mediaKey = await importContentKey(mediaCk);
 	const mediaSealed = await sealChunked(mediaKey, mediaPlain, chunk);
-	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: mediaPlain.length, chunk } });
+	const media = await store.newFile("clip.dat", "application/octet-stream", mediaCk);
+	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: mediaPlain.length, chunk, newFileId: media.id } });
 	assert.equal(start.status, 200, JSON.stringify(start.json));
 	const etags = [];
 	for (let p = 1; p <= 2; p++) {
@@ -114,7 +120,9 @@ try {
 		method: "POST",
 		headers: { "content-type": "multipart/form-data; boundary=cd", "x-gorani-dev-email": "jinu@family.test" },
 		body: await (async () => {
-			const fields = { key: start.json.key, size: String(mediaPlain.length), chunk: String(chunk), ck: await wrapContentKey(storePublic, mediaCk), name: await sealText(storePublic, "clip.dat"), type: await sealText(storePublic, "application/octet-stream"), parts: JSON.stringify(etags) };
+			const { file_id: _id, ...sealedFields } = media.fields;
+			void _id;
+			const fields = { key: start.json.key, size: String(mediaPlain.length), chunk: String(chunk), ...sealedFields, parts: JSON.stringify(etags) };
 			const head = new TextEncoder().encode(Object.entries(fields).map(([k, v]) => `--cd\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`).join("") + "--cd--\r\n");
 			return new Uint8Array([...head]);
 		})(),

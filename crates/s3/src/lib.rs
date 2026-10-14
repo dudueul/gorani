@@ -35,7 +35,11 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 /// Active S3 endpoint configuration (env-side: vars + secrets).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand (commit 25, docs/SECURITY-REVIEW.md › O16):
+/// the derived one printed `secret_key` in full for any `{:?}` — a panic
+/// message, a log line, a test failure. The keys show as `[redacted]`.
+#[derive(Clone)]
 pub struct S3Config {
 	/// `https://minio.example.com` (no trailing slash).
 	pub endpoint: String,
@@ -43,6 +47,18 @@ pub struct S3Config {
 	pub bucket: String,
 	pub access_key: String,
 	pub secret_key: String,
+}
+
+impl std::fmt::Debug for S3Config {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("S3Config")
+			.field("endpoint", &self.endpoint)
+			.field("region", &self.region)
+			.field("bucket", &self.bucket)
+			.field("access_key", &"[redacted]")
+			.field("secret_key", &"[redacted]")
+			.finish()
+	}
 }
 
 /// A signed request, ready for any transport: URL plus the headers to set.
@@ -227,6 +243,15 @@ pub fn complete_multipart_body(parts: &[(u32, String)]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+	/// O16: a `{:?}` of the config never prints a key.
+	#[test]
+	fn debug_redacts_the_keys() {
+		let cfg = super::S3Config { endpoint: "https://minio.example.com".into(), region: "us-east-1".into(), bucket: "gorani".into(), access_key: "AKIA-VISIBLE?".into(), secret_key: "very-secret-value".into() };
+		let shown = format!("{cfg:?}");
+		assert!(shown.contains("minio.example.com") && shown.contains("[redacted]"));
+		assert!(!shown.contains("very-secret-value") && !shown.contains("AKIA-VISIBLE?"), "{shown}");
+	}
 	use super::*;
 
 	const CFG: S3Config = S3Config {

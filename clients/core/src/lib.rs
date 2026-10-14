@@ -54,7 +54,12 @@ impl From<std::io::Error> for Error {
 
 /// The persisted device profile (the CLI keeps it in a JSON file next to
 /// its state; platform shells put it in their credential stores).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// `Debug` by hand (O16): the device token, the Access service secret and
+/// the device secret print as `[redacted]` — the derived impl printed all
+/// three for any `{:?}`, and the device secret plus the server's copy IS
+/// the root key.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceProfile {
 	pub server: String,
@@ -83,6 +88,22 @@ pub struct DeviceProfile {
 	/// Dev-mode identity (wrangler dev only; production uses Access).
 	#[serde(default)]
 	pub dev_email: Option<String>,
+}
+
+impl std::fmt::Debug for DeviceProfile {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let redact = |o: &Option<String>| if o.is_some() { "[redacted]" } else { "None" };
+		f.debug_struct("DeviceProfile")
+			.field("server", &self.server)
+			.field("member", &self.member)
+			.field("device_id", &self.device_id)
+			.field("token", &"[redacted]")
+			.field("access_id", &self.access_id)
+			.field("access_secret", &redact(&self.access_secret))
+			.field("device_secret", &redact(&self.device_secret))
+			.field("dev_email", &self.dev_email)
+			.finish()
+	}
 }
 
 /// The unlocked session: the root bundle (bytes, Zeroizing) + the settings.
@@ -133,19 +154,17 @@ impl Session {
 		Ok(store)
 	}
 
-	/// The files store's public half — derived from the VERIFIED private key,
-	/// never read off the record. Sealing is the attack path (O3): a client
-	/// that seals to whatever public key the settings row names hands every
-	/// upload to whoever wrote that row. This used to read the record's JWK
-	/// directly, so `push` sealed to a swapped record without ever running
-	/// the checks in `files_store` — found by api:client-live's swap step.
-	pub fn files_public(&self) -> Result<gorani_formats::formats::VaultPublicKey, Error> {
-		Ok(gorani_formats::formats::public_of(&self.files_store()?))
-	}
-
-	/// Seal text to the files store's public half (names, types).
-	pub fn seal_for_files(&self, text: &str) -> Result<String, Error> {
-		Ok(gorani_formats::formats::seal_text(&self.files_public()?, text))
+	/// Seal text INTO a place of the files store (GV04, commit 25 — O6).
+	///
+	/// The history of this function is the O3 → O6 story in two steps. It
+	/// once sealed to the record's public JWK, read straight off the settings
+	/// row — so a swapped record received every upload (O3a). Commit 24 made
+	/// it derive the public half from the VERIFIED private key. Commit 25
+	/// removes the public-key path altogether: a store seals to itself, with
+	/// a secret only its private key computes, so there is no public key to
+	/// get wrong — and nothing the server holds can seal here.
+	pub fn seal_into(&self, place: &gorani_formats::placed::Place, text: &str) -> Result<String, Error> {
+		gorani_formats::placed::seal_placed_text(&self.files_store()?, place, text).map_err(|_| Error::Open("files store key"))
 	}
 }
 

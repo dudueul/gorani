@@ -22,11 +22,8 @@
 //! TypeScript implementation is proven by `tests/vectors.rs` (the `record`
 //! vector, written by scripts/make-vectors.mjs).
 
-use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use ml_kem::EncodedSizeUser;
-use p256::PublicKey;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::formats::VaultPrivateKey;
@@ -57,21 +54,11 @@ pub fn record_bytes(r: &StoreRecord) -> Vec<u8> {
 	out
 }
 
-/// The member's record key, from the root alone (hybrid roots only).
+/// The member's record key, from the root alone (hybrid roots only) — the
+/// shared self-secret construction (formats.rs › self_secret) under the
+/// records label.
 pub fn record_key(root: &VaultPrivateKey) -> Result<Zeroizing<[u8; 32]>, Error> {
-	let VaultPrivateKey::Hybrid { ec, ec_public, kem, .. } = root else {
-		return Err(Error::Format("store records are authenticated with a hybrid root"));
-	};
-	let own = PublicKey::from_sec1_bytes(ec_public).map_err(|_| Error::Format("bad root public key"))?;
-	let shared = p256::ecdh::diffie_hellman(ec.to_nonzero_scalar(), own.as_affine());
-	let mut ikm = Zeroizing::new([0u8; 64]);
-	ikm[..32].copy_from_slice(shared.raw_secret_bytes());
-	ikm[32..].copy_from_slice(&Sha256::digest(kem.as_bytes()));
-	let mut key = Zeroizing::new([0u8; 32]);
-	Hkdf::<Sha256>::new(Some(b"gorani-records"), ikm.as_ref())
-		.expand(b"gorani-records-v1", key.as_mut())
-		.map_err(|_| Error::Format("hkdf"))?;
-	Ok(key)
+	crate::formats::self_secret(root, b"gorani-records", b"gorani-records-v1").map_err(|_| Error::Format("store records are authenticated with a hybrid root"))
 }
 
 fn hmac(key: &[u8; 32]) -> Hmac<Sha256> {

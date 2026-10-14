@@ -10,7 +10,8 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { generateHybridKey, importVaultKey, sealText, sealWith, openWith, newContentKey, importContentKey, wrapContentKey, unwrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { sealWith, openWith, newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta, openShareMeta } from "../../web/src/vault/share-crypto.ts";
 import { splitFrame, frameAad } from "../../web/public/gorani-media-lib.js";
@@ -43,15 +44,17 @@ try {
 	assert.equal(saved.status, 200);
 
 	// A file to share.
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	const store = await storeSealer(filesStore.bundle, "jinu");
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
 	const plain = enc.encode("the recipe for gorani bread — family secret");
 	const sealed = await sealWith(key, plain);
-	const nameSealed = await sealText(storePublic, "bread-recipe.txt");
-	const up = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: nameSealed, type: await sealText(storePublic, "text/plain"), size: String(plain.length) }, sealed);
+	const file = await store.newFile("bread-recipe.txt", "text/plain", ck);
+	const up = await uploadFile({ ...file.fields, size: String(plain.length) }, sealed);
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const fileId = up.json.id;
+	// The owner's copy of each link's name is sealed into THAT link's place.
+	const ownerName = (shareId) => store.shareName(shareId, "bread-recipe.txt");
 
 	// ── 1. The owner creates the share (GS01) ──────────────────────────
 	const id = newShareId();
@@ -59,10 +62,9 @@ try {
 	const keys = await shareKeys(id, secret);
 	const copy = await sealChunked(keys.data, plain, DEFAULT_CHUNK);
 	const metaSealed = await sealShareMeta(keys.meta, id, { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
-	const nameOwnerSealed = await sealText(storePublic, "bread-recipe.txt");
 	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length },
+		body: { id, fileId, version: 1, nameSealed: await ownerName(id), metaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length },
 	});
 	assert.equal(start.status, 200, JSON.stringify(start.json));
 	assert.equal(start.json.parts, 1, "one small file → one frame → one part");
@@ -104,13 +106,21 @@ try {
 	assert.equal(meta.name, "bread-recipe.txt");
 	assert.equal(meta.size, plain.length);
 
-	// The claim decrements.
+	// Without a claim there is no data (commit 25, O12): the link used to
+	// serve /data to anyone, so download limits were the page's courtesy.
+	assert.equal((await fetch(`${dev.base}/s/f/${id}/data`)).status, 403, "no token, no data");
+	assert.equal((await fetch(`${dev.base}/s/f/${id}/data`, { headers: { "x-gorani-share-token": "made-up-token" } })).status, 403, "a forged token, no data");
+
+	// The claim decrements — and returns the token /data serves to.
 	const claim = await fetch(`${dev.base}/s/f/${id}/claim`, { method: "POST" });
 	assert.equal(claim.status, 200);
-	assert.equal((await claim.json()).downloadsLeft, 1);
+	const claimed = await claim.json();
+	assert.equal(claimed.downloadsLeft, 1);
+	assert.match(claimed.token, /^[A-Za-z0-9_-]{43}$/, "a 256-bit token");
+	const withToken = { headers: { "x-gorani-share-token": claimed.token } };
 
 	// The data endpoint serves the sealed copy; the recipient decrypts.
-	const dataRes = await fetch(`${dev.base}/s/f/${id}/data`);
+	const dataRes = await fetch(`${dev.base}/s/f/${id}/data`, withToken);
 	assert.equal(dataRes.status, 200);
 	const sealedCopy = new Uint8Array(await dataRes.arrayBuffer());
 	assert.equal(sealedCopy.length, copy.length);
@@ -126,14 +136,21 @@ try {
 	assert.deepEqual(out, plain, "the recipient holds the exact bytes");
 	assert.equal(dec.decode(out), dec.decode(plain));
 
-	// Range requests work too (the SW-style path).
-	const ranged = await fetch(`${dev.base}/s/f/${id}/data`, { headers: { Range: `bytes=0-${DEFAULT_CHUNK + 27}` } });
+	// Range requests work too, within the same download session (a large
+	// copy fetched in pieces is still ONE download).
+	const ranged = await fetch(`${dev.base}/s/f/${id}/data`, { headers: { ...withToken.headers, Range: `bytes=0-${DEFAULT_CHUNK + 27}` } });
 	assert.equal(ranged.status, 206);
 	assert.ok(ranged.headers.get("content-range")?.startsWith("bytes 0-"));
 
 	// ── 3. Exhaustion: 2 downloads allowed, 2 claimed ──────────────────
 	const claim2 = await fetch(`${dev.base}/s/f/${id}/claim`, { method: "POST" });
 	assert.equal(claim2.status, 200);
+	const last = await claim2.json();
+	assert.equal(last.downloadsLeft, 0);
+	// The LAST download downloads (O12a): /data used to re-check
+	// `downloads_left > 0` after the claim had spent it — a one-download link
+	// could never be fetched at all.
+	assert.equal((await fetch(`${dev.base}/s/f/${id}/data`, { headers: { "x-gorani-share-token": last.token } })).status, 200, "the last claim's download is served");
 	const claim3 = await fetch(`${dev.base}/s/f/${id}/claim`, { method: "POST" });
 	assert.equal(claim3.status, 410, "used up");
 	const metaGone = await fetch(`${dev.base}/s/f/${id}/meta`);
@@ -146,7 +163,7 @@ try {
 	const meta2 = await sealShareMeta(keys2.meta, id2, { name: "x.txt", type: null, size: 4, modified: null });
 	const s2 = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: id2, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: meta2, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: id2, fileId, version: 1, nameSealed: await ownerName(id2), metaSealed: meta2, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
 	});
 	assert.equal(s2.status, 200);
 	// No parts uploaded yet: the meta must refuse (still being prepared).
@@ -159,7 +176,7 @@ try {
 	const metaEmpty = await sealShareMeta((await shareKeys(idEmpty, newShareSecret())).meta, idEmpty, { name: "x.txt", type: null, size: 4, modified: null });
 	const sEmpty = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: idEmpty, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: metaEmpty, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: idEmpty, fileId, version: 1, nameSealed: await ownerName(idEmpty), metaSealed: metaEmpty, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
 	});
 	assert.equal(sEmpty.status, 200);
 	const empty = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${idEmpty}/complete`, { email: "jinu@family.test", body: { parts: [], size: 4 } });
@@ -173,11 +190,14 @@ try {
 	assert.equal(c2.status, 200, JSON.stringify(c2.json));
 	const ready = await fetch(`${dev.base}/s/f/${id2}/meta`);
 	assert.equal(ready.status, 200);
+	// A download session open when the owner revokes dies with the link.
+	const token2 = (await (await fetch(`${dev.base}/s/f/${id2}/claim`, { method: "POST" })).json()).token;
+	assert.equal((await fetch(`${dev.base}/s/f/${id2}/data`, { headers: { "x-gorani-share-token": token2 } })).status, 200);
 	const revoke = await api(dev.base, "DELETE", `/api/v1/members/jinu/files/shares/${id2}`, { email: "mom@family.test" });
 	assert.equal(revoke.status, 200, JSON.stringify(revoke.json));
 	const revokedMeta = await fetch(`${dev.base}/s/f/${id2}/meta`);
 	assert.equal(revokedMeta.status, 404, "revoked shares open nothing");
-	const revokedData = await fetch(`${dev.base}/s/f/${id2}/data`);
+	const revokedData = await fetch(`${dev.base}/s/f/${id2}/data`, { headers: { "x-gorani-share-token": token2 } });
 	assert.equal(revokedData.status, 404);
 
 	// ── 5. Expiry ───────────────────────────────────────────────────────
@@ -187,7 +207,7 @@ try {
 	const meta3 = await sealShareMeta(keys3.meta, id3, { name: "old.txt", type: null, size: 4, modified: null });
 	await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: id3, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: meta3, expiresAt: new Date(Date.now() - 1000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: id3, fileId, version: 1, nameSealed: await ownerName(id3), metaSealed: meta3, expiresAt: new Date(Date.now() - 1000).toISOString(), downloadsLeft: 5, size: 4 },
 	});
 	// (A real 4-byte copy: completion must add up since commit 23.)
 	const part3 = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${id3}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": "jinu@family.test" }, body: await sealChunked(keys3.data, enc.encode("aged"), DEFAULT_CHUNK) });
@@ -209,7 +229,7 @@ try {
 	const pwMetaSealed = await sealShareMeta(pwKeys.meta, pwId, { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
 	const pwStart = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: pwId, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: pwMetaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf: pwKdf },
+		body: { id: pwId, fileId, version: 1, nameSealed: await ownerName(pwId), metaSealed: pwMetaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf: pwKdf },
 	});
 	assert.equal(pwStart.status, 200, JSON.stringify(pwStart.json));
 	const pwEtagRes = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${pwId}/parts/1`, {
@@ -231,8 +251,9 @@ try {
 	const pwOpen = await shareKeys(pwId, pwSecret, "bread-secret-2026", pwInfo.kdf);
 	assert.deepEqual(await openShareMeta(pwOpen.meta, pwId, pwInfo.metaSealed), { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
 	const pwClaim = await fetch(`${dev.base}/s/f/${pwId}/claim`, { method: "POST" });
+	const pwToken = (await pwClaim.clone().json()).token;
 	assert.equal(pwClaim.status, 200);
-	const pwData = await fetch(`${dev.base}/s/f/${pwId}/data`);
+	const pwData = await fetch(`${dev.base}/s/f/${pwId}/data`, { headers: { "x-gorani-share-token": pwToken } });
 	assert.equal(pwData.status, 200);
 	const pwSealedCopy = new Uint8Array(await pwData.arrayBuffer());
 	const pwOut = new Uint8Array(plain.length);

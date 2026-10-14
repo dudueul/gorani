@@ -17,6 +17,14 @@ portions are marked, their original notices are retained in place.
    engine, vendored under crates/media/ in a later commit, with the license
    and notices as marked in that repository.
 
-3. Runtime dependencies retain their own licenses (RustCrypto crates,
+3. Vendored file (served as-is, not built): web/public/vendor/argon2.umd.min.js
+   is hash-wasm 4.12.0's dist/argon2.umd.min.js (MIT, (c) Dani Biro),
+   byte for byte:
+     sha256 dcec617a2e1b700fa132d1583a186cb70611113395e869f2dd6cc82b415d3094
+   The share page loads it with the matching sha384 Subresource Integrity
+   hash (web/s.html); tests/unit/vendored.test.mjs checks all three agree
+   and that the file equals the installed package's.
+
+4. Runtime dependencies retain their own licenses (RustCrypto crates,
    @noble/*, hash-wasm, pdf.js, SQLite WASM, Lit, and others). They are
    declared in Cargo.toml / package.json and are not reproduced here.

@@ -22,6 +22,7 @@ import type { ViewerTarget } from "./viewer/viewer.ts";
 import "./files/win11.ts";
 import "./files/finder.ts";
 import "./files/music.ts";
+import { registerMediaWorker, forgetMedia } from "../lib/media-worker.ts";
 
 @customElement("gorani-shell")
 export class GoraniShell extends LitElement {
@@ -84,14 +85,12 @@ export class GoraniShell extends LitElement {
 
 	private async setupExplorer(): Promise<void> {
 		{
-			// The media service worker: scope /media/ ONLY (the app's own
-			// requests never pass through it — see public/sw-media.js).
-			if (typeof navigator !== "undefined" && navigator.serviceWorker) {
-				try {
-					await navigator.serviceWorker.register("/sw-media.js", { scope: "/media/" });
-				} catch (e) {
-					console.warn("media worker unavailable:", e);
-				}
+			// The media service worker: scope "/" so it controls this page,
+			// claiming only /media/ requests (lib/media-worker.ts, O11).
+			try {
+				await registerMediaWorker();
+			} catch (e) {
+				console.warn("media worker unavailable:", e);
 			}
 			// The local index: opened with the session's indexKey (derived from
 			// the root — the unlock ceremony gates it), fed by the model,
@@ -200,12 +199,6 @@ declare global {
 }
 
 /** Tell the media service worker to drop every content key it holds (lock). */
-async function forgetMediaKeys(): Promise<void> {
-	if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
-	try {
-		const reg = await navigator.serviceWorker.getRegistration("/media/");
-		reg?.active?.postMessage({ type: "media-forget-all" });
-	} catch {
-		// no worker registered — nothing to forget
-	}
+function forgetMediaKeys(): Promise<void> {
+	return forgetMedia();
 }

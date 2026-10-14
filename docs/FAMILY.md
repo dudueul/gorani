@@ -30,7 +30,9 @@ Two parents (Mom, Dad) and two children (Jinu, Sora):
    enrolls a device with it, a parent regains the vault with it — the
    child's password never leaves the child).
 2. **A file lands in Jinu's area**, sealed under Jinu's files-store key:
-   content key wrapped (GV03) to Jinu's store public half.
+   the content key, name and type sealed (GV04) into their places — this
+   file, this version — with the store's key itself (whoever writes into a
+   store holds its private key; docs/ENCRYPTION.md › GV04).
 3. **Mom opens it**: unlock her root → unwrap the master (`masterSealed`) →
    unwrap Jinu's store key (`guardian.storeSealed`) → unwrap the content
    key → open. Dad's chain is independent and reaches the same key.
@@ -64,9 +66,12 @@ and its order matters:
 2. **Re-seal everything the old key sealed** — `rotation.ts ›
    resealStore` walks `files/sealed` kind by kind (every VERSION's content
    key and type, file and folder names, music tags, share names, the files
-   secrets), opens each value with the old store private half, seals it to
-   the new public half and stores it via `files/reseal`. No file is
-   re-encrypted; the walk is idempotent and resumable. Then prove it:
+   secrets), opens each value in the place its row names with the old store
+   key, seals it into the same place with the NEW key (and so under the new
+   store's PSK — the departing member can no longer write here either) and
+   stores it via `files/reseal`. No file is re-encrypted; the walk is
+   idempotent and resumable, and a value moved between rows stops it.
+   Then prove it:
    `opensAnything(oldKey)` must be 0 (`tests/api/rotation.test.mjs` does
    exactly this). After this, their old store key unwraps nothing — not
    even bytes already stored. (Before commit 24 the walk reached living

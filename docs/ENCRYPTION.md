@@ -1,4 +1,4 @@
-# Encryption: the byte-level specification (GV01, GV02, GV03, GK01, GW01, GC01, GB1)
+# Encryption: the byte-level specification (GV01–GV04, GK01, GW01, GC01, GB2)
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > Written from the code (`crates/formats/src/`, `web/src/vault/vault-crypto.ts`) as of commit ⑨c; the code is the authority.
@@ -10,12 +10,13 @@
 | **GV01** | sealing to a P-256 public key (ECIES) | ECDH P-256, HKDF-SHA256, AES-256-GCM | 81 B | the recipient's P-256 private half | no |
 | **GV02** | content under a symmetric content key | AES-256-GCM | 32 B | the 32-byte content key | yes |
 | **GV03** | hybrid post-quantum sealing | ECDH P-256 **and** ML-KEM-768 → HKDF → AES-256-GCM | 1,185 B | **both** private halves | yes |
+| **GV04** | placed, store-authenticated sealing — **every value a files store keeps** | GV03 + the store PSK in the key schedule + the value's place as AAD | 1,185 B | the store key, **in that place** | yes |
 | **GK01** | a hybrid private key's bytes (bundle) | container | — | — | — |
 | **GW01** | a private key wrapped by an unlock secret | AES-256-GCM under the KEK | 32 B | the unlock secret | yes |
 | **GC01** | a large file in frames | AES-256-GCM per 8 MiB frame, position+finality AAD | 28 B/frame | the content key | yes |
-| **GB1** | the backup container | AES-256-GCM segments under a per-backup file key | ~28 B/1 MiB | the key file | yes |
+| **GB2** | the backup container (header authenticated; GB1 before commit 25) | AES-256-GCM segments under a per-backup file key | ~28 B/1 MiB | the key file | yes |
 
-The pattern everywhere: **content is GV02** (fast, symmetric, one fresh key per item) and only the small content key is sealed to a public key (GV03 in gorani — hybrid from birth). Rotation re-wraps keys, never content.
+The pattern everywhere: **content is GV02** (fast, symmetric, one fresh key per item) and only the small content key is sealed — into its place in the store (GV04, since commit 25; GV03 before). Key material sealed to a member's root (store records, master copies, guardian copies) stays GV03. Rotation re-seals keys, never content.
 
 ## The key hierarchy
 
@@ -62,12 +63,80 @@ Decisions a security review should know about (considered, not overlooked):
   keys), the whole header rides as AAD, and payload shapes differ (a 32-byte
   content key cannot parse as a GK01 bundle). Purpose tags inside the
   sealed payloads were considered and rejected: they change the wire format
-  for defense-in-depth that shape checks already provide.
+  for defense-in-depth that shape checks already provide. **Revisited in
+  commit 25:** that argument holds *between* key kinds, and fails *within*
+  a store — two files' content keys have the same shape, the same
+  recipient, and swap undetected. GV04 binds each store value's place
+  (kind, item, version) as AAD: the purpose tag, adopted once the threat
+  that needs it was named. A decision that is written down can be
+  revisited with its reasons; one that is not just gets repeated.
 - **One fresh content key per file version** (`model.ts › uploadOne`): the
   API tolerates a reused key, but the client never reuses one, so a key
   encrypts exactly one object's frames — see GC01 below.
 
 The GV03 salt binds both ciphertexts and both recipient halves — the "X-Wing" combiner: neither half can be swapped or replayed against another recipient, and an attacker must break **both** P-256 (a quantum computer) **and** ML-KEM-768 (a flaw in the new scheme) to open anything.
+
+### GV04 — placed, store-authenticated sealing (commit 25)
+
+Everything a files store keeps sealed — file names, each version's content
+key and type, music tags, folder names, share names, the store's secrets —
+is GV04. The Worker refuses any other format in those columns.
+
+```text
+place     = lp("gorani-place-v1") ‖ lp(kind) ‖ lp(store) ‖ lp(item) ‖ lp(version)
+            lp(x) = u32 BE length ‖ UTF-8;  version decimal, "" for none
+store_psk = HKDF-SHA256(ikm  = ECDH(store private, store public) ‖ SHA-256(ML-KEM dk),
+                        salt = "gorani-store-psk", info = "gorani-store-psk-v1")
+GV04      = "GV04" ‖ eph P-256 (65) ‖ ML-KEM ct (1088) ‖ nonce (12) ‖ ct ‖ tag
+  salt    = SHA-256(eph pub ‖ ML-KEM ct ‖ store P-256 pub ‖ store ML-KEM pub)   (GV03's)
+  key     = HKDF-SHA256(ikm = ss_ec ‖ ss_kem ‖ store_psk, salt, info = "gorani-vault-v4")
+  AAD     = header ‖ place
+text      = "GV04:" + base64
+```
+
+| kind | item | version | the value |
+|---|---|---|---|
+| `file.name` | file id | — | a file's name (a rename re-seals into the same place) |
+| `file.key` | file id | n | version n's content key |
+| `file.type` | file id | n | version n's MIME type |
+| `file.music` | file id | n | version n's tag summary |
+| `folder.name` | folder id | — | a folder's name |
+| `share.name` | share id | — | the owner's copy of a link's name |
+| `store.secrets` | — | — | fingerprint + index keys |
+
+`store` is the member id whose store it is. Code: `web/src/vault/places.ts`
++ `vault-crypto.ts › sealPlaced`; `crates/formats/src/placed.rs`.
+
+Why each part (docs/SECURITY-REVIEW.md › O6):
+
+- **The place, as AAD, stops moving.** GV03 values say nothing about where
+  they belong, so the server could swap two files' content keys (with their
+  objects) or names: "invoice.pdf" opened a malware sample. The place is
+  never stored — the opener rebuilds it from what it is opening — so a
+  value moved anywhere else fails authentication. Version numbers are in
+  the key's place, so version 1's key cannot pose as version 2's.
+- **The store PSK stops minting.** GV03 seals to a *public* key, which the
+  server holds: it could invent a file — content key, bytes, name — and the
+  file would appear in your store. The PSK is computable only from the
+  store's private key (the self-ECDH construction of the record key below),
+  so sealing into a store needs what opening needs. This is HPKE's PSK mode
+  (RFC 9180 §5.1) in our own framing; a store "seals to itself" — the API
+  takes the private key and derives the public halves from it.
+- **Ids come first.** The client chooses file and folder ids (128 random
+  bits, base64url) *before* sealing, because the places name them. The
+  Worker used to mint file ids after the upload, when nothing could be
+  bound to them any more; it now checks the shape and refuses an id that is
+  taken (409). A new version is `base_version + 1`, so `base_version` is
+  required.
+- **Opening refuses everything else** — plain text, GV03, a value from
+  another place, a value sealed with another store's PSK. A listing shows
+  such a name as *unverified* instead of hiding it or failing the view.
+
+The limits, stated: every holder of the store key holds the PSK, so GV04
+says "a store-key holder sealed this, here" — not **who** (per-member
+signatures are D5). And freshness is not covered: the server can still
+answer with an older row (a rename undone, the newest version hidden);
+what it shows is at least consistently what it claims to be.
 
 ### GK01 / GW01 — key containers
 
@@ -137,9 +206,31 @@ objects (the API tolerates it; the client never does), the random-nonce
 bound degrades gracefully but the per-version rule is the invariant to
 keep.
 
-### GB1 — backups
+### GB2 — backups (GB1 before commit 25)
 
-See `crates/formats/src/backup.rs` header + docs in that file: counter nonces, position+finality AAD, the file key sealed (GV03) into the header to the backup public key.
+```text
+"GBAK2\n" ‖ headerLen (4 BE) ‖ header JSON ‖ segment 0 ‖ … ‖ final segment
+header    = { format: "gorani-backup", v: 2, stamp, createdAt, kind, keyId, wrapped, seg, alg }
+H         = SHA-256(magic ‖ headerLen ‖ header)
+segment i = nonce (0x00000000 ‖ i, u64 BE) ‖ AES-256-GCM(fileKey, ≤ 1 MiB, AAD_i) ‖ tag
+AAD_i     = "GBAK2" ‖ '2' ‖ 'A' ‖ final (1) ‖ i (8 BE) ‖ H (32)
+```
+
+Counter nonces (one key spans many segments — they can never repeat), all
+twelve nonce bytes checked, position + finality + the header's hash in every
+AAD: segments cannot be reordered, dropped, duplicated or cut, the file
+cannot be cut down to its header, and the header cannot be relabelled. The
+file key is sealed (GV03) into the header to the backup public key; only
+the owner's key file opens it. Code + the "what GB2 fixed" story:
+`crates/formats/src/backup.rs`; the browser's reader: `web/src/vault/backup.ts`.
+
+### KDF bounds (commit 25)
+
+Stored Argon2id settings are served by the server, so they are bounded both
+ways before any run: memory 19–256 MiB, passes 2–10, lanes 1–8; salts 16–64
+bytes; at most 4 password methods tried per unlock. gorani writes 64 MiB /
+3 passes / 4 lanes (RFC 9106's second recommendation). `web/src/vault/kdf-bounds.ts`,
+`crates/formats/src/unlock.rs › check_argon2`.
 
 ## What the server can read
 

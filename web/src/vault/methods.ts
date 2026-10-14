@@ -22,6 +22,7 @@
  */
 
 import { fromBase64 } from "../lib/encoding.ts";
+import { MAX_PASSWORD_METHODS } from "./kdf-bounds.ts";
 import {
 	generateHybridKey,
 	makePasswordMethod,
@@ -54,9 +55,12 @@ export type PresentSecret =
 	| { kind: "recovery"; value: string }
 	| { kind: "passkey"; output: Uint8Array };
 
-/** Open the root bundle with the presented secret, trying that kind's methods. */
+/** Open the root bundle with the presented secret, trying that kind's methods.
+ * Password methods are capped (kdf-bounds.ts › MAX_PASSWORD_METHODS, O8):
+ * each try is a full Argon2 run, and the list comes from the server. */
 export async function openRoot(settings: VaultSettings, secret: PresentSecret): Promise<{ bundle: Uint8Array; methodId: string }> {
-	const candidates = settings.methods.filter((m) => m.kind === secret.kind);
+	const all = settings.methods.filter((m) => m.kind === secret.kind);
+	const candidates = secret.kind === "password" ? all.slice(0, MAX_PASSWORD_METHODS) : all;
 	let lastError = new Error(`no ${secret.kind} method is enrolled`);
 	for (const method of candidates) {
 		try {

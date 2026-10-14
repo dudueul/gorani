@@ -8,18 +8,19 @@
  *   listings decrypt names into memory → rename re-seals → upload seals with
  *   a fresh content key, fingerprints, asks about duplicates → download
  *   opens what was uploaded → trash + restore → copy-paste duplicates via a
- *   NEW key (the original's history untouched) → the change feed advances.
+ *   NEW key (the original's history untouched) → the change feed advances →
+ *   (commit 25, O6) names the server swapped between files show as
+ *   UNVERIFIED, and a key moved to another file does not open.
  */
 
 import assert from "node:assert/strict";
-import { generateHybridKey, importVaultKey, sealText, openText, sealWith, openWith, wrapContentKey, unwrapContentKey, newContentKey } from "../../web/src/vault/vault-crypto.ts";
-import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
-import { FilesModel } from "../../web/src/ui/files/model.ts";
-import { toBase64, fromBase64 } from "../../web/src/lib/encoding.ts";
+import { generateHybridKey, importVaultKey, openWith, unwrapPlacedKey, isPlacedText } from "../../web/src/vault/vault-crypto.ts";
+import { openChunk } from "../../web/src/vault/chunked-file.ts";
+import { FilesModel, UNVERIFIED, type FilesBridge } from "../../web/src/ui/files/model.ts";
+import { places } from "../../web/src/vault/places.ts";
 
 // ── the fake server: rows + objects, sealed like the real one ───────
 const store = await generateHybridKey();
-const storePublic = { ec: store.publicKey, kem: store.pqPublicKey };
 const storePrivate = await importVaultKey(store.bundle);
 const objects = new Map<string, Uint8Array>();
 const rows = new Map<string, { id: string; folder: string | null; name: string; size: number; version: number; createdAt: string; updatedAt: string; trashedWith?: string | null }>();
@@ -98,7 +99,9 @@ const server = {
 			return { files: (body!.files ?? []).length, folders: 0 };
 		}
 		if (p.endsWith("/files/folders") && method === "POST") {
-			const id = crypto.randomUUID();
+			// The client chose the id (commit 25) — its name is sealed into it.
+			const id = (body as { id?: string }).id;
+			assert.ok(id, "a new folder arrives with its client-chosen id");
 			folders.set(id, { id, parent: (body!.parentId as string | null) ?? null, name: body!.name as string, createdAt: now(), updatedAt: now() });
 			return { id };
 		}
@@ -143,20 +146,21 @@ const bridge: FilesBridge = {
 	apiGet: <T>(path: string) => Promise.resolve(server.get(path) as T),
 	apiSend: <T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) => Promise.resolve(server.send(method, path, body) as T),
 	storePrivate: async () => storePrivate,
-	storePublic: async () => storePublic,
-	async fetchObject(_member, id, version, range) {
+	identityHeaders: () => ({}),
+	async fetchObject(_member, id, _version, range) {
 		const v = versions.get(id)!;
 		const obj = objects.get(v.object)!;
+		const version = rows.get(id)?.version ?? 1;
 		if (range) {
 			// range in the test = a whole-frame fetch (the preview path)
-			return { body: obj.subarray(range[0], range[1] + 1), ck: v.ck, chunk: v.chunk };
+			return { body: obj.subarray(range[0], range[1] + 1), ck: v.ck, chunk: v.chunk, version };
 		}
-		return { body: obj, ck: v.ck, chunk: v.chunk };
+		return { body: obj, ck: v.ck, chunk: v.chunk, version };
 	},
-	async fetchObjectStream(_member, id, _version, sink) {
+	async fetchObjectStream(member, id, _version, sink) {
 		const v = versions.get(id)!;
 		const obj = objects.get(v.object)!;
-		const key = await unwrapContentKey(storePrivate, v.ck);
+		const key = await unwrapPlacedKey(storePrivate, places.fileKey(member, id, rows.get(id)?.version ?? 1), v.ck);
 		const chunk = v.chunk ?? 0;
 		if (!chunk) {
 			await sink(await openWith(key, obj));
@@ -168,8 +172,8 @@ const bridge: FilesBridge = {
 		}
 	},
 	async putWhole(_member, fields, sealed) {
-		const ckRaw = fromBase64(await openText(storePrivate, fields.ck));
-		const id = crypto.randomUUID();
+		const id = fields.file_id;
+		assert.ok(id && !rows.has(id), "a new file arrives with a fresh client-chosen id");
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
 		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk: null });
@@ -179,7 +183,7 @@ const bridge: FilesBridge = {
 		feed.push({ seq: feedCursor, kind: "file.put", data: { id } });
 	},
 	async putMultipart(_member, fields, sealed, chunk) {
-		const id = crypto.randomUUID();
+		const id = fields.file_id;
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
 		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk });
@@ -211,7 +215,7 @@ const folderId = await model.newFolder(null, "Photos");
 const listed = model.state.get().folders.find((f) => f.id === folderId);
 assert.equal(listed?.name, "Photos", "the tree shows the decrypted name");
 // The server holds only the sealed text.
-assert.ok(folders.get(folderId)!.name.startsWith("GV03:"), "the server never saw the name");
+assert.ok(isPlacedText(folders.get(folderId)!.name), "the server never saw the name (GV04, sealed into the folder's place)");
 
 // 3. Upload with a duplicate check: the first copy just lands.
 dupAnswer = "keep";
@@ -224,10 +228,11 @@ assert.equal(row.kind, "image");
 assert.equal(row.size, bytes.length);
 assert.equal(dupAsked, 0, "no twin, no question");
 
-// The stored object is GV02-sealed under a fresh content key, wrapped GV03.
+// The stored object is GV02-sealed under a fresh content key, wrapped GV04
+// into this file's version-1 place.
 const v = versions.get(row.id)!;
-assert.ok(v.ck.startsWith("GV03:"));
-const plain = await openWith(await unwrapContentKey(storePrivate, v.ck), objects.get(v.object)!);
+assert.ok(isPlacedText(v.ck));
+const plain = await openWith(await unwrapPlacedKey(storePrivate, places.fileKey("jinu", row.id, 1), v.ck), objects.get(v.object)!);
 assert.deepEqual(plain, bytes);
 
 // 4. The SAME bytes again → the fingerprint question fires.
@@ -242,7 +247,7 @@ void downloaded;
 
 // 6. Rename re-seals; the server's stored name changes shape but stays sealed.
 await model.rename("file", row.id, "sunset.png");
-assert.ok(rows.get(row.id)!.name.startsWith("GV03:"));
+assert.ok(isPlacedText(rows.get(row.id)!.name));
 assert.equal(model.names.get(row.id), "sunset.png");
 
 // 7. Trash + restore.
@@ -263,7 +268,7 @@ assert.equal(copies.length, 2);
 const ckA = versions.get(row.id)!.ck;
 const ckB = versions.get(copies.find((f) => f.id !== row.id)!.id)!.ck;
 assert.notEqual(ckA, ckB, "a copy is a new sealed object with its own key");
-assert.ok(ckA.startsWith("GV03:") && ckB.startsWith("GV03:"));
+assert.ok(isPlacedText(ckA) && isPlacedText(ckB));
 
 // 9. The change feed: the fake server counted the writes; the model advances.
 await new Promise((r) => setTimeout(r, 0));
@@ -274,6 +279,25 @@ model.sortBy("size");
 assert.equal(model.state.get().sort.by, "size");
 model.sortBy("size");
 assert.equal(model.state.get().sort.dir, "desc");
+
+// 11. O6 — the server swaps two files' names (and keys). The listing does
+// not crash and does not lie: both rows show as UNVERIFIED, and the moved
+// key does not open as the other file's.
+const [one, two] = [copies[0].id, copies[1].id];
+const fresh = new FilesModel(bridge, "jinu"); // a new session: no names cached
+const nameOne = rows.get(one)!.name;
+rows.get(one)!.name = rows.get(two)!.name;
+rows.get(two)!.name = nameOne;
+const keyOne = versions.get(one)!.ck;
+versions.get(one)!.ck = versions.get(two)!.ck;
+versions.get(two)!.ck = keyOne;
+await fresh.open();
+const shown = fresh.state.get().files;
+assert.equal(shown.find((f) => f.id === one)?.name, UNVERIFIED, "a name moved from another file is shown as unverified");
+assert.equal(shown.find((f) => f.id === two)?.name, UNVERIFIED);
+assert.ok(shown.some((f) => f.name === "beach.png" || f.name === "beach copy.png"), "untouched rows still open normally");
+await assert.rejects(fresh.openBytes(one, undefined, () => {}), /not sealed here/, "the moved key does not open as this file's");
+fresh.dispose();
 
 model.dispose(); // stops the change-feed poll so the test process can exit
 

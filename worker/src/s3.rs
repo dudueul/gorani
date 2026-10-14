@@ -113,30 +113,10 @@ async fn fetch_signed(cfg: &S3Config, method: &str, object_key: &str, query_pair
 
 // ── Object operations ───────────────────────────────────────────────
 
-/// Full GET into memory; None on 404. **Uncached on purpose** (commit 23):
-/// its only caller is the backup job, which reads EVERY object of a member
-/// once — caching that walk filled the edge with the whole vault and cost
-/// a full extra copy of each object in worker memory (the clone handed to
-/// `cache.put`). Interactive reads go through [`fetch_stream`], which is
-/// the path the cache was designed for.
-pub async fn get(env: &Env, key: &str) -> Result<Option<Vec<u8>>> {
-	if let Some(bucket) = r2_bucket(env).await? {
-		return match bucket.get(key).execute().await? {
-			Some(o) => match o.body() {
-				Some(b) => Ok(Some(b.bytes().await?)),
-				None => Ok(None),
-			},
-			None => Ok(None),
-		};
-	}
-	let cfg = config(env)?;
-	let mut resp = fetch_signed(&cfg, "GET", key, &[], None, None, None).await?;
-	match resp.status_code() {
-		200 => Ok(Some(resp.bytes().await?)),
-		404 => Ok(None),
-		s => Err(Error::RustError(format!("S3 get {key}: HTTP {s}"))),
-	}
-}
+// (A whole-object `get` into memory lived here until commit 25: its only
+// caller, the backup job, now streams every object through
+// `stream_uncached` — O9. A helper that invites holding a 255 GB file in a
+// 128 MB isolate is a helper to delete.)
 
 /// Full GET as a **streamable** Response (the file route pipes the body
 /// through with a Range header); None-style errors surfaced via status.

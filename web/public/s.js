@@ -96,7 +96,10 @@ $("download").addEventListener("click", async () => {
 		// revoked) ends here instead of being ignored.
 		const claim = await fetch(`/s/f/${id}/claim`, { method: "POST" });
 		if (!claim.ok) throw new Error((await claim.json().catch(() => ({}))).error ?? `download refused (${claim.status})`);
-		const res = await fetch(`/s/f/${id}/data`);
+		// The claim's token is what /data serves to (commit 25, O12): the
+		// download count is now enforced by the server, not by this page.
+		const { token } = await claim.json();
+		const res = await fetch(`/s/f/${id}/data`, { headers: { "x-gorani-share-token": token } });
 		if (!res.ok) throw new Error(`download refused (${res.status})`);
 		const sealed = new Uint8Array(await res.arrayBuffer());
 		// At least one frame, even for an empty file: GC01 always seals one

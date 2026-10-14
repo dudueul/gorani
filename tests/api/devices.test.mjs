@@ -14,7 +14,8 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { newContentKey, importContentKey, importVaultKey, openText, sealWith, openWith, sealText, generateHybridKey, wrapContentKey, unwrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, importVaultKey, openText, sealWith, openWith, generateHybridKey } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer, placedShape } from "../lib/placed.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, openStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 import { toBase64, fromBase64 } from "../../web/src/lib/encoding.ts";
 import { resealStore } from "../../web/src/vault/rotation.ts";
@@ -124,11 +125,10 @@ try {
 	// ── 5. Trash list + restore ────────────────────────────────────────
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
-	const ckSealed = await wrapContentKey(storePublic, ck);
+	const store = await storeSealer(filesStore.bundle, "jinu");
+	const trashme = await store.newFile("trashme.txt", "text/plain", ck);
 	const plain = enc.encode("to be trashed");
 	const sealed = await sealWith(key, plain);
-	const name = await sealText(storePublic, "trashme.txt");
 	async function uploadFile(fields, file) {
 		const boundary = `t${Math.random().toString(16).slice(2)}`;
 		const head = new TextEncoder().encode(Object.entries(fields).map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`).join("") + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`);
@@ -136,7 +136,7 @@ try {
 		const r = await fetch(`${dev.base}/api/v1/members/jinu/files`, { method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}`, "x-gorani-dev-email": "jinu@family.test" }, body });
 		return { status: r.status, json: await r.json() };
 	}
-	const f1 = await uploadFile({ ck: ckSealed, name, type: await sealText(storePublic, "text/plain"), size: String(plain.length) }, sealed);
+	const f1 = await uploadFile({ ...trashme.fields, size: String(plain.length) }, sealed);
 	assert.equal(f1.status, 200, JSON.stringify(f1.json));
 	const f = f1.json;
 	assert.ok(f.id);
@@ -154,7 +154,6 @@ try {
 	const newStore = await createStoreKey();
 	const newOwn = await sealStoreKeyToMember(newStore, { ec: kidVault.publicKey, kem: kidVault.pqPublicKey });
 	const newGuardian = await sealStoreKeyToMaster(newStore, master);
-	const newStorePublic = { ec: newStore.publicKey, kem: newStore.pqPublicKey };
 	// The client walks every sealed value (rotation.ts — commit 24 made it
 	// every version, folder, tag and secret, not just living versions; the
 	// full proof is api:rotation) — the raw keys stay in the client.
@@ -165,7 +164,7 @@ try {
 		assert.ok(r.status < 300, `${method} ${path}: ${r.status} ${r.text.slice(0, 200)}`);
 		return r.json;
 	};
-	const walked = await resealStore(call, "jinu", storePriv, await importVaultKey(newStore.bundle), newStorePublic);
+	const walked = await resealStore(call, "jinu", storePriv, await importVaultKey(newStore.bundle.slice()));
 	assert.ok(walked.resealed.version >= 1 && walked.resealed.file >= 1, JSON.stringify(walked));
 	// Settings updated to the new store key…
 	const updatedSettings = { ...settings, stores: { files: newOwn }, guardian: newGuardian };
@@ -173,9 +172,9 @@ try {
 	assert.equal(save2.status, 200);
 	// …and the keys endpoint now serves the new wrap, which opens.
 	const keys = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [f.id] } });
-	assert.ok(keys.json.keys[f.id].key.startsWith("GV03:"));
-	const newPrivate = await importVaultKey(newStore.bundle);
-	const ck2 = await unwrapContentKey(newPrivate, keys.json.keys[f.id].key);
+	assert.ok(keys.json.keys[f.id].key.startsWith("GV04:"));
+	const newSealer = await storeSealer(newStore.bundle, "jinu");
+	const ck2 = await newSealer.openFileKey(f.id, keys.json.keys[f.id].version, keys.json.keys[f.id].key);
 	assert.equal(dec.decode(await openWith(ck2, sealed)), dec.decode(plain), "the rotated key opens the content");
 
 	// ── 7. Crypto-shredding: armed (dev secret), confirm phrase, gone ──
@@ -186,14 +185,14 @@ try {
 	const gone = await api(dev.base, "GET", "/api/v1/members/jinu/vault", { email: "jinu@family.test" });
 	assert.equal(gone.json, null);
 	// Without the vault, uploads are refused: nothing lands in the clear.
-	const afterDestroy = await uploadFile({ ck: ckSealed, name, type: typeSealedHelper(), size: String(plain.length) }, sealed);
+	// (Every field is placed-SHAPED, so the 400 can only be the vault gate's —
+	// a GV03 placeholder here would now be refused for its format and the
+	// test would pass for the wrong reason.)
+	const afterDestroy = await uploadFile({ file_id: store.newId(), ck: placedShape("ck"), name: placedShape("name"), type: placedShape("type"), size: String(plain.length) }, sealed);
 	assert.equal(afterDestroy.status, 400, `afterDestroy: ${afterDestroy.status} ${JSON.stringify(afterDestroy)}`);
+	assert.match(afterDestroy.json.error, /vault/, "refused by the vault gate, not by a shape check");
 
 	console.log("ok  api:devices — enrol/unlock/rekey/leave/revoke, trash restore, reseal rotation, crypto-shredding");
 } finally {
 	await dev.close();
-}
-
-function typeSealedHelper() {
-	return "GV03:type"; // shape only; the vault is destroyed at this point
 }

@@ -22,8 +22,11 @@
 //! Gorani has no PBKDF2 legacy path (Mailflare kept one for methods made
 //! before 2026-10-06): a fresh product has no old methods, so the weakest
 //! derivation it can be talked into is Argon2id — and the parameters are
-//! **bounded** below and above, so a tampered settings object can neither
-//! weaken a password check (m < 19 MiB) nor exhaust the opener (1 GiB).
+//! **bounded** below and above (commit 25, O8 — the TS twin is
+//! web/src/vault/kdf-bounds.ts): a tampered settings object can neither
+//! weaken a password check below OWASP's floor (19 MiB with 2 passes) nor
+//! freeze the opener (at most 256 MiB, 10 passes, 8 lanes — and at most
+//! `MAX_PASSWORD_METHODS` Argon2 runs per unlock). Salts are 16–64 bytes.
 //!
 //! Also here: key generation (the native clients create vaults and rotate
 //! keys; the browser does it with its own code and the vectors prove the two
@@ -87,15 +90,37 @@ fn hkdf_kek(secret: &[u8], salt: &[u8], info: &str) -> Zeroizing<[u8; 32]> {
 	out
 }
 
-/// The password KEK: Argon2id, and *only* Argon2id — with the method's cost
-/// bounded (never weaker than RFC 9106's minimum, never an absurd
-/// allocation). A gorani settings object asking for anything else is not a
-/// gorani settings object.
-pub fn password_kek(password: &str, salt: &[u8], method: &UnlockMethod) -> Result<Zeroizing<[u8; 32]>, Error> {
-	let Some(a) = method.argon2 else { return Err(Error::Kdf("password method lacks Argon2id parameters")) };
-	if !(19 * 1024..=1024 * 1024).contains(&a.m) || !(1..=20).contains(&a.t) || !(1..=16).contains(&a.p) {
+/// What a stored Argon2id setting may ask (the TS twin: kdf-bounds.ts).
+pub const ARGON2_M: std::ops::RangeInclusive<u32> = 19 * 1024..=256 * 1024;
+pub const ARGON2_T: std::ops::RangeInclusive<u32> = 2..=10;
+pub const ARGON2_P: std::ops::RangeInclusive<u32> = 1..=8;
+pub const SALT_LEN: std::ops::RangeInclusive<usize> = 16..=64;
+/// At most this many password methods are tried per unlock (each is an Argon2 run).
+pub const MAX_PASSWORD_METHODS: usize = 4;
+
+/// Refuse a cost outside the bounds — too weak to protect a password, or
+/// heavy enough to freeze the device (the server serves these numbers).
+pub fn check_argon2(a: &Argon2Cost) -> Result<(), Error> {
+	if !ARGON2_M.contains(&a.m) || !ARGON2_T.contains(&a.t) || !ARGON2_P.contains(&a.p) {
 		return Err(Error::Kdf("unsupported password parameters"));
 	}
+	Ok(())
+}
+
+/// Refuse a salt outside 16–64 bytes (shorter is malformed, longer is padding).
+pub fn check_salt(salt: &[u8]) -> Result<(), Error> {
+	if !SALT_LEN.contains(&salt.len()) {
+		return Err(Error::Kdf("unsupported salt length"));
+	}
+	Ok(())
+}
+
+/// The password KEK: Argon2id, and *only* Argon2id — with the method's cost
+/// bounded both ways (`check_argon2`). A gorani settings object asking for
+/// anything else is not a gorani settings object.
+pub fn password_kek(password: &str, salt: &[u8], method: &UnlockMethod) -> Result<Zeroizing<[u8; 32]>, Error> {
+	let Some(a) = method.argon2 else { return Err(Error::Kdf("password method lacks Argon2id parameters")) };
+	check_argon2(&a)?;
 	let pw = Zeroizing::new(password.nfkc().collect::<String>());
 	let mut out = Zeroizing::new([0u8; 32]);
 	let params = Params::new(a.m, a.t, a.p, Some(32)).map_err(|_| Error::Kdf("unsupported password parameters"))?;
@@ -147,6 +172,7 @@ pub enum Secret<'a> {
 /// Open the root private key's bytes (GK01 bundle or PKCS#8) with one method.
 pub fn unlock_with_method(method: &UnlockMethod, secret: &Secret) -> Result<Zeroizing<Vec<u8>>, Error> {
 	let salt = STANDARD.decode(&method.salt).map_err(|_| Error::Format("bad salt"))?;
+	check_salt(&salt)?;
 	let kek = match (method.kind.as_str(), secret) {
 		("password", Secret::Password(p)) => password_kek(p, &salt, method)?,
 		("recovery", Secret::RecoveryCode(c)) => recovery_kek(c, &salt),
@@ -165,7 +191,10 @@ pub fn unlock(methods: &[UnlockMethod], secret: &Secret) -> Result<(Zeroizing<Ve
 		Secret::PasskeyPrf(_) => "passkey",
 	};
 	let mut last = Error::Open("no unlock method of this kind");
-	for m in methods.iter().filter(|m| m.kind == kind) {
+	// Password methods are capped: each try is a full Argon2 run, and the
+	// list comes from the server (O8).
+	let cap = if kind == "password" { MAX_PASSWORD_METHODS } else { usize::MAX };
+	for m in methods.iter().filter(|m| m.kind == kind).take(cap) {
 		match unlock_with_method(m, secret) {
 			Ok(k) => return Ok((k, m.id.clone())),
 			Err(e) => last = e,
@@ -235,6 +264,7 @@ pub fn make_device_copy(root_bytes: &[u8], device_secret: &[u8]) -> DeviceCopy {
 
 pub fn open_device_copy(wrapped: &str, salt_b64: &str, device_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
 	let salt = STANDARD.decode(salt_b64).map_err(|_| Error::Format("bad salt"))?;
+	check_salt(&salt)?;
 	formats::unwrap_private_key(&device_kek(device_secret, &salt), wrapped)
 }
 
@@ -251,4 +281,47 @@ pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
 /// did not get wrapped in `Zeroizing`).
 pub fn wipe(bytes: &mut [u8]) {
 	bytes.zeroize();
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn argon2_bounds_both_ways() {
+		// What gorani writes is inside.
+		assert!(check_argon2(&ARGON2ID_PARAMS).is_ok());
+		// OWASP's floor: 19 MiB with 2 passes. One pass at the floor (allowed
+		// before commit 25) is refused, and so is anything below 19 MiB.
+		assert!(check_argon2(&Argon2Cost { m: 19 * 1024, t: 2, p: 1 }).is_ok());
+		assert!(check_argon2(&Argon2Cost { m: 19 * 1024, t: 1, p: 1 }).is_err(), "t=1 is below the floor");
+		assert!(check_argon2(&Argon2Cost { m: 19 * 1024 - 1, t: 3, p: 1 }).is_err());
+		// The ceiling: a server cannot make a phone allocate a gigabyte or spin for a minute.
+		assert!(check_argon2(&Argon2Cost { m: 256 * 1024, t: 10, p: 8 }).is_ok());
+		assert!(check_argon2(&Argon2Cost { m: 1024 * 1024, t: 3, p: 4 }).is_err(), "1 GiB is refused");
+		assert!(check_argon2(&Argon2Cost { m: 64 * 1024, t: 20, p: 4 }).is_err(), "20 passes is refused");
+		assert!(check_argon2(&Argon2Cost { m: 64 * 1024, t: 3, p: 16 }).is_err(), "16 lanes is refused");
+		// Salts.
+		assert!(check_salt(&[0u8; 16]).is_ok() && check_salt(&[0u8; 64]).is_ok());
+		assert!(check_salt(&[0u8; 8]).is_err() && check_salt(&[0u8; 65]).is_err());
+	}
+
+	#[test]
+	fn password_methods_are_capped() {
+		// A settings row padded with decoys before the real method: the
+		// unlock tries MAX_PASSWORD_METHODS of them and stops — the method
+		// at position 5 is never reached (each try is a full Argon2 run).
+		let cost = Argon2Cost { m: 19 * 1024, t: 2, p: 1 }; // the floor, to keep the test quick
+		let method = |id: &str, wrapped: String| UnlockMethod { id: id.into(), kind: "password".into(), label: None, wrapped, salt: STANDARD.encode([7u8; 16]), argon2: Some(cost), credential_id: None, prf_salt: None, created_at: None };
+		let probe = method("probe", String::new());
+		let kek = password_kek("the real one", &[7u8; 16], &probe).unwrap();
+		let real = method("real", formats::wrap_private_key(&kek, b"root bundle bytes"));
+		let decoy = |i: usize| method(&format!("decoy{i}"), formats::wrap_private_key(&[9u8; 32], b"not yours"));
+		let mut methods: Vec<UnlockMethod> = (0..MAX_PASSWORD_METHODS).map(decoy).collect();
+		methods.push(real.clone());
+		assert!(unlock(&methods, &Secret::Password("the real one")).is_err(), "the 5th method is past the cap");
+		methods.insert(MAX_PASSWORD_METHODS - 1, real);
+		let (bytes, id) = unlock(&methods, &Secret::Password("the real one")).unwrap();
+		assert_eq!((&bytes[..], id.as_str()), (&b"root bundle bytes"[..], "real"), "within the cap it opens");
+	}
 }

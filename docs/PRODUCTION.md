@@ -89,18 +89,61 @@ npm install && npm --prefix web install
 npm run deploy          # builds web/ + the Rust worker (worker-build)
 ```
 
-First-run bootstrap: sign in through Access, `POST /api/v1/family/members`
-with your parent member (the first member is created by any authenticated
-caller), `PUT /api/v1/family/master` with the generated master public half,
-then create each vault from the UI (commit ⑨'s setup screen).
+First-run bootstrap (commit 25, O18): set a one-time secret first —
+
+```sh
+openssl rand -base64 32 | npx wrangler secret put BOOTSTRAP_TOKEN
+```
+
+— then sign in through Access and `POST /api/v1/family/members` with your
+parent member and the header `x-gorani-bootstrap: <that token>`. Without the
+secret a production deployment refuses to bootstrap at all; without the
+header nobody becomes the first member (the race the token closes: whoever
+got through Access first used to become a parent). The first member must
+be a parent; after it exists the token is meaningless (delete the secret
+if you like). Then `PUT /api/v1/family/master` with the generated master
+public half, and create each vault from the UI (commit ⑨'s setup screen).
+
+**Rate limits** (O13) are in `wrangler.jsonc › ratelimits` (60/min per
+caller + share link, 30/min per caller + device). They are per Cloudflare
+location and approximate — add a WAF rate-limiting rule as the second,
+edge-wide layer, e.g. `http.request.uri.path wildcard "/s/f/*"` → 120
+requests / 1 minute per IP → block for 10 minutes; and the same for
+`/api/v1/members/*/devices/*`.
+
+**Share links on their own hostname** (O17, recommended for a SecOps
+deployment): the recipient page runs a stranger's password through code
+on the same origin as the vault. Give `/s/*` its own hostname (a second
+Worker route, e.g. `share.example.com/s/*`, with no Access application in
+front) and keep the vault's hostname behind Access with `/s/*` excluded
+from the app's links — the page's CSP already forbids framing and inline
+code, so the separation is about cookies and storage, not script.
+
+Schema changes ride the deploy: each Durable Object migrates itself on its
+next wake-up through an append-only ledger (`worker/src/schema.rs`). Add new
+statements at the END of `MIGRATIONS`, never edit or reorder a shipped one.
+A store whose migration fails answers every request with a 500 naming the
+failed statement (it does not hang) — look for `member store schema:` in
+the Worker's logs.
 
 ## 4. Backups
+
+> **Upgrading across commit 25:** backups written before it are GB1 and
+> hold GV03 values, which a GV04 store refuses. Keep the old release (or a
+> checkout of it) to restore those, and take a fresh backup right after
+> upgrading — the new one is the one you will restore from.
 
 1. In the app, generate the backup key pair and **download the key file** —
    the only copy of the private bundle; the server stores the public half.
 2. `POST /api/v1/members/<id>/backup/run` writes `backups/<stamp>.gbak` —
-   sealed twice over (the objects are already GV-sealed; the GB1 container
-   wraps them under a key only your key file opens). Runs are created on
+   sealed twice over (the objects are already GV-sealed; the GB2 container
+   wraps them under a key only your key file opens, and authenticates its
+   own header — when it was made, which kind — so a copy cannot be
+   relabelled at rest). The job streams into a multipart upload, so memory
+   does not bound the backup — one container holds up to ~78 GiB. An object
+   missing from storage is listed in the run's answer and counted in the
+   manifest (`missing`); a nonzero count means investigate the bucket, not
+   that the backup is fine. Runs are created on
    purpose — by the owner in the app — not silently by the server: the
    in-memory job is sized for on-demand runs, and a daily full copy is a
    storage-economics decision a family should make knowingly.
@@ -112,7 +155,11 @@ then create each vault from the UI (commit ⑨'s setup screen).
    records each pass under the actor `cron`. The retention knobs
    (`trashDays`, `auditKeep`, …) are deployment defaults: the HTTP route
    honours them only on the dev server, so no member can shorten their own
-   audit trail.
+   audit trail. Deletions go through an **outbox** (commit 25): an object
+   leaves `pending_deletes` only when storage confirms it, so a failing
+   bucket delays deletion instead of orphaning objects — and fails the
+   scheduled event (look for `gorani cron:` errors). `GET
+   /api/v1/members/<id>/storage/pending` shows what is waiting and why.
 4. Keep the key file offline. Losing it loses the backups, not the vault.
 
 ## 5. Growth

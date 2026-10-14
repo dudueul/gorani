@@ -15,6 +15,13 @@
  *   POST   /bucket/key?uploadId…    complete multipart (concatenate)
  *   GET    /bucket?list-type=2…     ListObjectsV2 (minimal XML)
  *
+ * And one test-only control route (commit 25), for the suites that must see
+ * the Worker meet a FAILING storage backend (docs/SECURITY-REVIEW.md › O10):
+ *
+ *   POST   /__fault  { method, prefix, status, count }
+ *          the next `count` requests with that method on keys under
+ *          `prefix` answer `status` instead (count 0 clears the rule)
+ *
  * Authorization headers are accepted and ignored here on purpose.
  */
 
@@ -24,6 +31,7 @@ export function startS3Stub({ port = 0, host = "0.0.0.0" } = {}) {
 	const objects = new Map(); // key → Buffer
 	const uploads = new Map(); // uploadId → { key, parts: Map<n, Buffer> }
 	let nextUploadId = 1;
+	let faults = []; // { method, prefix, status, count }
 
 	const server = http.createServer((req, res) => {
 		const url = new URL(req.url, "http://stub");
@@ -38,6 +46,19 @@ export function startS3Stub({ port = 0, host = "0.0.0.0" } = {}) {
 
 		collect().then((body) => {
 			const q = url.searchParams;
+			if (url.pathname === "/__fault" && req.method === "POST") {
+				const rule = JSON.parse(body.toString() || "{}");
+				faults = faults.filter((f) => !(f.method === rule.method && f.prefix === rule.prefix));
+				if (rule.count > 0) faults.push(rule);
+				res.writeHead(200).end("{}");
+				return;
+			}
+			const fault = faults.find((f) => f.method === req.method && key.startsWith(f.prefix) && f.count > 0);
+			if (fault) {
+				fault.count--;
+				res.writeHead(fault.status).end();
+				return;
+			}
 			// multipart create
 			if (req.method === "POST" && q.has("uploads")) {
 				const id = `upl-${nextUploadId++}`;

@@ -13,6 +13,7 @@
  *      node scripts/make-vectors.mjs --only-record   (add/refresh the store-record
  *        vector inside the EXISTING file, keyed to its hybrid root — so a new
  *        vector does not churn every other one)
+ *      node scripts/make-vectors.mjs --only-placed   (the same for the GV04 vector)
  */
 
 import fs from "node:fs";
@@ -37,6 +38,8 @@ import { toBase64, fromBase64 } from "../web/src/lib/encoding.ts";
 import { importVaultKey } from "../web/src/vault/vault-crypto.ts";
 import { createStoreKey, sealStoreKeyToMember } from "../web/src/vault/family.ts";
 import { deriveRecordKey, macRecord } from "../web/src/vault/records.ts";
+import { sealPlacedText, wrapPlacedKey, storePsk } from "../web/src/vault/vault-crypto.ts";
+import { places } from "../web/src/vault/places.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const out = path.join(root, "crates/formats/tests/vectors.json");
@@ -52,6 +55,35 @@ async function recordVector(rootBundle, rootPublic) {
 	const record = await sealStoreKeyToMember(store, rootPublic);
 	const mac = await macRecord(await deriveRecordKey(await importVaultKey(rootBundle.slice())), "files", record);
 	return { name: "files", keyId: record.keyId, x: record.publicKey.x, y: record.publicKey.y, kem: record.pqPublicKey, privateKeySealed: record.privateKeySealed, mac };
+}
+
+/**
+ * The placed-sealing vector (commit 25, GV04, docs/SECURITY-REVIEW.md › O6):
+ * the hybrid key acts as a STORE; a name and a content key sealed into
+ * their places. Rust must derive the same store PSK and open both — and
+ * refuse them anywhere else.
+ */
+async function placedVector(storeBundle) {
+	const store = await importVaultKey(storeBundle.slice());
+	const contentKey = newContentKey();
+	return {
+		store: "jinu",
+		file: "f-0001",
+		version: 3,
+		psk: toBase64(await storePsk(store)),
+		name: "incident-2026-10.pcap",
+		nameSealed: await sealPlacedText(store, places.fileName("jinu", "f-0001"), "incident-2026-10.pcap"),
+		contentKey: toBase64(contentKey),
+		keySealed: await wrapPlacedKey(store, places.fileKey("jinu", "f-0001", 3), contentKey),
+	};
+}
+
+if (process.argv.includes("--only-placed")) {
+	const vectors = JSON.parse(fs.readFileSync(out, "utf8"));
+	vectors.placed = await placedVector(fromBase64(vectors.hybrid.bundle));
+	fs.writeFileSync(out, JSON.stringify(vectors, null, "\t") + "\n");
+	console.log(`placed vector written into ${path.relative(root, out)}`);
+	process.exit(0);
 }
 
 if (process.argv.includes("--only-record")) {
@@ -135,6 +167,7 @@ const vectors = {
 }
 
 vectors.record = await recordVector(hybrid.bundle, hybridPublic);
+vectors.placed = await placedVector(hybrid.bundle);
 
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, JSON.stringify(vectors, null, "\t") + "\n");

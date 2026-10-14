@@ -30,10 +30,10 @@ import {
 	importVaultKey,
 	importContentKey,
 	unlockWithMethod,
-	wrapContentKey,
-	unwrapContentKey,
-	rewrapContentKey,
-	sealText,
+	wrapPlacedKey,
+	unwrapPlacedKey,
+	sealPlacedText,
+	openPlacedText,
 	openText,
 	sealWith,
 	openWith,
@@ -41,6 +41,15 @@ import {
 	passwordProblem,
 } from "../../web/src/vault/vault-crypto.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
+import { places } from "../../web/src/vault/places.ts";
+
+// Every store value is sealed into its place (GV04, commit 25) with the
+// store's PRIVATE key — the key chain below decides who can open a store at
+// all; the place decides where a value may appear inside it.
+const DIARY_KEY = places.fileKey("kid1", "diary", 1);
+const DIARY_NAME = places.fileName("kid1", "diary");
+const RULES_KEY = places.fileKey("family", "rules", 1);
+const PHOTO_KEY = places.fileKey("family", "photo", 1);
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -79,24 +88,25 @@ const familyKeys = await sealFamilyStoreKey(familyStore, [hybridPublicOf(parentA
 // ── 4. A file lands in kid1's area (sealed to kid1's store key) ─────
 const fileKey = newContentKey();
 const fileBytes = enc.encode("my diary for 2026-10-13");
-const fileKeySealed = await wrapContentKey(hybridPublicOf({ publicKey: k1Store.publicKey, pqPublicKey: k1Store.pqPublicKey }), fileKey);
-const fileNameSealed = await sealText(hybridPublicOf({ publicKey: k1Store.publicKey, pqPublicKey: k1Store.pqPublicKey }), "diary.txt");
+const k1StoreSealer = await importVaultKey(k1Store.bundle.slice()); // whoever uploads holds the store key
+const fileKeySealed = await wrapPlacedKey(k1StoreSealer, DIARY_KEY, fileKey);
+const fileNameSealed = await sealPlacedText(k1StoreSealer, DIARY_NAME, "diary.txt");
 
 // ── 5. Parent A opens kid1's file: root → master → kid store → key ──
 const aOpenedMaster = await openMaster(aRoot, aMasterSealed);
 const k1StoreByParent = await openChildStoreKey(aRoot, aMasterSealed, k1Guardian);
-const openedKey = await unwrapContentKey(k1StoreByParent, fileKeySealed);
+const openedKey = await unwrapPlacedKey(k1StoreByParent, DIARY_KEY, fileKeySealed);
 assert.equal(dec.decode(await openWith(openedKey, await sealWith(openedKey, fileBytes))), dec.decode(fileBytes));
-assert.equal(await openText(k1StoreByParent, fileNameSealed), "diary.txt");
+assert.equal(await openPlacedText(k1StoreByParent, DIARY_NAME, fileNameSealed), "diary.txt");
 // The opened master is the same key either parent holds.
 const bOpenedMaster = await openMaster(await rootPrivateOf(parentB), bMasterSealed);
 const bStore = await openChildStoreKey(await rootPrivateOf(parentB), bMasterSealed, k1Guardian);
-assert.deepEqual(await unwrapContentKey(bStore, fileKeySealed), openedKey);
+assert.deepEqual(await unwrapPlacedKey(bStore, DIARY_KEY, fileKeySealed), openedKey);
 void bOpenedMaster;
 
 // ── 6. Kid1 opens their own file without any master ─────────────────
 const k1StoreOwn = await openStoreKey(kid1Root, k1Own);
-assert.deepEqual(await unwrapContentKey(k1StoreOwn, fileKeySealed), openedKey);
+assert.deepEqual(await unwrapPlacedKey(k1StoreOwn, DIARY_KEY, fileKeySealed), openedKey);
 
 // ── 7. The denials that must stay denials ───────────────────────────
 // kid1 cannot open parentA's store key (sealed to parentA's root).
@@ -113,12 +123,12 @@ await assert.rejects(() => openMaster(kid1Root, aMasterSealed));
 const familyContent = enc.encode("family rules");
 const familyKey = newContentKey();
 const familyKeyImported = await importContentKey(familyKey);
-const familyContentSealed = await wrapContentKey(hybridPublicOf({ publicKey: familyStore.publicKey, pqPublicKey: familyStore.pqPublicKey }), familyKey);
+const familyContentSealed = await wrapPlacedKey(await importVaultKey(familyStore.bundle.slice()), RULES_KEY, familyKey);
 // A probe sealed under the raw key; each member's copy must open it.
 const probe = await sealWith(familyKeyImported, familyContent);
 for (const [name, vault, idx] of [["parent A", parentA, 0], ["parent B", parentB, 1], ["kid1", kid1, 2], ["kid2", kid2, 3]]) {
 	const storePrivate = await openStoreKey(await rootPrivateOf(vault), familyKeys[idx]);
-	const k = await unwrapContentKey(storePrivate, familyContentSealed);
+	const k = await unwrapPlacedKey(storePrivate, RULES_KEY, familyContentSealed);
 	assert.equal(dec.decode(await openWith(k, probe)), dec.decode(familyContent), name);
 }
 // (kids *writing* there is stopped by the server's role policy, not crypto.)
@@ -132,10 +142,10 @@ assert.deepEqual(await unlockWithMethod(kid1.methods[0], kid1.recoveryCode), kid
 
 // ── 10. kid1's store key rotated by a parent alone ──────────────────
 const rotated = await rotateChildStoreKey(master, hybridPublicOf(kid1));
-const newContentSealed = await wrapContentKey(hybridPublicOf({ publicKey: rotated.key.publicKey, pqPublicKey: rotated.key.pqPublicKey }), fileKey);
+const newContentSealed = await wrapPlacedKey(await importVaultKey(rotated.key.bundle.slice()), DIARY_KEY, fileKey);
 const k1StoreRotated = await openChildStoreKey(aRoot, aMasterSealed, rotated.guardian);
-assert.deepEqual(await unwrapContentKey(k1StoreRotated, newContentSealed), openedKey, "parent opens the rotated key");
-assert.deepEqual(await unwrapContentKey(await openStoreKey(kid1Root, rotated.own), newContentSealed), openedKey, "kid opens the rotated key");
+assert.deepEqual(await unwrapPlacedKey(k1StoreRotated, DIARY_KEY, newContentSealed), openedKey, "parent opens the rotated key");
+assert.deepEqual(await unwrapPlacedKey(await openStoreKey(kid1Root, rotated.own), DIARY_KEY, newContentSealed), openedKey, "kid opens the rotated key");
 // The old copy no longer exists in settings (the caller replaces both).
 
 // ── 11. Parent B is revoked: the master rotates ─────────────────────
@@ -150,7 +160,7 @@ assert.equal(rotation.childGuardians.length, 2);
 // Parent A re-sealed to the new master; the children re-sealed to its public half.
 const aNewMaster = await openMaster(aRoot, rotation.parentSealed[0]);
 const k1StoreAfter = await openChildStoreKey(aRoot, rotation.parentSealed[0], rotation.childGuardians[0]);
-assert.deepEqual(await unwrapContentKey(k1StoreAfter, fileKeySealed), openedKey, "the chain still opens after rotation");
+assert.deepEqual(await unwrapPlacedKey(k1StoreAfter, DIARY_KEY, fileKeySealed), openedKey, "the chain still opens after rotation");
 void aNewMaster;
 
 // ── 12. A member leaves: the family shared area rotates ─────────────
@@ -165,23 +175,28 @@ const familyCopies = await sealFamilyStoreKey(familyArea, [hybridPublicOf(parent
 const familyPrivOld = await openStoreKey(aRoot, familyCopies[0]);
 const areaKey = newContentKey();
 const areaCk = await importContentKey(areaKey);
-const areaSealed = await wrapContentKey(hybridPublicOf(familyArea), areaKey);
+const areaSealed = await wrapPlacedKey(familyPrivOld, PHOTO_KEY, areaKey);
 const areaPlain = enc.encode("family photo bytes");
 const areaData = await sealWith(areaCk, areaPlain);
-assert.deepEqual(dec.decode(await openWith(await unwrapContentKey(familyPrivOld, areaSealed), areaData)), dec.decode(areaPlain), "baseline: the family area opens");
+assert.deepEqual(dec.decode(await openWith(await unwrapPlacedKey(familyPrivOld, PHOTO_KEY, areaSealed), areaData)), dec.decode(areaPlain), "baseline: the family area opens");
 
 // kid1 leaves. The parent rotates to a fresh pair sealed to the remaining roots…
 const familyRotation = await rotateFamilyStoreKey([hybridPublicOf(parentA), hybridPublicOf(kid2)]);
 assert.equal(familyRotation.copies.length, 2);
-// …re-wraps the content key to the new public half — the canonical walk
-// (`rewrapContentKey`: open the old wrap with the old private half, seal
-// to the new public half; exactly what files/reseal stores)…
-const areaRewrapped = await rewrapContentKey(familyPrivOld, hybridPublicOf(familyRotation.key), areaSealed);
+// …re-seals the content key in its place under the NEW key — the
+// canonical walk (rotation.ts › resealStore does this for every row: open
+// in the row's place with the old key, seal into the same place with the
+// new one; exactly what files/reseal stores)…
+const familyPrivNew = await openStoreKey(aRoot, familyRotation.copies[0]);
+const areaRewrapped = await sealPlacedText(familyPrivNew, PHOTO_KEY, await openPlacedText(familyPrivOld, PHOTO_KEY, areaSealed));
 // …and from here the departing member's material opens nothing:
 await assert.rejects(() => openStoreKey(kid1Root, familyRotation.copies[0]), "their root opens none of the new copies");
-await assert.rejects(() => unwrapContentKey(familyPrivOld, areaRewrapped), "their old store key unwraps no re-wrapped key");
+await assert.rejects(() => unwrapPlacedKey(familyPrivOld, PHOTO_KEY, areaRewrapped), "their old store key unwraps no re-wrapped key");
+// …nor can they write: a value they seal with the OLD key (its PSK) does
+// not open under the new one, even in the right place.
+const leaverMint = await wrapPlacedKey(familyPrivOld, PHOTO_KEY, newContentKey());
+await assert.rejects(() => unwrapPlacedKey(familyPrivNew, PHOTO_KEY, leaverMint), "the leaver can no longer seal into the family area");
 // The remaining family keeps reading everything.
-const familyPrivNew = await openStoreKey(aRoot, familyRotation.copies[0]);
-assert.deepEqual(dec.decode(await openWith(await unwrapContentKey(familyPrivNew, areaRewrapped), areaData)), dec.decode(areaPlain), "the family keeps reading; the leaver does not");
+assert.deepEqual(dec.decode(await openWith(await unwrapPlacedKey(familyPrivNew, PHOTO_KEY, areaRewrapped), areaData)), dec.decode(areaPlain), "the family keeps reading; the leaver does not");
 
 console.log("ok  family: hierarchy, denials, enrolment code, rotations, member removal");

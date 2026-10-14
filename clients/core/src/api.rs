@@ -153,7 +153,9 @@ impl Client {
 		// sent `?version=0` and only worked because the server ignored the
 		// query entirely — the bug fixed in commit 23, S17.)
 		let query = version.map(|v| format!("?version={v}")).unwrap_or_default();
-		let mut r = self.req("GET", &self.url(&format!("/files/{id}{query}")));
+		// `x-gorani-client`: what kind of client read this, for the read log
+		// (O14) — a description, not a credential.
+		let mut r = self.req("GET", &self.url(&format!("/files/{id}{query}"))).set("x-gorani-client", "cli");
 		if let Some((a, b)) = range {
 			r = r.set("Range", &format!("bytes={a}-{}", b.saturating_sub(1)));
 		}

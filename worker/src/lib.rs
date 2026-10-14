@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Everything this program receives from a client is already sealed in the
-//! client (GV02 content, GV03-wrapped keys, sealed names). It verifies who the
+//! client (GV02 content; keys and names sealed into their places, GV04). It verifies who the
 //! caller is, checks shapes, stores and relays — and never holds a key that
 //! can open content. This scaffold wires the entrypoint; routes arrive per
 //! commit:
@@ -38,6 +38,7 @@ mod files_store;
 mod member;
 mod routes;
 mod s3;
+mod schema;
 
 /// The nightly maintenance pass (wrangler.jsonc › `triggers` › `crons`):
 /// per member — retention housekeeping on the deployment defaults and
@@ -46,9 +47,10 @@ mod s3;
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 	if let Err(e) = cron::run(env).await {
-		// A failed pass is loud in observability and retried by the next
-		// trigger; the family's data never depends on this having run.
-		console_log!("gorani cron failed: {e}");
+		// A failed pass is loud in observability (an error, not a log line)
+		// and retried by the next trigger; the deletion outbox keeps what it
+		// could not finish (O10). The family's data never depends on it.
+		console_error!("gorani cron failed: {e}");
 	}
 }
 

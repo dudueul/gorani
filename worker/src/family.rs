@@ -26,6 +26,8 @@ use worker::{durable_object, DurableObject, Env, Error, Request, Response, Resul
 
 use crate::auth;
 
+/// APPEND-ONLY: a statement's index is its identity in the schema ledger
+/// (schema.rs). Never reorder or edit a shipped line; add new ones at the end.
 pub const MIGRATIONS: &[&str] = &[
 	// Family-level key/values: the master's public half, deployment flags.
 	"CREATE TABLE IF NOT EXISTS family (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
@@ -76,18 +78,24 @@ struct FamilyState {
 #[durable_object]
 pub struct GoraniFamilyDO {
 	sql: worker::SqlStorage,
+	/// A failed migration, kept instead of panicking (schema.rs).
+	schema: std::result::Result<(), String>,
 }
 
 impl DurableObject for GoraniFamilyDO {
 	fn new(state: State, _env: Env) -> Self {
 		let sql = state.storage().sql();
-		for stmt in MIGRATIONS {
-			sql.exec(stmt, None).expect("family migration");
-		}
-		Self { sql }
+		// The same ledger as the member stores (schema.rs). This list has no
+		// ADD COLUMN yet — which is why the registry survived restarts while
+		// every member store hung — but the next one would have broken it too.
+		let schema = crate::schema::migrate(&sql, MIGRATIONS);
+		Self { sql, schema }
 	}
 
 	async fn fetch(&self, req: Request) -> Result<Response> {
+		if let Err(e) = &self.schema {
+			return json_error(500, &format!("registry schema: {e}"));
+		}
 		// Errors become JSON with their message: an opaque 500 helps nobody,
 		// least of all the tests that must tell refusals from faults.
 		match self.dispatch(req).await {
@@ -244,6 +252,17 @@ impl GoraniFamilyDO {
 		let has_members = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE active = 1", None)?.one::<Count>()?.n > 0;
 		if has_members && !self.is_parent(actor).await? {
 			return json_error(403, "only a parent may add members");
+		}
+		// The bootstrap (O18): the first member needs the Worker's proof that
+		// the operator's BOOTSTRAP_TOKEN was presented — and is a parent (a
+		// family whose only member is a child has no one to run it).
+		if !has_members {
+			if body.bootstrap.as_deref() != Some("ok") {
+				return json_error(403, body.bootstrap.as_deref().unwrap_or("the first member needs the bootstrap token"));
+			}
+			if body.role != "parent" {
+				return json_error(400, "the first member must be a parent");
+			}
 		}
 		if let Some(e) = self.email_taken(&body.emails, None)? {
 			return json_error(409, &format!("{e} already belongs to another member"));
@@ -453,6 +472,10 @@ struct NewMember {
 	role: String,
 	#[serde(default)]
 	emails: Vec<String>,
+	/// The Worker's bootstrap verdict ("ok", or why not) — set by routes.rs
+	/// on every create, overwriting anything a client sent (O18).
+	#[serde(default, rename = "__bootstrap")]
+	bootstrap: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct PatchMember {

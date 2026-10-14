@@ -63,3 +63,17 @@ export function resolveRange(header, size) {
 	if (start > end || start >= size) return null;
 	return { start, end };
 }
+
+/**
+ * Exactly the bytes the browser asked for (commit 25, O11): the decrypted
+ * frames cover [first frame start, last frame end]; the answer is the
+ * requested [start, end] cut out of them, with a Content-Range that says
+ * so. The worker used to answer with the whole frame span — a response
+ * starting before the requested offset, which media stacks may reject.
+ */
+export function cutToRange(plainFrames, framesStart, start, end) {
+	const from = start - framesStart;
+	const to = Math.min(end - framesStart + 1, plainFrames.length);
+	if (from < 0 || from >= to) throw new Error("range outside the decrypted frames");
+	return plainFrames.subarray(from, to);
+}

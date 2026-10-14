@@ -144,6 +144,9 @@ fn opens_what_the_browser_sealed_and_seals_what_it_opens() {
 			"chunkedPlain": STANDARD.encode(&plain),
 			"textSealed": formats::seal_text(&h_pub, "러스트가 봉인한 이름.txt"),
 			"rewrapped": formats::wrap_content_key(&p_pub, &key),
+			// GV04 (commit 25): the hybrid key as a store, sealing into places.
+			"placedName": gorani_formats::placed::seal_placed_text(&h_priv, &gorani_formats::placed::Place::file_name("jinu", "f-0002"), "러스트가 봉인한 증거.bin").unwrap(),
+			"placedKey": gorani_formats::placed::wrap_placed_key(&h_priv, &gorani_formats::placed::Place::file_key("jinu", "f-0002", 7), &key).unwrap(),
 		});
 		std::fs::write(out_path, serde_json::to_string_pretty(&out).unwrap()).unwrap();
 	}
@@ -192,4 +195,28 @@ fn store_record_mac_from_typescript() {
 
 fn rec_copy<'a>(r: &gorani_formats::records::StoreRecord<'a>) -> gorani_formats::records::StoreRecord<'a> {
 	gorani_formats::records::StoreRecord { name: r.name, key_id: r.key_id, ec_public: r.ec_public, kem_public: r.kem_public, private_key_sealed: r.private_key_sealed }
+}
+
+/// Placed sealing (commit 25, GV04, docs/SECURITY-REVIEW.md › O6): the
+/// browser sealed a name and a content key into their places with the
+/// hybrid key acting as a store. Rust derives the same store PSK, opens
+/// both where they belong — and nowhere else.
+#[test]
+fn placed_values_from_typescript() {
+	use gorani_formats::placed::{open_placed_text, store_psk, unwrap_placed_key, Place};
+	let v = vectors();
+	let store = VaultPrivateKey::from_bytes(&b(&v["hybrid"]["bundle"])).unwrap();
+	let p = &v["placed"];
+	let (member, file, version) = (s(&p["store"]), s(&p["file"]), p["version"].as_i64().unwrap());
+	assert_eq!(STANDARD.encode(*store_psk(&store).unwrap()), s(&p["psk"]), "the same store PSK from the same key");
+	assert_eq!(&*open_placed_text(&store, &Place::file_name(member, file), s(&p["nameSealed"])).unwrap(), s(&p["name"]));
+	let key = unwrap_placed_key(&store, &Place::file_key(member, file, version), s(&p["keySealed"])).unwrap();
+	assert_eq!(STANDARD.encode(*key), s(&p["contentKey"]));
+	// Moved: the name to another file, the key to another version or kind.
+	assert!(open_placed_text(&store, &Place::file_name(member, "f-0003"), s(&p["nameSealed"])).is_err());
+	assert!(unwrap_placed_key(&store, &Place::file_key(member, file, version + 1), s(&p["keySealed"])).is_err());
+	assert!(unwrap_placed_key(&store, &Place::file_type(member, file, version), s(&p["keySealed"])).is_err());
+	// The P-256-only key cannot be a store at all.
+	let p256 = VaultPrivateKey::from_bytes(&b(&v["p256"]["pkcs8"])).unwrap();
+	assert!(store_psk(&p256).is_err());
 }

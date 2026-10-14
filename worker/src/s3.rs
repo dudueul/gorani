@@ -52,7 +52,10 @@ pub fn config(env: &Env) -> Result<S3Config> {
 	let secret = |name: &str| -> Result<String> {
 		env.secret(name).map(|v| v.to_string()).or_else(|_| var(name))
 	};
-	let endpoint = var("S3_ENDPOINT")?.trim_end_matches('/').to_string();
+	let raw = var("S3_ENDPOINT")?.trim_end_matches('/').to_string();
+	// A bare host (`s3.eu-central-1.idrivee2.com`, as provider consoles show
+	// it) means https — never http, which only `wrangler dev` may use.
+	let endpoint = if raw.contains("://") { raw } else { format!("https://{raw}") };
 	// TLS is part of the signing contract, not an option (security review,
 	// commit 23). The signer uses UNSIGNED-PAYLOAD — the body is NOT covered
 	// by the signature, only by the transport — so over plain http anyone
@@ -69,7 +72,8 @@ pub fn config(env: &Env) -> Result<S3Config> {
 		region: var("S3_REGION")?,
 		bucket: var("S3_BUCKET")?,
 		access_key: secret("S3_ACCESS_KEY_ID")?,
-		secret_key: secret("S3_SECRET_KEY")?,
+		// (`S3_SECRET_ACCESS_KEY`, the AWS-style name, is accepted too.)
+		secret_key: secret("S3_SECRET_KEY").or_else(|_| secret("S3_SECRET_ACCESS_KEY"))?,
 	})
 }
 

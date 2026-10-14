@@ -25,16 +25,49 @@ simulator so both branches stay tested.
 5. Prove it: `GORANI_LIVE_S3=1 S3_ENDPOINT=… S3_REGION=… S3_BUCKET=…
    S3_ACCESS_KEY_ID=… S3_SECRET_KEY=… node tests/api/s3-live.test.mjs`
    against a dedicated test bucket — it checks that anonymous reads are
-   refused before it writes anything. More: docs/SECURITY-REVIEW.md ›
-   Operational controls.
+   refused, and that a signed list works, before it writes anything. Add
+   `GORANI_LIVE_S3_LOCK=1` for a bucket with Object Lock (below): it locks
+   ONE small object for ONE day and asks the server to delete it. More:
+   docs/SECURITY-REVIEW.md › Operational controls.
 
 `wrangler.jsonc` vars: `S3_ENDPOINT`, `S3_REGION` (any string MinIO
 accepts, e.g. `us-east-1`), `S3_BUCKET`. The endpoint must be `https://`
 — the worker refuses anything else outside `wrangler dev` (the signatures
-use UNSIGNED-PAYLOAD, so body integrity is TLS's job). Secrets (`wrangler secret put`):
-`S3_ACCESS_KEY_ID`, `S3_SECRET_KEY`. The worker signs SigV4 with path-style
-addressing (`https://endpoint/bucket/key`) — verified against golden
-vectors in `crates/s3`.
+use UNSIGNED-PAYLOAD, so body integrity is TLS's job); a bare host
+(`s3.example.com`, as provider consoles print it) means `https://`.
+Secrets (`wrangler secret put`): `S3_ACCESS_KEY_ID`, `S3_SECRET_KEY`
+(`S3_SECRET_ACCESS_KEY`, the AWS spelling, is read too). The worker signs
+SigV4 with path-style addressing (`https://endpoint/bucket/key`) —
+verified against golden vectors in `crates/s3`.
+
+### A hosted S3 provider: IDrive e2
+
+Nothing in gorani is provider-specific; these are the points where e2's
+console differs from the MinIO steps above.
+
+- **Endpoint and region**: e2 gives each region its own host, shown on the
+  bucket's page — e.g. `s3.eu-central-1.idrivee2.com` with region
+  `eu-central-1`. Use the region the host names; SigV4 signs it into the
+  scope, and a wrong one is refused as a bad signature, not a bad region.
+- **The bucket**: create it with **Object Lock enabled** if it will hold
+  evidence (e2 offers it only at creation; it turns versioning on), and
+  set **no default retention** — gorani locks each evidence object itself,
+  and a bucket default would lock working files and the purge with them.
+  Leave it private; gorani uses no ACLs (e2 does not support them).
+- **The key**: an access key limited to that one bucket. The worker needs
+  object read/write/delete, multipart and list; nothing at bucket level.
+- **Lifecycle**: the 2-day rule for incomplete multipart uploads (step 4),
+  and — because an Object Lock bucket is versioned — a rule expiring
+  NONCURRENT versions after a few days, where e2 offers one: a delete in a
+  versioned bucket only hides the object (a delete marker), so purged
+  working files would otherwise stay billed. Locked versions are immune
+  to such a rule until their retention ends; that is the point.
+- **Prove it** with step 5, then once with `GORANI_LIVE_S3_LOCK=1`
+  (it reads the bucket's Object Lock and versioning settings first, and
+  writes nothing if they are not what gorani expects).
+- **Cost shape**: e2 bills storage only, with egress included up to a
+  multiple of what is stored (check the current terms) — the edge cache
+  (below) matters less for the bill here than for latency.
 
 Part-size rule (both backends): a multipart upload's parts are GC01
 frames, and every part but the last must be ≥ 5 MiB. The chunk the client
@@ -135,6 +168,8 @@ Object Lock can only be enabled when a bucket is CREATED. For evidence:
 - **AWS S3**: create the bucket with "Object Lock" enabled (it enables
   versioning). No default retention — gorani sets each evidence object's
   retention itself, so working files keep their Trash and purge.
+- **IDrive e2** (and other hosted S3): the same — Object Lock at creation,
+  no default retention (see › A hosted S3 provider: IDrive e2).
 - **R2**: no per-object retention through the Workers binding; add a
   bucket lock rule for the prefix `cases/` with the retention you need
   (it then applies to working cases too — a stricter default), and
@@ -148,6 +183,16 @@ counsel before turning it on; it cannot be taken back for objects already
 locked. Evidence uploaded while it was off is locked on the next request to
 its case. A lock that fails is retried; the nightly pass reports any still
 failing (HTTP 503 from the member pass, logged as a cron failure).
+
+A bucket with Object Lock is **versioned**. Two consequences: a purge of a
+working file removes it from gorani's view and leaves a noncurrent version
+behind (add a lifecycle rule that expires noncurrent versions — it cannot
+touch a version still under retention); and a credential that skips the
+Worker can still add a delete marker above an evidence object — the
+locked version stays and can be restored, but the Worker answers 404 for
+it until someone does. The lock protects versions, not the current
+pointer; `tests/api/s3-live.test.mjs` with `GORANI_LIVE_S3_LOCK=1` proves
+the version part against the real server.
 
 ### Upgrading across commit 29 (the audit trails)
 

@@ -187,12 +187,40 @@ here" — not *who* (per-member signatures over each upload are D5), and not
 *freshness* (the server can still serve an older row; it is at least
 consistently what it claims to be).
 
+### O7 + O8, fixed in commit 25 — the backup's label, and what a stored KDF may ask
+
+| # | Sev | What | Fix |
+|---|---|---|---|
+| O7 | Medium | **GB1 authenticated the segments, not the header** — and the header is what a restore believes (`stamp`, `kind`). Anyone holding the bytes (the bucket, a download folder, an offline copy) could relabel one backup as another and nothing failed. The header did not even say *when* it was made. | **GB2** (`crates/formats/src/backup.rs`, `web/src/vault/backup.ts`): H = SHA-256(magic ‖ headerLen ‖ header) ends every segment's AAD; the writer emits the prefix itself so H is of exactly the bytes written; the header carries a sealed `createdAt`. Change one header byte and nothing opens. |
+| O7a | Medium | **A backup cut down to its header parsed as a valid, EMPTY backup** in both readers (zero segments, zero entries, no error). | The writer always emits a final segment; both readers require one. |
+| O7b | Low | The Rust reader compared the last 8 bytes of each stored nonce and rebuilt the rest: 4 bytes per segment were free to change. | All 12 bytes are compared against the counter nonce (both readers). |
+| O8 | Medium | **Argon2 bounds**: the floor allowed one pass at 19 MiB (below OWASP's 19 MiB / 2 passes); the ceiling allowed 1 GiB, 20 passes, 16 lanes — and every password method was tried, so a server serving a padded settings row (or a share link's `kdf`) could freeze a phone for minutes. Salts had no length check. | `web/src/vault/kdf-bounds.ts` (+ the Rust twin in `unlock.rs`): m 19–256 MiB, t 2–10, p 1–8; salts 16–64 bytes; at most 4 password methods tried per unlock (`MAX_PASSWORD_METHODS`). Vault methods, device copies and share links all pass through it; the module has no imports so the share page carries it cheaply. |
+
+The honest scope of O7: the **Worker writes backups** (it holds the
+backup public key, by design: the server writes backups and never opens
+them), so a malicious *server* could still write a whole false backup with
+any header it likes. What GB2 adds is integrity at rest — against whoever
+can change bytes but cannot run the Worker. A forged backup's contents are
+still bounded by O6: it can only replay genuine placed values, never mint
+new ones (that takes the store's PSK). Per-member signatures over backups
+are D5.
+
+Proven by: `cargo test -p gorani-formats` (relabelled header, header-only
+truncation, a flipped nonce byte — each refused; an honestly empty backup
+still round-trips; the bounds both ways; a real method in 5th place is
+never reached, inside the cap it opens), `api:backup` (the browser reader
+refuses a relabelled `createdAt` and a header-only file from the real
+Worker), `unit:kdf-bounds` (the same bounds and cap in TypeScript, plus a
+share link's `kdf`).
+
+Upgrade note: backups written before commit 25 are GB1 and hold GV03
+values, which a GV04 store refuses — restore them with the release that
+wrote them, then take a fresh backup (docs/PRODUCTION.md › Backups).
+
 ## Open findings (proposals — need a decision)
 
 | # | Sev | Finding | Proposal |
 |---|---|---|---|
-| O7 | Medium | GB1: header outside the AAD; nonce prefix not compared. | Hash the header into each segment's AAD; compare full nonce. |
-| O8 | Medium | Argon2 bounds: floor below OWASP (t=1 at 19 MiB), ceiling lets a server freeze a phone. | t ≥ 2 floor; ~256 MiB / t ≤ 10 ceiling; cap methods tried. |
 | O9 | Medium | The backup job is in memory and one missing object aborts the run. | Multipart streaming; record missing objects. |
 | O10 | Medium | Cron ignores non-2xx and S3-delete failures (manifest row removed, `.gbak` orphaned). | Collect failures, fail the pass, delete rows only after the object. |
 | O11 | Medium | Media service worker: keys never forgotten, scope cannot control `/`, wrong AAD on the whole-object path. | Scope `/` (handle `/media/` only), forget on close/lock, fix AAD. |

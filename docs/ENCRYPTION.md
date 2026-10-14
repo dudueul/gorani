@@ -1,4 +1,4 @@
-# Encryption: the byte-level specification (GV01–GV04, GK01, GW01, GC01, GB1)
+# Encryption: the byte-level specification (GV01–GV04, GK01, GW01, GC01, GB2)
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > Written from the code (`crates/formats/src/`, `web/src/vault/vault-crypto.ts`) as of commit ⑨c; the code is the authority.
@@ -14,7 +14,7 @@
 | **GK01** | a hybrid private key's bytes (bundle) | container | — | — | — |
 | **GW01** | a private key wrapped by an unlock secret | AES-256-GCM under the KEK | 32 B | the unlock secret | yes |
 | **GC01** | a large file in frames | AES-256-GCM per 8 MiB frame, position+finality AAD | 28 B/frame | the content key | yes |
-| **GB1** | the backup container | AES-256-GCM segments under a per-backup file key | ~28 B/1 MiB | the key file | yes |
+| **GB2** | the backup container (header authenticated; GB1 before commit 25) | AES-256-GCM segments under a per-backup file key | ~28 B/1 MiB | the key file | yes |
 
 The pattern everywhere: **content is GV02** (fast, symmetric, one fresh key per item) and only the small content key is sealed — into its place in the store (GV04, since commit 25; GV03 before). Key material sealed to a member's root (store records, master copies, guardian copies) stays GV03. Rotation re-seals keys, never content.
 
@@ -206,9 +206,31 @@ objects (the API tolerates it; the client never does), the random-nonce
 bound degrades gracefully but the per-version rule is the invariant to
 keep.
 
-### GB1 — backups
+### GB2 — backups (GB1 before commit 25)
 
-See `crates/formats/src/backup.rs` header + docs in that file: counter nonces, position+finality AAD, the file key sealed (GV03) into the header to the backup public key.
+```text
+"GBAK2\n" ‖ headerLen (4 BE) ‖ header JSON ‖ segment 0 ‖ … ‖ final segment
+header    = { format: "gorani-backup", v: 2, stamp, createdAt, kind, keyId, wrapped, seg, alg }
+H         = SHA-256(magic ‖ headerLen ‖ header)
+segment i = nonce (0x00000000 ‖ i, u64 BE) ‖ AES-256-GCM(fileKey, ≤ 1 MiB, AAD_i) ‖ tag
+AAD_i     = "GBAK2" ‖ '2' ‖ 'A' ‖ final (1) ‖ i (8 BE) ‖ H (32)
+```
+
+Counter nonces (one key spans many segments — they can never repeat), all
+twelve nonce bytes checked, position + finality + the header's hash in every
+AAD: segments cannot be reordered, dropped, duplicated or cut, the file
+cannot be cut down to its header, and the header cannot be relabelled. The
+file key is sealed (GV03) into the header to the backup public key; only
+the owner's key file opens it. Code + the "what GB2 fixed" story:
+`crates/formats/src/backup.rs`; the browser's reader: `web/src/vault/backup.ts`.
+
+### KDF bounds (commit 25)
+
+Stored Argon2id settings are served by the server, so they are bounded both
+ways before any run: memory 19–256 MiB, passes 2–10, lanes 1–8; salts 16–64
+bytes; at most 4 password methods tried per unlock. gorani writes 64 MiB /
+3 passes / 4 lanes (RFC 9106's second recommendation). `web/src/vault/kdf-bounds.ts`,
+`crates/formats/src/unlock.rs › check_argon2`.
 
 ## What the server can read
 

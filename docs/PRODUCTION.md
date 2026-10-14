@@ -103,11 +103,18 @@ the Worker's logs.
 
 ## 4. Backups
 
+> **Upgrading across commit 25:** backups written before it are GB1 and
+> hold GV03 values, which a GV04 store refuses. Keep the old release (or a
+> checkout of it) to restore those, and take a fresh backup right after
+> upgrading — the new one is the one you will restore from.
+
 1. In the app, generate the backup key pair and **download the key file** —
    the only copy of the private bundle; the server stores the public half.
 2. `POST /api/v1/members/<id>/backup/run` writes `backups/<stamp>.gbak` —
-   sealed twice over (the objects are already GV-sealed; the GB1 container
-   wraps them under a key only your key file opens). Runs are created on
+   sealed twice over (the objects are already GV-sealed; the GB2 container
+   wraps them under a key only your key file opens, and authenticates its
+   own header — when it was made, which kind — so a copy cannot be
+   relabelled at rest). Runs are created on
    purpose — by the owner in the app — not silently by the server: the
    in-memory job is sized for on-demand runs, and a daily full copy is a
    storage-economics decision a family should make knowingly.

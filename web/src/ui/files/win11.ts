@@ -25,6 +25,7 @@
 
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
+import { styleMap } from "lit/directives/style-map.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
@@ -552,7 +553,7 @@ export class GoraniWin11 extends LitElement {
 					<div>
 						<button
 							class="flex w-full items-center gap-1.5 rounded-lg py-1.5 pr-2.5 hover:bg-neutral-800 ${s.folderId === f.id && !s.trashMode ? "bg-neutral-800" : ""}"
-							style="padding-left: ${8 + depth * 14}px"
+							style=${styleMap({ paddingLeft: `${8 + depth * 14}px` })}
 							@click=${() => void this.model.setFolder(f.id)}
 							@drop=${(e: DragEvent) => this.onDropIntoFolder(e, f.id)}
 							@dragover=${(e: DragEvent) => e.preventDefault()}
@@ -599,7 +600,7 @@ export class GoraniWin11 extends LitElement {
 				<button class="text-left hover:text-neutral-200" @click=${() => this.model.sortBy("type")}>Type${sortArrow("type")}</button>
 				<button class="text-right hover:text-neutral-200" @click=${() => this.model.sortBy("size")}>Size${sortArrow("size")}</button>
 			</div>
-			<div class="p-2" style="content-visibility: auto">
+			<div class="p-2 [content-visibility:auto]">
 				${folders.map((f) => item("folder", f.id, f.name, "folder", f.updatedAt, null))}
 				${files.map((f) => item("file", f.id, f.name, f.kind, f.updatedAt, f.size))}
 				${!folders.length && !files.length ? html`<p class="p-8 text-center text-sm text-neutral-500">${this.s().loading ? "Opening…" : "This folder is empty"}</p>` : nothing}
@@ -626,7 +627,7 @@ export class GoraniWin11 extends LitElement {
 			</div>
 		`;
 		return html`
-			<div class="grid gap-1.5 p-3 ${large ? "grid-cols-[repeat(auto-fill,minmax(112px,1fr))]" : this.view === "small" ? "grid-cols-[repeat(auto-fill,minmax(240px,1fr))]" : "grid-cols-[repeat(auto-fill,minmax(180px,1fr))]"}" style="content-visibility: auto">
+			<div class="grid gap-1.5 p-3 [content-visibility:auto] ${large ? "grid-cols-[repeat(auto-fill,minmax(112px,1fr))]" : this.view === "small" ? "grid-cols-[repeat(auto-fill,minmax(240px,1fr))]" : "grid-cols-[repeat(auto-fill,minmax(180px,1fr))]"}">
 				${folders.map((f) => cell("folder", f.id, f.name, "folder"))}
 				${files.map((f) => cell("file", f.id, f.name, f.kind))}
 				${!folders.length && !files.length ? html`<p class="col-span-full p-8 text-center text-sm text-neutral-500">${this.s().loading ? "Opening…" : "This folder is empty"}</p>` : nothing}

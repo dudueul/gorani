@@ -810,20 +810,33 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 	};
 	match segs.get(2) {
 		None => {
-			// Serve the self-contained recipient page. s.html lives outside
-			// /s/* (the asset server owns it), so this self-fetch cannot loop.
-			let origin = { let url = req.url()?; format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()) };
-			let page = Fetch::Url(Url::parse(&format!("{origin}/s.html")).map_err(|_| Error::RustError("page missing".into()))?).send().await?;
-			let mut page = page;
+			// Serve the recipient page from the ASSETS binding (wrangler.jsonc ›
+			// assets.binding) — an in-process read of the built s.html.
+			//
+			// Commit 24: this used to `fetch("<own origin>/s.html")` over the
+			// network. A Worker's subrequest to its own hostname is refused
+			// (workers.dev, wrangler dev's loopback) or loops back through the
+			// Worker, so /s/f/<id> answered a bare 500 and the share page was
+			// never served — the api suites only ever called /meta, /claim and
+			// /data, and the e2e never opened a link. The binding is the
+			// platform's own door to the static files.
+			let mut page = env.assets("ASSETS")?.fetch("https://assets.internal/s.html", None).await?;
+			if page.status_code() != 200 {
+				return http_text(500, "the share page is missing from this deployment").await;
+			}
 			let body = page.bytes().await?;
 			let headers = Headers::new();
 			headers.set("Content-Type", "text/html; charset=utf-8")?;
 			headers.set("Cache-Control", "no-store")?;
 			// The page holds the link secret (in the fragment) while it runs:
 			// never framed by another site, never leaking its URL in a Referer,
-			// never MIME-sniffed. (A full script CSP for s.html needs its
-			// inline module moved out first — see docs/SECURITY-REVIEW.md.)
-			headers.set("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'none'")?;
+			// never MIME-sniffed — and since commit 24 a full script policy:
+			// its code is /s.js + the vendored Argon2id (WebAssembly, hence
+			// 'wasm-unsafe-eval'), nothing inline, and Trusted Types with NO
+			// policy at all ('none'): the page writes the DOM only through
+			// textContent/classList, so no string can ever become markup.
+			// Kept in step with the /s.html rule in web/public/_headers.
+			headers.set("Content-Security-Policy", SHARE_PAGE_CSP)?;
 			headers.set("Referrer-Policy", "no-referrer")?;
 			headers.set("X-Content-Type-Options", "nosniff")?;
 			Ok(Response::from_bytes(body)?.with_headers(headers))
@@ -902,6 +915,9 @@ async fn http_text(status: u16, text: &str) -> Result<Response> {
 	r = r.with_status(status).with_headers(h);
 	Ok(r)
 }
+
+/// The share recipient page's CSP (also in web/public/_headers › /s.html).
+const SHARE_PAGE_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 
 // ── Share plumbing (the Worker's half; the DO owns rows) ───────────────────
 

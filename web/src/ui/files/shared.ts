@@ -11,6 +11,7 @@
 
 import { LitElement, html, nothing } from "lit";
 import { customElement, property } from "lit/decorators.js";
+import { styleMap } from "lit/directives/style-map.js";
 import type { FileKind } from "./icons.ts";
 
 export function fmtSize(bytes: number): string {
@@ -85,7 +86,7 @@ export function dragIds(dt: DataTransfer): { kind: string; id: string }[] | null
 
 export interface MenuItem {
 	label: string;
-	icon?: string; // an svg string (icons.ts)
+	icon?: Node; // an SVG element (icons.ts › icon)
 	run?: () => void;
 	separator?: boolean;
 	disabled?: boolean;
@@ -120,7 +121,12 @@ export class GoraniMenu extends LitElement {
 
 	protected override render() {
 		return html`
-			<div class="fixed z-50 min-w-52 rounded-xl border border-neutral-700 bg-neutral-900/95 py-1.5 shadow-2xl backdrop-blur" style="left:${Math.min(this.x, innerWidth - 240)}px; top:${Math.min(this.y, innerHeight - this.items.length * 34 - 24)}px" role="menu" tabindex="-1">
+			<div
+				class="fixed z-50 min-w-52 rounded-xl border border-neutral-700 bg-neutral-900/95 py-1.5 shadow-2xl backdrop-blur"
+				style=${styleMap({ left: `${Math.min(this.x, innerWidth - 240)}px`, top: `${Math.min(this.y, innerHeight - this.items.length * 34 - 24)}px` })}
+				role="menu"
+				tabindex="-1"
+			>
 				${this.items.map((item) =>
 					item.separator
 						? html`<div class="my-1.5 border-t border-neutral-800"></div>`
@@ -196,16 +202,31 @@ export function promptName(title: string, placeholder: string): Promise<string |
 		wrap.className = "fixed inset-0 z-50 flex items-center justify-center bg-black/50";
 		const card = document.createElement("div");
 		card.className = "w-80 rounded-2xl border border-neutral-700 bg-neutral-900 p-5 shadow-2xl";
-		card.innerHTML = `<h3 class="text-sm font-medium text-neutral-200"></h3><input class="mt-3 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-[var(--color-accent)]" /><div class="mt-4 flex justify-end gap-2"><button class="rounded-lg px-3 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800" data-no>Cancel</button><button class="rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-neutral-950 hover:opacity-90" data-yes>Create</button></div>`;
-		(card.querySelector("h3") as HTMLElement).textContent = title;
-		const input = card.querySelector("input")!;
+		// Built node by node, not with `card.innerHTML = …` (commit 24): under
+		// the app's Trusted Types CSP an innerHTML assignment throws — there is
+		// deliberately no policy that turns strings into HTML. The markup was
+		// static, so nothing was exploitable; the point is that NO sink exists
+		// for the next, less careful, edit to reach.
+		const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string) => {
+			const e = document.createElement(tag);
+			e.className = cls;
+			if (text) e.textContent = text;
+			return e;
+		};
+		const heading = el("h3", "text-sm font-medium text-neutral-200", title);
+		const input = el("input", "mt-3 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-[var(--color-accent)]");
 		input.placeholder = placeholder;
+		const no = el("button", "rounded-lg px-3 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800", "Cancel");
+		const yes = el("button", "rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-neutral-950 hover:opacity-90", "Create");
+		const row = el("div", "mt-4 flex justify-end gap-2");
+		row.append(no, yes);
+		card.append(heading, input, row);
 		const done = (v: string | null) => {
 			wrap.remove();
 			resolve(v);
 		};
-		card.querySelector("[data-yes]")!.addEventListener("click", () => done(input.value.trim() || null));
-		card.querySelector("[data-no]")!.addEventListener("click", () => done(null));
+		yes.addEventListener("click", () => done(input.value.trim() || null));
+		no.addEventListener("click", () => done(null));
 		input.addEventListener("keydown", (e) => {
 			if (e.key === "Enter") done(input.value.trim() || null);
 			if (e.key === "Escape") done(null);

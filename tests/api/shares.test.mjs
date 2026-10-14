@@ -85,6 +85,16 @@ try {
 	assert.ok(mine && mine.ready && !mine.revoked);
 
 	// ── 2. The recipient opens it — no member identity at all ──────────
+	// First the PAGE itself (commit 24): it used to be fetched by the Worker
+	// from its own public origin, a subrequest the platform refuses — so
+	// /s/f/<id> was a bare 500 and no link ever opened. It now comes from the
+	// ASSETS binding, under the share page's own strict CSP.
+	const pageRes = await fetch(`${dev.base}/s/f/${id}`);
+	assert.equal(pageRes.status, 200, "the share page is served");
+	assert.match(pageRes.headers.get("content-type") ?? "", /^text\/html/);
+	assert.match(pageRes.headers.get("content-security-policy") ?? "", /trusted-types 'none'/, "with the share page's policy, not the API's");
+	assert.match(await pageRes.text(), /src="\/s\.js"/, "the built page, whose code is the same-origin /s.js");
+
 	const metaRes = await fetch(`${dev.base}/s/f/${id}/meta`);
 	if (metaRes.status !== 200) console.error("META FAIL", metaRes.status, await metaRes.text());
 	assert.equal(metaRes.status, 200);

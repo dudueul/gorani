@@ -1,0 +1,46 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+#
+# Security headers for every STATIC asset (Cloudflare Workers static assets
+# read this file; Vite copies it from public/ into dist/). Worker responses
+# (/api/*, /s/*) get theirs in worker/src/lib.rs › harden — the platform's
+# asset server answers the paths below without running the Worker at all,
+# which is why the CSP the app always claimed was never sent (commit 24,
+# docs/SECURITY-REVIEW.md › O1).
+#
+# The CSP, directive by directive:
+#   default-src 'none'          deny by default; everything below is an exception
+#   script-src 'self'           only our hashed bundles — no inline script, no CDN
+#     'wasm-unsafe-eval'        WebAssembly.compile for Argon2id (hash-wasm); NOT 'unsafe-eval'
+#   style-src 'self'            the compiled Tailwind file; Lit's styleMap uses the CSSOM (allowed)
+#   img-src 'self' blob:        decrypted previews are blob: URLs (raster types only, mode.ts)
+#   media-src 'self' blob:      the media service worker (/media/) and decrypted blobs
+#   connect-src 'self'          the API; no third-party origin, ever
+#   worker-src 'self'           the local-index worker and the media service worker
+#   form-action 'none'          the app has no HTML form submissions
+#   frame-ancestors 'none'      never framed (clickjacking); X-Frame-Options for old browsers
+#   base-uri 'none'             no <base> hijack of relative URLs
+#   object-src 'none'           no plugins
+#   require-trusted-types-for 'script'
+#   trusted-types lit-html default
+#                               every string→code sink needs a policy; only Lit's and
+#                               ours (web/src/lib/trusted-types.ts) exist
+
+/*
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types lit-html default
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), interest-cohort=()
+  Strict-Transport-Security: max-age=63072000; includeSubDomains
+
+# The share recipient page (/s.html, and /s — the asset server's
+# extension-less canonical path). A SECOND policy is added: browsers enforce
+# every CSP they receive, so the page runs under both — effectively the
+# stricter share policy (no Trusted Types policy at all). Kept in step with
+# SHARE_PAGE_CSP in worker/src/routes.rs, which serves /s/f/<id>.
+/s.html
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'
+/s
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'

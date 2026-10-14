@@ -443,7 +443,7 @@ export class GoraniFinder extends LitElement {
 			</div>
 		`;
 		return html`
-			<div class="grid grid-cols-[repeat(auto-fill,minmax(118px,1fr))] gap-2 p-4" style="content-visibility: auto">
+			<div class="grid grid-cols-[repeat(auto-fill,minmax(118px,1fr))] gap-2 p-4 [content-visibility:auto]">
 				${folders.map((f) => cell("folder", f.id, f.name, "folder"))}
 				${files.map((f) => cell("file", f.id, f.name, f.kind))}
 				${!folders.length && !files.length ? html`<p class="col-span-full py-16 text-center text-sm text-neutral-500">This folder is empty</p>` : nothing}
@@ -481,7 +481,7 @@ export class GoraniFinder extends LitElement {
 				<button class="text-left hover:text-neutral-200" @click=${() => this.model.sortBy("type")}>Kind${sortArrow("type")}</button>
 				<button class="text-right hover:text-neutral-200" @click=${() => this.model.sortBy("modified")}>Date Modified${sortArrow("modified")}</button>
 			</div>
-			<div class="p-2" style="content-visibility: auto">
+			<div class="p-2 [content-visibility:auto]">
 				${folders.map((f) => item("folder", f.id, f.name, "folder", null))}
 				${files.map((f) => item("file", f.id, f.name, f.kind, f.size))}
 			</div>

@@ -5,13 +5,13 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<!-- INTENDED: a strict Content-Security-Policy (default-src 'none';
-		     self only; Trusted Types). NOT YET DELIVERED: static assets are
-		     served by the platform, not the Worker, and there is no _headers
-		     file — docs/SECURITY-REVIEW.md › O1 (commit 23 corrected this
-		     comment, which used to say the header was sent). In the built
-		     app there is no inline script — the module below is the only
-		     one, served same-origin and hashed. -->
+		<!-- The strict Content-Security-Policy (default-src 'none'; self only;
+		     Trusted Types) arrives as a HEADER from public/_headers — static
+		     assets are served by the platform, not the Worker, so a header the
+		     Worker set would never reach this page (docs/SECURITY-REVIEW.md ›
+		     O1; the e2e suite asserts it is delivered). There is no inline
+		     script or style: the module below is the only script, served
+		     same-origin and hashed. -->
 		<meta name="color-scheme" content="dark" />
 		<meta name="robots" content="noindex" />
 		<title>Gorani</title>

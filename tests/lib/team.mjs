@@ -22,6 +22,7 @@ import { importVaultKey, openSealedText } from "../../web/src/vault/vault-crypto
 import { buildTrust, certify, createIdentity, pin } from "../../web/src/vault/identity.ts";
 import { newCase, sealCaseGrant } from "../../web/src/vault/cases.ts";
 import { sha256Hex, signContentHash } from "../../web/src/vault/content-hash.ts";
+import { signIntake } from "../../web/src/vault/intake.ts";
 import { fromBase64, toBase64 } from "../../web/src/lib/encoding.ts";
 import { storeSealer } from "./placed.mjs";
 
@@ -84,4 +85,11 @@ export async function openCase(dev, lead, id, title, grants = [], kind = "workin
  * form field an evidence upload must carry. */
 export async function signedHash(who, sealer, id, version, plain) {
 	return signContentHash(who.signer, sealer.priv, sealer.member, id, version, await sha256Hex(plain), plain.length);
+}
+
+/** `who`'s signed intake record for a NEW file `id` in the area `sealer`
+ * seals for (commit 29g, intake.ts) — the `intake` form field an evidence
+ * file's first version must carry. Suite-standard fields unless given. */
+export async function signedIntake(who, sealer, id, fields = {}) {
+	return signIntake(who.signer, sealer.priv, sealer.member, id, { source: "a suite fixture", collector: who.id, method: "uploaded by the test", collectedAt: new Date().toISOString(), notes: "", ...fields });
 }

@@ -275,6 +275,28 @@ pub const MIGRATIONS: &[&str] = &[
 	// version)`, so the server stores a claim it can neither read nor
 	// forge. Required on evidence (files_store.rs › hash_refusal).
 	"ALTER TABLE file_versions ADD COLUMN hash_sealed TEXT",
+	// Migration v13 (commit 29e, docs/CUSTODY.md › Stage 5, D8): a malware
+	// sample. Readable, because the SERVER enforces what follows from it (no
+	// share links; one way); the client's own mark is the sealed type
+	// (web/src/vault/samples.ts), which a server cannot clear.
+	"ALTER TABLE files ADD COLUMN sample INTEGER NOT NULL DEFAULT 0",
+	// Migration v14 (commit 29g, docs/CUSTODY.md › Stage 6, D5.6): an
+	// evidence file's intake record (sealed, signed by the uploader), and
+	// its custody chain — offers and acceptances, each signed (custody.rs).
+	"ALTER TABLE files ADD COLUMN intake_sealed TEXT",
+	"CREATE TABLE IF NOT EXISTS custody (
+		file_id TEXT NOT NULL,
+		seq INTEGER NOT NULL,
+		from_member TEXT NOT NULL,
+		to_member TEXT NOT NULL,
+		reason_sealed TEXT NOT NULL,
+		offered_at TEXT NOT NULL,
+		offer_signature TEXT NOT NULL,
+		accepted_at TEXT,
+		accept_signature TEXT,
+		cancelled_at TEXT,
+		PRIMARY KEY (file_id, seq)
+	)",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -335,6 +357,33 @@ impl DurableObject for GoraniMemberDO {
 		out
 	}
 
+}
+
+// ── The legal hold (commit 29f, docs/CUSTODY.md › Stage 6, D5.7) ────────
+
+impl GoraniMemberDO {
+	/// Is this store under a legal hold? While it is, nothing leaves: trash
+	/// is refused (files_store.rs › evidence_refusal) and housekeeping purges
+	/// and prunes nothing.
+	pub(crate) async fn is_held(&self) -> Result<bool> {
+		Ok(self.vault_settings().await?.is_some_and(|s| s.get("hold").and_then(|h| h.as_bool()) == Some(true)))
+	}
+
+	/// Bring this store's copy of the hold in line with the registry's
+	/// (the record — family/approvals.rs): told by the Worker when the hold
+	/// changes, and again by every nightly pass (cron.rs), so a lost call
+	/// heals by morning. A change is audited in the case's own trail too:
+	/// its history says when the hold began and ended.
+	async fn sync_hold(&self, actor: &str, hold: bool) -> Result<()> {
+		let Some(mut settings) = self.vault_settings().await? else { return Ok(()) };
+		if settings.get("hold").and_then(|h| h.as_bool()).unwrap_or(false) == hold {
+			return Ok(());
+		}
+		settings["hold"] = serde_json::json!(hold);
+		let v = serde_json::to_string(&settings).map_err(|_| Error::RustError("bad settings JSON".into()))?;
+		self.sql.exec("INSERT INTO vault (k, v) VALUES ('settings', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", Some(vec![v.into()]))?;
+		self.audit(actor, if hold { "case.hold" } else { "case.hold.release" }, "settings", None, None).await
+	}
 }
 
 // ── Write-once evidence (commit 29c, docs/CUSTODY.md › Stage 3, D6) ─────
@@ -452,6 +501,29 @@ impl GoraniMemberDO {
 			("PUT", "vault-reroot") => {
 				let body = req.json::<VaultPut>().await?;
 				self.vault_reroot(&actor, body).await
+			}
+			// A case's legal hold placed or released (commit 29f): internal,
+			// from routes.rs after the registry recorded it. No public path.
+			// Custody (commit 29g, custody.rs). The Worker names the acting
+			// member in the body (`member`), from its own check of the caller.
+			("GET", id) if id.starts_with("custody/") => self.custody_get(&id["custody/".len()..]).await,
+			("POST", id) if id.starts_with("custody/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				match id["custody/".len()..].split('/').collect::<Vec<_>>().as_slice() {
+					[file] => self.custody_offer(&actor, file, body).await,
+					[file, seq, "accept"] => self.custody_accept(&actor, file, seq.parse().unwrap_or(0), body).await,
+					[file, seq, "cancel"] => {
+						let member = body.get("member").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+						self.custody_cancel(&actor, file, seq.parse().unwrap_or(0), &member).await
+					}
+					_ => json_error(404, "custody/<file>[/<seq>/accept|cancel]"),
+				}
+			}
+			("PUT", "case-hold") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let hold = body.get("hold").and_then(|h| h.as_bool()).unwrap_or(false);
+				self.sync_hold(&actor, hold).await?;
+				Ok(Response::from_json(&serde_json::json!({ "hold": hold }))?)
 			}
 			("GET", "audit") => self.get_audit(Some(&member).filter(|m| !m.is_empty()).map(|m| m.as_str())).await,
 			("POST", "audit") => {
@@ -744,6 +816,10 @@ impl GoraniMemberDO {
 		// files cannot even be trashed — files_store.rs › evidence_refusal).
 		let version_days = knob("versionDays", 365).max(0);
 		let evidence = self.is_evidence().await?;
+		// A legal hold (commit 29f): nothing leaves while it stands — every
+		// purge query below carries `AND 0`, so it matches no row at all.
+		let held = self.is_held().await?;
+		let hold_gate = if held { " AND 0" } else { "" };
 
 		// 1. Trash purge: sealed objects leave S3, rows leave (triggers
 		// journal the purge). Every object key goes into the deletion outbox
@@ -754,7 +830,7 @@ impl GoraniMemberDO {
 		let purged_files: Vec<ObjRow> = self
 			.sql
 			.exec(
-				&format!("SELECT v.object_key AS object_key FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.deleted_at IS NOT NULL AND f.deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days')"),
+				&format!("SELECT v.object_key AS object_key FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.deleted_at IS NOT NULL AND f.deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days'){hold_gate}"),
 				None,
 			)?
 			.to_array()?;
@@ -765,7 +841,7 @@ impl GoraniMemberDO {
 		let n_files_purged = self
 			.sql
 			.exec(
-				&format!("DELETE FROM files WHERE deleted_at IS NOT NULL AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days')"),
+				&format!("DELETE FROM files WHERE deleted_at IS NOT NULL AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days'){hold_gate}"),
 				None,
 			)?
 			.rows_written();
@@ -780,7 +856,7 @@ impl GoraniMemberDO {
 		let n_folders_purged = self
 			.sql
 			.exec(
-				&format!("DELETE FROM file_folders WHERE deleted_at IS NOT NULL AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days')"),
+				&format!("DELETE FROM file_folders WHERE deleted_at IS NOT NULL AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-{trash_days} days'){hold_gate}"),
 				None,
 			)?
 			.rows_written();
@@ -789,7 +865,7 @@ impl GoraniMemberDO {
 		// the window that are NOT a file's current one. Objects into the
 		// outbox first, then the rows — the same order as the trash purge.
 		let mut n_versions_pruned = 0u64;
-		if !evidence {
+		if !evidence && !held {
 			#[derive(serde::Deserialize)]
 			struct OldVersion {
 				file_id: String,
@@ -881,7 +957,7 @@ impl GoraniMemberDO {
 			self.audit(actor, "housekeeping.run", "retention", None, Some(&format!("files:{n_files_purged},versions:{n_versions_pruned},shares:{n_shares_purged},journal:{journal_pruned},audit:{audit_pruned},deleted:{},deletesPending:{}", drained.done, drained.pending))).await?;
 		}
 		Ok(Response::from_json(&serde_json::json!({
-			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged, "versionsPruned": n_versions_pruned, "evidence": evidence,
+			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged, "versionsPruned": n_versions_pruned, "evidence": evidence, "held": held,
 			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": drained.done,
 			"uploadsAborted": stale_uploads.len(), "deletesFailed": drained.failed, "deletesPending": drained.pending,
 		}))?)
@@ -944,6 +1020,11 @@ impl GoraniMemberDO {
 	/// O10): the fan-out (cron.rs) reports it, the outbox keeps the keys, and
 	/// the next night retries. It used to answer 200 whatever S3 said.
 	async fn cron_pass(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		// A case's legal hold, as the registry has it (commit 29f; cron.rs):
+		// reconciled FIRST, so tonight's purge already obeys it.
+		if let Some(hold) = body.get("hold").and_then(|h| h.as_bool()) {
+			self.sync_hold(actor, hold).await?;
+		}
 		let keep = body.get("keep").and_then(|v| v.as_i64()).unwrap_or(7).clamp(1, 100);
 		let stale: Vec<BackupStamp> = self
 			.sql

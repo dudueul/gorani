@@ -56,7 +56,15 @@ async fn areas(env: &Env) -> Result<Vec<String>> {
 /// whose deletes never reached S3, looked exactly like a healthy one.
 pub async fn run(env: Env) -> Result<()> {
 	let mut failures: Vec<String> = Vec::new();
+	// The legal holds, from the record (commit 29f): each case store is told
+	// its own before its pass, so a hold change whose call to the store was
+	// lost is corrected tonight — and a held store purges nothing tonight.
+	let held: Vec<String> = registry_ids(&env, "case-holds").await?;
 	for member in areas(&env).await? {
+		let body = match crate::area::case_of(&member) {
+			Some(case) => serde_json::json!({ "hold": held.iter().any(|h| h == case) }),
+			None => serde_json::json!({}),
+		};
 		let namespace = env.durable_object("MEMBER")?;
 		let stub = namespace.id_from_name(&crate::area::do_name(&member))?.get_stub()?;
 		let headers = Headers::new();
@@ -64,7 +72,7 @@ pub async fn run(env: Env) -> Result<()> {
 		headers.set("x-gorani-member", &member)?;
 		let req = Request::new_with_init(
 			"https://do.internal/cron",
-			&RequestInit { method: Method::Post, headers, body: Some(serde_json::json!({}).to_string().into()), ..Default::default() },
+			&RequestInit { method: Method::Post, headers, body: Some(body.to_string().into()), ..Default::default() },
 		)?;
 		match stub.fetch_with_request(req).await {
 			Ok(resp) if resp.status_code() < 300 => {}

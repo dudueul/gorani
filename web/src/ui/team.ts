@@ -24,6 +24,7 @@ import { fingerprint, pin, certify, buildTrust, type RegistryIdentity } from "..
 import { newCase, openCaseKey, openCaseTitle, rotateCase, sealCaseGrant, type CaseKind, type CasePermission, type CaseRow, type MemberRoot } from "../vault/cases.ts";
 import { approveCeremony, combineCeremony, newCeremony, recoverCaseGrant, recoverMemberStore, setupRecovery, type Ceremony, type RecoveryRecord } from "../vault/recovery.ts";
 import type { TeamCall, TeamContext } from "../vault/team.ts";
+import { approveRequest, requestApproval, verifyApproval, type Approval, type ApprovalCheck } from "../vault/approvals.ts";
 
 type Tab = "people" | "cases" | "recovery";
 
@@ -47,6 +48,8 @@ export class GoraniTeam extends LitElement {
 	@state() private cases: (CaseRow & { title?: string | null })[] = [];
 	@state() private recovery: { recovery: (RecoveryRecord & { holdersCurrent?: boolean }) | null; myShare: string | null } | null = null;
 	@state() private ceremonies: Ceremony[] = [];
+	/** Each case's two-person requests (commit 29f), with this member's own check of their signatures. */
+	@state() private approvals: Record<string, (Approval & { check: ApprovalCheck })[]> = {};
 	/** Ephemeral keys of the ceremonies THIS tab coordinates (memory only). */
 	private ephemerals = new Map<string, VaultPrivateKey>();
 	private caseKeys = new Map<string, VaultPrivateKey>();
@@ -93,6 +96,14 @@ export class GoraniTeam extends LitElement {
 		this.team = { ...this.team, identities: this.identities, trust: await buildTrust(this.team.memberId, this.session.root, this.team.settings.identity!, this.identities) };
 		const cases = (await quiet(() => this.call<{ cases: CaseRow[] }>("GET", "/api/v1/cases"), { cases: [] })).cases;
 		this.cases = await Promise.all(cases.map(async (c) => ({ ...c, title: c.grant ? await quiet(async () => openCaseTitle(await this.caseKey(c), c), null) : null })));
+		// The two-person requests, each checked HERE against this member's
+		// trust — the panel shows what the signatures say, not the server.
+		const approvals: typeof this.approvals = {};
+		for (const c of cases) {
+			const list = (await quiet(() => this.call<{ approvals: Approval[] }>("GET", `/api/v1/cases/${c.id}/approvals`), { approvals: [] })).approvals;
+			approvals[c.id] = await Promise.all(list.filter((a) => a.status === "pending").map(async (a) => ({ ...a, check: await verifyApproval(this.team.trust, a) })));
+		}
+		this.approvals = approvals;
 		if (this.member.role !== "external") this.recovery = await quiet(() => this.call("GET", "/api/v1/recovery"), null);
 		if (this.isLead || this.member.role === "auditor") this.ceremonies = (await quiet(() => this.call<{ ceremonies: Ceremony[] }>("GET", "/api/v1/recovery/ceremonies"), { ceremonies: [] })).ceremonies;
 	}
@@ -224,6 +235,7 @@ export class GoraniTeam extends LitElement {
 					${c.closed ? html`<span class="text-xs text-neutral-500">closed</span>` : nothing}
 					${c.rotationRequired ? html`<span class="text-xs text-amber-400">rotation owed</span>` : nothing}
 					${c.rotating ? html`<span class="text-xs text-amber-400">rotation walking</span>` : nothing}
+					${c.hold ? html`<span class="text-xs text-amber-400" data-test="hold-${c.id}">legal hold since ${c.hold.since.slice(0, 10)}</span>` : nothing}
 					<span class="ml-auto text-xs text-neutral-400">${c.grant ? `you: ${c.grant.permission}` : "structure only"}</span>
 					${c.grant ? html`<button class=${primary} ?disabled=${this.busy} data-test="case-enter-${c.id}" @click=${() => this.act(`Opening ${c.id}`, async () => {
 						await this.caseKey(c); // the signature check, before the explorer
@@ -260,12 +272,61 @@ export class GoraniTeam extends LitElement {
 							const r = await rotateCase(this.call, this.session.root, c, roots, this.team.signer, this.team.trust);
 							return `${c.id} rotated: ${Object.values(r.report.resealed).reduce((a, b) => a + b, 0)} values re-sealed; the old key opens nothing.`;
 						})}>Rotate the key</button>` : nothing}
-						<button class=${button} ?disabled=${this.busy} @click=${() => window.confirm(`Close ${c.id}? It becomes read-only for good.`) && this.act(`Closing ${c.id}`, async () => {
-							await this.call("POST", `/api/v1/cases/${c.id}/close`);
-						})}>Close</button>
+						${c.kind === "working"
+							? html`<button class=${button} ?disabled=${this.busy} @click=${() => window.confirm(`Close ${c.id}? It becomes read-only for good.`) && this.act(`Closing ${c.id}`, async () => {
+									await this.call("POST", `/api/v1/cases/${c.id}/close`);
+								})}>Close</button>`
+							: nothing}
 					</div>`
 					: nothing}
+				${this.twoPerson(c, manage)}
 			</section>
+		`;
+	}
+
+	/**
+	 * The legal hold and the two-person rule (commit 29f): a hold is placed
+	 * by one manager or lead; closing an EVIDENCE case and lifting a hold
+	 * are asked for by one and agreed by a second lead. Each pending request
+	 * shows what its signature says to THIS member.
+	 */
+	private twoPerson(c: CaseRow, manage: boolean) {
+		const may = (manage || this.isLead) && !c.closed;
+		const pending = this.approvals[c.id] ?? [];
+		const ask = (action: "case.close" | "hold.release", label: string) => html`<button class=${button} ?disabled=${this.busy || pending.some((a) => a.action === action)} data-test="ask-${action}-${c.id}" @click=${() => this.act(label, async () => {
+			await requestApproval(this.call, this.team.signer, c.id, action);
+			return `Asked: ${action} on ${c.id}. A second lead must agree — they see it here.`;
+		})}>${label}</button>`;
+		return html`
+			${may
+				? html`<div class="mt-2 flex flex-wrap items-center gap-2">
+					${c.hold
+						? ask("hold.release", "Ask to lift the hold")
+						: html`<button class=${button} ?disabled=${this.busy} data-test="hold-place-${c.id}" @click=${() => window.confirm(`Place a legal hold on ${c.id}? Nothing in it can be deleted or purged until two leads lift it.`) && this.act(`Holding ${c.id}`, async () => {
+								await this.call("POST", `/api/v1/cases/${c.id}/hold`);
+								return `${c.id} is under a legal hold. Lifting it takes two leads.`;
+							})}>Place a legal hold</button>`}
+					${c.kind === "evidence" ? ask("case.close", "Ask to close") : nothing}
+				</div>`
+				: nothing}
+			${pending.length
+				? html`<ul class="mt-2 space-y-1 text-xs">${pending.map((a) => html`
+					<li class="flex flex-wrap items-center gap-2 rounded-lg bg-neutral-900 px-2 py-1" data-test="approval-${a.id}">
+						<span><b>${a.action}</b> asked by ${this.nameOf(a.requestedBy)} · ${a.requestedAt.slice(0, 16).replace("T", " ")}</span>
+						<span class=${a.check.request ? "text-emerald-400" : "text-red-400"}>${a.check.request ? "signature verified" : "signature does NOT verify — do not agree"}</span>
+						${this.isLead && a.requestedBy !== this.team.memberId && a.check.request
+							? html`<button class=${primary} ?disabled=${this.busy} data-test="approve-${a.id}" @click=${() => window.confirm(`Agree to ${a.action} on ${c.id}, asked by ${this.nameOf(a.requestedBy)}? It runs at once.`) && this.act(`Agreeing to ${a.action}`, async () => {
+									const done = await approveRequest(this.call, this.team.signer, this.team.trust, a);
+									return `${done.executed} on ${c.id}: done, with your signature and ${this.nameOf(a.requestedBy)}'s.`;
+								})}>Agree</button>`
+							: nothing}
+						${a.requestedBy === this.team.memberId
+							? html`<button class=${button} ?disabled=${this.busy} @click=${() => this.act("Withdrawing", async () => {
+									await this.call("DELETE", `/api/v1/cases/${c.id}/approvals/${a.id}`);
+								})}>Withdraw</button>`
+							: nothing}
+					</li>`)}</ul>`
+				: nothing}
 		`;
 	}
 

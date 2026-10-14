@@ -15,8 +15,10 @@ import { createHash, createHmac } from "node:crypto";
 const hmac = (key, data) => createHmac("sha256", key).update(data).digest();
 const enc = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 
-/** fetch() a signed S3 request. `key` "" for the bucket; `query` pairs. */
-export async function s3fetch(cfg, method, key, query = {}, extraHeaders = {}) {
+/** fetch() a signed S3 request. `key` "" for the bucket; `query` pairs;
+ * `body` sent as is (UNSIGNED-PAYLOAD: the body is TLS's to protect, as in
+ * the Worker). Headers in `extraHeaders` ride unsigned (Content-MD5, …). */
+export async function s3fetch(cfg, method, key, query = {}, extraHeaders = {}, body = undefined) {
 	const url = new URL(cfg.endpoint);
 	const path = `/${enc(cfg.bucket)}${key ? `/${key.split("/").map(enc).join("/")}` : ""}`;
 	const cq = Object.entries(query).map(([k, v]) => [enc(k), enc(v)]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([k, v]) => `${k}=${v}`).join("&");
@@ -33,5 +35,5 @@ export async function s3fetch(cfg, method, key, query = {}, extraHeaders = {}) {
 	const auth = `AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId}/${scope}, SignedHeaders=${signed.join(";")}, Signature=${signature}`;
 	const { host, ...sent } = headers;
 	void host;
-	return fetch(`${cfg.endpoint}${path}${cq ? `?${cq}` : ""}`, { method, headers: { ...sent, ...extraHeaders, authorization: auth } });
+	return fetch(`${cfg.endpoint}${path}${cq ? `?${cq}` : ""}`, { method, headers: { ...sent, ...extraHeaders, authorization: auth }, body });
 }

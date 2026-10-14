@@ -26,6 +26,7 @@ use worker::{durable_object, DurableObject, Env, Error, Request, Response, Resul
 
 use crate::auth;
 
+mod approvals;
 mod recovery;
 
 /// APPEND-ONLY: a statement's index is its identity in the schema ledger
@@ -157,6 +158,23 @@ pub const MIGRATIONS: &[&str] = &[
 	)",
 	"CREATE TABLE IF NOT EXISTS ceremony_shares (ceremony_id TEXT NOT NULL, member_id TEXT NOT NULL, share_sealed TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (ceremony_id, member_id))",
 	"CREATE TABLE IF NOT EXISTS reenrol_drafts (member_id TEXT PRIMARY KEY, settings TEXT NOT NULL, root_digest TEXT NOT NULL, at TEXT NOT NULL)",
+	// Migration v6 (commit 29f, docs/CUSTODY.md › Stage 6, D5.7): the
+	// two-person rule — a signed request, a second lead's signed approval
+	// that runs the action once — and the legal hold it releases.
+	"CREATE TABLE IF NOT EXISTS approvals (
+		id TEXT PRIMARY KEY,
+		case_id TEXT NOT NULL,
+		action TEXT NOT NULL,
+		requested_by TEXT NOT NULL,
+		requested_at TEXT NOT NULL,
+		request_signature TEXT NOT NULL,
+		approved_by TEXT,
+		approved_at TEXT,
+		approve_signature TEXT,
+		cancelled_at TEXT
+	)",
+	"ALTER TABLE cases ADD COLUMN hold_at TEXT",
+	"ALTER TABLE cases ADD COLUMN hold_by TEXT",
 ];
 
 /// The four roles (docs/CASES.md). (The family's parent/child were accepted
@@ -314,6 +332,12 @@ impl GoraniFamilyDO {
 				let case = req.headers().get("x-gorani-case")?.unwrap_or_default();
 				self.case_access(&actor, &case).await
 			}
+			// The cases under a legal hold (commit 29f) — the cron reconciles
+			// each case store's copy with it nightly.
+			("GET", "case-holds") => {
+				let rows: Vec<IdRow> = self.sql.exec("SELECT id FROM cases WHERE hold_at IS NOT NULL ORDER BY id", None)?.to_array()?;
+				Ok(Response::from_json(&serde_json::json!({ "ids": rows.into_iter().map(|r| r.id).collect::<Vec<_>>() }))?)
+			}
 			("GET", "case-ids") => {
 				let rows: Vec<IdRow> = self.sql.exec("SELECT id FROM cases ORDER BY id", None)?.to_array()?;
 				Ok(Response::from_json(&serde_json::json!({ "ids": rows.into_iter().map(|r| r.id).collect::<Vec<_>>() }))?)
@@ -335,6 +359,24 @@ impl GoraniFamilyDO {
 				self.case_rekey(&actor, &id["case-key/".len()..], body).await
 			}
 			("POST", id) if id.starts_with("case-close/") => self.case_close(&actor, &id["case-close/".len()..]).await,
+			// ── The two-person rule and the legal hold (commit 29f, family/approvals.rs) ──
+			("POST", id) if id.starts_with("case-hold/") => self.case_hold(&actor, &id["case-hold/".len()..]).await,
+			("GET", id) if id.starts_with("case-approvals/") => self.approvals_list(&actor, &id["case-approvals/".len()..]).await,
+			("POST", id) if id.starts_with("case-approvals/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.approval_request(&actor, &id["case-approvals/".len()..], body).await
+			}
+			("POST", id) if id.starts_with("case-approve/") => match id["case-approve/".len()..].split_once('/') {
+				Some((case, approval)) => {
+					let body = req.json::<serde_json::Value>().await?;
+					self.approval_approve(&actor, case, approval, body).await
+				}
+				None => json_error(400, "case-approve/<case>/<approval>"),
+			},
+			("DELETE", id) if id.starts_with("case-approvals/") => match id["case-approvals/".len()..].split_once('/') {
+				Some((case, approval)) => self.approval_cancel(&actor, case, approval).await,
+				None => json_error(400, "case-approvals/<case>/<approval>"),
+			},
 			// ── Identities (commit 27, docs/CASES.md › Member identity keys) ──
 			("GET", "identities") => self.identities(&actor).await,
 			("PUT", "identity") => {
@@ -677,7 +719,7 @@ impl GoraniFamilyDO {
 	fn case_row(&self, case: &str) -> Result<Option<CaseRow>> {
 		Ok(self
 			.sql
-			.exec("SELECT id, kind, title_sealed, key_id, public_key, created_by, created_at, closed_at, rotation_required, prev_key_id FROM cases WHERE id = ?1", Some(vec![case.into()]))?
+			.exec("SELECT id, kind, title_sealed, key_id, public_key, created_by, created_at, closed_at, rotation_required, prev_key_id, hold_at FROM cases WHERE id = ?1", Some(vec![case.into()]))?
 			.to_array::<CaseRow>()?
 			.into_iter()
 			.next())
@@ -719,7 +761,7 @@ impl GoraniFamilyDO {
 	/// and — for leads and auditors — every case's structure, without keys.
 	async fn case_list(&self, actor: &str) -> Result<Response> {
 		let Some(me) = self.member_by_email(actor)? else { return json_error(403, "not a team member") };
-		let cases: Vec<CaseRow> = self.sql.exec("SELECT id, kind, title_sealed, key_id, public_key, created_by, created_at, closed_at, rotation_required, prev_key_id FROM cases ORDER BY created_at, id", None)?.to_array()?;
+		let cases: Vec<CaseRow> = self.sql.exec("SELECT id, kind, title_sealed, key_id, public_key, created_by, created_at, closed_at, rotation_required, prev_key_id, hold_at FROM cases ORDER BY created_at, id", None)?.to_array()?;
 		let mut out = Vec::new();
 		for c in cases {
 			let grant = self.grant_of(&c.id, &me.id)?;
@@ -740,6 +782,7 @@ impl GoraniFamilyDO {
 				"id": c.id, "kind": c.kind, "titleSealed": c.title_sealed, "keyId": c.key_id,
 				"publicKey": serde_json::from_str::<serde_json::Value>(&c.public_key).unwrap_or(serde_json::Value::Null),
 				"createdBy": c.created_by, "createdAt": c.created_at, "closed": c.closed_at.is_some(), "rotationRequired": c.rotation_required != 0 || self.stale_grants(&c.id)? > 0,
+				"hold": c.hold_at.as_ref().map(|at| serde_json::json!({ "since": at })),
 				// A rotation whose reseal walk has not finished: the previous
 				// key (id here, each grantee's copy in their grant) still opens
 				// what the walk has not reached.
@@ -762,10 +805,10 @@ impl GoraniFamilyDO {
 	async fn case_access(&self, actor: &str, case: &str) -> Result<Response> {
 		let (Some(me), Some(c)) = (self.member_by_email(actor)?, self.case_row(case)?) else { return Ok(Response::from_json(&serde_json::Value::Null)?) };
 		match self.grant_of(case, &me.id)? {
-			Some(g) => Ok(Response::from_json(&serde_json::json!({ "id": me.id, "role": me.role, "permission": g.permission, "closed": c.closed_at.is_some() }))?),
+			Some(g) => Ok(Response::from_json(&serde_json::json!({ "id": me.id, "role": me.role, "permission": g.permission, "closed": c.closed_at.is_some(), "hold": c.hold_at.is_some() }))?),
 			// Auditors and leads read every case's AUDIT and read log (not its
 			// content — they would need the key); the Worker narrows by route.
-			None if me.role == "auditor" || me.role == "lead" => Ok(Response::from_json(&serde_json::json!({ "id": me.id, "role": me.role, "permission": "audit", "closed": c.closed_at.is_some() }))?),
+			None if me.role == "auditor" || me.role == "lead" => Ok(Response::from_json(&serde_json::json!({ "id": me.id, "role": me.role, "permission": "audit", "closed": c.closed_at.is_some(), "hold": c.hold_at.is_some() }))?),
 			None => Ok(Response::from_json(&serde_json::Value::Null)?),
 		}
 	}
@@ -947,6 +990,12 @@ impl GoraniFamilyDO {
 	async fn case_close(&self, actor: &str, case: &str) -> Result<Response> {
 		if let Err(r) = self.require_manager(actor, case) {
 			return Ok(r);
+		}
+		// An evidence case closes only with a second lead's signed approval
+		// (D5.7, commit 29f — family/approvals.rs); a working case still
+		// closes with one manager.
+		if self.case_row(case)?.is_some_and(|c| c.kind == "evidence") {
+			return json_error(409, "an evidence case closes with a second lead's approval — POST /api/v1/cases/<id>/approvals { action: \"case.close\" } (docs/CUSTODY.md › stage 6)");
 		}
 		self.sql.exec("UPDATE cases SET closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND closed_at IS NULL", Some(vec![case.into()]))?;
 		self.audit(actor, "case.close", case, None).await?;
@@ -1145,6 +1194,9 @@ struct CaseRow {
 	closed_at: Option<String>,
 	rotation_required: i64,
 	prev_key_id: Option<String>,
+	/// When a legal hold was placed (commit 29f); NULL when none.
+	#[serde(default)]
+	hold_at: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct IdRow {

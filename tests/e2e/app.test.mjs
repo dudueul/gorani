@@ -350,15 +350,52 @@ try {
 		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
 		assert.equal(await page.locator('[data-test="area"]').inputValue(), "case:ir-e2e", "the explorer is on the case");
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "case-note.txt", mimeType: "text/plain", buffer: Buffer.from("sealed under the case key") });
+		// An evidence upload asks for its intake record first (commit 29g).
+		const fillIntake = async (source, method) => {
+			await page.locator('[data-test="intake-dialog"]').waitFor({ timeout: 30_000 });
+			await page.locator('[data-test="intake-source"]').fill(source);
+			await page.locator('[data-test="intake-method"]').fill(method);
+			await page.locator('[data-test="intake-submit"]').click();
+		};
+		await fillIntake("mom's laptop, Downloads", "browser upload, as received");
 		await page.locator("text=case-note.txt").first().waitFor({ timeout: 60_000 });
 		const listed = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
 		assert.equal(listed.json.files.length, 1, "the upload landed in the CASE's store");
 		const keyed = await api(dev.base, "POST", "/api/v1/cases/ir-e2e/files/keys", { email: "mom@family.test", body: { ids: [listed.json.files[0].id] } });
 		assert.match(keyed.json.keys[listed.json.files[0].id].hash ?? "", /^GV04:/, "…carrying the browser's signed content hash, sealed (the evidence case requires it)");
+		assert.match(keyed.json.keys[listed.json.files[0].id].intake ?? "", /^GV04:/, "…and its intake record, sealed and signed in the browser");
 		assert.equal((await api(dev.base, "GET", "/api/v1/members/mom/files/list?folder=all", { email: "mom@family.test" })).json.files?.length ?? 0, 0, "…not in mom's own area");
 		await page.locator("text=case-note.txt").first().dblclick();
 		await page.locator("text=sealed under the case key").first().waitFor({ timeout: 30_000 });
 		await page.keyboard.press("Escape");
+		// A malware sample (commit 29e), uploaded through its own input: an
+		// HTML dropper the viewer must NOT open — the refusal panel shows
+		// instead, and the page stays violation-free.
+		await page.locator("gorani-win11 [data-upload-sample]").setInputFiles({ name: "dropper.html", mimeType: "text/html", buffer: Buffer.from("<script>alert('pwned')</script>") });
+		await fillIntake("phishing mail attachment, ticket 4711", "saved from the mail gateway's quarantine");
+		await page.locator("text=dropper.html").first().waitFor({ timeout: 60_000 });
+		const afterSample = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
+		assert.equal(afterSample.json.files.find((f) => f.sample)?.sample, true, "the server lists it as a sample");
+		await page.locator("text=dropper.html").first().dblclick();
+		await page.locator('[data-test="viewer-refused"]').waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator("text=pwned").count(), 0, "nothing of the sample is rendered");
+		await page.keyboard.press("Escape");
+		// The legal hold and the two-person rule (commit 29f), from the Team
+		// panel: one person places the hold; closing the EVIDENCE case is
+		// only ASKED for — the request shows its signature verified in this
+		// browser, and no "Agree" for the person who asked.
+		await teamButton.click();
+		await page.getByRole("button", { name: "Cases" }).click();
+		page.once("dialog", (d) => void d.accept());
+		await page.locator('[data-test="hold-place-ir-e2e"]').click();
+		await page.locator('[data-test="hold-ir-e2e"]').waitFor({ timeout: 30_000 });
+		await page.locator('[data-test="ask-case.close-ir-e2e"]').click();
+		const asked = page.locator('[data-test^="approval-"]').first();
+		await asked.waitFor({ timeout: 30_000 });
+		assert.match(await asked.textContent(), /case\.close asked by .*signature verified/s, "the request's signature verifies in the browser");
+		assert.equal(await asked.locator('[data-test^="approve-"]').count(), 0, "no Agree for the person who asked");
+		const reqs = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/approvals", { email: "mom@family.test" });
+		assert.equal(reqs.json.approvals[0].status, "pending", "the case stays open until a second lead agrees");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
 		await ctx.close();
 	}
@@ -384,7 +421,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-enrol");
 } finally {
 	await dev.close();
 }

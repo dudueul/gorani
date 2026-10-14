@@ -37,7 +37,8 @@ import { areaPath } from "../lib/area.ts";
 
 // (`hash`: the uploaders' signed content hashes — commit 29d. Re-sealed like
 // the rest; the SIGNATURE inside does not change, it never named a key.)
-export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets", "hash"] as const;
+// (`intake`, `custody`: evidence's intake records and custody reasons — 29g.)
+export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets", "hash", "intake", "custody"] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
 
 /** A JSON call against the API (the browser's bridge, or a test's helper). */
@@ -80,6 +81,10 @@ function placesOf(memberId: string, kind: SealedKind, it: SealedItem): [Uint8Arr
 			return [places.storeSecrets(memberId), null];
 		case "hash":
 			return [places.fileHash(memberId, id, version), null];
+		case "intake":
+			return [places.fileIntake(memberId, id), null];
+		case "custody":
+			return [places.custodyReason(memberId, id, version), null];
 	}
 }
 

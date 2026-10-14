@@ -99,9 +99,11 @@ text      = "GV04:" + base64
 |---|---|---|---|
 | `file.name` | file id | — | a file's name (a rename re-seals into the same place) |
 | `file.key` | file id | n | version n's content key |
-| `file.type` | file id | n | version n's MIME type |
+| `file.type` | file id | n | version n's MIME type — for a malware sample, `application/x-gorani-sample; original=…` (commit 29e, `samples.ts`) |
 | `file.music` | file id | n | version n's tag summary |
 | `file.hash` | file id | n | version n's signed content hash (commit 29d, `content-hash.ts`) |
+| `file.intake` | file id | — | an evidence file's signed intake record (commit 29g, `intake.ts`) |
+| `custody.reason` | file id | n | custody link n's reason (commit 29g, `custody.ts`) |
 | `folder.name` | folder id | — | a folder's name |
 | `share.name` | share id | — | the owner's copy of a link's name |
 | `store.secrets` | — | — | fingerprint + index keys |

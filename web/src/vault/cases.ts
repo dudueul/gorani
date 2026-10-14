@@ -65,6 +65,8 @@ export interface CaseRow {
 	rotationRequired: boolean;
 	/** A rotation whose reseal walk has not finished. */
 	rotating: { prevKeyId: string } | null;
+	/** A legal hold (commit 29f): placed by one person, lifted only by two. */
+	hold?: { since: string } | null;
 	/** The caller's own grant, with their key copy and who signed it — null
 	 * for a lead's or auditor's structure-only view. */
 	grant: {

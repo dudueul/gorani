@@ -25,8 +25,8 @@ rendered, delivered zipped under the industry's "infected" password).
 | 2 *(landed: commit 29b, `api:retention`)* | D7 | retention by kind: evidence keeps every version and refuses deletion; working areas prune non-current versions after a year |
 | 3 *(landed: commit 29c, `api:objectlock`)* | D6 | Object Lock on evidence objects (COMPLIANCE mode, the case's retention) |
 | 4 *(landed: commit 29d, `api:hashes`)* | D5.1 | the uploader signs SHA-256 of the plaintext (identity key, stage 4 of CASES.md) — stored beside the version, verified on open |
-| 5 | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
-| 6 | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
+| 5 *(landed: commit 29e, `api:samples`)* | D8 | samples: a readable flag; the viewer refuses them; download as a zip encrypted with "infected" |
+| 6 *(landed: 29f `api:approvals`, 29g `api:custody`)* | D5.6 / D5.7 | intake record (sealed) at upload; signed custody transfers; the two-person rule for export, legal-hold release and case deletion |
 | 7 | D5.8 / D5.5 / D5.4 | signed export package and a re-verification job; RFC 3161 timestamps; the SIEM feed |
 
 ## Stage 1 — the audit, tamper-evident
@@ -214,3 +214,185 @@ any reader:          opens the record in its place, verifies the signature again
   area only, where the hash is optional; when it gains cases it must sign
   too. A re-enrolled member's earlier signatures read as `untrusted` until
   the signed export (stage 7) carries signers' past keys.
+
+## Stage 5 — malware samples (D8), the design
+
+```text
+upload as a sample:  sealed type = "application/x-gorani-sample; original=<mime>"   (GV04, per version)
+                     form field sample=1 → files.sample = 1                          (readable: the server enforces)
+mark as a sample:    PATCH files/<id> { sample: true, types: { <n>: <sealed>, … } } — one way, every version
+any reader:          sample = the flag OR the sealed type says so
+                     the viewer, previews, thumbnails and the media worker refuse it;
+                     a download is <name>.zip, ZipCrypto under the password "infected"
+```
+
+- **Two marks, for two jobs.** The readable flag lets the SERVER enforce
+  what it can: a sample is never shared by link (409 — D11's partners get
+  the case instead), the flag shows in listings, the change is audited.
+  The sealed type lets the CLIENT refuse to render even when the server
+  lies: a server that clears the flag cannot clear the type (GV04 — it
+  cannot seal into the store), and a server that SETS the flag on a normal
+  file only makes the client more careful. The client treats a file as a
+  sample if either says so — the safe direction is the only one a server
+  can push.
+- **One way.** A sample never becomes a normal file again (`sample: false`
+  is refused): to "unmark", someone uploads a new file, on the record.
+  Marking re-seals every version's type in the same request — the DO
+  refuses a mark that leaves a version unmarked.
+- **Never rendered, anywhere in this app.** The viewer shows a refusal
+  panel instead of a mode; `preview` and `mediaHandle` return nothing
+  (no bytes decrypted for rendering); audio tags are not parsed at upload
+  (a parser is an attack surface too); a COPY of a sample is a sample.
+- **Downloads zipped with "infected".** The industry convention
+  (MalwareBazaar, VirusShare, vendor exchanges): desktop antivirus would
+  otherwise quarantine the sample mid-investigation, or a double-click
+  would run it. ZipCrypto (traditional PKWARE encryption), stored, UTF-8
+  names — the one every unzip tool and Windows Explorer opens. It is NOT
+  confidentiality (ZipCrypto is broken, and the password is public); the
+  sample's confidentiality is the vault's job, which ends at the analyst's
+  machine. Up to 4 GiB (no ZIP64 — refused above, said plainly). The signed
+  content hash (stage 4) is checked before the zip is made, and the
+  plaintext's SHA-256 is in the toast, for the reputation lookup.
+- **The sync client** (`gorani-sync pull`) refuses to write a sample to
+  disk raw.
+
+### Stage 5 as built
+
+- `web/src/vault/samples.ts` — the mark (`sampleType`, `isSampleType`,
+  `originalType`) and `zipEncrypted`: CRC-32, ZipCrypto (keys advance on
+  the plaintext byte; the 12-byte header ends with the CRC's high byte, the
+  wrong-password check), stored, UTF-8 names. `unit:explorer` opens what it
+  writes with Python's `zipfile` — an independent reader — and checks a
+  wrong password is refused.
+- The Worker (`files_store.rs`): `files.sample` (migration v13), set by the
+  upload form field `sample=1`; in listings, `files/keys` and file rows;
+  `share_create` refuses a sample (409); `file_mark_sample` — one way,
+  every version's type re-sealed in the same request, validated whole
+  before anything is written; audited as `file.upload.sample` /
+  `file.sample`. `files/sealed?kind=version&file=<id>` lists one file's
+  versions (the mark's walk).
+- The model (`model.ts › renderPolicy`): `normal`, `sample` (the flag OR
+  the sealed type), or `unverified` (a type that is missing or does not
+  open in its place — refused like a sample, because garbling the sealed
+  mark is the one way a server could try to hide it). Only `normal` is
+  previewed, played (`mediaHandle`) or opened in the viewer, which shows a
+  refusal panel instead (`mode.ts › "refused"`). Downloads of anything not
+  `normal` are `<name>.zip` under "infected", the toast carries SHA-256 and
+  the signature check; uploads as samples skip the audio-tag parser; a copy
+  of a sample is a sample.
+- The explorers: "Upload malware samples…" (Windows skin), "Mark as
+  malware sample…" in both context menus (a confirm says it cannot be
+  undone), "Share…" disabled for samples.
+- `gorani-sync pull` refuses a sample (either mark) and writes nothing
+  (`api:client-live` › 4b).
+- Not yet: ZIP64 (samples over 4 GiB are refused, not zipped); the desktop
+  shells (docs/DESKTOP.md) must route their downloads through the same zip.
+
+## Stage 6 — intake, custody transfers, the two-person rule (D5.6 / D5.7), the design
+
+Two commits: **29f** the two-person rule and the legal hold it releases;
+**29g** the intake record and signed custody transfers.
+
+### 29f — the two-person rule, and a legal hold
+
+```text
+requester (a manager of the case, or a lead)
+   POST /cases/<id>/approvals { id, action, signature }      s1 = sign(stmt("gorani-approval-v1", id, action, case, requester))
+second lead (not the requester)
+   POST /cases/<id>/approvals/<aid>/approve { signature }    s2 = sign(stmt("gorani-approve-v1", id, action, case, requester, approver))
+                                                              → the action runs in the same request, once
+```
+
+- **Which actions**: `case.close` for an EVIDENCE case (a working case
+  still closes with one manager), `hold.release`, and — stage 7 —
+  `case.export`. A direct `POST …/close` on an evidence case answers 409
+  and names the approval route.
+- **What the server enforces** (policy, like read-only grants): the
+  requester may request; the approver is a lead, active, and not the
+  requester; a request is approved once, executes once, and expires after
+  7 days; the requester may cancel. **What the signatures add**: who asked
+  and who agreed, verifiable by any client against its own trust — the
+  registry stores the signatures and, as everywhere since commit 27,
+  verifies none of them.
+- **Legal hold** (`POST /cases/<id>/hold`, a manager or a lead): placing a
+  hold is ONE person — adding protection never waits for a second; lifting
+  it is a `hold.release` approval. While a case is held its store refuses
+  trash (409), its housekeeping prunes no versions and purges nothing, and
+  the nightly pass does the same. The Worker tells the case store (an
+  internal call, like the kind at opening); the registry is the record.
+
+#### 29f as built
+
+- `worker/src/family/approvals.rs` — the registry's `approvals` table
+  (migration v6, with `cases.hold_at/hold_by`); request, list, approve,
+  withdraw; `case_hold`. The approve call re-checks that the action is
+  still possible, runs it, records who agreed, and audits both
+  (`approval.approve`, then the action itself naming the approval).
+- `web/src/vault/approvals.ts` — `requestApproval` (the id chosen before
+  signing), `approveRequest` (checks the REQUEST's signature against the
+  approver's trust before signing its own), `verifyApproval` (both
+  signatures, two different people).
+- The hold in the case store (`member.rs › is_held, sync_hold`): told by
+  the Worker after the registry records a change (`routes.rs ›
+  tell_case_hold`), and again by every nightly pass, which sends each case
+  store the registry's word (`case-holds`) before it purges. A held store
+  refuses trash (`files_store.rs › evidence_refusal`) and its housekeeping
+  gates every purge query with `AND 0` — it matches nothing.
+- The Team panel: "Place a legal hold", "Ask to lift the hold", "Ask to
+  close" (evidence), and each pending request with its signature's verdict
+  as THIS member's client sees it; "Agree" only for a different lead, only
+  when the request verifies.
+- Not yet: approvals expire after 7 days by the clock; `case.export` joins
+  in stage 7.
+
+### 29g — intake and custody transfers
+
+```text
+evidence upload (version 1):  intake = { source, collector, method, collectedAt, notes }
+                              signed: stmt("gorani-intake-v1", area, file, source, collector, method, collectedAt, notes)
+                              sealed into file.intake(area, file)     — required on evidence, like the hash
+custody, per evidence file:   custodian = the uploader, then each accepted transfer's receiver
+   offer   (the custodian)    stmt("gorani-custody-offer-v1", area, file, seq, from, to, SHA-256(reason))
+   accept  (the receiver)     stmt("gorani-custody-accept-v1", area, file, seq, from, to)
+```
+
+- **The intake record** says where the item came from — the half of
+  provenance the content hash (stage 4) cannot: a disk imaged from which
+  host, by whom, with which tool, when. Sealed (it names hosts and
+  people), signed by the uploader, in its own place per file (it describes
+  the acquisition, not a version).
+- **Custody** is a chain per evidence file, kept in the case's store: one
+  pending offer at a time; only the current custodian offers, only the
+  named receiver (holding a grant on the case) accepts, both sign. The
+  reason is sealed (the case key); its digest is in the offer statement.
+  The chain verifies on any client: every link's two signatures, every
+  `from` the previous `to`.
+- **What it does not do**: custody here is a RECORD of responsibility, not
+  an access control — everyone granted on the case still reads the file.
+  That is what the read log (O14) and the grants are for.
+
+#### 29g as built
+
+- `web/src/vault/intake.ts` — `signIntake` (source, collector and method
+  required; the signed statement lists every field) and `checkIntake`
+  (open in this file's place, then the signer's trust and key, then the
+  signature). The Worker takes the form field `intake` on new files (whole
+  and multipart), refuses one that is not sealed, and requires it in an
+  evidence store (`files.intake_sealed`, migration v14); `files/keys`
+  hands it back. Versions carry hashes, not intake: an item is acquired
+  once.
+- `worker/src/custody.rs` + `web/src/vault/custody.ts` — the chain per
+  evidence file (`custody` table): offer (the custodian, link number
+  `seq` signed, no gaps, one open offer), accept (only the person named;
+  a read-only grantee too — the case route asks only Read), withdraw (the
+  offerer). `verifyChain` walks it: both signatures per link, every `from`
+  the previous `to`, the reason opening in its place with the digest the
+  offer signed; withdrawn links are skipped.
+- Rotation walks both (kinds `intake`, `custody`); backups carry the
+  intake in each file entry and every custody link as its own entry; a
+  restore fills custody links into gaps only.
+- The web app: an intake dialog once per evidence upload batch
+  (`ui/files/intake-dialog.ts`), signed per file; a copy inside an
+  evidence case gets an automatic intake naming its source; "Custody…" in
+  both explorers shows the chain as this client verified it and offers
+  the one action open to the member (accept, or hand over).

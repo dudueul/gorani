@@ -14,6 +14,8 @@ import { suiteDev, api } from "../api/_dev.mjs";
 import { createCodeVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { deriveRecordKey, macRecord } from "../../web/src/vault/records.ts";
 import { importVaultKey } from "../../web/src/vault/vault-crypto.ts";
+import { sampleType } from "../../web/src/vault/samples.ts";
+import { storeSealer } from "../lib/placed.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const BIN = path.join(ROOT, "target/debug/gorani-sync");
@@ -115,6 +117,18 @@ try {
 	assert.equal(pull.status, 0, `pull failed: ${pull.out}`);
 	assert.equal(fs.readFileSync(outPath, "utf8"), plainHello.toString("utf8"), "round trip: the exact bytes");
 
+	// ── 4b. A malware sample is never written to disk raw (commit 29e) ──
+	// Marked the way the web app marks it (every version's type re-sealed
+	// with the sample mark); then `pull` refuses, and writes nothing.
+	const sealer = await storeSealer(filesStore.bundle, "jinu");
+	const marked = await api(dev.base, "PATCH", `/api/v1/members/jinu/files/${fileId}`, { email: "jinu@family.test", body: { sample: true, types: { "1": await sealer.fileType(fileId, 1, sampleType("text/plain")) } } });
+	assert.equal(marked.status, 200, marked.text);
+	const samplePath = path.join(home, "sample.out");
+	const refusedPull = await sync(["pull", "--id", fileId, "--out", samplePath, "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	assert.notEqual(refusedPull.status, 0, "pull refuses a sample");
+	assert.match(refusedPull.out, /malware sample/, `the refusal says why: ${refusedPull.out}`);
+	assert.ok(!fs.existsSync(samplePath), "…and wrote nothing to disk");
+
 	// ── 5. Zero-trust spot check: the server stored only sealed shapes ──
 	const keys = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [fileId] } });
 	assert.ok(keys.json.keys[fileId].key.startsWith("GV04:"), "the content key rides wrapped — sealed into its place by the CLI (GV04)");
@@ -136,7 +150,7 @@ try {
 	assert.notEqual(refused.status, 0, "push with a swapped store record is refused");
 	assert.match(refused.out, /failed authentication/, `the refusal names the reason: ${refused.out}`);
 
-	console.log("ok  live:client — enrol, push, ls, pull, round trip, zero-trust, a swapped store record refused");
+	console.log("ok  live:client — enrol, push, ls, pull, round trip, a sample refused by pull, zero-trust, a swapped store record refused");
 } finally {
 	await dev.close();
 }

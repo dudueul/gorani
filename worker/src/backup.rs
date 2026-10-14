@@ -127,7 +127,7 @@ impl GoraniMemberDO {
 		let folders: Vec<FolderJsonRow> = self.sql.exec("SELECT id, parent_id, name_sealed, created_at, updated_at FROM file_folders WHERE deleted_at IS NULL", None)?.to_array()?;
 		let files: Vec<FileJsonRow> = self
 			.sql
-			.exec("SELECT f.id, f.folder_id, f.name_sealed, f.size, f.version, f.created_at, f.updated_at, f.owner FROM files f WHERE f.deleted_at IS NULL", None)?
+			.exec("SELECT f.id, f.folder_id, f.name_sealed, f.size, f.version, f.created_at, f.updated_at, f.owner, f.intake_sealed FROM files f WHERE f.deleted_at IS NULL", None)?
 			.to_array()?;
 		let versions: Vec<VersionJsonRow> = self
 			.sql
@@ -196,12 +196,25 @@ impl GoraniMemberDO {
 			sink.drain(out).await?;
 		}
 		for f in files {
-			row(serde_json::json!({ "kind": "file", "id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size, "version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner }), writer, out);
+			// (`intake`: an evidence file's sealed, signed intake record —
+			// commit 29g; still sealed, as everything here.)
+			row(serde_json::json!({ "kind": "file", "id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size, "version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner, "intake": f.intake_sealed }), writer, out);
 			entries += 1;
 			sink.drain(out).await?;
 		}
 		if let Some(s) = secrets.into_iter().next() {
 			row(serde_json::json!({ "kind": "files-secrets", "sealed": s.v }), writer, out);
+			entries += 1;
+		}
+		// The custody chains (commit 29g): every link with both signatures
+		// and its sealed reason — a restored evidence file keeps its history
+		// of who answered for it.
+		let links: Vec<CustodyJsonRow> = self
+			.sql
+			.exec("SELECT file_id, seq, from_member, to_member, reason_sealed, offered_at, offer_signature, accepted_at, accept_signature, cancelled_at FROM custody ORDER BY file_id, seq", None)?
+			.to_array()?;
+		for l in links {
+			row(serde_json::json!({ "kind": "custody", "file": l.file_id, "seq": l.seq, "from": l.from_member, "to": l.to_member, "reasonSealed": l.reason_sealed, "offeredAt": l.offered_at, "offerSignature": l.offer_signature, "acceptedAt": l.accepted_at, "acceptSignature": l.accept_signature, "cancelledAt": l.cancelled_at }), writer, out);
 			entries += 1;
 		}
 		let mut missing = Vec::new();
@@ -291,6 +304,20 @@ struct FileJsonRow {
 	created_at: String,
 	updated_at: String,
 	owner: Option<String>,
+	intake_sealed: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct CustodyJsonRow {
+	file_id: String,
+	seq: i64,
+	from_member: String,
+	to_member: String,
+	reason_sealed: String,
+	offered_at: String,
+	offer_signature: String,
+	accepted_at: Option<String>,
+	accept_signature: Option<String>,
+	cancelled_at: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct VersionJsonRow {
@@ -381,13 +408,13 @@ impl GoraniMemberDO {
 				if !crate::auth::valid_object_id(&id) {
 					return json_error(400, "restored file ids must be ids");
 				}
-				if !gorani_formats::placed::is_placed_text(&name) {
-					return json_error(400, "restored file names must be placed sealed text (GV04)");
+				if !gorani_formats::placed::is_placed_text(&name) || get("intake").is_some_and(|i| !gorani_formats::placed::is_placed_text(&i)) {
+					return json_error(400, "restored file names and intake records must be placed sealed text (GV04)");
 				}
 				self.sql
 					.exec(
-						"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7) ON CONFLICT(id) DO UPDATE SET folder_id = ?2, name_sealed = ?3, size = ?4, deleted_at = NULL, trashed_with = NULL, owner = COALESCE(owner, ?7), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-						Some(vec![id.clone().into(), bind(get("folder")), name.into(), f.get("size").and_then(|v| v.as_i64()).unwrap_or(0).into(), f.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(), bind(get("createdAt")), bind(get("owner"))]),
+						"INSERT INTO files (id, folder_id, name_sealed, size, version, created_at, updated_at, owner, intake_sealed) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7, ?8) ON CONFLICT(id) DO UPDATE SET folder_id = ?2, name_sealed = ?3, size = ?4, deleted_at = NULL, trashed_with = NULL, owner = COALESCE(owner, ?7), intake_sealed = COALESCE(intake_sealed, ?8), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+						Some(vec![id.clone().into(), bind(get("folder")), name.into(), f.get("size").and_then(|v| v.as_i64()).unwrap_or(0).into(), f.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(), bind(get("createdAt")), bind(get("owner")), bind(get("intake"))]),
 					)
 					.map_err(|e| worker::Error::RustError(format!("restore file: {e}")))?;
 				self.contributor_add(&id, actor).await?;
@@ -459,6 +486,21 @@ impl GoraniMemberDO {
 			// Only into an empty slot: the secrets (fingerprint + index keys)
 			// a live vault already uses are never swapped by a restore.
 			self.sql.exec("INSERT INTO files_secrets (v) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM files_secrets)", Some(vec![sealed.into()]))?;
+		}
+		// Custody links (commit 29g): only into a gap — a link the store
+		// still has is never overwritten by an older copy of itself.
+		if let Some(links) = body.get("custody").and_then(|v| v.as_array()) {
+			for l in links {
+				let get = |k: &str| l.get(k).and_then(|v| v.as_str()).map(str::to_string);
+				let (Some(file), Some(seq), Some(from), Some(to), Some(reason), Some(offered), Some(sig)) = (get("file"), l.get("seq").and_then(|v| v.as_i64()), get("from"), get("to"), get("reasonSealed"), get("offeredAt"), get("offerSignature")) else { continue };
+				if !gorani_formats::placed::is_placed_text(&reason) {
+					return json_error(400, "restored custody reasons must be placed sealed text (GV04)");
+				}
+				self.sql.exec(
+					"INSERT OR IGNORE INTO custody (file_id, seq, from_member, to_member, reason_sealed, offered_at, offer_signature, accepted_at, accept_signature, cancelled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+					Some(vec![file.into(), seq.into(), from.into(), to.into(), reason.into(), offered.into(), sig.into(), bind(get("acceptedAt")), bind(get("acceptSignature")), bind(get("cancelledAt"))]),
+				)?;
+			}
 		}
 		self.audit(actor, "backup.restore", "restore", None, Some(&format!("objects: {}", objects.len()))).await?;
 		Ok(Response::from_json(&serde_json::json!({ "objects": objects.into_iter().map(|(r, k)| serde_json::json!({ "ref": r, "objectKey": k })).collect::<Vec<_>>(), "skipped": skipped }))?)

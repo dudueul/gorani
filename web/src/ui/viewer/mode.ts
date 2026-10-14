@@ -7,14 +7,17 @@
  * falls back to Download rather than being read whole into a tab.
  */
 
-export type ViewerMode = "image" | "video" | "audio" | "text" | "unsupported";
+// (`refused`: a malware sample, or a file whose type does not verify —
+// commit 29e. Decided before anything else, and nothing is decrypted.)
+export type ViewerMode = "image" | "video" | "audio" | "text" | "unsupported" | "refused";
 
 /** Above this, offer Download instead of reading whole (chunked files stream, but a tab holding 1 GB of bytes is not an experience). */
 export const MAX_INLINE = 256 * 1024 * 1024;
 /** Text is rendered up to this many bytes, then truncated with a note. */
 export const TEXT_CAP = 2 * 1024 * 1024;
 
-export function pickViewerMode(kind: string, mime: string | null, size: number): ViewerMode {
+export function pickViewerMode(kind: string, mime: string | null, size: number, policy: "normal" | "sample" | "unverified" = "normal"): ViewerMode {
+	if (policy !== "normal" || kind === "sample") return "refused";
 	if (size > MAX_INLINE) return "unsupported";
 	switch (kind) {
 		case "image":

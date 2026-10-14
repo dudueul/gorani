@@ -30,7 +30,7 @@ import { sealChunked } from "../../web/src/vault/chunked-file.ts";
 import { checkContentHash, sha256Hex, signContentHash } from "../../web/src/vault/content-hash.ts";
 import { places } from "../../web/src/vault/places.ts";
 import { statements } from "../../web/src/vault/identity.ts";
-import { member, vouch, openCase, trustOf, signedHash } from "../lib/team.mjs";
+import { member, vouch, openCase, trustOf, signedHash, signedIntake } from "../lib/team.mjs";
 
 const dev = await suiteDev();
 const enc = new TextEncoder();
@@ -91,12 +91,12 @@ try {
 	const mpUnsigned = await multipart({});
 	assert.equal(mpUnsigned.status, 400, "a multipart completion without the hash is refused too");
 	assert.deepEqual(await keysUnder("cases/ir-hash/"), [], "…and its completed object deleted");
-	const mp = await multipart({ hash: await signedHash(bo, ev.sealer, bigFile.id, 1, big) });
+	const mp = await multipart({ hash: await signedHash(bo, ev.sealer, bigFile.id, 1, big), intake: await signedIntake(bo, ev.sealer, bigFile.id) });
 	assert.equal(mp.status, 200, JSON.stringify(mp.json));
 
 	// ── 2. A signed upload, stored and handed back sealed ────────────────
 	const hash1 = await signedHash(bo, ev.sealer, f.id, 1, plain);
-	const up = await post(bo, `${ev.base}/files`, { ...f.fields, size: String(plain.length), hash: hash1 }, sealed);
+	const up = await post(bo, `${ev.base}/files`, { ...f.fields, size: String(plain.length), hash: hash1, intake: await signedIntake(bo, ev.sealer, f.id) }, sealed);
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const keyed = await api(dev.base, "POST", `${ev.base}/files/keys`, { email: cy.email, body: { ids: [f.id] } });
 	assert.equal(keyed.json.keys[f.id].hash, hash1, "with the key: the record exactly as the uploader sealed it");

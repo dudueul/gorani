@@ -17,6 +17,7 @@ import { openWith, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vau
 import { places } from "../../vault/places.ts";
 import type { VaultSession } from "../../vault/session.ts";
 import type { Signer, Trust } from "../../vault/identity.ts";
+import type { IntakeFields } from "../../vault/intake.ts";
 import { openChunkedStream } from "../../vault/chunked-file.ts";
 
 export interface FilesHooks {
@@ -24,6 +25,9 @@ export interface FilesHooks {
 	toast(message: string): void;
 	/** The member's signer and trust, once the team context is open (model.ts › FilesBridge.identity). */
 	identity?(): { signer: Signer; trust: Trust } | null;
+	/** The area's kind, and the intake form evidence uploads need (commit 29g). */
+	areaKind?(): "evidence" | "working" | "own" | null;
+	intake?(files: File[]): Promise<IntakeFields | null>;
 }
 
 /**
@@ -132,6 +136,8 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 		confirmDuplicate: hooks.confirmDuplicate,
 		toast: hooks.toast,
 		identity: () => hooks.identity?.() ?? null,
+		areaKind: () => hooks.areaKind?.() ?? null,
+		intake: (files) => hooks.intake?.(files) ?? Promise.resolve(null),
 	};
 }
 

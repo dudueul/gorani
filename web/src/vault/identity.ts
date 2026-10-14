@@ -29,6 +29,11 @@
  * cert      "gorani-cert-v1"     ‖ member ‖ identity key id ‖ root digest   (by a certifier)
  * grant     "gorani-grant-v1"    ‖ case   ‖ case key digest ‖ grantee       (by the granter)
  * content   "gorani-content-hash-v1" ‖ area ‖ file ‖ version ‖ SHA-256 ‖ size   (by the uploader; content-hash.ts)
+ * approval  "gorani-approval-v1" ‖ id ‖ action ‖ case ‖ requester              (two-person rule: who asked; approvals.ts)
+ * approve   "gorani-approve-v1"  ‖ id ‖ action ‖ case ‖ requester ‖ approver   (…and the second lead who agreed)
+ * intake    "gorani-intake-v1"   ‖ area ‖ file ‖ source ‖ collector ‖ method ‖ collected-at ‖ notes   (intake.ts)
+ * offer     "gorani-custody-offer-v1"  ‖ area ‖ file ‖ seq ‖ from ‖ to ‖ SHA-256(reason)          (custody.ts)
+ * accept    "gorani-custody-accept-v1" ‖ area ‖ file ‖ seq ‖ from ‖ to
  * ```
  *
  * Digests are FULL SHA-256 of the public halves (ec raw ‖ ML-KEM public):
@@ -82,6 +87,11 @@ export const statements = {
 	cert: (member: string, keyId: string, rootDigest: string) => stmt("gorani-cert-v1", member, keyId, rootDigest),
 	grant: (caseId: string, caseKeyDigest: string, grantee: string) => stmt("gorani-grant-v1", caseId, caseKeyDigest, grantee),
 	contentHash: (area: string, file: string, version: number, sha256: string, size: number) => stmt("gorani-content-hash-v1", area, file, String(version), sha256, String(size)),
+	approval: (id: string, action: string, caseId: string, requester: string) => stmt("gorani-approval-v1", id, action, caseId, requester),
+	approve: (id: string, action: string, caseId: string, requester: string, approver: string) => stmt("gorani-approve-v1", id, action, caseId, requester, approver),
+	intake: (area: string, file: string, source: string, collector: string, method: string, collectedAt: string, notes: string) => stmt("gorani-intake-v1", area, file, source, collector, method, collectedAt, notes),
+	custodyOffer: (area: string, file: string, seq: number, from: string, to: string, reasonDigest: string) => stmt("gorani-custody-offer-v1", area, file, String(seq), from, to, reasonDigest),
+	custodyAccept: (area: string, file: string, seq: number, from: string, to: string) => stmt("gorani-custody-accept-v1", area, file, String(seq), from, to),
 };
 
 // ── ids, digests, fingerprints ────────────────────────────────────────

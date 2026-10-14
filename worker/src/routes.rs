@@ -316,6 +316,35 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 		}
 		("POST", [case, "key", "done"]) => return forward_family(&env, &identity.email, "POST", format!("case-key-done/{case}"), Some(serde_json::json!({}))).await,
 		("POST", [case, "close"]) => return forward_family(&env, &identity.email, "POST", format!("case-close/{case}"), Some(serde_json::json!({}))).await,
+		// ── The two-person rule and the legal hold (commit 29f, family/approvals.rs) ──
+		("GET", [case, "approvals"]) => return forward_family(&env, &identity.email, "GET", format!("case-approvals/{case}"), None).await,
+		("POST", [case, "approvals"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			return forward_family(&env, &identity.email, "POST", format!("case-approvals/{case}"), Some(body)).await;
+		}
+		("DELETE", [case, "approvals", approval]) => return forward_family(&env, &identity.email, "DELETE", format!("case-approvals/{case}/{approval}"), None).await,
+		("POST", [case, "approvals", approval, "approve"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			let mut done = forward_family(&env, &identity.email, "POST", format!("case-approve/{case}/{approval}"), Some(body)).await?;
+			if done.status_code() != 200 {
+				return Ok(done);
+			}
+			let answer: serde_json::Value = done.json().await?;
+			// A released hold reaches the case's store now (the registry is
+			// the record; tonight's pass would correct a lost call — cron.rs).
+			if answer.get("executed").and_then(|e| e.as_str()) == Some("hold.release") {
+				tell_case_hold(&env, case, false, &identity.email).await?;
+			}
+			return Response::from_json(&answer);
+		}
+		("POST", [case, "hold"]) => {
+			let placed = forward_family(&env, &identity.email, "POST", format!("case-hold/{case}"), Some(serde_json::json!({}))).await?;
+			if placed.status_code() != 200 {
+				return Ok(placed);
+			}
+			tell_case_hold(&env, case, true, &identity.email).await?;
+			return Response::from_json(&serde_json::json!({ "hold": true }));
+		}
 		_ => {}
 	}
 	let Some((case, content)) = rest.split_first() else { return json_error(404, "no such route") };
@@ -351,6 +380,10 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
+		// Custody (commit 29g) is a record of responsibility, not access:
+		// anyone on the case may hold an item — a read-only analyst too, and
+		// after the case closed. custody.rs decides WHO, link by link.
+		("POST", ["files", _, "custody"] | ["files", _, "custody", _, "accept" | "cancel"]) => Some(Need::Read),
 		// Rotation's reseal walk, the backup key and runs, restores and
 		// retention: the case's managers.
 		("PUT", ["files", "reseal"] | ["backup-key"] | ["backup", "restore", "object"]) | ("GET", ["backup-key"]) | ("POST", ["backup", "run"] | ["backup", "restore"] | ["housekeeping"]) => Some(Need::Manage),
@@ -363,6 +396,20 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 /// lives there), then the case's store — settings that say only "on" and
 /// whose store it is. A case has no root and no unlock methods: its key is
 /// in the grants, sealed to each grantee's own root.
+/// Tell a case's store its legal hold (commit 29f), after the registry
+/// recorded the change. A store that does not confirm is an error the
+/// caller sees: the record already changed, and placing a hold again is
+/// harmless (idempotent) — retry it, or tonight's reconciliation (cron.rs)
+/// finishes the job. (A lost RELEASE leaves the store held a little longer:
+/// the safe side.)
+async fn tell_case_hold(env: &Env, case: &str, hold: bool, actor: &str) -> Result<()> {
+	let told = forward_member(env, &format!("case:{case}"), "PUT", "case-hold", Some(serde_json::json!({ "hold": hold })), actor.to_string()).await?;
+	if told.status_code() >= 300 {
+		return Err(Error::RustError(format!("the case store did not confirm the legal hold ({}); the registry has it, and tonight's pass will retry", told.status_code())));
+	}
+	Ok(())
+}
+
 async fn case_open(mut req: Request, env: Env, identity: &Identity) -> Result<Response> {
 	let body = req.json::<serde_json::Value>().await?;
 	let Some(id) = body.get("id").and_then(|v| v.as_str()).filter(|i| crate::area::valid_case_id(i)).map(str::to_string) else {
@@ -500,6 +547,27 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		}
 		("GET", ["members", id, "files", "list"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/list", &req, actor)).await,
 		("GET", ["members", id, "files", "changes"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/changes", &req, actor)).await,
+		// ── Custody (commit 29g, custody.rs) ── the acting member rides in the
+		// body, from the Worker's own check (a case grant, or the member).
+		("GET", ["members", id, "files", file, "custody"]) => {
+			let path = format!("custody/{file}");
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", path, None, actor)).await
+		}
+		("POST", ["members", id, "files", file, "custody", ..]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			let rest: &[&str] = &segments[5..];
+			let path = match rest {
+				[] => format!("custody/{file}"),
+				[seq, verb @ ("accept" | "cancel")] if seq.parse::<i64>().is_ok() => format!("custody/{file}/{seq}/{verb}"),
+				_ => return json_error(404, "files/<id>/custody[/<seq>/accept|cancel]"),
+			};
+			let mut body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+			body["member"] = serde_json::json!(actor.id);
+			forward_member(&env, id, "POST", &path, Some(body), &actor.email).await
+		}
 		("GET", ["members", id, "files", "music"]) => {
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "music/feed", None, actor)).await
 		}
@@ -783,8 +851,10 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	let form = req.form_data().await?;
 	// The known text fields; FormData has no iteration in workers-rs, so we
 	// ask for each by name (the upload contract is fixed anyway).
-	// (`hash`: the uploader's signed content hash, sealed — commit 29d.)
-	const KNOWN: [&str; 13] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash"];
+	// (`hash`: the uploader's signed content hash, sealed — commit 29d.
+	// `sample`: "1" uploads a malware sample — commit 29e. `intake`: an
+	// evidence file's sealed, signed intake record — commit 29g.)
+	const KNOWN: [&str; 15] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -865,6 +935,8 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
+		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
+		"intake": form.fields.get("intake"),
 		"objectKey": object_key,
 		"bytesSealed": true,
 		"owner": actor.id,
@@ -1034,6 +1106,9 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
 		"hash": form.fields.get("hash"),
+		// (A new file only: a version of a sample is a sample already.)
+		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
+		"intake": form.fields.get("intake"),
 		"key": form.fields.get("key"),
 		// The Worker's attestation: the object added up to its declared size
 		// (size + frames × 28). GC01 frames carry no magic — their sealing is

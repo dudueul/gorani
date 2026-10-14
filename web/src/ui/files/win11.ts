@@ -28,7 +28,7 @@ import { customElement, property, state } from "lit/decorators.js";
 import { styleMap } from "lit/directives/style-map.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, type MenuItem } from "./shared.ts";
+import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -200,6 +200,7 @@ export class GoraniWin11 extends LitElement {
 		if (!this.isSelected(kind, id)) this.model.select({ kind, id });
 		const many = this.selection().length > 1;
 		const s = this.s();
+		const sample = s.files.find((f) => f.id === id)?.sample === true;
 		const items: MenuItem[] = s.trashMode
 			? [
 					{ label: "Restore", run: () => void this.model.restore(this.selection().filter((x) => x.kind === "file").map((x) => x.id), this.selection().filter((x) => x.kind === "folder").map((x) => x.id)) },
@@ -208,11 +209,13 @@ export class GoraniWin11 extends LitElement {
 					{ label: "Open", run: () => void this.openEntry(kind, id, name), disabled: many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
 					{ label: "Verify signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },
+					{ label: "Custody…", run: () => void custodyAction(this.model, id, name), disabled: kind === "folder" || many },
 					{ separator: true, label: "" },
 					{ label: "Cut", run: () => this.model.cut() },
 					{ label: "Copy", run: () => this.model.copy() },
 					{ separator: true, label: "" },
-					{ label: "Share…", run: () => this.openShare(id, name), disabled: kind === "folder" || many },
+					{ label: "Share…", run: () => this.openShare(id, name), disabled: kind === "folder" || many || sample },
+					{ label: "Mark as malware sample…", run: () => void markSample(this.model, id, name), disabled: kind === "folder" || many || sample },
 					{ label: "Rename", run: () => void this.renameSelection(), disabled: many },
 					{ label: "Move to…", run: () => void 0, disabled: many },
 					{ label: "Delete", run: () => void this.deleteSelection() },
@@ -455,6 +458,8 @@ export class GoraniWin11 extends LitElement {
 					<button class="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 hover:bg-neutral-800" @click=${(e: MouseEvent) => showMenu([
 						{ label: "Folder", icon: icon("folder"), run: () => void this.newFolder() },
 						{ label: "Upload files…", icon: icon("file"), run: () => (this.querySelector<HTMLInputElement>("[data-upload]") as HTMLInputElement)?.click() },
+						// Marked from the first byte (commit 29e): never previewed, never linked.
+						{ label: "Upload malware samples…", icon: icon("sample"), run: () => (this.querySelector<HTMLInputElement>("[data-upload-sample]") as HTMLInputElement)?.click() },
 					], e.clientX, e.clientY)}>
 						<span class="text-accent">＋</span> New <span class="text-neutral-500">▾</span>
 					</button>
@@ -469,6 +474,11 @@ export class GoraniWin11 extends LitElement {
 				<input data-upload type="file" multiple class="hidden" @change=${(e: Event) => {
 					const input = e.target as HTMLInputElement;
 					if (input.files?.length) void this.model.upload([...input.files]);
+					input.value = "";
+				}} />
+				<input data-upload-sample type="file" multiple class="hidden" @change=${(e: Event) => {
+					const input = e.target as HTMLInputElement;
+					if (input.files?.length) void this.model.upload([...input.files], { sample: true });
 					input.value = "";
 				}} />
 			</div>

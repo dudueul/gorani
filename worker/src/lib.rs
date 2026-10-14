@@ -34,6 +34,7 @@ mod auth;
 mod backup;
 mod cache;
 mod cron;
+mod custody;
 mod devices;
 mod family;
 mod files_store;

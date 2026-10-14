@@ -20,7 +20,7 @@
 import assert from "node:assert/strict";
 import { startDev, api } from "./_dev.mjs";
 import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
-import { member, vouch, openCase, signedHash } from "../lib/team.mjs";
+import { member, vouch, openCase, signedHash, signedIntake } from "../lib/team.mjs";
 
 const dev = await startDev({ vars: { OBJECT_LOCK: "on", EVIDENCE_RETAIN_DAYS: "30" } });
 const enc = new TextEncoder();
@@ -30,7 +30,7 @@ async function upload(who, base, sealer, name) {
 	const f = await sealer.newFile(name, "application/octet-stream", ck);
 	const plain = enc.encode(`bytes of ${name}`);
 	const boundary = `l${Math.random().toString(16).slice(2)}`;
-	const fields = { ...f.fields, size: String(plain.length), hash: await signedHash(who, sealer, f.id, 1, plain) };
+	const fields = { ...f.fields, size: String(plain.length), hash: await signedHash(who, sealer, f.id, 1, plain), intake: await signedIntake(who, sealer, f.id) };
 	const head = enc.encode(Object.entries(fields).map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`).join("") + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`);
 	const sealed = await sealWith(await importContentKey(ck), plain);
 	const r = await fetch(`${dev.base}${base}/files`, { method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}`, "x-gorani-dev-email": who.email }, body: new Uint8Array([...head, ...sealed, ...enc.encode(`\r\n--${boundary}--\r\n`)]) });

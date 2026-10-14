@@ -10,7 +10,10 @@
  *   - images and media go through blob URLs that are revoked on close;
  *   - text/code is escaped by Lit and rendered as text (never as HTML);
  *   - nothing is fetched from anywhere; there is no eval, no remote fonts;
- *   - a file too big to show inline offers Download (model.download).
+ *   - a file too big to show inline offers Download (model.download);
+ *   - a malware sample — or a file whose sealed type does not verify — is
+ *     never opened at all (commit 29e, docs/CUSTODY.md › stage 5): the mode
+ *     is decided before a byte is decrypted, and Download zips it.
  *
  * Formats arrive in steps: images, text/code, audio/video now (played from
  * the decrypted blob — seeking works because the GC1 frames open on their
@@ -26,6 +29,7 @@ import { icon, type FileKind } from "../files/icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
 import { forgetMedia } from "../../lib/media-worker.ts";
+import { SAMPLE_PASSWORD } from "../../vault/samples.ts";
 
 export interface ViewerTarget {
 	id: string;
@@ -47,6 +51,8 @@ export class GoraniViewer extends LitElement {
 	@state() private truncated = false;
 	@state() private busy = true;
 	@state() private error: string | null = null;
+	@state() private policy: "normal" | "sample" | "unverified" = "normal";
+	@state() private shownType: string | null = null;
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -81,8 +87,10 @@ export class GoraniViewer extends LitElement {
 		const { id, kind, size } = this.target;
 		const info = await this.model.info(id);
 		const mime = info?.mime ?? null;
-		this.mode = pickViewerMode(kind, mime, size);
-		if (this.mode === "unsupported") {
+		this.mode = pickViewerMode(kind, mime, size, info?.policy ?? "unverified");
+		this.policy = info?.policy ?? "unverified";
+		this.shownType = info?.shownType ?? null;
+		if (this.mode === "unsupported" || this.mode === "refused") {
 			this.busy = false;
 			return;
 		}
@@ -165,9 +173,25 @@ export class GoraniViewer extends LitElement {
 						${this.truncated ? html`<p class="border-t border-neutral-800 px-5 py-2 text-xs text-neutral-500">Shown: the first ${fmtSize(TEXT_CAP)} — Download for the rest.</p>` : nothing}
 					</div>
 				`;
+			case "refused":
+				return this.refused();
 			default:
 				return this.unknown();
 		}
+	}
+
+	/** A sample is never rendered here (commit 29e). Download zips it. */
+	private refused(): TemplateResult {
+		const sample = this.policy === "sample";
+		return html`
+			<div class="max-w-md rounded-2xl border border-amber-700/60 bg-neutral-900 p-8 text-center" data-test="viewer-refused">
+				${icon("sample", "h-16 w-16 text-amber-500 mx-auto")}
+				<p class="mt-3 text-sm text-neutral-200">${sample ? "A malware sample — never opened in this app." : "This file's type does not verify in its place — not opened, as if it were a sample."}</p>
+				${this.shownType ? html`<p class="mt-1 text-xs text-neutral-500">Type: ${this.shownType}</p>` : nothing}
+				<p class="mt-1 text-xs text-neutral-500">Download saves it as a zip encrypted with the password <code class="text-neutral-300">${SAMPLE_PASSWORD}</code>, the convention antivirus and analysts expect. Open it only inside an analysis environment.</p>
+				<button class="mt-4 rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" @click=${() => void this.model.download(this.target.id, this.target.name)}>Download zipped</button>
+			</div>
+		`;
 	}
 
 	private unknown(): TemplateResult {

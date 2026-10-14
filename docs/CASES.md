@@ -172,7 +172,9 @@ old CHECK constraint allowed only parent/child.
    role aliases and the act-for rule removed; every suite ported, shared
    work modelled as a case — `api:ownership`).
 6. **UI** — the case list, grant dialog, ceremony screens. Designed below
-   in **Stage 6, the screens**.
+   in **Stage 6, the screens** (landed: commit 28, `web/src/ui/team.ts`,
+   `web/src/vault/team.ts`, the area switcher in `ui/shell.ts`, re-enrol in
+   `ui/unlock.ts`; `e2e:app` §5–6).
 
 ## Stage 3 as built
 

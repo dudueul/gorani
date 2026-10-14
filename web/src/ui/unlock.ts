@@ -12,6 +12,12 @@
  * "try again"; two hints travel with it: the recovery code forgives case and
  * dashes (normalised in vault-crypto), a password's Argon2id cost is the
  * deliberate quarter-second of work per guess.
+ *
+ * **Lost every method?** (commit 27, docs/CASES.md › Recovery) The member,
+ * still signed in through Access, RE-ENROLS: a new root, a password, a
+ * recovery code and an identity, posted as a draft. Nothing opens yet —
+ * a recovery ceremony that several leads approve seals their area to the
+ * new root, after the coordinating lead hears its fingerprint from them.
  */
 
 import { LitElement, html, nothing } from "lit";
@@ -19,6 +25,10 @@ import { customElement, property, state } from "lit/decorators.js";
 import { enrolledKinds, openRoot, type PresentSecret, type VaultSettings } from "../vault/methods.ts";
 import { openSession, heldBundle, rememberOnDevice, type VaultSession } from "../vault/session.ts";
 import { prfOutput } from "../vault/passkey.ts";
+import { createVaultBundle } from "../vault/methods.ts";
+import { importVaultKey, passwordProblem } from "../vault/vault-crypto.ts";
+import { createIdentity, fingerprint, hybridDigest } from "../vault/identity.ts";
+import { api } from "../lib/api.ts";
 
 export interface UnlockResult {
 	session: VaultSession;
@@ -36,6 +46,7 @@ export class GoraniUnlock extends LitElement {
 	@state() private busy = false;
 	@state() private error = "";
 	@state() private stay = false;
+	@state() private reenrol: { password: string; confirm: string; done: { code: string; fingerprint: string } | null } | null = null;
 
 	protected override createRenderRoot(): HTMLElement {
 		return this; // global Tailwind stylesheet (see styles/global.css)
@@ -60,7 +71,66 @@ export class GoraniUnlock extends LitElement {
 		}
 	}
 
+	private renderReenrol(r: NonNullable<GoraniUnlock["reenrol"]>) {
+		if (r.done) {
+			return html`
+				<section class="w-full max-w-sm rounded-2xl border border-accent/40 bg-neutral-900 p-6 shadow-xl" data-test="reenrolled">
+					<h2 class="text-lg font-medium">Re-enrolled — waiting for the leads</h2>
+					<p class="mt-2 text-sm text-neutral-400">Read this fingerprint to the lead who coordinates your recovery. They type it before your area is sealed to your new key:</p>
+					<code class="mt-3 block select-all rounded-xl bg-neutral-950 p-3 text-center font-mono text-sm text-accent" data-test="reenrol-fingerprint">${r.done.fingerprint}</code>
+					<p class="mt-3 text-sm text-neutral-400">Your new recovery code — write it down, it is shown once:</p>
+					<code class="mt-2 block select-all rounded-xl bg-neutral-950 p-3 text-center text-sm tracking-widest">${r.done.code}</code>
+					<p class="mt-3 text-xs text-neutral-500">When the ceremony completes, unlock with your new password.</p>
+				</section>
+			`;
+		}
+		return html`
+			<section class="w-full max-w-sm rounded-2xl border border-neutral-800 bg-neutral-900 p-6 shadow-xl">
+				<h2 class="text-lg font-medium">Re-enrol ${this.memberName}</h2>
+				<p class="mt-2 text-sm text-neutral-400">A new key for you. Your files stay sealed until several leads approve a recovery ceremony — nobody, you included, can skip that.</p>
+				<form class="mt-4" @submit=${(e: Event) => {
+					e.preventDefault();
+					void this.submitReenrol(r);
+				}}>
+					<input class="w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2.5 text-sm outline-none focus:border-accent" type="password" placeholder="New password (12+ chars)" .value=${r.password} @input=${(e: InputEvent) => (this.reenrol = { ...r, password: (e.target as HTMLInputElement).value })} autocomplete="new-password" />
+					<input class="mt-2 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2.5 text-sm outline-none focus:border-accent" type="password" placeholder="Repeat it" .value=${r.confirm} @input=${(e: InputEvent) => (this.reenrol = { ...r, confirm: (e.target as HTMLInputElement).value })} autocomplete="new-password" />
+					<button class="mt-4 w-full rounded-xl bg-accent px-4 py-2.5 font-medium text-neutral-950 hover:opacity-90 disabled:opacity-50" ?disabled=${this.busy}>${this.busy ? "Sealing…" : "Re-enrol"}</button>
+					<button type="button" class="mt-2 w-full text-xs text-neutral-500 hover:text-neutral-300" @click=${() => (this.reenrol = null)}>Back to unlock</button>
+					${this.error ? html`<p class="mt-3 text-sm text-red-400">${this.error}</p>` : nothing}
+				</form>
+			</section>
+		`;
+	}
+
+	private async submitReenrol(r: NonNullable<GoraniUnlock["reenrol"]>): Promise<void> {
+		this.error = "";
+		if (r.password !== r.confirm) {
+			this.error = "The two passwords differ";
+			return;
+		}
+		const problem = passwordProblem(r.password);
+		if (problem) {
+			this.error = problem;
+			return;
+		}
+		this.busy = true;
+		try {
+			const bundle = await createVaultBundle(r.password);
+			const root = await importVaultKey(bundle.rootBundle); // wipes the bundle
+			const rootPublic = { ec: bundle.settings.publicKey, kem: bundle.settings.pqPublicKey };
+			const identity = await createIdentity(this.memberId, root, rootPublic);
+			const rootDigest = await hybridDigest(rootPublic.ec, rootPublic.kem);
+			await api.put("/api/v1/recovery/reenrol", { settings: { ...bundle.settings, identity: identity.record }, rootDigest });
+			this.reenrol = { ...r, password: "", confirm: "", done: { code: bundle.recoveryCode, fingerprint: fingerprint(rootDigest) } };
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.busy = false;
+		}
+	}
+
 	protected override render() {
+		if (this.reenrol) return this.renderReenrol(this.reenrol);
 		const kinds = enrolledKinds(this.settings);
 		return html`
 			<section class="w-full max-w-sm rounded-2xl border border-neutral-800 bg-neutral-900 p-6 shadow-xl">
@@ -112,6 +182,10 @@ export class GoraniUnlock extends LitElement {
 					</button>
 					${this.error ? html`<p class="mt-3 text-sm text-red-400">${this.error}</p>` : nothing}
 				</form>
+				<button class="mt-4 w-full text-xs text-neutral-500 hover:text-neutral-300" data-test="lost-methods" @click=${() => {
+					this.error = "";
+					this.reenrol = { password: "", confirm: "", done: null };
+				}}>Lost every way in? Re-enrol</button>
 			</section>
 		`;
 	}

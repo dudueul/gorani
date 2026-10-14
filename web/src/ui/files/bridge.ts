@@ -23,7 +23,13 @@ export interface FilesHooks {
 	toast(message: string): void;
 }
 
-export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBridge {
+/**
+ * `openKey` is the area's key source: by default the member's own files
+ * store; for a case (commit 27, the area switcher) the case key opened from
+ * the member's grant — cases.ts › openCaseKey, signature checked. Either way
+ * the key lives only as long as this bridge, and a locked session ends it.
+ */
+export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey: () => Promise<VaultPrivateKey> = async () => (await session.openStoreKey("files")).privateKey): FilesBridge {
 	let cached: { privateKey: VaultPrivateKey } | null = null;
 	const store = async () => {
 		// A locked session hands out nothing — not even the store key this
@@ -37,8 +43,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 			// The private key is all a store needs: it opens AND seals (GV04 —
 			// a store seals to itself; commit 25). No public half is kept: a
 			// public key in hand is exactly the path the server used to have.
-			const opened = await session.openStoreKey("files");
-			cached = { privateKey: opened.privateKey };
+			cached = { privateKey: await openKey() };
 		}
 		return cached;
 	};

@@ -37,8 +37,25 @@ export function r2Twin() {
  * (tests/api/s3-live.test.mjs) uses it. The credentials go only into the
  * gitignored .dev.vars, exactly where `wrangler dev` reads secrets from.
  */
+/** Is web/dist missing, or older than a file under web/src, web/public or a page? */
+function webBuildStale() {
+	const built = path.join(ROOT, "web/dist/index.html");
+	if (!fs.existsSync(built)) return true;
+	const at = fs.statSync(built).mtimeMs;
+	const newer = (p) => {
+		const st = fs.statSync(p);
+		if (st.isDirectory()) return fs.readdirSync(p).some((f) => newer(path.join(p, f)));
+		return st.mtimeMs > at;
+	};
+	return ["web/src", "web/public", "web/index.html", "web/s.html"].some((p) => fs.existsSync(path.join(ROOT, p)) && newer(path.join(ROOT, p)));
+}
+
 export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3, keepState = false, vars = {} } = {}) {
-	if (!fs.existsSync(path.join(ROOT, "web/dist/index.html"))) {
+	// Build the web app when it is missing OR older than any of its sources.
+	// (It used to build only when missing: the browser e2e then served a
+	// stale bundle — and passed or failed for code that was not the code
+	// under test. Commit 27's team screens were caught by exactly that.)
+	if (webBuildStale()) {
 		const b = spawnSync("npm", ["--prefix", "web", "run", "build"], { cwd: ROOT, encoding: "utf8" });
 		if (b.status !== 0) throw new Error(`web build failed:\n${b.stdout}\n${b.stderr}`);
 	}

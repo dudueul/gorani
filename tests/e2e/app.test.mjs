@@ -308,8 +308,78 @@ try {
 		await ctx.close();
 	}
 
+	// ── 5. The team screens (commit 27, docs/CASES.md › Stage 6) ───────
+	// Mom unlocked once already (section 3), which created and registered
+	// her identity; this unlock must OPEN it (its MAC verifies under her
+	// root). Then a case, opened from the Team panel and entered through
+	// the area switcher, takes a browser upload sealed under the case key.
+	{
+		const ctx = await guardedContext(browser, "mom@family.test");
+		const page = await ctx.newPage();
+		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
+		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
+		await page.goto(dev.base);
+		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
+		await page.getByRole("button", { name: /Mom/ }).click();
+		await page.locator('input[type="password"]').fill("correct horse battery staple 42");
+		await page.getByRole("button", { name: "Unlock" }).click();
+		// The Team button enables once the team is open (identity opened or
+		// created, recovery copy checked).
+		const teamButton = page.locator('[data-test="team-button"]:not([disabled])');
+		await teamButton.waitFor({ timeout: 30_000 }).catch(async (e) => {
+			console.error("PAGE:", (await page.content()).replace(/<style[\s\S]*?<\/style>/g, "").replace(/\s+/g, " ").slice(0, 4000));
+			throw e;
+		});
+		const ids = (await api(dev.base, "GET", "/api/v1/family/identities", { email: "mom@family.test" })).json.identities;
+		assert.equal(ids.filter((e) => e.member === "mom").length, 1, "mom's identity is registered, once");
+		await teamButton.click();
+		const fp = (await page.locator('[data-test="my-fingerprint"]').textContent())?.trim() ?? "";
+		assert.match(fp, /^([0-9A-F]{4} ){7}[0-9A-F]{4}$/, "the fingerprint people read to each other");
+		assert.equal(fp.replace(/ /g, ""), ids.find((e) => e.member === "mom").keyId.slice(0, 32).toUpperCase(), "…is the registered identity's");
+
+		await page.getByRole("button", { name: "Cases" }).click();
+		await page.locator('[data-test="case-id"]').fill("ir-e2e");
+		await page.locator('[data-test="case-title"]').fill("Browser case");
+		await page.locator('[data-test="case-open"]').click();
+		await page.locator('[data-test="case-enter-ir-e2e"]').waitFor({ timeout: 30_000 });
+		assert.ok((await page.locator('[data-test="case-ir-e2e"]').textContent()).includes("Browser case"), "the sealed title opens in the panel");
+		await page.locator('[data-test="case-enter-ir-e2e"]').click();
+		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
+		assert.equal(await page.locator('[data-test="area"]').inputValue(), "case:ir-e2e", "the explorer is on the case");
+		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "case-note.txt", mimeType: "text/plain", buffer: Buffer.from("sealed under the case key") });
+		await page.locator("text=case-note.txt").first().waitFor({ timeout: 60_000 });
+		const listed = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
+		assert.equal(listed.json.files.length, 1, "the upload landed in the CASE's store");
+		assert.equal((await api(dev.base, "GET", "/api/v1/members/mom/files/list?folder=all", { email: "mom@family.test" })).json.files?.length ?? 0, 0, "…not in mom's own area");
+		await page.locator("text=case-note.txt").first().dblclick();
+		await page.locator("text=sealed under the case key").first().waitFor({ timeout: 30_000 });
+		await page.keyboard.press("Escape");
+		await assertNoViolations(page, "team panel, case open, upload and preview");
+		await ctx.close();
+	}
+
+	// ── 6. Lost every way in: re-enrol, and read the fingerprint ───────
+	{
+		const ctx = await guardedContext(browser, "jinu@family.test");
+		const page = await ctx.newPage();
+		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
+		await page.goto(dev.base);
+		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
+		await page.getByRole("button", { name: /Jinu/ }).click();
+		await page.locator('[data-test="lost-methods"]').click();
+		await page.getByPlaceholder("New password (12+ chars)").fill("jinu's brand new password");
+		await page.getByPlaceholder("Repeat it").fill("jinu's brand new password");
+		await page.getByRole("button", { name: "Re-enrol" }).click();
+		const shown = (await page.locator('[data-test="reenrol-fingerprint"]').textContent({ timeout: 60_000 }))?.trim() ?? "";
+		assert.match(shown, /^([0-9A-F]{4} ){7}[0-9A-F]{4}$/, "the new root's fingerprint, to read to the coordinating lead");
+		const still = await api(dev.base, "GET", "/api/v1/members/jinu/vault", { email: "jinu@family.test" });
+		assert.equal(still.json.keyId, jinu.keyId, "nothing changed yet — only a ceremony can re-root the vault");
+		await assertNoViolations(page, "re-enrol");
+		await ctx.close();
+	}
+
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel + case upload, re-enrol");
 } finally {
 	await dev.close();
 }

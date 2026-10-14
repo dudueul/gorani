@@ -3,9 +3,16 @@
 /**
  * <gorani-shell>: the unlocked application frame. It owns the lock button,
  * the auto-lock clock, and the explorer — in whichever platform skin the
- * family member prefers (persisted per browser): the Windows 11 File
- * Explorer simulation or the macOS Finder simulation, both views over the
- * same sealed model.
+ * member prefers (persisted per browser): the Windows 11 File Explorer
+ * simulation or the macOS Finder simulation, both views over the same
+ * sealed model.
+ *
+ * Since commit 27 it also opens the TEAM at unlock (vault/team.ts: the
+ * member's identity, created and registered the first time; their own
+ * area's recovery copy, refreshed when missing or stale), and switches the
+ * explorer between AREAS — "My files" or a case the member is granted, the
+ * same explorer over `case:<id>` with the case key (signature checked
+ * before the first byte is opened) — and the Team panel (ui/team.ts).
  */
 
 import { LitElement, html, nothing } from "lit";
@@ -23,6 +30,13 @@ import "./files/win11.ts";
 import "./files/finder.ts";
 import "./files/music.ts";
 import { registerMediaWorker, forgetMedia } from "../lib/media-worker.ts";
+import "./team.ts";
+import { openTeam, refreshRecoveryCopy, type TeamCall, type TeamContext } from "../vault/team.ts";
+import { openCaseKey, type CaseRow } from "../vault/cases.ts";
+
+/** The browser's TeamCall: the same-origin JSON API (lib/api.ts). */
+const teamCall: TeamCall = <T>(method: "GET" | "PUT" | "POST" | "DELETE", path: string, body?: unknown) =>
+	(method === "GET" ? api.get<T>(path) : method === "PUT" ? api.put<T>(path, body) : method === "POST" ? api.post<T>(path, body) : api.del<T>(path)) as Promise<T>;
 
 @customElement("gorani-shell")
 export class GoraniShell extends LitElement {
@@ -34,6 +48,12 @@ export class GoraniShell extends LitElement {
 	private model: FilesModel | null = null;
 	private index: import("../vault/index.ts").LocalIndex | null = null;
 	@state() private viewer: ViewerTarget | null = null;
+	/** The area the explorer shows: the member's own id, or `case:<id>`. */
+	@state() private area = "";
+	@state() private areaTitle = "";
+	@state() private view: "files" | "team" = "files";
+	@state() private team: TeamContext | null = null;
+	@state() private grantedCases: CaseRow[] = [];
 	/** Cleanups for the current session's clock and lock subscription. */
 	private stopAutoLock: (() => void) | null = null;
 	private stopOnLock: (() => void) | null = null;
@@ -58,6 +78,8 @@ export class GoraniShell extends LitElement {
 		this.model?.dispose();
 		this.model = null;
 		this.viewer = null;
+		this.team = null;
+		this.grantedCases = [];
 		void this.index?.close();
 		this.index = null;
 		revokeAllBlobURLs();
@@ -103,18 +125,66 @@ export class GoraniShell extends LitElement {
 			// Locked while the index was opening (the user pressed Lock early)?
 			// Then nothing more is built for a session that is already over.
 			if (this.session.locked) return;
-			// The explorer's model: bridge = the session's non-extractable keys.
-			this.model = new FilesModel(sessionBridge(this.session, {
-				confirmDuplicate: async (count) =>
-					window.confirm(`${count} identical file${count > 1 ? "s" : ""} already here.\n\nOK — keep both copies\nCancel — skip the upload`)
-						? "keep"
-						: "skip",
-				toast: (m) => this.toast(m),
-			}), this.member.id, this.index ?? undefined);
-			window.__goraniMember = this.member.id;
-			void this.model.open().then(() => this.persistPinned());
-			void this.requestUpdate();
+			// An external member has no own area: they start in a case, once
+			// the team (and so their trust) is open.
+			if (this.member.role !== "external") this.openArea(this.member.id, this.member.name);
+			void this.openTeamContext();
 		}
+	}
+
+	/** The team, at unlock: identity first, then this area's recovery copy.
+	 * Best effort — a failure is said, and the files still open. */
+	private async openTeamContext(): Promise<void> {
+		try {
+			this.team = await openTeam(teamCall, this.session, this.member.id);
+			if (this.session.locked) return;
+			const copy = this.member.role === "external" ? "none" : await refreshRecoveryCopy(teamCall, this.session, this.team);
+			if (copy === "sealed") this.toast("Your area's recovery copy is up to date");
+			if (copy === "untrusted") this.toast("The team's recovery key is not verified yet — compare a lead's fingerprint (Team › People)");
+			await this.loadCases();
+			if (!this.area && this.grantedCases[0]) this.openArea(`case:${this.grantedCases[0].id}`, this.grantedCases[0].id);
+		} catch (e) {
+			this.toast(`Team: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	private async loadCases(): Promise<void> {
+		try {
+			this.grantedCases = (await api.get<{ cases: CaseRow[] }>("/api/v1/cases")).cases.filter((c) => c.grant && !c.closed);
+		} catch {
+			this.grantedCases = [];
+		}
+	}
+
+	/** Point the explorer at an area. A case's key comes from the member's
+	 * grant, opened only after its signature verifies (cases.ts). */
+	private openArea(area: string, title: string): void {
+		this.model?.dispose();
+		const own = area === this.member.id;
+		const caseId = own ? null : area.slice("case:".length);
+		const openKey = own
+			? undefined
+			: async () => {
+					if (!this.team) throw new Error("the team is still opening — try again in a moment");
+					const row = (await api.get<{ cases: CaseRow[] }>("/api/v1/cases")).cases.find((c) => c.id === caseId);
+					if (!row?.grant) throw new Error(`you hold no grant on ${caseId}`);
+					return openCaseKey(this.session.root, row, this.team.trust);
+				};
+		this.model = new FilesModel(sessionBridge(this.session, {
+			confirmDuplicate: async (count) =>
+				window.confirm(`${count} identical file${count > 1 ? "s" : ""} already here.\n\nOK — keep both copies\nCancel — skip the upload`)
+					? "keep"
+					: "skip",
+			toast: (m) => this.toast(m),
+		}, openKey), area, own ? (this.index ?? undefined) : undefined);
+		this.area = area;
+		this.areaTitle = title;
+		window.__goraniMember = area;
+		void this.model
+			.open()
+			.then(() => (own ? this.persistPinned() : undefined))
+			.catch((e) => this.toast(e instanceof Error ? e.message : String(e)));
+		void this.requestUpdate();
 	}
 
 	/**
@@ -161,6 +231,19 @@ export class GoraniShell extends LitElement {
 						<span class="rounded-full bg-neutral-800 px-2 py-0.5 text-[10px] uppercase tracking-wide text-neutral-400">${this.member.role} · sealed</span>
 					</div>
 					<div class="flex items-center gap-2 text-xs">
+						<select class="rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5" title="Area" data-test="area" .value=${this.area} @change=${(e: Event) => {
+							const v = (e.target as HTMLSelectElement).value;
+							const c = this.grantedCases.find((x) => `case:${x.id}` === v);
+							this.view = "files";
+							this.openArea(v, c ? c.id : this.member.name);
+						}}>
+							${this.member.role === "external" ? nothing : html`<option value=${this.member.id}>My files</option>`}
+							${this.grantedCases.map((c) => html`<option value=${`case:${c.id}`}>Case ${c.id}</option>`)}
+						</select>
+						<button class="rounded-lg border px-3 py-1.5 ${this.view === "team" ? "border-accent text-white" : "border-neutral-700 hover:border-accent"}" data-test="team-button" ?disabled=${!this.team} @click=${() => {
+							this.view = this.view === "team" ? "files" : "team";
+							if (this.view === "files") void this.loadCases();
+						}}>Team</button>
 						<div class="flex overflow-hidden rounded-lg border border-neutral-700">
 							<button class="px-2.5 py-1.5 ${this.mode === "win11" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="Windows 11 File Explorer" @click=${() => this.switchMode("win11")}>Windows</button>
 							<button class="px-2.5 py-1.5 ${this.mode === "macos" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="macOS Finder" @click=${() => this.switchMode("macos")}>Finder</button>
@@ -175,13 +258,20 @@ export class GoraniShell extends LitElement {
 					this.viewer = e.detail as ViewerTarget;
 					void this.requestUpdate();
 				}}>
-					${this.model
-						? this.mode === "win11"
-							? html`<gorani-win11 .model=${this.model} .memberName=${this.member.name} .memberRole=${this.member.role}></gorani-win11>`
-							: this.mode === "music"
-								? html`<gorani-music .model=${this.model} .memberName=${this.member.name}></gorani-music>`
-								: html`<gorani-finder .model=${this.model} .memberName=${this.member.name}></gorani-finder>`
-						: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
+					${this.view === "team" && this.team
+						? html`<gorani-team .session=${this.session} .member=${this.member} .team=${this.team} .call=${teamCall} @open-area=${(e: CustomEvent<{ area: string; title: string }>) => {
+								void this.loadCases().then(() => {
+									this.view = "files";
+									this.openArea(e.detail.area, e.detail.area.slice("case:".length));
+								});
+							}}></gorani-team>`
+						: this.model
+							? this.mode === "win11"
+								? html`<gorani-win11 .model=${this.model} .memberName=${this.areaTitle} .memberRole=${this.member.role}></gorani-win11>`
+								: this.mode === "music"
+									? html`<gorani-music .model=${this.model} .memberName=${this.areaTitle}></gorani-music>`
+									: html`<gorani-finder .model=${this.model} .memberName=${this.areaTitle}></gorani-finder>`
+							: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
 				${this.viewer ? html`<gorani-viewer .model=${this.model} .target=${this.viewer} @closed=${() => (this.viewer = null)}></gorani-viewer>` : nothing}
 				<div class="pointer-events-none fixed bottom-4 left-1/2 z-50 -translate-x-1/2 space-y-2">

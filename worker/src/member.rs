@@ -15,8 +15,8 @@
 //! | Column | Readable? |
 //! |---|---|
 //! | file sizes, version numbers, times, folder *shape*, ids | yes (structure) |
-//! | file names, types, folder names, extracted text, dates inside documents | **no** — sealed text (`GV01:`/`GV02:`/`GV03:`) |
-//! | content keys | stored **wrapped** to a store key; the server cannot open them |
+//! | file names, types, folder names, extracted text, dates inside documents | **no** — placed sealed text (`GV04:`, commit 25) |
+//! | content keys | stored **sealed into their place** (GV04) under the store key; the server can neither open them nor make new ones |
 //! | vault settings | public halves + wrapped private copies only |
 //!
 //! # The change feed (docs/DESKTOP.md's cursor)

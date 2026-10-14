@@ -449,13 +449,13 @@ fn check_sealed(file: &Option<Vec<u8>>, declared_size: Option<&String>, name: &O
 		return Err("size must be the plaintext length (the sealed bytes minus 32)".into());
 	}
 	if let Some(n) = name {
-		if !gorani_formats::formats::is_sealed_text(n) {
-			return Err("name must be sealed text".into());
+		if !gorani_formats::placed::is_placed_text(n) {
+			return Err("name must be placed sealed text (GV04)".into());
 		}
 	}
 	if let Some(t) = type_sealed {
-		if !gorani_formats::formats::is_sealed_text(t) {
-			return Err("type must be sealed text".into());
+		if !gorani_formats::placed::is_placed_text(t) {
+			return Err("type must be placed sealed text (GV04)".into());
 		}
 	}
 	Ok(())
@@ -472,7 +472,12 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 	if let Err(msg) = check_sealed(&form.file, form.fields.get("size"), &name, &type_sealed) {
 		return json_error(400, &msg);
 	}
-	let file_id = crate::files_store::uuid();
+	// The client chose the file id (commit 25, O6): it sealed the name and
+	// the content key into places that name this file, before uploading.
+	// The id becomes a key segment, so the router's allow-list applies.
+	let Some(file_id) = form.fields.get("file_id").filter(|f| auth::valid_object_id(f)).cloned() else {
+		return json_error(400, "file_id is required: the client chooses it ([A-Za-z0-9_-], ≤ 64) and seals into it");
+	};
 	let version_id = crate::files_store::uuid();
 	let object_key = format!("files/{member_id}/{file_id}/v-{version_id}");
 	s3::put(&env, &object_key, form.file.clone().unwrap_or_default()).await?;
@@ -555,14 +560,20 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 	if parts > 10_000 {
 		return json_error(400, "this plan needs more than 10 000 parts (the backends' limit) — raise the chunk size");
 	}
-	// A body-supplied file id becomes a key segment: same allow-list as paths.
-	let requested = body.get("fileId").and_then(|v| v.as_str());
-	if requested.is_some_and(|f| !auth::valid_object_id(f)) {
-		return json_error(400, "fileId must be an id ([A-Za-z0-9_-], ≤ 64)");
-	}
-	let file_id = requested.map(str::to_string).unwrap_or_else(crate::files_store::uuid);
+	// Which file (commit 25, O6): `fileId` names an EXISTING file (this is
+	// a new version), `newFileId` the client-chosen id of a new one — chosen
+	// before sealing, because the places name it. Exactly one; both become
+	// key segments, so the router's allow-list applies.
+	let version_of = body.get("fileId").and_then(|v| v.as_str());
+	let new_file = body.get("newFileId").and_then(|v| v.as_str());
+	let file_id = match (version_of, new_file) {
+		(Some(f), None) | (None, Some(f)) if auth::valid_object_id(f) => f.to_string(),
+		(Some(_), Some(_)) => return json_error(400, "fileId (a new version) or newFileId (a new file), not both"),
+		(None, None) => return json_error(400, "newFileId is required for a new file (the client chooses it and seals into it); fileId for a new version"),
+		_ => return json_error(400, "file ids are ids ([A-Za-z0-9_-], ≤ 64)"),
+	};
 	let object_key = format!("files/{member_id}/{file_id}/u-{}", crate::files_store::uuid());
-	let started = forward_member(&env, member_id, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key, "fileId": body.get("fileId") })), &actor.email).await?;
+	let started = forward_member(&env, member_id, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key, "fileId": version_of })), &actor.email).await?;
 	if started.status_code() >= 400 {
 		return Ok(started);
 	}
@@ -746,6 +757,14 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 	}
 	if let Some(kid) = meta.get("vaultKeyId").and_then(|x| x.as_str()) {
 		headers.set("x-gorani-vault-key-id", kid)?;
+	}
+	// Which version these bytes are (commit 25): the client opens the key
+	// in `x-gorani-ck` from the place `file.key(member, file, version)`, so
+	// it must know the version even when it asked for "the current one".
+	// A server lying here gains nothing: a key sealed into another
+	// version's place does not open.
+	if let Some(v) = meta.get("version").and_then(|x| x.as_i64()) {
+		headers.set("x-gorani-version", &v.to_string())?;
 	}
 	if let Some(chunk) = meta.get("chunk").and_then(|x| x.as_u64()) {
 		if chunk > 0 {

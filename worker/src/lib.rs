@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Everything this program receives from a client is already sealed in the
-//! client (GV02 content, GV03-wrapped keys, sealed names). It verifies who the
+//! client (GV02 content; keys and names sealed into their places, GV04). It verifies who the
 //! caller is, checks shapes, stores and relays — and never holds a key that
 //! can open content. This scaffold wires the entrypoint; routes arrive per
 //! commit:

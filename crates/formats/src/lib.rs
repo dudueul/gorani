@@ -40,6 +40,7 @@
 pub mod backup;
 pub mod chunked;
 pub mod formats;
+pub mod placed;
 pub mod records;
 pub mod unlock;
 

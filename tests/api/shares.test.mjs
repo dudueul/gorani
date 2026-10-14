@@ -10,7 +10,8 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { generateHybridKey, importVaultKey, sealText, sealWith, openWith, newContentKey, importContentKey, wrapContentKey, unwrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { sealWith, openWith, newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { sealChunked, openChunk, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta, openShareMeta } from "../../web/src/vault/share-crypto.ts";
 import { splitFrame, frameAad } from "../../web/public/gorani-media-lib.js";
@@ -43,15 +44,17 @@ try {
 	assert.equal(saved.status, 200);
 
 	// A file to share.
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	const store = await storeSealer(filesStore.bundle, "jinu");
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
 	const plain = enc.encode("the recipe for gorani bread — family secret");
 	const sealed = await sealWith(key, plain);
-	const nameSealed = await sealText(storePublic, "bread-recipe.txt");
-	const up = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: nameSealed, type: await sealText(storePublic, "text/plain"), size: String(plain.length) }, sealed);
+	const file = await store.newFile("bread-recipe.txt", "text/plain", ck);
+	const up = await uploadFile({ ...file.fields, size: String(plain.length) }, sealed);
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const fileId = up.json.id;
+	// The owner's copy of each link's name is sealed into THAT link's place.
+	const ownerName = (shareId) => store.shareName(shareId, "bread-recipe.txt");
 
 	// ── 1. The owner creates the share (GS01) ──────────────────────────
 	const id = newShareId();
@@ -59,10 +62,9 @@ try {
 	const keys = await shareKeys(id, secret);
 	const copy = await sealChunked(keys.data, plain, DEFAULT_CHUNK);
 	const metaSealed = await sealShareMeta(keys.meta, id, { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
-	const nameOwnerSealed = await sealText(storePublic, "bread-recipe.txt");
 	const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length },
+		body: { id, fileId, version: 1, nameSealed: await ownerName(id), metaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length },
 	});
 	assert.equal(start.status, 200, JSON.stringify(start.json));
 	assert.equal(start.json.parts, 1, "one small file → one frame → one part");
@@ -146,7 +148,7 @@ try {
 	const meta2 = await sealShareMeta(keys2.meta, id2, { name: "x.txt", type: null, size: 4, modified: null });
 	const s2 = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: id2, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: meta2, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: id2, fileId, version: 1, nameSealed: await ownerName(id2), metaSealed: meta2, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
 	});
 	assert.equal(s2.status, 200);
 	// No parts uploaded yet: the meta must refuse (still being prepared).
@@ -159,7 +161,7 @@ try {
 	const metaEmpty = await sealShareMeta((await shareKeys(idEmpty, newShareSecret())).meta, idEmpty, { name: "x.txt", type: null, size: 4, modified: null });
 	const sEmpty = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: idEmpty, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: metaEmpty, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: idEmpty, fileId, version: 1, nameSealed: await ownerName(idEmpty), metaSealed: metaEmpty, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 5, size: 4 },
 	});
 	assert.equal(sEmpty.status, 200);
 	const empty = await api(dev.base, "POST", `/api/v1/members/jinu/files/shares/${idEmpty}/complete`, { email: "jinu@family.test", body: { parts: [], size: 4 } });
@@ -187,7 +189,7 @@ try {
 	const meta3 = await sealShareMeta(keys3.meta, id3, { name: "old.txt", type: null, size: 4, modified: null });
 	await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: id3, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: meta3, expiresAt: new Date(Date.now() - 1000).toISOString(), downloadsLeft: 5, size: 4 },
+		body: { id: id3, fileId, version: 1, nameSealed: await ownerName(id3), metaSealed: meta3, expiresAt: new Date(Date.now() - 1000).toISOString(), downloadsLeft: 5, size: 4 },
 	});
 	// (A real 4-byte copy: completion must add up since commit 23.)
 	const part3 = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${id3}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": "jinu@family.test" }, body: await sealChunked(keys3.data, enc.encode("aged"), DEFAULT_CHUNK) });
@@ -209,7 +211,7 @@ try {
 	const pwMetaSealed = await sealShareMeta(pwKeys.meta, pwId, { name: "bread-recipe.txt", type: "text/plain", size: plain.length, modified: null });
 	const pwStart = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email: "jinu@family.test",
-		body: { id: pwId, fileId, version: 1, nameSealed: nameOwnerSealed, metaSealed: pwMetaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf: pwKdf },
+		body: { id: pwId, fileId, version: 1, nameSealed: await ownerName(pwId), metaSealed: pwMetaSealed, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf: pwKdf },
 	});
 	assert.equal(pwStart.status, 200, JSON.stringify(pwStart.json));
 	const pwEtagRes = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${pwId}/parts/1`, {

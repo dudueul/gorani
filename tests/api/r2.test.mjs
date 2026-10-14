@@ -15,7 +15,8 @@
 
 import assert from "node:assert/strict";
 import { api, startDev, r2Twin } from "./_dev.mjs";
-import { newContentKey, importContentKey, sealWith, wrapContentKey, sealText } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { sealChunked, FRAME_OVERHEAD } from "../../web/src/vault/chunked-file.ts";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 
@@ -62,16 +63,16 @@ try {
 		const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { body: { settings: { enabled: true, keyId: kidVault.keyId, publicKey: kidVault.publicKey, pqPublicKey: kidVault.pqPublicKey, methods: kidVault.methods, stores: { files: own }, guardian } } });
 		assert.equal(saved.status, 200, JSON.stringify(saved.json));
 
-		const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+		const store = await storeSealer(filesStore.bundle, "jinu");
 		const ck = newContentKey();
 		const key = await importContentKey(ck);
-		const ckSealed = await wrapContentKey(storePublic, ck);
-		const typeSealed = await sealText(storePublic, "application/octet-stream");
+		const letter = await store.newFile("letter.txt", "application/octet-stream", ck);
+		const ckSealed = letter.fields.ck;
 
 		// ── 1. A whole upload through the binding ──────────────────────────
 		const plain = enc.encode("r2-backed, still sealed on the way up");
 		const sealed = await sealWith(key, plain);
-		const up = await upload(dev, "/files", { ck: ckSealed, name: await sealText(storePublic, "letter.txt"), type: typeSealed, size: String(plain.length) }, sealed);
+		const up = await upload(dev, "/files", { ...letter.fields, size: String(plain.length) }, sealed);
 		assert.equal(up.status, 200, JSON.stringify(up.json));
 		const fileId = up.json.id;
 
@@ -97,8 +98,10 @@ try {
 		const chunk = 5 * 1024 * 1024;
 		const bigPlain = new Uint8Array(2 * chunk);
 		for (let i = 0; i < bigPlain.length; i++) bigPlain[i] = i % 251;
-		const bigSealed = await sealChunked(key, bigPlain, chunk);
-		const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: bigPlain.length, chunk } });
+		const bigCk = newContentKey();
+		const bigSealed = await sealChunked(await importContentKey(bigCk), bigPlain, chunk);
+		const photo = await store.newFile("photo.dat", "application/octet-stream", bigCk);
+		const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: bigPlain.length, chunk, newFileId: photo.id } });
 		assert.equal(start.status, 200, JSON.stringify(start.json));
 		assert.equal(start.json.parts, 2);
 		const partEtags = [];
@@ -108,7 +111,7 @@ try {
 			assert.equal(r.status, 200, `part ${p}`);
 			partEtags.push({ partNumber: p, etag: (await r.json()).etag });
 		}
-		const done = await upload(dev, `/files/uploads/${start.json.uploadId}/complete`, { key: start.json.key, size: String(bigPlain.length), chunk: String(chunk), ck: ckSealed, name: await sealText(storePublic, "photo.dat"), type: typeSealed, parts: JSON.stringify(partEtags) }, null);
+		const done = await upload(dev, `/files/uploads/${start.json.uploadId}/complete`, { key: start.json.key, size: String(bigPlain.length), chunk: String(chunk), ck: photo.fields.ck, name: photo.fields.name, type: photo.fields.type, parts: JSON.stringify(partEtags) }, null);
 		if (done.status !== 200) {
 			// workerd logs errors to observability traces, not stderr — pull
 			// them before the server dies so the failure is readable.

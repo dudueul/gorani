@@ -120,7 +120,7 @@ try {
 
 	// ── 5. Zero-trust spot check: the server stored only sealed shapes ──
 	const keys = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [fileId] } });
-	assert.ok(keys.json.keys[fileId].key.startsWith("GV03:"), "the content key rides wrapped");
+	assert.ok(keys.json.keys[fileId].key.startsWith("GV04:"), "the content key rides wrapped — sealed into its place by the CLI (GV04)");
 	const raw = await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
 	const stored = new Uint8Array(await raw.arrayBuffer());
 	assert.equal(new TextDecoder().decode(stored.subarray(0, 4)), "GV02", "the stored object is GV02-sealed");

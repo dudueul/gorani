@@ -18,6 +18,7 @@ import {
 	open,
 	openText,
 	openWith,
+	sealWith,
 	openTextWith,
 	importVaultKey,
 	importContentKey,
@@ -100,5 +101,17 @@ const hybridPublic = { ec: { kty: "EC", crv: "P-256", x: v.hybrid.x, y: v.hybrid
 assert.ok(isHybridPublic(hybridPublic));
 const resealed = await wrapContentKey(hybridPublic, fromBase64(v.content.key));
 assert.deepEqual(await unwrapContentKey(hPriv, resealed), ck);
+
+// GV04 (commit 25): what Rust sealed into places opens in TS, there only.
+const { openPlacedText, unwrapPlacedKey } = await import("../../web/src/vault/vault-crypto.ts");
+const { places } = await import("../../web/src/vault/places.ts");
+assert.equal(await openPlacedText(hPriv, places.fileName("jinu", "f-0002"), r.placedName), "러스트가 봉인한 증거.bin");
+await assert.rejects(openPlacedText(hPriv, places.fileName("jinu", "f-0001"), r.placedName), /not sealed here/);
+const placedKey = await unwrapPlacedKey(hPriv, places.fileKey("jinu", "f-0002", 7), r.placedKey);
+// (Content keys are non-extractable: prove it is the SAME key by use —
+// what the vector's key seals, the placed key opens.)
+const probe = await sealWith(ck, new TextEncoder().encode("same key"));
+assert.equal(new TextDecoder().decode(await openWith(placedKey, probe)), "same key");
+await assert.rejects(unwrapPlacedKey(hPriv, places.fileKey("jinu", "f-0002", 8), r.placedKey), /not sealed here/);
 
 console.log("ok  formats: TS ⇄ Rust vectors, both directions");

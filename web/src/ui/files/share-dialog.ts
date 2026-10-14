@@ -125,8 +125,8 @@ export class GoraniShare extends LitElement {
 			const plain = concatParts(plainParts);
 			const copy = await sealChunked(keys.data, plain, DEFAULT_CHUNK);
 			const metaSealed = await sealShareMeta(keys.meta, id, { name: this.target.name, type: null, size: plain.length, modified: null });
-			// The owner's list keeps the link sealed to the files store key.
-			const nameSealed = await this.model.sealForOwner(this.target.name);
+			// The owner's list keeps the link's name sealed into the share's place.
+			const nameSealed = await this.model.sealShareName(id, this.target.name);
 			const expiresAt = new Date(Date.now() + this.expiry * 86_400_000).toISOString();
 
 			const start = await this.model.api.apiSend<{ parts: number }>("POST", `/api/v1/members/${this.model.memberId}/files/shares`, {

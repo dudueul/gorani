@@ -9,12 +9,16 @@
 //!
 //! | Where | Job |
 //! |---|---|
-//! | Worker routes | multipart parsing, sealed-shape checks (bytes must start `GV02`, names must be sealed text), S3 put/multipart, streaming reads |
+//! | Worker routes | multipart parsing, sealed-shape checks (bytes must start `GV02`, names must be placed text), S3 put/multipart, streaming reads |
 //! | This DO | rows: files, folders, versions, the change feed, secrets, upload bookkeeping |
 //!
-//! The DO never sees a plaintext name or an unsealed byte: every text column
-//! it accepts is checked with `is_sealed_text` before insert. Object keys are
-//! opaque ids (`files/<member>/<file>/<v-uuid>`), never file names.
+//! The DO never sees a plaintext name or an unsealed byte: every sealed
+//! column it accepts is checked with `is_placed_text` before insert — GV04
+//! only (commit 25, docs/SECURITY-REVIEW.md › O6). The DO cannot check that
+//! a value sits in its RIGHT place (that takes the store's key); it refuses
+//! the older formats, so an honest server keeps the clean break clean and
+//! an old client gets a 400, not a store its own peers cannot open. Object
+//! keys are opaque ids (`files/<member>/<file>/<v-uuid>`), never file names.
 
 use rand_core::{OsRng, RngCore};
 use base64::Engine;
@@ -84,8 +88,11 @@ struct VersionSqlRow {
 impl GoraniMemberDO {
 	// ── Files: create (one-request upload) and versions ─────────────────
 
-	/// Record a whole-file upload the Worker already put in S3. The Worker
-	/// generated the file id, version id and object key; the DO owns the rows.
+	/// Record a whole-file upload the Worker already put in S3. The CLIENT
+	/// chose the file id (commit 25: it seals the name and the content key
+	/// into places that name the file, so the id must exist before the
+	/// sealing does); the Worker checked its shape and built the object key;
+	/// the DO owns the rows — and refuses an id already taken (409).
 	pub(crate) async fn file_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
 		if let Some(msg) = self.vault_gate().await? {
 			return json_error(400, &msg);
@@ -93,20 +100,31 @@ impl GoraniMemberDO {
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let name = get("name").ok_or_else(|| worker::Error::RustError("missing name".into()))?;
 		let r#type = get("type");
-		if !gorani_formats::formats::is_sealed_text(&name) || r#type.as_ref().is_some_and(|t| !gorani_formats::formats::is_sealed_text(t)) {
-			return json_error(400, "names and types must be sealed text");
+		if !gorani_formats::placed::is_placed_text(&name) || r#type.as_ref().is_some_and(|t| !gorani_formats::placed::is_placed_text(t)) {
+			return json_error(400, "names and types must be placed sealed text (GV04)");
 		}
 		if body.get("bytesSealed").and_then(|v| v.as_bool()) != Some(true) {
 			return json_error(400, "the Worker confirms sealed bytes before calling the store");
 		}
-		let file_id = get("id").unwrap_or_else(uuid);
+		// Every refusal BEFORE the first write (commit 25): the music blob was
+		// checked after the file and version rows were inserted, so a refused
+		// blob answered 400 — the Worker then deleted the object — and left
+		// rows pointing at nothing.
+		if get("mmeta").is_some_and(|b| !gorani_formats::placed::is_placed_text(&b)) {
+			return json_error(400, "music metadata must arrive sealed into its place (GV04)");
+		}
+		let Some(file_id) = get("id") else { return json_error(400, "the file id is chosen by the client (file_id)") };
+		let taken: Option<ExistsRow> = self.sql.exec("SELECT 1 AS one FROM files WHERE id = ?1", Some(vec![file_id.clone().into()]))?.to_array::<ExistsRow>().ok().and_then(|mut r| r.pop());
+		if taken.is_some() {
+			return json_error(409, "a file with this id exists — choose a fresh id (a new version goes to files/<id>/versions)");
+		}
 		let version = 1i64;
 		let object_key = get("objectKey").ok_or_else(|| worker::Error::RustError("missing objectKey".into()))?;
 		let content_key = get("ck").ok_or_else(|| worker::Error::RustError("missing content key".into()))?;
 		// The content key must arrive already sealed to the store key — a raw
 		// key would let the server (or a leaked row) open the content.
-		if !gorani_formats::formats::is_sealed_text(&content_key) {
-			return json_error(400, "the content key must arrive sealed to the store key");
+		if !gorani_formats::placed::is_placed_text(&content_key) {
+			return json_error(400, "the content key must arrive sealed into its place (GV04)");
 		}
 		let size = body.get("size").and_then(|v| v.as_i64()).ok_or_else(|| worker::Error::RustError("missing size".into()))?;
 		self.sql
@@ -151,13 +169,18 @@ impl GoraniMemberDO {
 		let file_id = get("fileId").ok_or_else(|| worker::Error::RustError("missing fileId".into()))?;
 		let name = get("name");
 		if let Some(n) = &name {
-			if !gorani_formats::formats::is_sealed_text(n) {
-				return json_error(400, "names must be sealed text");
+			if !gorani_formats::placed::is_placed_text(n) {
+				return json_error(400, "names must be placed sealed text (GV04)");
 			}
 		}
 		let current: Option<i64> = self.sql.exec("SELECT version FROM files WHERE id = ?1", Some(vec![file_id.clone().into()]))?.to_array::<CurrentVersion>().ok().and_then(|mut r| r.pop()).map(|r| r.version);
 		let Some(current) = current else { return json_error(404, "no such file") };
-		let base = body.get("baseVersion").and_then(|v| v.as_i64()).unwrap_or(current);
+		// Required since commit 25: the client sealed this version's key and
+		// type into places that name version base + 1, so a write that lands
+		// as any other number would be unopenable. No base, no guess.
+		let Some(base) = body.get("baseVersion").and_then(|v| v.as_i64()) else {
+			return json_error(400, "baseVersion is required (the version this one follows)");
+		};
 		if base != current {
 			return Ok(Response::from_json(&serde_json::json!({ "error": "the file moved on since", "version": current }))?.with_status(409));
 		}
@@ -166,13 +189,16 @@ impl GoraniMemberDO {
 		let content_key = get("ck").ok_or_else(|| worker::Error::RustError("missing content key".into()))?;
 		// The content key must arrive already sealed to the store key — a raw
 		// key would let the server (or a leaked row) open the content.
-		if !gorani_formats::formats::is_sealed_text(&content_key) {
-			return json_error(400, "the content key must arrive sealed to the store key");
+		if !gorani_formats::placed::is_placed_text(&content_key) {
+			return json_error(400, "the content key must arrive sealed into its place (GV04)");
 		}
 		let size = body.get("size").and_then(|v| v.as_i64()).ok_or_else(|| worker::Error::RustError("missing size".into()))?;
 		let r#type = get("type");
-		if r#type.as_ref().is_some_and(|t| !gorani_formats::formats::is_sealed_text(t)) {
-			return json_error(400, "types must be sealed text");
+		if r#type.as_ref().is_some_and(|t| !gorani_formats::placed::is_placed_text(t)) {
+			return json_error(400, "types must be placed sealed text (GV04)");
+		}
+		if get("mmeta").is_some_and(|b| !gorani_formats::placed::is_placed_text(&b)) {
+			return json_error(400, "music metadata must arrive sealed into its place (GV04)");
 		}
 		self.sql
 			.exec(
@@ -208,7 +234,7 @@ impl GoraniMemberDO {
 	/// like every other sealed text — the library opens them, not reads them.
 	async fn music_meta_put(&self, file_id: &str, version: i64, blob: Option<String>) -> std::result::Result<(), Response> {
 		if let Some(b) = blob {
-			if !gorani_formats::formats::is_sealed_text(&b) {
+			if !gorani_formats::placed::is_placed_text(&b) {
 				return Err(json_error_raw(400, "music metadata must arrive sealed"));
 			}
 			if let Err(e) = self.sql.exec(
@@ -378,7 +404,7 @@ impl GoraniMemberDO {
 		match self.file_object(file_id, version).await? {
 			Some(o) => Ok(Response::from_json(&serde_json::json!({
 				"objectKey": o.object_key, "ck": o.content_key, "vaultKeyId": o.vault_key_id,
-				"chunk": o.chunk_size, "size": o.size,
+				"chunk": o.chunk_size, "size": o.size, "version": o.version,
 			}))?),
 			None => json_error(404, "no such file"),
 		}
@@ -402,14 +428,14 @@ impl GoraniMemberDO {
 		let row: Option<ObjectRow> = match version {
 			Some(v) => self
 				.sql
-				.exec("SELECT content_key, vault_key_id, object_key, chunk_size, size FROM file_versions WHERE file_id = ?1 AND version = ?2", Some(vec![file_id.into(), v.into()]))?
+				.exec("SELECT version, content_key, vault_key_id, object_key, chunk_size, size FROM file_versions WHERE file_id = ?1 AND version = ?2", Some(vec![file_id.into(), v.into()]))?
 				.to_array::<ObjectRow>()
 				.ok()
 				.and_then(|mut r| r.pop()),
 			None => self
 				.sql
 				.exec(
-					"SELECT v.content_key, v.vault_key_id, v.object_key, v.chunk_size, v.size FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE f.id = ?1",
+					"SELECT v.version, v.content_key, v.vault_key_id, v.object_key, v.chunk_size, v.size FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE f.id = ?1",
 					Some(vec![file_id.into()]),
 				)?
 				.to_array::<ObjectRow>()
@@ -424,8 +450,8 @@ impl GoraniMemberDO {
 	pub(crate) async fn file_patch(&self, actor: &str, id: &str, body: serde_json::Value) -> Result<Response> {
 		let name = body.get("name").and_then(|v| v.as_str()).map(str::to_string);
 		if let Some(n) = &name {
-			if !gorani_formats::formats::is_sealed_text(n) {
-				return json_error(400, "names must be sealed text");
+			if !gorani_formats::placed::is_placed_text(n) {
+				return json_error(400, "names must be placed sealed text (GV04)");
 			}
 		}
 		// Dynamic SET list: `folderId: null` means "move to the root" — a
@@ -478,8 +504,8 @@ impl GoraniMemberDO {
 
 	pub(crate) async fn folder_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
 		let name = body.get("name").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| worker::Error::RustError("missing name".into()))?;
-		if !gorani_formats::formats::is_sealed_text(&name) {
-			return json_error(400, "names must be sealed text");
+		if !gorani_formats::placed::is_placed_text(&name) {
+			return json_error(400, "names must be placed sealed text (GV04)");
 		}
 		let parent = body.get("parentId").and_then(|v| v.as_str()).map(str::to_string);
 		if let Some(p) = &parent {
@@ -504,8 +530,8 @@ impl GoraniMemberDO {
 	pub(crate) async fn folder_patch(&self, actor: &str, id: &str, body: serde_json::Value) -> Result<Response> {
 		let name = body.get("name").and_then(|v| v.as_str()).map(str::to_string);
 		if let Some(n) = &name {
-			if !gorani_formats::formats::is_sealed_text(n) {
-				return json_error(400, "names must be sealed text");
+			if !gorani_formats::placed::is_placed_text(n) {
+				return json_error(400, "names must be placed sealed text (GV04)");
 			}
 		}
 		let parent_new: Option<Option<String>> = if body.get("parentId").is_some() {
@@ -603,8 +629,8 @@ impl GoraniMemberDO {
 		// The name is sealed to the owner's store key (GV*); the meta is
 		// sealed to the link's meta key (GS01) — different keys, different
 		// readers, both opaque here.
-		if !gorani_formats::formats::is_sealed_text(&name) {
-			return json_error(400, "the share name must be sealed text");
+		if !gorani_formats::placed::is_placed_text(&name) {
+			return json_error(400, "the share name must be placed sealed text (GV04)");
 		}
 		// sealShareMeta returns base64("GS01" ‖ nonce ‖ ct) — check the magic
 		// after decoding (the recipient's page derives the meta key and opens
@@ -760,8 +786,8 @@ impl GoraniMemberDO {
 
 	pub(crate) async fn secrets_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
 		let Some(sealed) = body.get("sealed").and_then(|v| v.as_str()).map(str::to_string) else { return json_error(400, "sealed required") };
-		if !gorani_formats::formats::is_sealed_text(&sealed) {
-			return json_error(400, "secrets must be sealed text");
+		if !gorani_formats::placed::is_placed_text(&sealed) {
+			return json_error(400, "secrets must be placed sealed text (GV04)");
 		}
 		self.sql.exec("DELETE FROM files_secrets", None)?;
 		self.sql.exec("INSERT INTO files_secrets (v) VALUES (?1)", Some(vec![sealed.into()]))?;
@@ -814,7 +840,12 @@ impl GoraniMemberDO {
 				body["fileId"] = serde_json::json!(fid);
 				self.file_version_put(actor, body).await?
 			}
-			None => self.file_put(actor, body).await?,
+			None => {
+				// A new file: its client-chosen id is the object key's file
+				// segment (`files/<member>/<file>/u-…`, set at start).
+				body["id"] = serde_json::json!(upload.object_key.split('/').nth(2).unwrap_or_default());
+				self.file_put(actor, body).await?
+			}
 		};
 		if response.status_code() < 400 {
 			self.sql.exec("DELETE FROM uploads WHERE id = ?1", Some(vec![id.into()]))?;
@@ -955,8 +986,8 @@ impl GoraniMemberDO {
 			let Some(row) = it.get("row").and_then(|v| v.as_i64()) else { return json_error(400, "each item needs its row") };
 			let Some(v1) = it.get("v1").and_then(|v| v.as_str()).map(str::to_string) else { return json_error(400, "each item needs v1") };
 			let v2 = it.get("v2").and_then(|v| v.as_str()).map(str::to_string);
-			if !gorani_formats::formats::is_sealed_text(&v1) || v2.as_ref().is_some_and(|t| !gorani_formats::formats::is_sealed_text(t)) {
-				return json_error(400, "reseal values must be sealed text");
+			if !gorani_formats::placed::is_placed_text(&v1) || v2.as_ref().is_some_and(|t| !gorani_formats::placed::is_placed_text(t)) {
+				return json_error(400, "reseal values must be placed sealed text (GV04)");
 			}
 			let sql: &'static str = match kind {
 				"version" => "UPDATE file_versions SET content_key = ?1, type_sealed = COALESCE(?2, type_sealed) WHERE rowid = ?3",
@@ -1043,6 +1074,7 @@ struct MatchRow {
 }
 #[derive(serde::Deserialize)]
 struct ObjectRow {
+	version: i64,
 	content_key: String,
 	vault_key_id: Option<String>,
 	object_key: String,

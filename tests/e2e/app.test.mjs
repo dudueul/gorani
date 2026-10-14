@@ -15,7 +15,8 @@
 import assert from "node:assert/strict";
 import { startDev, api } from "../api/_dev.mjs";
 import { createParentsMaster, createChildVault, createParentVault, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
-import { newContentKey, importContentKey, sealText, sealWith, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { sealChunked, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
 
@@ -237,11 +238,11 @@ try {
 	// and hands over a download. Trusted Types with NO policy: the page must
 	// do all of it through textContent/classList.
 	{
-		const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+		const store = await storeSealer(filesStore.bundle, "jinu");
 		const plain = new TextEncoder().encode("the incident timeline, shared with a partner CERT");
 		const ck = newContentKey();
 		const boundary = `e2e${Date.now()}`;
-		const fields = { ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "timeline.txt"), size: String(plain.length) };
+		const fields = { ...(await store.newFile("timeline.txt", "text/plain", ck)).fields, size: String(plain.length) };
 		const sealed = await sealWith(await importContentKey(ck), plain);
 		const head = new TextEncoder().encode(Object.entries(fields).map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`).join("") + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`);
 		const up = await fetch(`${dev.base}/api/v1/members/jinu/files`, { method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}`, "x-gorani-dev-email": "jinu@family.test" }, body: new Uint8Array([...head, ...sealed, ...new TextEncoder().encode(`\r\n--${boundary}--\r\n`)]) });
@@ -253,7 +254,7 @@ try {
 		const keys = await shareKeys(id, secret, "partner-passphrase", kdf);
 		const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 			email: "jinu@family.test",
-			body: { id, fileId, version: 1, nameSealed: await sealText(storePublic, "timeline.txt"), metaSealed: await sealShareMeta(keys.meta, id, { name: "timeline.txt", type: "text/plain", size: plain.length, modified: null }), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf },
+			body: { id, fileId, version: 1, nameSealed: await store.shareName(id, "timeline.txt"), metaSealed: await sealShareMeta(keys.meta, id, { name: "timeline.txt", type: "text/plain", size: plain.length, modified: null }), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 2, size: plain.length, kdf },
 		});
 		assert.equal(start.status, 200, JSON.stringify(start.json));
 		const part = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${id}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": "jinu@family.test" }, body: await sealChunked(keys.data, plain, DEFAULT_CHUNK) });

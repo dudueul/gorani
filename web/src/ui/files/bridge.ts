@@ -12,7 +12,8 @@
 
 import type { FilesBridge } from "./model.ts";
 import { devIdentityHeaders } from "../../lib/api.ts";
-import { openWith, unwrapContentKey, type VaultPrivateKey, type SealTarget } from "../../vault/vault-crypto.ts";
+import { openWith, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
+import { places } from "../../vault/places.ts";
 import type { VaultSession } from "../../vault/session.ts";
 import { openChunkedStream } from "../../vault/chunked-file.ts";
 
@@ -22,7 +23,7 @@ export interface FilesHooks {
 }
 
 export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBridge {
-	let cached: { privateKey: VaultPrivateKey; publicKey: SealTarget } | null = null;
+	let cached: { privateKey: VaultPrivateKey } | null = null;
 	const store = async () => {
 		// A locked session hands out nothing — not even the store key this
 		// bridge already opened (an upload still in flight when Lock is
@@ -32,12 +33,11 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 			throw new Error("the vault is locked");
 		}
 		if (!cached) {
+			// The private key is all a store needs: it opens AND seals (GV04 —
+			// a store seals to itself; commit 25). No public half is kept: a
+			// public key in hand is exactly the path the server used to have.
 			const opened = await session.openStoreKey("files");
-			// The store key's public half is hybrid (GV03) — seal with both halves.
-			cached = {
-				privateKey: opened.privateKey,
-				publicKey: opened.pqPublicKey ? { ec: opened.publicKey, kem: opened.pqPublicKey } : opened.publicKey,
-			};
+			cached = { privateKey: opened.privateKey };
 		}
 		return cached;
 	};
@@ -46,7 +46,6 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		apiGet: <T>(path: string) => fetchJson<T>("GET", path),
 		apiSend: <T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) => fetchJson<T>(method, path, body),
 		storePrivate: () => store().then((s) => s.privateKey),
-		storePublic: () => store().then((s) => s.publicKey),
 
 		async fetchObject(memberId, id, version, range) {
 			const headers: Record<string, string> = { ...devIdentityHeaders() };
@@ -57,6 +56,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 				body: new Uint8Array(await res.arrayBuffer()),
 				ck: res.headers.get("x-gorani-ck") ?? "",
 				chunk: Number(res.headers.get("x-gorani-chunk")) || null,
+				version: servedVersion(res),
 			};
 		},
 
@@ -65,8 +65,11 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
 			const ck = res.headers.get("x-gorani-ck") ?? "";
 			const chunk = Number(res.headers.get("x-gorani-chunk")) || 0;
+			const served = servedVersion(res);
+			if (version !== undefined && served !== version) throw new Error("download failed: the server answered with another version");
 			const storePriv = await store().then((s) => s.privateKey);
-			const key = await unwrapContentKey(storePriv, ck);
+			// The key opens only from the place of THIS file's THIS version (O6).
+			const key = await unwrapPlacedKey(storePriv, places.fileKey(memberId, id, served), ck);
 			if (!chunk || !res.body) {
 				await sink(await openWith(key, new Uint8Array(await res.arrayBuffer())));
 				return;
@@ -88,7 +91,9 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		},
 
 		async putMultipart(memberId, fields, sealed, chunk) {
-			const start = await fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `/api/v1/members/${memberId}/files/uploads`, { size: Number(fields.size), chunk });
+			// The new file's id was chosen (and sealed into) by the model.
+			const { file_id: newFileId, ...rest } = fields;
+			const start = await fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `/api/v1/members/${memberId}/files/uploads`, { size: Number(fields.size), chunk, newFileId });
 			const frames = Math.ceil(sealed.length / (chunk + 28));
 			const parts: { partNumber: number; etag: string }[] = [];
 			for (let p = 1; p <= frames; p++) {
@@ -101,7 +106,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 				await throwIfError(res);
 				parts.push((await res.json()) as { partNumber: number; etag: string });
 			}
-			const form = formBody({ ...fields, key: start.key, parts: JSON.stringify(parts) }, null);
+			const form = formBody({ ...rest, key: start.key, parts: JSON.stringify(parts) }, null);
 			const res = await fetch(`/api/v1/members/${memberId}/files/uploads/${start.uploadId}/complete`, {
 				method: "POST",
 				headers: { ...devIdentityHeaders(), "content-type": form.contentType },
@@ -113,6 +118,14 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks): FilesBr
 		confirmDuplicate: hooks.confirmDuplicate,
 		toast: hooks.toast,
 	};
+}
+
+/** The version a download IS (the Worker's `x-gorani-version`). Missing or
+ * malformed is a refusal, not a guess — the key's place depends on it. */
+function servedVersion(res: Response): number {
+	const v = Number(res.headers.get("x-gorani-version"));
+	if (!Number.isInteger(v) || v < 1) throw new Error("download failed: the server did not say which version this is");
+	return v;
 }
 
 function formBody(fields: Record<string, string>, file: Uint8Array | null): { contentType: string; body: Blob } {

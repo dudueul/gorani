@@ -276,8 +276,8 @@ impl GoraniMemberDO {
 				if !crate::auth::valid_object_id(&id) || get("parent").is_some_and(|p| !crate::auth::valid_object_id(&p)) {
 					return json_error(400, "restored folder ids must be ids");
 				}
-				if !gorani_formats::formats::is_sealed_text(&name) {
-					return json_error(400, "restored folder names must be sealed text");
+				if !gorani_formats::placed::is_placed_text(&name) {
+					return json_error(400, "restored folder names must be placed sealed text (GV04)");
 				}
 				self.sql
 					.exec(
@@ -295,8 +295,8 @@ impl GoraniMemberDO {
 				if !crate::auth::valid_object_id(&id) {
 					return json_error(400, "restored file ids must be ids");
 				}
-				if !gorani_formats::formats::is_sealed_text(&name) {
-					return json_error(400, "restored file names must be sealed text");
+				if !gorani_formats::placed::is_placed_text(&name) {
+					return json_error(400, "restored file names must be placed sealed text (GV04)");
 				}
 				self.sql
 					.exec(
@@ -316,8 +316,8 @@ impl GoraniMemberDO {
 				if !crate::auth::valid_object_id(&file) {
 					return json_error(400, "restored version file ids must be ids");
 				}
-				if !gorani_formats::formats::is_sealed_text(&ck) {
-					return json_error(400, "restored content keys must be sealed text");
+				if !gorani_formats::placed::is_placed_text(&ck) || get("type").is_some_and(|t| !gorani_formats::placed::is_placed_text(&t)) {
+					return json_error(400, "restored content keys and types must be placed sealed text (GV04)");
 				}
 				let version = v.get("version").and_then(|x| x.as_i64()).unwrap_or(1);
 				// Gap-filling: a version whose object still exists stays as it is.
@@ -358,8 +358,8 @@ impl GoraniMemberDO {
 			}
 		}
 		if let Some(sealed) = body.get("secrets").and_then(|v| v.as_str()).map(str::to_string) {
-			if !gorani_formats::formats::is_sealed_text(&sealed) {
-				return json_error(400, "restored secrets must be sealed text");
+			if !gorani_formats::placed::is_placed_text(&sealed) {
+				return json_error(400, "restored secrets must be placed sealed text (GV04)");
 			}
 			// Only into an empty slot: the secrets (fingerprint + index keys)
 			// a live vault already uses are never swapped by a restore.

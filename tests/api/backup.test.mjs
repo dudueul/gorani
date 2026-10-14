@@ -10,7 +10,8 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { generateHybridKey, importVaultKey, sealText, sealWith, openWith, newContentKey, importContentKey, wrapContentKey, unwrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { generateHybridKey, sealWith, openWith, newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { readBackup } from "../../web/src/vault/backup.ts";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 import { toBase64, fromBase64 } from "../../web/src/lib/encoding.ts";
@@ -40,25 +41,19 @@ try {
 	assert.equal(get.json.keyId, backup.keyId, "the public half is stored (the private bundle is not)");
 
 	// ── 2. Two files to back up ─────────────────────────────────────────
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	const store = await storeSealer(filesStore.bundle, "jinu");
 	const files = [
 		{ name: "diary.txt", bytes: enc.encode("a diary entry — sealed twice over in the backup") },
 		{ name: "notes.md", bytes: enc.encode("## notes\n\nmore bytes for the second version row") },
 	];
-	const privStore = await importVaultKey(filesStore.bundle);
 	for (const f of files) {
 		const ck = newContentKey();
 		const key = await importContentKey(ck);
 		const sealed = await sealWith(key, f.bytes);
-		const ckSealed = await wrapContentKey(storePublic, ck);
+		const { fields } = await store.newFile(f.name, "text/plain", ck);
 		const boundary = `t${Math.random().toString(16).slice(2)}`;
 		const head = new TextEncoder().encode(
-			[
-				["ck", ckSealed],
-				["name", await sealText(storePublic, f.name)],
-				["type", await sealText(storePublic, "text/plain")],
-				["size", String(f.bytes.length)],
-			]
+			[...Object.entries(fields), ["size", String(f.bytes.length)]]
 				.map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)
 				.join("") + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`,
 		);
@@ -68,8 +63,7 @@ try {
 	}
 
 	// Files secrets exist once any device fingerprints an upload — simulate.
-	const storePriv = await importVaultKey(filesStore.bundle);
-	const secretsSealed = await sealText(storePublic, JSON.stringify({ fp: toBase64(new Uint8Array(32)), idx: toBase64(new Uint8Array(32)) }));
+	const secretsSealed = await store.secrets(JSON.stringify({ fp: toBase64(new Uint8Array(32)), idx: toBase64(new Uint8Array(32)) }));
 	const ps = await api(dev.base, "PUT", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test", body: { sealed: secretsSealed } });
 	assert.equal(ps.status, 200);
 
@@ -99,9 +93,11 @@ try {
 	assert.ok(parsed.entries.some((e) => e.json.kind === "files-secrets"), "the sealed files secrets ride along");
 
 	// The content round trip: a version's object opens with the files store
-	// key to the exact plaintext (the backup carries the SEALED originals).
+	// key to the exact plaintext (the backup carries the SEALED originals —
+	// still sealed into their places, so a restore must keep ids and version
+	// numbers exactly; it does, backup.rs › backup_restore).
 	for (const v of versionEntries) {
-		const ck = await unwrapContentKey(storePriv, String(v.json.key));
+		const ck = await store.openFileKey(String(v.json.file), Number(v.json.version), String(v.json.key));
 		const plain = await openWith(ck, v.object);
 		assert.ok(files.some((f) => Buffer.from(f.bytes).equals(Buffer.from(plain))), `the object's plaintext matches: ${v.json.file}`);
 	}
@@ -148,7 +144,7 @@ try {
 	const after = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" });
 	assert.ok(after.json.files.some((f) => f.id === victim.id), "the restored file is back");
 	const ckBack = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [victim.id] } });
-	const ckKey = await unwrapContentKey(storePriv, ckBack.json.keys[victim.id].key);
+	const ckKey = await store.openFileKey(victim.id, ckBack.json.keys[victim.id].version, ckBack.json.keys[victim.id].key);
 	const dlBack = await fetch(`${dev.base}/api/v1/members/jinu/files/${victim.id}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
 	const got = new Uint8Array(await dlBack.arrayBuffer());
 	// The download serves the SEALED object (GV02 = magic ‖ nonce ‖ ct ‖ tag);

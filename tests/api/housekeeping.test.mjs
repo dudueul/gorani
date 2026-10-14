@@ -9,7 +9,8 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { sealText, sealWith, newContentKey, importContentKey, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { sealWith, newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 
 const dev = await suiteDev();
@@ -37,15 +38,15 @@ try {
 	assert.equal(saved.status, 200);
 
 	// Two files; one trashed (a mini disaster to purge).
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	const store = await storeSealer(filesStore.bundle, "jinu");
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
 	const sealed = await sealWith(key, enc.encode("to be purged from the trash"));
-	const up1 = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "purge-me.txt"), type: await sealText(storePublic, "text/plain"), size: String(sealed.length - 32) }, sealed); // plaintext length (GV02 = +32)
+	const up1 = await uploadFile({ ...(await store.newFile("purge-me.txt", "text/plain", ck)).fields, size: String(sealed.length - 32) }, sealed); // plaintext length (GV02 = +32)
 	assert.equal(up1.status, 200);
 	const ck2 = newContentKey();
 	const key2 = await importContentKey(ck2);
-	const up2 = await uploadFile({ ck: await wrapContentKey(storePublic, ck2), name: await sealText(storePublic, "keep-me.txt"), type: await sealText(storePublic, "text/plain"), size: String(enc.encode("stays in the vault").length) }, await sealWith(key2, enc.encode("stays in the vault")));
+	const up2 = await uploadFile({ ...(await store.newFile("keep-me.txt", "text/plain", ck2)).fields, size: String(enc.encode("stays in the vault").length) }, await sealWith(key2, enc.encode("stays in the vault")));
 	assert.equal(up2.status, 200);
 	await api(dev.base, "DELETE", `/api/v1/members/jinu/files/${up1.json.id}`, { email: "jinu@family.test" });
 	const trashBefore = await api(dev.base, "GET", "/api/v1/members/jinu/files/trash", { email: "jinu@family.test" });

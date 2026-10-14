@@ -18,8 +18,9 @@
 
 import assert from "node:assert/strict";
 import { startDev, api } from "./_dev.mjs";
+import { placedShape } from "../lib/placed.mjs";
 
-const sealedName = (s) => "GV03:" + Buffer.from(`not-really-sealed:${s}`).toString("base64"); // the shape check is all the DO applies
+const sealedName = placedShape; // the shape check is all the DO applies
 
 let dev = await startDev({ persist: "restart" });
 try {

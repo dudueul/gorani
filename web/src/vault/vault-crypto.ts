@@ -207,11 +207,6 @@ export function wrapContentKey(storePublicKey: VaultPublicKey, raw: Uint8Array):
 	return sealText(storePublicKey, toBase64(raw));
 }
 
-/** Re-wrap a sealed content key from one sealing key to another (rotation). */
-export async function rewrapContentKey(oldPrivateKey: VaultPrivateKey, newPublicKey: VaultPublicKey, sealedKey: string): Promise<string> {
-	return sealText(newPublicKey, await openText(oldPrivateKey, sealedKey));
-}
-
 /** Recover a content key with a store private key. */
 export async function unwrapContentKey(storePrivateKey: VaultPrivateKey, sealedKey: string): Promise<CryptoKey> {
 	return importContentKey(fromBase64(await openSealedText(storePrivateKey, sealedKey)));
@@ -253,9 +248,9 @@ export async function sealText(publicKey: VaultPublicKey, text: string): Promise
 	return prefix + toBase64(await seal(publicKey, new TextEncoder().encode(text)));
 }
 
-/** True for GV1 (ECIES), GV2 (content key) and GV3 (hybrid) sealed text values. */
+/** True for GV1 (ECIES), GV2 (content key), GV3 (hybrid) and GV4 (placed) sealed text values. */
 export function isSealedText(value: string | null | undefined): boolean {
-	return typeof value === "string" && (value.startsWith(SEALED_TEXT_PREFIX) || value.startsWith(SEALED_TEXT_PREFIX_V2) || value.startsWith(SEALED_TEXT_PREFIX_V3));
+	return typeof value === "string" && (value.startsWith(SEALED_TEXT_PREFIX) || value.startsWith(SEALED_TEXT_PREFIX_V2) || value.startsWith(SEALED_TEXT_PREFIX_V3) || value.startsWith("GV04:"));
 }
 
 /**
@@ -358,6 +353,137 @@ async function openV3(privateKey: VaultPrivateKey, sealed: Uint8Array): Promise<
 	} catch {
 		throw new Error("Cannot open: wrong key or corrupted object");
 	}
+}
+
+// ── v4: placed, store-authenticated sealing (commit 25, O6) ─────────
+//
+// Every value a files store keeps sealed — file names, each version's
+// content key and type, music tags, folder names, share names, the store's
+// secrets — is GV04. Two differences from GV03, one per attack:
+//
+//  - MOVING: the value's PLACE (store, kind, item, version — places.ts) is
+//    bound as AAD. It is not stored; the opener rebuilds it from what it is
+//    opening, so a key or name moved to another file fails to open.
+//  - MINTING: GV03 seals to a public key, and the server holds the public
+//    key — it could make up a file, seal its key and name to the store, and
+//    the file would appear. GV04 mixes the STORE PSK into the key schedule:
+//    a secret only the store's private key computes (self-ECDH ‖ a hash of
+//    the ML-KEM secret — the record key's construction, records.ts). Sealing
+//    into a store now needs what opening needs. (HPKE's PSK mode, RFC 9180
+//    §5.1, in our own framing.)
+//
+// Layout: "GV04" | eph P-256 (65) | ML-KEM ct (1088) | nonce (12) | ct+tag;
+// key = HKDF(ss_ec ‖ ss_kem ‖ psk, salt = GV03's, info "gorani-vault-v4");
+// AAD = header ‖ place. Text: "GV04:" + base64. Rust twin: crates/formats
+// › placed.rs (the cross-language vector proves both directions).
+
+const MAGIC4 = new TextEncoder().encode("GV04");
+const INFO_SEAL_V4 = new TextEncoder().encode("gorani-vault-v4");
+const SEALED_TEXT_PREFIX_V4 = "GV04:";
+
+/** The store PSK, cached per opened key object (it dies with the key on Lock). */
+const pskCache = new WeakMap<HybridPrivateKey, Promise<Uint8Array>>();
+
+/** The store's write secret: HKDF(ECDH(store, store's own public) ‖ SHA-256(ML-KEM dk)). */
+export function storePsk(store: HybridPrivateKey): Promise<Uint8Array> {
+	let p = pskCache.get(store);
+	if (!p) {
+		p = (async () => {
+			const own = await subtle().importKey("raw", store.ecPublic as BufferSource, { name: "ECDH", namedCurve: "P-256" }, false, []);
+			const shared = new Uint8Array(await subtle().deriveBits({ name: "ECDH", public: own }, store.ec, 256));
+			const kemHash = new Uint8Array(await subtle().digest("SHA-256", store.kem as BufferSource));
+			const ikmBytes = concat(shared, kemHash);
+			try {
+				const ikm = await subtle().importKey("raw", ikmBytes as BufferSource, "HKDF", false, ["deriveBits"]);
+				const enc = new TextEncoder();
+				return new Uint8Array(await subtle().deriveBits({ name: "HKDF", hash: "SHA-256", salt: enc.encode("gorani-store-psk"), info: enc.encode("gorani-store-psk-v1") }, ikm, 256));
+			} finally {
+				ikmBytes.fill(0);
+				shared.fill(0);
+			}
+		})();
+		pskCache.set(store, p);
+	}
+	return p;
+}
+
+async function placedAesKey(ecdh: ArrayBuffer, kemShared: Uint8Array, psk: Uint8Array, ephPubRaw: Uint8Array, kemCt: Uint8Array, storeEc: Uint8Array, storeKem: Uint8Array): Promise<CryptoKey> {
+	const salt = new Uint8Array(await subtle().digest("SHA-256", concat(ephPubRaw, kemCt, storeEc, storeKem) as BufferSource));
+	const ikmBytes = concat(new Uint8Array(ecdh), kemShared, psk);
+	try {
+		const ikm = await subtle().importKey("raw", ikmBytes as BufferSource, "HKDF", false, ["deriveKey"]);
+		return await subtle().deriveKey({ name: "HKDF", hash: "SHA-256", salt: salt as BufferSource, info: INFO_SEAL_V4 as BufferSource }, ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+	} finally {
+		ikmBytes.fill(0);
+	}
+}
+
+/**
+ * Seal bytes into `place` of the store whose PRIVATE key this is. A store
+ * seals to itself: the public halves come from the private key, never from
+ * a settings row (the O3 lesson) — and no other caller can seal here.
+ */
+export async function sealPlaced(store: VaultPrivateKey, place: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
+	if (!isHybridPrivate(store)) throw new Error("placed sealing needs a hybrid store key");
+	const psk = await storePsk(store);
+	const storeKem = kemPublicOf(store.kem);
+	const ecPub = await subtle().importKey("raw", store.ecPublic as BufferSource, { name: "ECDH", namedCurve: "P-256" }, false, []);
+	const eph = await subtle().generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+	const ephPubRaw = new Uint8Array(await subtle().exportKey("raw", eph.publicKey));
+	const ecdh = await subtle().deriveBits({ name: "ECDH", public: ecPub }, eph.privateKey, 256);
+	const { cipherText, sharedSecret } = ml_kem768.encapsulate(storeKem);
+	const key = await placedAesKey(ecdh, sharedSecret, psk, ephPubRaw, cipherText, store.ecPublic, storeKem);
+	sharedSecret.fill(0);
+	const nonce = randomBytes(NONCE_LEN);
+	const header = concat(MAGIC4, ephPubRaw, cipherText, nonce);
+	const ct = new Uint8Array(await subtle().encrypt({ name: "AES-GCM", iv: nonce as BufferSource, additionalData: concat(header, place) as BufferSource }, key, plaintext as BufferSource));
+	return concat(header, ct);
+}
+
+/** Open a GV04 value found at `place`. Another place, another format, or a value minted without the store's PSK: refused. */
+export async function openPlaced(store: VaultPrivateKey, place: Uint8Array, sealed: Uint8Array): Promise<Uint8Array> {
+	if (!isHybridPrivate(store)) throw new Error("placed values open with a hybrid store key");
+	const headerLen = MAGIC4.length + EPH_LEN + KEM_CT_LEN + NONCE_LEN;
+	if (!startsWith(sealed, MAGIC4) || sealed.length < headerLen + 16) throw new Error("not a placed (GV04) value");
+	const ephPubRaw = sealed.subarray(MAGIC4.length, MAGIC4.length + EPH_LEN);
+	const kemCt = sealed.subarray(MAGIC4.length + EPH_LEN, MAGIC4.length + EPH_LEN + KEM_CT_LEN);
+	const nonce = sealed.subarray(headerLen - NONCE_LEN, headerLen);
+	const header = sealed.subarray(0, headerLen);
+	const ephPub = await subtle().importKey("raw", ephPubRaw as BufferSource, { name: "ECDH", namedCurve: "P-256" }, false, []);
+	const ecdh = await subtle().deriveBits({ name: "ECDH", public: ephPub }, store.ec, 256);
+	const kemShared = ml_kem768.decapsulate(kemCt, store.kem);
+	const key = await placedAesKey(ecdh, kemShared, await storePsk(store), new Uint8Array(ephPubRaw), new Uint8Array(kemCt), store.ecPublic, kemPublicOf(store.kem));
+	kemShared.fill(0);
+	try {
+		return new Uint8Array(await subtle().decrypt({ name: "AES-GCM", iv: nonce as BufferSource, additionalData: concat(header, place) as BufferSource }, key, sealed.subarray(headerLen) as BufferSource));
+	} catch {
+		throw new Error("Cannot open: not sealed here, or not by a holder of this store's key");
+	}
+}
+
+export async function sealPlacedText(store: VaultPrivateKey, place: Uint8Array, text: string): Promise<string> {
+	return SEALED_TEXT_PREFIX_V4 + toBase64(await sealPlaced(store, place, new TextEncoder().encode(text)));
+}
+
+/** Open placed text. Nothing passes through — not plain text, not GV03: a server cannot downgrade a name to a movable, mintable format. */
+export async function openPlacedText(store: VaultPrivateKey, place: Uint8Array, value: string): Promise<string> {
+	if (!isPlacedText(value)) throw new Error("not a placed (GV04) value");
+	return new TextDecoder().decode(await openPlaced(store, place, fromBase64(value.slice(SEALED_TEXT_PREFIX_V4.length))));
+}
+
+export function isPlacedText(value: string | null | undefined): boolean {
+	return typeof value === "string" && value.startsWith(SEALED_TEXT_PREFIX_V4);
+}
+
+/** A version's content key, sealed into its `file.key` place. */
+export function wrapPlacedKey(store: VaultPrivateKey, place: Uint8Array, raw: Uint8Array): Promise<string> {
+	return sealPlacedText(store, place, toBase64(raw));
+}
+
+export async function unwrapPlacedKey(store: VaultPrivateKey, place: Uint8Array, sealed: string): Promise<CryptoKey> {
+	const raw = fromBase64(await openPlacedText(store, place, sealed));
+	if (raw.length !== 32) throw new Error("bad content key");
+	return importContentKey(raw);
 }
 
 /** A new hybrid key pair: its public halves, and the private bundle (GK1) to seal or wrap. The caller wipes the bundle. */

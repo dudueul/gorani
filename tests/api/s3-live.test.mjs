@@ -31,7 +31,8 @@
 
 import assert from "node:assert/strict";
 import { startDev, api } from "./_dev.mjs";
-import { newContentKey, importContentKey, sealText, sealWith, openWith, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith, openWith } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 import { sealChunked, openChunk, FRAME_OVERHEAD } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
@@ -84,15 +85,15 @@ try {
 	const store = await createStoreKey();
 	const settings = { enabled: true, keyId: vault.keyId, publicKey: vault.publicKey, pqPublicKey: vault.pqPublicKey, methods: vault.methods, stores: { files: await sealStoreKeyToMember(store, { ec: vault.publicKey, kem: vault.pqPublicKey }) }, guardian: await sealStoreKeyToMaster(store, master) };
 	assert.equal((await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email, body: { settings } })).status, 200);
-	const storePublic = { ec: store.publicKey, kem: store.pqPublicKey };
+	const sealer = await storeSealer(store.bundle, "jinu");
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
-	const ckSealed = await wrapContentKey(storePublic, ck);
 
 	// ── 2. Whole upload, download, exact Range ──────────────────────────
 	const plain = enc.encode("live S3: signed PUT, signed GET, a Range the real server slices");
 	const sealed = await sealWith(key, plain);
-	const up = await post("/files", { ck: ckSealed, name: await sealText(storePublic, "live.txt"), size: String(plain.length) }, sealed);
+	const live = await sealer.newFile("live.txt", "text/plain", ck);
+	const up = await post("/files", { ...live.fields, size: String(plain.length) }, sealed);
 	assert.equal(up.status, 200, `whole upload through the real bucket: ${JSON.stringify(up.json)}`);
 	const fileId = up.json.id;
 	const dl = await fetch(`${dev.base}/api/v1/members/jinu/files/${fileId}`, { headers: { "x-gorani-dev-email": email } });
@@ -106,9 +107,12 @@ try {
 	const chunk = 5 * 1024 * 1024;
 	const big = new Uint8Array(chunk + 4096);
 	for (let i = 0; i < big.length; i++) big[i] = (i * 31) % 251;
-	const bigSealed = await sealChunked(key, big, chunk);
+	const bigCk = newContentKey();
+	const bigKey = await importContentKey(bigCk);
+	const bigSealed = await sealChunked(bigKey, big, chunk);
 	async function multipartUpload(declaredSize) {
-		const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email, body: { size: big.length, chunk } });
+		const bigFile = await sealer.newFile("big.bin", "application/octet-stream", bigCk);
+		const start = await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email, body: { size: big.length, chunk, newFileId: bigFile.id } });
 		assert.equal(start.status, 200, JSON.stringify(start.json));
 		const etags = [];
 		for (let p = 1; p <= start.json.parts; p++) {
@@ -117,14 +121,14 @@ try {
 			assert.equal(r.status, 200, `part ${p} through the real bucket`);
 			etags.push({ partNumber: p, etag: (await r.json()).etag });
 		}
-		return post(`/files/uploads/${start.json.uploadId}/complete`, { key: start.json.key, size: String(declaredSize), chunk: String(chunk), ck: ckSealed, name: await sealText(storePublic, "big.bin"), parts: JSON.stringify(etags) }, null);
+		return post(`/files/uploads/${start.json.uploadId}/complete`, { key: start.json.key, size: String(declaredSize), chunk: String(chunk), ck: bigFile.fields.ck, name: bigFile.fields.name, type: bigFile.fields.type, parts: JSON.stringify(etags) }, null);
 	}
 	const done = await multipartUpload(big.length);
 	assert.equal(done.status, 200, `multipart complete: ${JSON.stringify(done.json)}`);
 	const bigDl = new Uint8Array(await (await fetch(`${dev.base}/api/v1/members/jinu/files/${done.json.id}`, { headers: { "x-gorani-dev-email": email } })).arrayBuffer());
 	assert.equal(bigDl.length, bigSealed.length);
-	const f0 = await openChunk(key, bigDl.subarray(0, chunk + FRAME_OVERHEAD), 0, false);
-	const f1 = await openChunk(key, bigDl.subarray(chunk + FRAME_OVERHEAD), 1, true);
+	const f0 = await openChunk(bigKey, bigDl.subarray(0, chunk + FRAME_OVERHEAD), 0, false);
+	const f1 = await openChunk(bigKey, bigDl.subarray(chunk + FRAME_OVERHEAD), 1, true);
 	assert.deepEqual(new Uint8Array([...f0, ...f1]), big, "both frames open, the second as final");
 	const forged = await multipartUpload(big.length + 1);
 	assert.equal(forged.status, 400, "a declared size the object does not add up to is refused (and the object deleted)");
@@ -135,7 +139,7 @@ try {
 	const copy = await sealChunked(keys.data, plain, 8 * 1024 * 1024);
 	const sh = await api(dev.base, "POST", "/api/v1/members/jinu/files/shares", {
 		email,
-		body: { id: shareId, fileId, version: 1, nameSealed: await sealText(storePublic, "live.txt"), metaSealed: await sealShareMeta(keys.meta, shareId, { name: "live.txt", type: "text/plain", size: plain.length, modified: null }), expiresAt: new Date(Date.now() + 3600_000).toISOString(), downloadsLeft: 3, size: plain.length },
+		body: { id: shareId, fileId, version: 1, nameSealed: await sealer.shareName(shareId, "live.txt"), metaSealed: await sealShareMeta(keys.meta, shareId, { name: "live.txt", type: "text/plain", size: plain.length, modified: null }), expiresAt: new Date(Date.now() + 3600_000).toISOString(), downloadsLeft: 3, size: plain.length },
 	});
 	assert.equal(sh.status, 200, JSON.stringify(sh.json));
 	const part = await fetch(`${dev.base}/api/v1/members/jinu/files/shares/${shareId}/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": email }, body: copy });

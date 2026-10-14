@@ -14,7 +14,8 @@
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { generateHybridKey, newContentKey, importContentKey, sealWith, wrapContentKey, sealText } from "../../web/src/vault/vault-crypto.ts";
+import { generateHybridKey, newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
+import { storeSealer } from "../lib/placed.mjs";
 import { createChildVault, createParentsMaster, createStoreKey, sealStoreKeyToMember, sealStoreKeyToMaster } from "../../web/src/vault/family.ts";
 
 const dev = await suiteDev();
@@ -44,13 +45,13 @@ try {
 
 	// A file so jinu's backups have content, and the backup PUBLIC key (the
 	// private half stays in the test tab, exactly like the browser).
-	const storePublic = { ec: filesStore.publicKey, kem: filesStore.pqPublicKey };
+	const store = await storeSealer(filesStore.bundle, "jinu");
 	const ck = newContentKey();
 	const key = await importContentKey(ck);
 	// (size: the plaintext's real length — commit 23's size-honesty rule; this
 	// used to declare "30" for a 25-byte diary.)
 	const diary = enc.encode("the cron tends the museum");
-	const up = await uploadFile({ ck: await wrapContentKey(storePublic, ck), name: await sealText(storePublic, "diary.txt"), type: await sealText(storePublic, "text/plain"), size: String(diary.length) }, await sealWith(key, diary));
+	const up = await uploadFile({ ...(await store.newFile("diary.txt", "text/plain", ck)).fields, size: String(diary.length) }, await sealWith(key, diary));
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	const backup = await generateHybridKey();
 	const put = await api(dev.base, "PUT", "/api/v1/members/jinu/backup-key", { email: "jinu@family.test", body: { keyId: backup.keyId, publicKey: backup.publicKey, pqPublicKey: backup.pqPublicKey } });

@@ -17,9 +17,18 @@
  * Idempotent and resumable: a value that already opens under the NEW key is
  * skipped; one that opens under neither is an error (it was sealed to some
  * third key — stop and look, never guess).
+ *
+ * Places (commit 25, GV04 — places.ts): every value is opened and re-sealed
+ * in the place its ROW names — `version` rows by (file, version), `file`
+ * and `folder` rows by their id, and so on. The walk never trusts a value
+ * to say where it belongs; it asks the row, and a value moved from another
+ * row fails under both keys. Re-sealing under the new key also moves every
+ * value to the new store PSK: what the departing member could still mint
+ * with the OLD key is refused from here on.
  */
 
-import { openSealedText, sealText, type SealTarget, type VaultPrivateKey } from "./vault-crypto.ts";
+import { openPlacedText, sealPlacedText, type VaultPrivateKey } from "./vault-crypto.ts";
+import { places } from "./places.ts";
 
 export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets"] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
@@ -27,8 +36,16 @@ export type SealedKind = (typeof SEALED_KINDS)[number];
 /** A JSON call against the API (the browser's bridge, or a test's helper). */
 export type ApiCall = (method: "GET" | "PUT", path: string, body?: unknown) => Promise<unknown>;
 
+interface SealedItem {
+	row: number;
+	a: string | null;
+	b: string | null;
+	v1: string | null;
+	v2: string | null;
+}
+
 interface SealedPage {
-	items: { row: number; a: string | null; b: string | null; v1: string | null; v2: string | null }[];
+	items: SealedItem[];
 	next: number | null;
 }
 
@@ -37,41 +54,71 @@ export interface RotationReport {
 	alreadyNew: Record<SealedKind, number>;
 }
 
-/** Re-seal one value: old key → new key; already-new → null (skip). */
-async function reseal(value: string, oldPrivate: VaultPrivateKey, newPrivate: VaultPrivateKey, newPublic: SealTarget): Promise<string | null> {
+/** The places of a row's two values (v1, v2) — from the row, never the value. */
+function placesOf(memberId: string, kind: SealedKind, it: SealedItem): [Uint8Array, Uint8Array | null] {
+	const id = it.a ?? "";
+	const version = Number(it.b);
+	switch (kind) {
+		case "version":
+			return [places.fileKey(memberId, id, version), places.fileType(memberId, id, version)];
+		case "file":
+			return [places.fileName(memberId, id), null];
+		case "folder":
+			return [places.folderName(memberId, id), null];
+		case "music":
+			return [places.fileMusic(memberId, id, version), null];
+		case "share":
+			return [places.shareName(memberId, id), null];
+		case "secrets":
+			return [places.storeSecrets(memberId), null];
+	}
+}
+
+/** Re-seal one value in its place: old key → new key; already-new → null (skip). */
+async function reseal(value: string, place: Uint8Array, oldPrivate: VaultPrivateKey, newPrivate: VaultPrivateKey): Promise<string | null> {
 	let plain: string;
 	try {
-		plain = await openSealedText(oldPrivate, value);
+		plain = await openPlacedText(oldPrivate, place, value);
 	} catch {
 		try {
-			await openSealedText(newPrivate, value);
+			await openPlacedText(newPrivate, place, value);
 			return null; // done on an earlier run
 		} catch {
-			throw new Error("a value opens under neither the old nor the new store key — refusing to continue");
+			throw new Error("a value opens under neither the old nor the new store key in its place — refusing to continue");
 		}
 	}
-	return sealText(newPublic, plain);
+	return sealPlacedText(newPrivate, place, plain);
+}
+
+async function* pages(call: ApiCall, memberId: string, kind: SealedKind): AsyncGenerator<SealedItem[]> {
+	let after = 0;
+	for (;;) {
+		const page = (await call("GET", `/api/v1/members/${memberId}/files/sealed?kind=${kind}&after=${after}&limit=500`)) as SealedPage;
+		yield page.items;
+		if (page.next === null) return;
+		after = page.next;
+	}
 }
 
 /**
- * Walk member `memberId`'s whole store from `oldPrivate` to the new key pair.
- * Run it BEFORE the settings switch to the new key and before the departing
- * member is deactivated (the runbook's order).
+ * Walk member `memberId`'s whole store from `oldPrivate` to `newPrivate`.
+ * (No public key parameter: a store seals to itself, GV04.) Run it BEFORE
+ * the settings switch to the new key and before the departing member is
+ * deactivated (the runbook's order).
  */
-export async function resealStore(call: ApiCall, memberId: string, oldPrivate: VaultPrivateKey, newPrivate: VaultPrivateKey, newPublic: SealTarget): Promise<RotationReport> {
+export async function resealStore(call: ApiCall, memberId: string, oldPrivate: VaultPrivateKey, newPrivate: VaultPrivateKey): Promise<RotationReport> {
 	const zero = () => Object.fromEntries(SEALED_KINDS.map((k) => [k, 0])) as Record<SealedKind, number>;
 	const report: RotationReport = { resealed: zero(), alreadyNew: zero() };
 	for (const kind of SEALED_KINDS) {
-		let after = 0;
-		for (;;) {
-			const page = (await call("GET", `/api/v1/members/${memberId}/files/sealed?kind=${kind}&after=${after}&limit=500`)) as SealedPage;
+		for await (const page of pages(call, memberId, kind)) {
 			const items: { kind: SealedKind; row: number; v1: string; v2?: string }[] = [];
-			for (const it of page.items) {
+			for (const it of page) {
 				if (!it.v1) continue;
-				const v1 = await reseal(it.v1, oldPrivate, newPrivate, newPublic);
-				// A version's type rides with its content key (both sealed to the
-				// store); a version without a type has nothing more to move.
-				const v2 = kind === "version" && it.v2 ? await reseal(it.v2, oldPrivate, newPrivate, newPublic) : null;
+				const [p1, p2] = placesOf(memberId, kind, it);
+				const v1 = await reseal(it.v1, p1, oldPrivate, newPrivate);
+				// A version's type rides with its content key (both sealed into
+				// the version's places); a version without a type has no v2.
+				const v2 = p2 && it.v2 ? await reseal(it.v2, p2, oldPrivate, newPrivate) : null;
 				if (v1 === null && v2 === null) {
 					report.alreadyNew[kind]++;
 					continue;
@@ -82,34 +129,32 @@ export async function resealStore(call: ApiCall, memberId: string, oldPrivate: V
 				await call("PUT", `/api/v1/members/${memberId}/files/reseal`, { items });
 				report.resealed[kind] += items.length;
 			}
-			if (page.next === null) break;
-			after = page.next;
 		}
 	}
 	return report;
 }
 
-/** Can this key still open any value of the store? (The proof step: after a
- * rotation, the OLD key must open nothing.) Returns the count it opens. */
+/** Can this key still open any value of the store, in its place? (The proof
+ * step: after a rotation, the OLD key must open nothing.) Returns the count. */
 export async function opensAnything(call: ApiCall, memberId: string, key: VaultPrivateKey): Promise<number> {
 	let opened = 0;
 	for (const kind of SEALED_KINDS) {
-		let after = 0;
-		for (;;) {
-			const page = (await call("GET", `/api/v1/members/${memberId}/files/sealed?kind=${kind}&after=${after}&limit=500`)) as SealedPage;
-			for (const it of page.items) {
-				for (const v of [it.v1, it.v2]) {
-					if (!v) continue;
+		for await (const page of pages(call, memberId, kind)) {
+			for (const it of page) {
+				const [p1, p2] = placesOf(memberId, kind, it);
+				for (const [v, p] of [
+					[it.v1, p1],
+					[it.v2, p2],
+				] as const) {
+					if (!v || !p) continue;
 					try {
-						await openSealedText(key, v);
+						await openPlacedText(key, p, v);
 						opened++;
 					} catch {
 						// sealed to another key — exactly what the proof wants
 					}
 				}
 			}
-			if (page.next === null) break;
-			after = page.next;
 		}
 	}
 	return opened;

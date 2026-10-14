@@ -19,6 +19,7 @@
 //!       ss_kem = ML-KEM-768 encapsulation to the recipient ML-KEM public
 //!       salt   = SHA-256(ephemeral public ‖ ML-KEM ciphertext ‖ recipient P-256 public ‖ recipient ML-KEM public)
 //!       key    = HKDF-SHA256(ikm = ss_ec ‖ ss_kem, salt, info = "gorani-vault-v3")
+//! GV04 = GV03's layout, sealed INTO a place with the store's PSK — placed.rs
 //! GK01 = "GK01" ‖ len(PKCS#8):2 ‖ P-256 private, PKCS#8 ‖ ML-KEM seed (64) ‖ P-256 public (65)
 //! GW01 = "GW01" ‖ nonce (12) ‖ AES-256-GCM(KEK, key bytes) ‖ tag (16),  AAD = "GW01"
 //! ```
@@ -54,10 +55,10 @@ pub const MAGIC_WRAP: &[u8; 4] = b"GW01";
 pub const MAGIC_BUNDLE: &[u8; 4] = b"GK01";
 const INFO_V1: &[u8] = b"gorani-vault-v1";
 const INFO_V3: &[u8] = b"gorani-vault-v3";
-const EPH_LEN: usize = 65;
-const NONCE_LEN: usize = 12;
+pub(crate) const EPH_LEN: usize = 65;
+pub(crate) const NONCE_LEN: usize = 12;
 pub(crate) const TAG_LEN: usize = 16;
-const KEM_CT_LEN: usize = 1088;
+pub(crate) const KEM_CT_LEN: usize = 1088;
 const KEM_PK_LEN: usize = 1184;
 const KEM_SEED_LEN: usize = 64;
 
@@ -155,23 +156,50 @@ fn aes(key: &[u8]) -> Aes256Gcm {
 	Aes256Gcm::new_from_slice(key).expect("32-byte key")
 }
 
-fn random<const N: usize>() -> [u8; N] {
+pub(crate) fn random<const N: usize>() -> [u8; N] {
 	let mut b = [0u8; N];
 	OsRng.fill_bytes(&mut b);
 	b
 }
 
-fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
 	let mut out = Zeroizing::new([0u8; 32]);
 	Hkdf::<Sha256>::new(Some(salt), ikm).expand(info, out.as_mut()).expect("32 bytes");
 	out
 }
 
-fn ecdh(secret: &SecretKey, public: &PublicKey) -> Zeroizing<[u8; 32]> {
+pub(crate) fn ecdh(secret: &SecretKey, public: &PublicKey) -> Zeroizing<[u8; 32]> {
 	let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
 	let mut out = Zeroizing::new([0u8; 32]);
 	out.copy_from_slice(shared.raw_secret_bytes());
 	out
+}
+
+/// A secret only a private key's holder can compute, from the key alone:
+/// ECDH of the key with its OWN public half, plus a hash of its ML-KEM
+/// secret, through HKDF. Two uses, two labels: the record key (a member's
+/// root authenticates its store records, records.rs) and the store PSK (a
+/// store's holders authenticate what they seal into it, placed.rs).
+///
+/// Why self-ECDH is a secret: computing d·(d·G) from the public d·G is the
+/// Diffie-Hellman problem itself. The ML-KEM half joins so that a quantum
+/// attacker who recovers d still lacks the secret.
+pub(crate) fn self_secret(key: &VaultPrivateKey, salt: &[u8], info: &[u8]) -> Result<Zeroizing<[u8; 32]>, Error> {
+	let VaultPrivateKey::Hybrid { ec, ec_public, kem, .. } = key else {
+		return Err(Error::Format("this secret is derived from a hybrid key"));
+	};
+	let own = PublicKey::from_sec1_bytes(ec_public).map_err(|_| Error::Format("bad public key"))?;
+	let shared = ecdh(ec, &own);
+	let mut ikm = Zeroizing::new([0u8; 64]);
+	ikm[..32].copy_from_slice(shared.as_ref());
+	ikm[32..].copy_from_slice(&Sha256::digest(kem.as_bytes()));
+	Ok(hkdf32(ikm.as_ref(), salt, info))
+}
+
+/// An ML-KEM-768 encapsulation key from its 1184 public bytes.
+pub(crate) fn encaps_key(kem_public: &[u8]) -> Result<EncapsKey, Error> {
+	let enc = ml_kem::Encoded::<EncapsKey>::try_from(kem_public).map_err(|_| Error::Format("bad ML-KEM public key"))?;
+	Ok(EncapsKey::from_bytes(&enc))
 }
 
 /// The raw uncompressed P-256 public key (65 bytes: `04 ‖ X ‖ Y`), the wire
@@ -195,7 +223,7 @@ pub(crate) fn nonce_of(b: &[u8]) -> Nonce<aes_gcm::aead::consts::U12> {
 	Nonce::from(n)
 }
 
-fn decrypt(key: &[u8], nonce: &[u8], aad: &[u8], ct: &[u8], what: &'static str) -> Result<Zeroizing<Vec<u8>>, Error> {
+pub(crate) fn decrypt(key: &[u8], nonce: &[u8], aad: &[u8], ct: &[u8], what: &'static str) -> Result<Zeroizing<Vec<u8>>, Error> {
 	aes(key).decrypt(&nonce_of(nonce), Payload { msg: ct, aad }).map(Zeroizing::new).map_err(|_| Error::Open(what))
 }
 
@@ -203,7 +231,7 @@ fn decrypt(key: &[u8], nonce: &[u8], aad: &[u8], ct: &[u8], what: &'static str) 
 /// building block of the formats). Encryption cannot fail with a fresh
 /// nonce; the expect documents the invariant rather than inventing an error
 /// type for the impossible.
-fn encrypt(key: &[u8], nonce: &[u8; NONCE_LEN], aad: &[u8], plain: &[u8]) -> Vec<u8> {
+pub(crate) fn encrypt(key: &[u8], nonce: &[u8; NONCE_LEN], aad: &[u8], plain: &[u8]) -> Vec<u8> {
 	aes(key).encrypt(&Nonce::from(*nonce), Payload { msg: plain, aad }).expect("AES-GCM encrypt")
 }
 
@@ -212,7 +240,9 @@ fn encrypt(key: &[u8], nonce: &[u8; NONCE_LEN], aad: &[u8], plain: &[u8]) -> Vec
 /// Seal bytes to a public key: GV03 when it has an ML-KEM half, GV01 otherwise.
 /// Anyone with the public key can seal; only the matching private key opens —
 /// so a sealed object proves nothing about who sealed it (integrity covers
-/// tampering, not origin; docs/VAULT.md).
+/// tampering, not origin; docs/VAULT.md). That is why a files store does not
+/// use this: its values are GV04 (placed.rs), which only a holder of the
+/// store's private key can produce.
 pub fn seal(public: &VaultPublicKey, plain: &[u8]) -> Vec<u8> {
 	match public {
 		VaultPublicKey::P256(pk) => {
@@ -308,10 +338,11 @@ pub fn open_text(private: &VaultPrivateKey, value: &str) -> Result<Zeroizing<Str
 	String::from_utf8(plain.to_vec()).map(Zeroizing::new).map_err(|_| Error::Format("not text"))
 }
 
-/// The three sealed text shapes; a Worker route accepts **only** these (or
-/// nothing) for names, types and other sealed columns.
+/// The sealed text shapes. A files-store column takes only GV04 (placed,
+/// `placed::is_placed_text`, commit 25); this broader check is for values
+/// sealed elsewhere (settings records, requests).
 pub fn is_sealed_text(value: &str) -> bool {
-	value.starts_with("GV01:") || value.starts_with("GV02:") || value.starts_with("GV03:")
+	value.starts_with("GV01:") || value.starts_with("GV02:") || value.starts_with("GV03:") || value.starts_with("GV04:")
 }
 
 // ── GV02: content keys ───────────────────────────────────────────────────────

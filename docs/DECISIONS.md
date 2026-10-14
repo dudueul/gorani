@@ -128,6 +128,10 @@ each object (key, size, its sealed hash), with the objects themselves
 protected by the bucket's own versioning / Object Lock (D6). The copy
 format stays for stores that fit.
 
+*The design:* docs/LARGE-FILES.md — adaptive chunks, streamed parts and
+uploads (31a), resumable uploads (31b), streaming downloads and export
+with ZIP64 (31c).
+
 ## D13 — Formats
 
 **Clean break.** There is no production data; v-next formats (store-key

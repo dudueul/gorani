@@ -40,6 +40,7 @@ fn read_secret(prompt: &str) -> String {
 
 fn run(args: &[String]) -> Result<(), Error> {
 	// Flags: --server --member --name --secret --device-secret --dev-email
+	//        --access-id --access-secret (Cloudflare Access service token)
 	//        --file --id --out --profile
 	let mut flags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 	let mut pos: Vec<String> = Vec::new();
@@ -67,7 +68,8 @@ fn run(args: &[String]) -> Result<(), Error> {
 				device_id: String::new(),
 				token: String::new(),
 				access_id: flag("access-id"),
-				access_secret: flag("device-secret"),
+				access_secret: flag("access-secret"),
+				device_secret: flag("device-secret"),
 				dev_email: flag("dev-email"),
 			};
 			let name = flag("name").unwrap_or_else(|| "this computer".into());
@@ -100,31 +102,30 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let client = api::Client::new(profile);
 			let keys = client.keys(&[id.clone()])?;
 			let ck = keys["keys"][&id]["key"].as_str().unwrap_or_default().to_string();
-			let chunk = keys["keys"][&id]["chunk"].as_u64().map(|c| c as usize);
+			let chunk = keys["keys"][&id]["chunk"].as_u64();
+			let size = keys["keys"][&id]["size"].as_u64();
 			let store = sess.files_store()?;
 			let ck_key = gorani_formats::formats::unwrap_content_key(&store, &ck).map_err(|_| Error::Open("content key"))?;
 			let plain = if let Some(chunk) = chunk.filter(|c| *c > 0) {
+				// The reference reader, not a hand-rolled loop (security review,
+				// commit 23). The loop that stood here counted frames with FLOOR
+				// division: an empty or shortened body opened to zero bytes and
+				// `pull` happily overwrote --out with nothing, and every honest
+				// file whose size was not a multiple of the chunk failed. The
+				// format's own reader rounds up and binds the final flag, so a
+				// truncation at any frame boundary is an authentication failure.
 				let sealed = client.fetch(&id, None, None)?;
-				let frame = chunk + 28;
-				let frames = sealed.len() / frame;
-				let mut out_bytes = Vec::new();
-				for i in 0..frames {
-					let at = i * frame;
-					let len = std::cmp::min(frame, sealed.len() - at);
-					let iv = &sealed[at..at + 12];
-					let body = &sealed[at + 12..at + len];
-					let mut aad = vec![b'G', b'C', b'0', b'1'];
-					aad.extend_from_slice(&(i as u64).to_be_bytes());
-					aad.push(u8::from(i == frames - 1));
-					let plain = gorani_formats::chunked::open_chunk_frame(&ck_key, iv, body, &aad).map_err(|_| Error::Open("frame"))?;
-					out_bytes.extend_from_slice(&plain);
-				}
-				out_bytes
+				gorani_formats::chunked::open_chunked(&ck_key, &sealed, chunk).map_err(|_| Error::Open("content (altered, reordered or cut short)"))?
 			} else {
 				let sealed = client.fetch(&id, None, None)?;
-				gorani_formats::formats::open_with(&ck_key, &sealed).map_err(|_| Error::Open("content"))?.to_vec()
+				gorani_formats::formats::open_with(&ck_key, &sealed).map_err(|_| Error::Open("content"))?
 			};
-			std::fs::write(&out, plain)?;
+			// The listing's size and the opened bytes must agree before anything
+			// touches the disk.
+			if size.is_some_and(|s| s != plain.len() as u64) {
+				return Err(Error::Open("content size does not match the file's size"));
+			}
+			std::fs::write(&out, &*plain)?;
 			println!("pulled {id} → {out}");
 		}
 		Some("push") => {
@@ -151,7 +152,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {}", row["id"].as_str().unwrap_or("?"));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|ls|pull|push> [--server S --member M --name N --secret S --device-secret H --dev-email E --file P --id I --out O --profile P]");
+			eprintln!("usage: gorani-sync <setup|ls|pull|push> [--server S --member M --name N --secret S --device-secret H --access-id I --access-secret S --dev-email E --file P --id I --out O --profile P]");
 			std::process::exit(2);
 		}
 	}

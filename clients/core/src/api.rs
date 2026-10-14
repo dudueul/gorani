@@ -145,7 +145,11 @@ impl Client {
 	/// Fetch a version's sealed object (Range honoured; chunked objects are
 	/// fetched frame-aligned by the caller).
 	pub fn fetch(&self, id: &str, version: Option<u64>, range: Option<(u64, u64)>) -> Result<Vec<u8>, Error> {
-		let mut r = self.req("GET", &self.url(&format!("/files/{id}?version={}", version.unwrap_or(0))));
+		// No version → no query: the server serves the living version. (This
+		// sent `?version=0` and only worked because the server ignored the
+		// query entirely — the bug fixed in commit 23, S17.)
+		let query = version.map(|v| format!("?version={v}")).unwrap_or_default();
+		let mut r = self.req("GET", &self.url(&format!("/files/{id}{query}")));
 		if let Some((a, b)) = range {
 			r = r.set("Range", &format!("bytes={a}-{}", b.saturating_sub(1)));
 		}

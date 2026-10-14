@@ -79,16 +79,14 @@ pub fn enrol(profile: &mut DeviceProfile, device_name: &str, secret_text: &str, 
 /// Platform shells: a TPM signature behind Windows Hello, a Secure Enclave
 /// agreement, a keyring + TPM pair — docs/DESKTOP.md.
 fn profile_device_secret(profile: &mut DeviceProfile) -> Result<Zeroizing<Vec<u8>>, Error> {
-	if let Some(hex_secret) = &profile.access_secret {
-		// (the CLI reuses the access-secret slot for the device secret hex —
-		// documented quirk of the dev CLI; shells use real key stores)
+	if let Some(hex_secret) = &profile.device_secret {
 		if hex_secret.len() == 64 {
 			return Ok(Zeroizing::new(decode_hex(hex_secret)?));
 		}
 	}
 	let mut s = Zeroizing::new(vec![0u8; 32]);
 	rand_core::OsRng.fill_bytes(s.as_mut_slice());
-	profile.access_secret = Some(hex_of(&s));
+	profile.device_secret = Some(hex_of(&s));
 	Ok(s)
 }
 
@@ -104,8 +102,27 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, Error> {
 }
 
 /// Persist the profile (the CLI writes it; shells use their key stores).
+///
+/// The file holds the device token AND the device secret — together with
+/// the server's wrapped copy, the root. So (commit 23): owner-only
+/// permissions from the first byte (0600 at creation, not a chmod after a
+/// world-readable write), and an atomic rename so a crash never leaves a
+/// half-written profile.
 pub fn save_profile(path: &std::path::Path, profile: &DeviceProfile) -> Result<(), Error> {
-	std::fs::write(path, serde_json::to_vec_pretty(profile).map_err(|e| Error::Config(e.to_string()))?)?;
+	use std::io::Write;
+	let bytes = serde_json::to_vec_pretty(profile).map_err(|e| Error::Config(e.to_string()))?;
+	let tmp = path.with_extension("tmp");
+	let mut opts = std::fs::OpenOptions::new();
+	opts.write(true).create(true).truncate(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		opts.mode(0o600);
+	}
+	let mut f = opts.open(&tmp)?;
+	f.write_all(&bytes)?;
+	f.sync_all()?;
+	std::fs::rename(&tmp, path)?;
 	Ok(())
 }
 

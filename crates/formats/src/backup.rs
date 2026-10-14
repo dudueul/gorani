@@ -213,7 +213,7 @@ impl<'a> BackupReader<'a> {
 						aad: &aad(seg, final_seg),
 					},
 				)
-				.map_err(|e| {
+				.map_err(|_e| {
 					#[cfg(test)]
 					eprintln!("decrypt seg {seg} failed: payload_len {payload_len} final {final_seg} remaining {remaining}");
 					Error::Open("wrong backup key or corrupted backup")

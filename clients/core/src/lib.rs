@@ -61,10 +61,25 @@ pub struct DeviceProfile {
 	pub member: String,
 	pub device_id: String,
 	pub token: String,
+	/// Cloudflare Access service-token pair (docs/PRODUCTION.md › 2.5) —
+	/// sent as `CF-Access-Client-Id/Secret` on every request.
 	#[serde(default)]
 	pub access_id: Option<String>,
-	#[serde(default)]
+	#[serde(default, rename = "accessClientSecret")]
 	pub access_secret: Option<String>,
+	/// The device secret (hex) — the input to this computer's KEK. It must
+	/// NEVER leave the machine: the server holds the wrapped root copy and
+	/// its salt, so server + device secret = the root.
+	///
+	/// Security review, commit 23: the dev CLI stored this in the
+	/// `access_secret` slot, and the API client sends that slot as
+	/// `CF-Access-Client-Secret` — so with an Access id configured, every
+	/// request handed the server (and Access, and any log of either) the
+	/// one secret the device design keeps on the device. Old profiles named
+	/// the field `accessSecret` and always meant the device secret by it;
+	/// the alias reads them into the right slot.
+	#[serde(default, alias = "accessSecret")]
+	pub device_secret: Option<String>,
 	/// Dev-mode identity (wrangler dev only; production uses Access).
 	#[serde(default)]
 	pub dev_email: Option<String>,

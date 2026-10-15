@@ -145,13 +145,34 @@ fn register_shell(root: &Path, area: &str, read_only: bool) -> Result<String, St
 }
 
 /// The folder the shell holds under `id`, if it holds one (an unknown id
-/// is "none", not an error).
+/// is "none", not an error): asked of the shell, then read where the shell
+/// writes it down — `…\Explorer\SyncRootManager\<id>\UserSyncRoots`, the
+/// user's SID naming the folder. (Found in CI: on a Server runner, a
+/// non-interactive session, the shell's queries answered nothing for a root
+/// Register had just taken.)
 pub fn registered_path(id: &str) -> Result<Option<String>, String> {
 	match StorageProviderSyncRootManager::GetSyncRootInformationForId(&HSTRING::from(id)) {
-		Ok(info) => Ok(Some(info.Path().and_then(|f| f.cast::<IStorageItem>()).and_then(|i| i.Path()).map_err(text)?.to_string())),
-		Err(e) if e.code() == windows::Win32::Foundation::ERROR_NOT_FOUND.to_hresult() || e.code() == windows::Win32::Foundation::E_INVALIDARG => Ok(None),
-		Err(e) => Err(text(e)),
+		Ok(info) => return Ok(Some(info.Path().and_then(|f| f.cast::<IStorageItem>()).and_then(|i| i.Path()).map_err(text)?.to_string())),
+		Err(e) if e.code() == windows::Win32::Foundation::ERROR_NOT_FOUND.to_hresult() || e.code() == windows::Win32::Foundation::E_INVALIDARG => {}
+		Err(e) => return Err(text(e)),
 	}
+	Ok(registry_path(id))
+}
+
+/// The shell's record of a sync root's folder for this user, from the registry.
+fn registry_path(id: &str) -> Option<String> {
+	use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+	let sid = user_sid().ok()?;
+	let key = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}\UserSyncRoots");
+	let mut buf = vec![0u16; 2048];
+	let mut len = (buf.len() * 2) as u32;
+	// SAFETY: a buffer of `len` bytes, written by the call; strings outlive it.
+	let r = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, &HSTRING::from(key), &HSTRING::from(sid), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut len)) };
+	if r.is_err() {
+		return None;
+	}
+	let chars = (len as usize / 2).min(buf.len());
+	Some(String::from_utf16_lossy(&buf[..chars]).trim_end_matches('\0').to_string())
 }
 
 /// Whether `path` is the folder `root` (canonical, folded).

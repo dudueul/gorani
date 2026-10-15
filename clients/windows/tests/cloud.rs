@@ -99,7 +99,9 @@ fn a_cloud_files_folder_over_the_replica() {
 		}
 		Ok(None) => {
 			// (Only a Windows without the shell's support may fall back.)
-			assert!(!shell::supported(), "the shell supports sync roots here, yet holds nothing under {id} — by folder: {:?}, among its roots: {:?}", shell::registered_id(&root), shell::roots());
+			// (What the registry holds, for the reader of a failure.)
+			let reg = std::process::Command::new("reg").args(["query", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager", "/s"]).output().map(|o| String::from_utf8_lossy(&o.stdout).chars().take(4000).collect::<String>()).unwrap_or_default();
+			assert!(!shell::supported(), "the shell supports sync roots here, yet holds nothing under {id} — by folder: {:?}, among its roots: {:?}; the registry: {reg}", shell::registered_id(&root), shell::roots());
 			eprintln!("this Windows has no shell sync-root support — cldapi's sync root only");
 		}
 		Err(e) => panic!("the shell, asked for {id}: {e} — by folder: {:?}, among its roots: {:?}", shell::registered_id(&root), shell::roots()),

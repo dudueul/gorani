@@ -10,7 +10,7 @@ serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 # (Storage_Provider and friends: Explorer's registration, 39e — shell.rs.)
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_CorrelationVector", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Foundation", "Security_Cryptography", "Storage", "Storage_Provider", "Storage_Search", "Storage_Streams"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_CorrelationVector", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Registry", "Foundation", "Security_Cryptography", "Storage", "Storage_Provider", "Storage_Search", "Storage_Streams"] }
 # The WinRT collection the shell takes a file's states in (the windows
 # crate's own companion — already in the build, now named directly).
 windows-collections = "0.2"

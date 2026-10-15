@@ -18,9 +18,11 @@ settings are in § 3 › The desktop installers.)
 2. **Storage** (§ 1): either an R2 bucket — uncomment `r2_buckets` in
    `wrangler.jsonc`, nothing else to set — or an S3-compatible bucket and
    its five secrets below. For evidence, a bucket created with Object Lock.
-3. **Access** (§ 2): a self-hosted application for `gorani.at.day`; an
-   Allow policy for the team; a Bypass for `/s/*`, `/s.html`, `/r.html` and
-   `/api/healthz`; its *Application Audience (AUD) Tag* is `POLICY_AUD`.
+3. **Access** (§ 2): a self-hosted application for `gorani.at.day` with
+   an Allow policy for the team — its *Application Audience (AUD) Tag* is
+   `POLICY_AUD`; and a second one, Bypass for everyone, for what a
+   stranger's share or upload link loads: `/s/*`, `/s.html`, `/s.js`,
+   `/r.html`, `/assets/*`, `/vendor/*`, `/favicon.svg`, `/api/healthz`.
 4. **Deploy** (§ 3), from a machine that can build the Worker. On Ubuntu
    (WSL too — keep the checkout in the Linux file system, e.g. `~/work`,
    not under `/mnt/c`): Node.js 22 or later (wrangler needs it), Rust
@@ -226,19 +228,52 @@ memory.
 ## 2. Cloudflare Access (the perimeter)
 
 1. Enable Access on the Worker's host, **gorani.at.day** (commit 39j —
-   the custom domain `wrangler.jsonc › routes` attaches; one-click modal
-   or a self-hosted application for that hostname).
-2. `wrangler secret put POLICY_AUD` and `TEAM_DOMAIN` from the modal — the
-   Worker verifies every request's JWT (issuer, audience, expiry, signature
-   against the team JWKS) and **fails closed** when they are missing.
+   the custom domain `wrangler.jsonc › routes` attaches). In the Zero Trust
+   dashboard (one.dash.cloudflare.com): the first visit asks for a **team
+   name** — your team domain is then `https://<team>.cloudflareaccess.com`
+   (shown again under Settings). Then *Access › Applications › Add an
+   application › Self-hosted*: name "Gorani", destination `gorani.at.day`
+   (no path), an identity provider (One-time PIN to start, your SSO later).
+2. Its **Application Audience (AUD) Tag** (the application's Overview /
+   Basic information) and the team domain are the Worker's two Access
+   secrets:
+
+   ```sh
+   npx wrangler secret put TEAM_DOMAIN     # https://<team>.cloudflareaccess.com
+   npx wrangler secret put POLICY_AUD      # the AUD tag
+   ```
+
+   The Worker verifies every request's JWT (issuer, audience, expiry,
+   signature against the team JWKS) and **fails closed** when either is
+   missing: the page loads, but every API call is refused with *Access is
+   not configured (POLICY_AUD/TEAM_DOMAIN missing)*, which the app shows. A
+   `secret put` takes effect without a redeploy.
 3. People: an Allow policy for the family (One-time PIN / GitHub / your
    IdP). Each member's Access email is registered on their member row
    (`POST /api/v1/family/members` with `emails`).
-4. **Bypass for the public share surface**: the Access application needs an
-   exception for `/s/*` (and `/s.html`, `/r.html`) — the share pages and the
+4. **Bypass for the public share surface**: the share pages and the
    upload-link pages (`/s/r/*`, commit 38) authenticate with the link's
-   fragment secret, not Access: a sender has no account. Same for
-   `/api/healthz`.
+   fragment secret, not Access — a sender has no account. So everything such
+   a page loads must answer without Access: a second self-hosted
+   application on `gorani.at.day` with these paths as its destinations
+   (or one application per path) and one policy, action **Bypass**,
+   include **Everyone**:
+
+   | Path | Why |
+   |---|---|
+   | `/s/*` | the link itself and its API (the Worker serves the page) |
+   | `/s.html`, `/s.js`, `/r.html` | the share and upload pages and the share page's script |
+   | `/assets/*` | their stylesheet and the upload page's scripts (Vite puts every bundle there — the app's own code becomes downloadable too; it holds no key and no data, which all stay behind the API) |
+   | `/vendor/*` | Argon2 for the share password (`web/public/vendor`) |
+   | `/favicon.svg` | the tab icon |
+   | `/api/healthz` | uptime checks |
+
+   Access applies the most specific match, so these paths skip it while
+   the rest of `gorani.at.day` stays behind the Allow policy. (Until commit
+   39j this step listed only `/s/*`, `/s.html`, `/r.html` and
+   `/api/healthz`: a stranger's link page would then have been sent to the
+   Access login for its own script and stylesheet — the local tests, which
+   run without Access, could not see it.)
 5. Desktop clients sign in as their **member** (commit 33a): install
    `cloudflared` on the computer and set the profile's `accessTokenCmd` to
    `cloudflared access token -app=https://gorani.at.day` (or export

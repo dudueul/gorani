@@ -82,10 +82,19 @@ try {
 		await page.getByText("letters, digits and + / =").waitFor();
 		await page.locator('input[name="bootstrap-token"]').fill("any-token-dev-mode-allows");
 		await page.getByRole("button", { name: "Create" }).click();
-		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
-		await page.getByText("Mom", { exact: false }).first().waitFor();
+		// Straight into the new lead's own vault setup — no chooser (39l).
+		await page.getByRole("button", { name: "Create the vault" }).waitFor({ timeout: 30_000 });
 		await assertNoViolations(page, "the first-lead screen");
 		await ctx.close();
+		// Someone signed in whose email no account holds sees no one's
+		// account — not a list of the team (39l: "Who's opening?" listed
+		// every member to anyone through Access).
+		const strangerCtx = await guardedContext(browser, "stranger@elsewhere.test");
+		const stranger = await strangerCtx.newPage();
+		await stranger.goto(dev.base);
+		await stranger.getByText("no account in this team uses that address").waitFor({ timeout: 30_000 });
+		assert.equal(await stranger.getByText("Mom").count(), 0, "no member's name is shown to a stranger");
+		await strangerCtx.close();
 		const team = await api(dev.base, "GET", "/api/v1/family", { email: "mom@family.test" });
 		const first = team.json.members.find((m) => m.id === "mom");
 		assert.equal(first?.role, "lead", "the first member is a lead");
@@ -128,8 +137,7 @@ try {
 		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
 		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
 		await page.goto(dev.base);
-		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
-		await page.getByRole("button", { name: /Sora/ }).click();
+		// (The signed-in email opens its own account — no chooser since 39l.)
 		await page.getByPlaceholder("Password (12+ chars)").fill("sora's very long password!");
 		await page.getByPlaceholder("Repeat it").fill("sora's very long password!");
 		await page.getByRole("button", { name: "Create the vault" }).click();
@@ -177,8 +185,7 @@ try {
 		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
 		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
 		await page.goto(dev.base);
-		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
-		await page.getByRole("button", { name: /Jinu/ }).click();
+		// (The signed-in email opens its own account — no chooser since 39l.)
 		await page.getByPlaceholder(/Recovery code/).fill(jinu.recoveryCode);
 		await page.getByRole("button", { name: "Unlock" }).click();
 		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
@@ -433,8 +440,7 @@ try {
 		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
 		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
 		await page.goto(dev.base);
-		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
-		await page.getByRole("button", { name: /Mom/ }).click();
+		// (The signed-in email opens its own account — no chooser since 39l.)
 		const pw = page.locator('input[type="password"]');
 		await pw.waitFor({ timeout: 30_000 });
 		await pw.fill("deliberately wrong password");
@@ -515,8 +521,7 @@ try {
 		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
 		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
 		await page.goto(dev.base);
-		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
-		await page.getByRole("button", { name: /rae/ }).click();
+		// (The signed-in email opens its own account — no chooser since 39l.)
 		await page.getByPlaceholder(/Recovery code/).fill(rae.recoveryCode);
 		await page.getByRole("button", { name: "Unlock" }).click();
 		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
@@ -590,8 +595,7 @@ try {
 		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
 		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
 		await page.goto(dev.base);
-		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
-		await page.getByRole("button", { name: /Mom/ }).click();
+		// (The signed-in email opens its own account — no chooser since 39l.)
 		await page.locator('input[type="password"]').fill("correct horse battery staple 42");
 		await page.getByRole("button", { name: "Unlock" }).click();
 		// The Team button enables once the team is open (identity opened or
@@ -770,8 +774,7 @@ try {
 		const page = await ctx.newPage();
 		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
 		await page.goto(dev.base);
-		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
-		await page.getByRole("button", { name: /Jinu/ }).click();
+		// (The signed-in email opens its own account — no chooser since 39l.)
 		await page.locator('[data-test="lost-methods"]').click();
 		await page.getByPlaceholder("New password (12+ chars)").fill("jinu's brand new password");
 		await page.getByPlaceholder("Repeat it").fill("jinu's brand new password");

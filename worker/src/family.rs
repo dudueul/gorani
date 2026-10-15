@@ -353,6 +353,11 @@ impl GoraniFamilyDO {
 				let target = req.headers().get("x-gorani-target")?;
 				self.actor(&actor, target.as_deref()).await
 			}
+			// Who is this caller (commit 39l)? The app opens the ONE account
+			// tied to the signed-in Access email — it used to list every
+			// member and let anyone pick (the Worker refused the wrong ones,
+			// but the list said who was on the team to anyone signed in).
+			("GET", "me") => self.me(&actor),
 			// The system's own view (the nightly cron): active member ids only.
 			// Internal — routes.rs maps no public path here.
 			("GET", "member-ids") => {
@@ -603,6 +608,29 @@ impl GoraniFamilyDO {
 
 	fn member_row(&self, id: &str) -> Result<Option<ActiveRow>> {
 		Ok(self.sql.exec("SELECT active FROM members WHERE id = ?1", Some(vec![id.into()]))?.to_array::<ActiveRow>()?.into_iter().next())
+	}
+
+	/// The caller's own account, as the registry lists members — or null —
+	/// and whether the team has anyone yet (the first-lead screen).
+	fn me(&self, email: &str) -> Result<Response> {
+		let id = self.actor_row(email)?.map(|r| r.id);
+		let member = match &id {
+			Some(id) => self
+				.sql
+				.exec("SELECT id, name, role, emails, active, created_at, expires_at FROM members WHERE id = ?1", Some(vec![id.clone().into()]))?
+				.to_array::<MemberRow>()?
+				.into_iter()
+				.next()
+				.map(|m| {
+					serde_json::json!({
+						"id": m.id, "name": m.name, "role": m.role,
+						"emails": serde_json::from_str::<serde_json::Value>(&m.emails).unwrap_or(serde_json::json!([])),
+						"active": m.active != 0, "createdAt": m.created_at, "expiresAt": m.expires_at,
+					})
+				}),
+			None => None,
+		};
+		Response::from_json(&serde_json::json!({ "email": email, "member": member, "empty": self.active_count()? == 0 }))
 	}
 
 	fn active_count(&self) -> Result<i64> {

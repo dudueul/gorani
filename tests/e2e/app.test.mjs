@@ -75,7 +75,12 @@ try {
 		await page.getByText("Member id: 2–32 characters").waitFor();
 		await page.locator('input[name="member-id"]').fill("mom");
 		await page.locator('input[name="member-name"]').fill("Mom");
-		await page.locator('input[name="bootstrap-token"]').fill("any — dev mode");
+		// (A header carries Latin-1 only: a token with "—" in it never leaves
+		// the page — the screen says so instead of fetch's TypeError.)
+		await page.locator('input[name="bootstrap-token"]').fill("bad — token");
+		await page.getByRole("button", { name: "Create" }).click();
+		await page.getByText("letters, digits and + / =").waitFor();
+		await page.locator('input[name="bootstrap-token"]').fill("any-token-dev-mode-allows");
 		await page.getByRole("button", { name: "Create" }).click();
 		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
 		await page.getByText("Mom", { exact: false }).first().waitFor();

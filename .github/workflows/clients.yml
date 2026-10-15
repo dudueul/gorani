@@ -66,8 +66,11 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
+      # (On Windows these include the device-key protectors — DPAPI, a CNG
+      # key in the software provider and the TPM's where the runner has one,
+      # Hello's "not set up" — 39d.)
       - name: Unit tests (formats, client core)
-        run: cargo test --locked -p gorani-formats -p gorani-client-core
+        run: cargo test --locked -p gorani-formats -p gorani-client-core -- --nocapture
       - name: Build the CLI
         run: cargo build --locked -p gorani-client-core --bin gorani-sync
       # ── 39b: the Windows shell, on a real Cloud Files sync root ──
@@ -99,6 +102,17 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: clients/macos/GoraniKit
         run: swift test
+      # ── 39d: the Mac's stores for a device-secret part, through the helper ──
+      # (The real Secure Enclave where the runner has one — a virtual Mac
+      # usually has not: then the debug helper's software stand-in, which the
+      # client accepts only in its tests. The login Keychain is the runner's.)
+      - name: The Secure Enclave and Keychain helper, with the client (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          (cd clients/macos/GoraniKit && swift build --product gorani-keystore)
+          export GORANI_KEYSTORE="$(cd clients/macos/GoraniKit && swift build --show-bin-path)/gorani-keystore"
+          echo "this runner: $("$GORANI_KEYSTORE" probe)"
+          GORANI_KEYSTORE_SOFTWARE=1 cargo test --locked -p gorani-client-core devicekey -- --ignored --nocapture --test-threads=1
       - name: Build the app and its File Provider extension, unsigned (macOS)
         if: runner.os == 'macOS'
         working-directory: clients/macos

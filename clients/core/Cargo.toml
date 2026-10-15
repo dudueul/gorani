@@ -29,6 +29,12 @@ hmac = "0.12"
 # The device secret from its parts (devicekey.rs, commit 34).
 hkdf = "0.12"
 
+# Windows' own stores for the parts (devicekey/windows.rs, commit 39d): DPAPI,
+# the TPM's CNG provider, Windows Hello — the crate the Windows shell
+# already builds on, nothing new to trust.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Foundation", "Security_Credentials", "Security_Cryptography", "Storage_Streams", "Win32_Foundation", "Win32_Security_Cryptography"] }
+
 [[bin]]
 name = "gorani-sync"
 path = "src/bin/gorani-sync.rs"

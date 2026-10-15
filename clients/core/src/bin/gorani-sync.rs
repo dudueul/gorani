@@ -99,8 +99,9 @@ fn run(args: &[String]) -> Result<(), Error> {
 	//        --file --id --out --profile --case --device
 	//        --source --collector --method --collected-at --notes (intake, 33c)
 	//        --accept-unverified (a switch)
-	//        --protect auto|tpm|keyring|tpm+keyring|file (where the device secret lives — commit 34)
-	//        --tpm-pin (a switch) --tpm-pcrs 7 (the TPM part's PIN and boot state — commit 36)
+	//        --protect auto|tpm|keyring|tpm+keyring|file (where the device secret lives — commit 34;
+	//          on Windows also dpapi, hello; on a Mac enclave, keychain, presence — 39d)
+	//        --tpm-pin (a switch) --tpm-pcrs 7 (Linux's TPM part's PIN and boot state — commit 36)
 	let mut flags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 	let mut pos: Vec<String> = Vec::new();
 	let mut i = 0;
@@ -536,7 +537,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash]");
+			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file (Windows: +dpapi +hello; macOS: enclave +keychain +presence) --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash]");
 			std::process::exit(2);
 		}
 	}

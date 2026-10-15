@@ -52,7 +52,10 @@ pub fn register(root: &Path, area: &str) -> Result<()> {
 		StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
 		Hydration: CF_HYDRATION_POLICY { Primary: CF_HYDRATION_POLICY_PARTIAL, Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE },
 		Population: CF_POPULATION_POLICY { Primary: CF_POPULATION_POLICY_ALWAYS_FULL, Modifier: CF_POPULATION_POLICY_MODIFIER_NONE },
-		InSync: CF_INSYNC_POLICY_TRACK_ALL,
+		// Everything but the read-only attribute: the shell sets it on what
+		// may not be written (evidence, samples) and must lift it for a
+		// moment to dehydrate or update one — that is not a change to sync.
+		InSync: CF_INSYNC_POLICY(CF_INSYNC_POLICY_TRACK_ALL.0 & !(CF_INSYNC_POLICY_TRACK_FILE_READONLY_ATTRIBUTE.0 | CF_INSYNC_POLICY_TRACK_DIRECTORY_READONLY_ATTRIBUTE.0)),
 		HardLink: CF_HARDLINK_POLICY_NONE,
 		PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
 	};
@@ -198,10 +201,35 @@ pub fn info(path: &Path) -> Option<Info> {
 	Some(Info { in_sync: basic.InSyncState == CF_IN_SYNC_STATE_IN_SYNC, identity: buf[at..at + len].to_vec() })
 }
 
+/// Run `f` with a write handle — lifting the read-only attribute for the
+/// moment if the shell set it (found in CI: an exclusive write open of a
+/// read-only placeholder is refused, so evidence could not be dehydrated).
+fn writable<T>(path: &Path, f: impl FnOnce(&Handle) -> Result<T>) -> Result<T> {
+	let ro = std::fs::metadata(path).map(|m| m.permissions().readonly()).unwrap_or(false);
+	let set = |v: bool| {
+		if let Ok(m) = std::fs::metadata(path) {
+			let mut p = m.permissions();
+			p.set_readonly(v);
+			let _ = std::fs::set_permissions(path, p);
+		}
+	};
+	if ro {
+		set(false);
+	}
+	let r = Handle::open(path, true).and_then(|h| f(&h));
+	if ro {
+		set(true);
+	}
+	r
+}
+
 /// Point a placeholder at a new identity (a new version), optionally with
 /// new metadata and its local bytes dropped, and mark it in sync.
 pub fn update(path: &Path, identity: &[u8], meta: Option<(bool, u64, u64, bool)>, dehydrate: bool) -> Result<()> {
-	let h = Handle::open(path, true)?;
+	writable(path, |h| update_with(h, identity, meta, dehydrate))
+}
+
+fn update_with(h: &Handle, identity: &[u8], meta: Option<(bool, u64, u64, bool)>, dehydrate: bool) -> Result<()> {
 	let md = meta.map(|(dir, size, modified, ro)| CF_FS_METADATA { BasicInfo: basic_info(dir, modified, ro), FileSize: size as i64 });
 	let mut flags = CF_UPDATE_FLAG_MARK_IN_SYNC;
 	if dehydrate {
@@ -213,31 +241,35 @@ pub fn update(path: &Path, identity: &[u8], meta: Option<(bool, u64, u64, bool)>
 
 /// A file or folder the member made becomes a placeholder, in sync.
 pub fn convert(path: &Path, identity: &[u8]) -> Result<()> {
-	let h = Handle::open(path, true)?;
-	// SAFETY: the identity outlives the call.
-	unsafe { CfConvertToPlaceholder(h.win32(), Some(identity.as_ptr() as *const c_void), identity.len() as u32, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None) }
+	writable(path, |h| {
+		// SAFETY: the identity outlives the call.
+		unsafe { CfConvertToPlaceholder(h.win32(), Some(identity.as_ptr() as *const c_void), identity.len() as u32, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None) }
+	})
 }
 
 /// Drop a placeholder's local bytes (it stays listed, its bytes on the server).
 pub fn dehydrate(path: &Path) -> Result<()> {
-	let h = Handle::open(path, true)?;
-	// SAFETY: a handle we own; the whole file.
-	unsafe { CfDehydratePlaceholder(h.win32(), 0, -1, CF_DEHYDRATE_FLAG_NONE, None) }
+	writable(path, |h| {
+		// SAFETY: a handle we own; the whole file.
+		unsafe { CfDehydratePlaceholder(h.win32(), 0, -1, CF_DEHYDRATE_FLAG_NONE, None) }
+	})
 }
 
 /// A placeholder stops being one (its bytes stay, as a plain local file).
 pub fn revert(path: &Path) -> Result<()> {
-	let h = Handle::open(path, true)?;
-	// SAFETY: a handle we own.
-	unsafe { CfRevertPlaceholder(h.win32(), CF_REVERT_FLAG_NONE, None) }
+	writable(path, |h| {
+		// SAFETY: a handle we own.
+		unsafe { CfRevertPlaceholder(h.win32(), CF_REVERT_FLAG_NONE, None) }
+	})
 }
 
 /// Mark a placeholder in sync without changing anything else (a folder
-/// whose attributes or times were touched).
+/// whose attributes or times were touched; a file only renamed).
 pub fn mark_in_sync(path: &Path) -> Result<()> {
-	let h = Handle::open(path, true)?;
-	// SAFETY: a handle we own.
-	unsafe { CfSetInSyncState(h.win32(), CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, None) }
+	writable(path, |h| {
+		// SAFETY: a handle we own.
+		unsafe { CfSetInSyncState(h.win32(), CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, None) }
+	})
 }
 
 // ── answering a callback ─────────────────────────────────────────────

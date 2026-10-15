@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gorani_client_core::engine::{FsError, Kind};
 use gorani_client_core::replica::{Item, Remote, Saved};
@@ -67,6 +67,17 @@ struct Known {
 	/// None when learnt from the disk (the next listing says).
 	modified: Option<u64>,
 	sample: bool,
+	/// Its size and last-write time on disk when it was last in sync: a
+	/// rename clears the platform's in-sync state (found in CI) though not a
+	/// byte changed, and this tells the two apart (`local`).
+	stamp: Option<Stamp>,
+}
+
+type Stamp = (u64, SystemTime);
+
+fn stamp(p: &Path) -> Option<Stamp> {
+	let m = std::fs::metadata(p).ok()?;
+	Some((m.len(), m.modified().ok()?))
 }
 
 #[derive(Default)]
@@ -131,6 +142,10 @@ pub struct Provider {
 	/// Our own deletes and renames, by folded volume path: their callbacks are
 	/// acknowledged without asking the server again.
 	self_ops: Mutex<HashSet<String>>,
+	/// Where the member's renames landed (folded relative paths), until the
+	/// watcher's look at them: such a path out of sync is, if its stamp
+	/// matches, only renamed — marked in sync, not sent again.
+	renamed: Mutex<HashSet<String>>,
 	pending: Mutex<BTreeMap<PathBuf, Instant>>,
 	stop: AtomicBool,
 	verbose: bool,
@@ -282,7 +297,7 @@ impl Provider {
 		match cf::create_placeholders(&dir, &[ph]).into_iter().next() {
 			Some(Ok(())) => {
 				self.log(&format!("placed {}", rel.display()));
-				self.state.lock().expect("lock").insert(Known { id: i.id.clone(), rel: rel.to_path_buf(), kind: i.kind, version: i.version, size: i.size, modified: Some(i.modified), sample: i.sample });
+				self.state.lock().expect("lock").insert(Known { id: i.id.clone(), rel: rel.to_path_buf(), kind: i.kind, version: i.version, size: i.size, modified: Some(i.modified), sample: i.sample, stamp: stamp(&full) });
 			}
 			Some(Err(e)) => self.warn_once(&format!("place:{}", i.id), &format!("could not place {}: {e}", rel.display())),
 			None => {}
@@ -297,6 +312,12 @@ impl Provider {
 		}
 		match self.ours(&[&from], || std::fs::rename(&from, &dest)) {
 			Ok(()) => {
+				// (A rename clears the in-sync state, even the provider's own:
+				// unmarked, a later removal on the server would think this
+				// file the member's unsent change and keep it.)
+				if let Err(e) = cf::mark_in_sync(&dest) {
+					self.log(&format!("{} not marked in sync ({e})", to.display()));
+				}
 				self.log(&format!("moved {} → {}", k.rel.display(), to.display()));
 				self.state.lock().expect("lock").moved(&k.id, to);
 			}
@@ -344,7 +365,7 @@ impl Provider {
 			Some(info) if info.in_sync => match cf::update(&full, &identity(&i.id, i.version), Some((false, i.size, i.modified, self.read_only_item(i))), true) {
 				Ok(()) => {
 					self.log(&format!("{} is version {} now", k.rel.display(), i.version));
-					self.state.lock().expect("lock").insert(Known { version: i.version, size: i.size, modified: Some(i.modified), sample: i.sample, ..k.clone() });
+					self.state.lock().expect("lock").insert(Known { version: i.version, size: i.size, modified: Some(i.modified), sample: i.sample, stamp: stamp(&full), ..k.clone() });
 				}
 				// In use: the next round tries again.
 				Err(e) => self.log(&format!("{} is busy ({e}); later", k.rel.display())),
@@ -358,7 +379,7 @@ impl Provider {
 	fn retag_local(&self, k: &Known, i: &Item) {
 		let full = self.root.join(&k.rel);
 		if cf::update(&full, &identity(&i.id, k.version), Some((k.kind == Kind::Dir, k.size, i.modified, self.read_only_item(i))), i.sample && !k.sample).is_ok() {
-			self.state.lock().expect("lock").insert(Known { modified: Some(i.modified), sample: i.sample, ..k.clone() });
+			self.state.lock().expect("lock").insert(Known { modified: Some(i.modified), sample: i.sample, stamp: stamp(&full), ..k.clone() });
 		}
 	}
 
@@ -404,6 +425,7 @@ impl Provider {
 		let parent = rel.parent().map(Path::to_path_buf).unwrap_or_default();
 		let parent_id = self.state.lock().expect("lock").id_at(&parent);
 		let fs = |e: FsError| e.to_string();
+		let was_renamed = self.renamed.lock().expect("lock").remove(&key(rel));
 		match cf::info(&full) {
 			None => {
 				if let Some(why) = &self.read_only {
@@ -414,7 +436,7 @@ impl Provider {
 				if meta.is_dir() {
 					let item = self.remote.lock().expect("lock").mkdir(&pid, &name).map_err(fs)?;
 					cf::convert(&full, &identity(&item.id, 0)).map_err(|e| e.to_string())?;
-					self.state.lock().expect("lock").insert(Known { id: item.id.clone(), rel: rel.to_path_buf(), kind: Kind::Dir, version: 0, size: 0, modified: Some(item.modified), sample: false });
+					self.state.lock().expect("lock").insert(Known { id: item.id.clone(), rel: rel.to_path_buf(), kind: Kind::Dir, version: 0, size: 0, modified: Some(item.modified), sample: false, stamp: None });
 					self.log(&format!("sent folder {}", rel.display()));
 					if let Ok(entries) = std::fs::read_dir(&full) {
 						for e in entries.flatten() {
@@ -427,7 +449,7 @@ impl Provider {
 					}
 					let item = self.remote.lock().expect("lock").create_file(&pid, &name, &full).map_err(fs)?;
 					cf::convert(&full, &identity(&item.id, item.version)).map_err(|e| e.to_string())?;
-					self.state.lock().expect("lock").insert(Known { id: item.id.clone(), rel: rel.to_path_buf(), kind: Kind::File, version: item.version, size: item.size, modified: Some(item.modified), sample: false });
+					self.state.lock().expect("lock").insert(Known { id: item.id.clone(), rel: rel.to_path_buf(), kind: Kind::File, version: item.version, size: item.size, modified: Some(item.modified), sample: false, stamp: stamp(&full) });
 					self.log(&format!("sent {}", rel.display()));
 				}
 				Ok(true)
@@ -439,6 +461,21 @@ impl Provider {
 					return Ok(true);
 				}
 				let Some((id, base)) = parse_identity(&info.identity) else { return Ok(true) };
+				// Only renamed? Its size and last-write time as when last in
+				// sync (a rename touches neither; an edit moves the time):
+				// in sync again, nothing sent. (rsync's quick check — asked
+				// only of a path the member just renamed, so an edit that
+				// also put the time back would have to coincide with one.)
+				let known = self.state.lock().expect("lock").known.get(&id).and_then(|k| k.stamp);
+				if was_renamed && known.is_some() && known == stamp(&full) {
+					if let Err(e) = cf::mark_in_sync(&full) {
+						// (Held open by someone: asked again on the next look.)
+						self.renamed.lock().expect("lock").insert(key(rel));
+						return Err(e.to_string());
+					}
+					self.log(&format!("{} was only renamed", rel.display()));
+					return Ok(true);
+				}
 				if let Some(why) = &self.read_only {
 					self.warn_once(&format!("ro:{}", key(rel)), &format!("{} was changed here and is not sent — {why}", rel.display()));
 					return Ok(true);
@@ -452,7 +489,7 @@ impl Provider {
 						cf::update(&full, &identity(&item.id, item.version), None, false).map_err(|e| e.to_string())?;
 						let k = self.state.lock().expect("lock").known.get(&id).cloned();
 						if let Some(k) = k {
-							self.state.lock().expect("lock").insert(Known { version: item.version, size: item.size, modified: Some(item.modified), ..k });
+							self.state.lock().expect("lock").insert(Known { version: item.version, size: item.size, modified: Some(item.modified), stamp: stamp(&full), ..k });
 						}
 						self.log(&format!("sent {} as version {}", rel.display(), item.version));
 					}
@@ -465,7 +502,7 @@ impl Provider {
 						cf::update(&dest, &identity(&copy.id, copy.version), None, false).map_err(|e| e.to_string())?;
 						let mut st = self.state.lock().expect("lock");
 						st.remove(&id);
-						st.insert(Known { id: copy.id.clone(), rel: copy_rel.clone(), kind: Kind::File, version: copy.version, size: copy.size, modified: Some(copy.modified), sample: false });
+						st.insert(Known { id: copy.id.clone(), rel: copy_rel.clone(), kind: Kind::File, version: copy.version, size: copy.size, modified: Some(copy.modified), sample: false, stamp: stamp(&dest) });
 						drop(st);
 						eprintln!("gorani-cloud: {} changed elsewhere meanwhile — your bytes are saved as “{}”", rel.display(), copy_rel.display());
 						self.sync_remote(true)?;
@@ -487,7 +524,8 @@ impl Provider {
 			match cf::info(&full).and_then(|i| parse_identity(&i.identity).map(|(id, v)| (i.in_sync, id, v))) {
 				Some((in_sync, id, version)) => {
 					let kind = if meta.is_dir() { Kind::Dir } else { Kind::File };
-					self.state.lock().expect("lock").insert(Known { id, rel: rel.clone(), kind, version, size: if meta.is_dir() { 0 } else { meta.len() }, modified: None, sample: false });
+					let st = if in_sync && !meta.is_dir() { stamp(&full) } else { None };
+					self.state.lock().expect("lock").insert(Known { id, rel: rel.clone(), kind, version, size: if meta.is_dir() { 0 } else { meta.len() }, modified: None, sample: false, stamp: st });
 					if !in_sync || queue_all {
 						self.note(rel.clone());
 					}
@@ -638,6 +676,7 @@ unsafe extern "system" fn on_rename(info: *const CF_CALLBACK_INFO, params: *cons
 					None => cf::STATUS_CLOUD_FILE_NOT_IN_SYNC,
 					Some(pid) => match p.remote.lock().expect("lock").rename(&id, &pid, &name) {
 						Ok(()) => {
+							p.renamed.lock().expect("lock").insert(key(&rel));
 							p.state.lock().expect("lock").moved(&id, &rel);
 							p.log(&format!("renamed {id} → {}", rel.display()));
 							cf::STATUS_SUCCESS
@@ -684,6 +723,7 @@ pub fn start(root: &Path, remote: Arc<Mutex<dyn Remote + Send>>, opts: Options) 
 		read_only,
 		state: Mutex::new(State::default()),
 		self_ops: Mutex::new(HashSet::new()),
+		renamed: Mutex::new(HashSet::new()),
 		pending: Mutex::new(BTreeMap::new()),
 		stop: AtomicBool::new(false),
 		verbose: opts.verbose,

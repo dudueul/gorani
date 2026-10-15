@@ -12,14 +12,17 @@
 //!   2. a read fetches it (a whole small file; a range of a large one), a
 //!      sample's read is refused;
 //!   3. a new file, a new folder with a file in it, and an edit reach the
-//!      server once written; a rename and a delete are the server's first;
+//!      server once written; a rename and a delete are the server's first
+//!      (and a rename is not mistaken for an edit);
 //!   4. the server's changes reach the folder: a new file, new bytes for
-//!      a file (read afresh), a move, a removal;
+//!      a file (read afresh), a move, a removal (of the moved file: gone,
+//!      not kept as the member's);
 //!   5. a save the server refuses as stale becomes a conflict copy — both
 //!      versions on both sides;
 //!   6. a read-only area refuses deletes and keeps new files local;
-//!   7. after stop, the bytes are gone from the disk: the placeholder stays
-//!      listed, and a read without the shell running cannot fill it.
+//!   7. after stop, the bytes are gone from the disk — the evidence's too,
+//!      read-only as it is: the placeholder stays listed, and a read without
+//!      the shell running cannot fill it.
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
@@ -122,6 +125,10 @@ fn a_cloud_files_folder_over_the_replica() {
 	wait("a.txt version 2", &run, || mem.lock().unwrap().content(&a.id).as_deref() == Some(&b"hello again"[..]));
 	assert!(elsewhere(&format!("Move-Item -LiteralPath {} -Destination {}", ps(&root.join("docs").join("new.txt")), ps(&root.join("renamed.txt")))), "the rename went through");
 	assert!(mem.lock().unwrap().find("", "renamed.txt").is_some(), "the rename is the server's before it is the folder's");
+	// (A rename clears the platform's in-sync state; the shell must see it
+	// was only renamed, not send the same bytes again as version 2.)
+	wait("renamed.txt in sync again", &run, || cf::info(&root.join("renamed.txt")).is_some_and(|i| i.in_sync));
+	assert_eq!(mem.lock().unwrap().find("", "renamed.txt").map(|i| i.version), Some(1), "only renamed: no new version");
 	assert!(elsewhere(&format!("Remove-Item -LiteralPath {}", ps(&root.join("renamed.txt")))), "the delete went through");
 	assert!(mem.lock().unwrap().find("", "renamed.txt").is_none(), "…and so is the delete");
 
@@ -138,6 +145,11 @@ fn a_cloud_files_folder_over_the_replica() {
 	mem.lock().unwrap().remove(&remote_file.id);
 	run.sync_remote().unwrap();
 	assert!(!root.join("docs").join("moved.txt").exists());
+	// (Found in CI: the move had cleared the in-sync state, and the removal
+	// then took the file for the member's unsent change — kept and sent
+	// back as "moved.txt (removed elsewhere)".)
+	let leftovers: Vec<String> = std::fs::read_dir(root.join("docs")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.starts_with("moved.txt")).collect();
+	assert!(leftovers.is_empty(), "removed on the server, removed here: {leftovers:?}");
 
 	// 5. A stale save: both versions kept, on both sides.
 	mem.lock().unwrap().edit(&a.id, b"theirs");
@@ -152,6 +164,7 @@ fn a_cloud_files_folder_over_the_replica() {
 	run.stop();
 	assert!(root.join("docs").join("a.txt").exists(), "still listed");
 	assert!(std::fs::read(root.join("docs").join("a.txt")).is_err(), "its bytes are gone: nothing serves them now");
+	assert!(mem.lock().unwrap().find(&docs.id, "moved.txt (removed elsewhere)").is_none(), "nothing came back from the dead");
 	cleanup(&root);
 }
 
@@ -176,5 +189,9 @@ fn a_read_only_area_refuses_deletes_and_keeps_new_files_local() {
 	run.sync_local();
 	assert!(mem.lock().unwrap().find("", "notes.txt").is_none(), "nothing is sent into a read-only area");
 	run.stop();
+	// (Found in CI: a read-only placeholder refused the write open that
+	// dehydrating takes, and the evidence stayed on the disk in the clear.)
+	assert!(std::fs::read(root.join("memory.raw")).is_err(), "the evidence's bytes left with the shell");
+	assert_eq!(std::fs::read_to_string(root.join("notes.txt")).unwrap(), "local only", "the member's own file stays");
 	cleanup(&root);
 }

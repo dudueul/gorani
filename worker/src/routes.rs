@@ -302,6 +302,19 @@ pub async fn route(req: Request, env: Env) -> Result<Response> {
 	if let Some(bad) = segments.iter().find(|s| !auth::valid_object_id(s)) {
 		return json_error(400, &format!("bad path segment ({} chars) — ids are [A-Za-z0-9_-]", bad.len()));
 	}
+	// A collector (commit 37a, docs/COLLECTORS.md) reaches the drop routes
+	// and NOTHING else: this is the one place the router looks at what kind
+	// of identity it holds, before any member rule runs — so no member route
+	// can be reached by a service token, whatever it would have checked.
+	if let Some(cn) = identity.collector.clone() {
+		return match segments.split_first() {
+			Some((&"collect", rest)) => route_collector(req, env, &cn, &method, rest).await,
+			_ => json_error(403, "a collector (an Access service token) may use only the drop routes — /api/v1/collect/…"),
+		};
+	}
+	if segments.first() == Some(&"collect") {
+		return json_error(403, "the drop routes are for collectors (an Access service token two leads registered)");
+	}
 	if let Some(("cases", rest)) = segments.split_first().map(|(a, r)| (*a, r)) {
 		return route_case(req, env, identity, &method, rest).await;
 	}
@@ -332,6 +345,9 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 			return forward_family(&env, &identity.email, "PUT", format!("case-grants/{case}/{member}"), Some(body)).await;
 		}
 		("DELETE", [case, "grants", member]) => return forward_family(&env, &identity.email, "DELETE", format!("case-grants/{case}/{member}"), None).await,
+		// Which collectors may drop into the case's inbox (commit 37a).
+		("PUT", [case, "collectors", collector]) => return forward_family(&env, &identity.email, "PUT", format!("collector-grants/{case}/{collector}"), None).await,
+		("DELETE", [case, "collectors", collector]) => return forward_family(&env, &identity.email, "DELETE", format!("collector-grants/{case}/{collector}"), None).await,
 		("PUT", [case, "key"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			return forward_family(&env, &identity.email, "PUT", format!("case-key/{case}"), Some(body)).await;
@@ -498,6 +514,17 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			_ => json_error(403, "the registry's audit is verified by leads and auditors"),
 		},
 		// ── The timestamp authority (commit 29j, family/tsa_certs.rs) ──
+		// ── Collectors (commit 37a, family/collectors.rs) ──
+		("GET", ["family", "collectors"]) => forward_family(&env, &identity.email, "GET", "collectors", None).await,
+		("POST", ["family", "collectors"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "POST", "collectors", Some(body)).await
+		}
+		("POST", ["family", "collectors", id, "approve"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_family(&env, &identity.email, "POST", format!("collector-approve/{id}"), Some(body)).await
+		}
+		("DELETE", ["family", "collectors", id]) => forward_family(&env, &identity.email, "DELETE", format!("collectors/{id}"), None).await,
 		("GET", ["family", "tsa"]) => forward_family(&env, &identity.email, "GET", "tsa", None).await,
 		("PUT", ["family", "tsa"]) => {
 			let body = req.json::<serde_json::Value>().await?;
@@ -858,6 +885,28 @@ async fn device_call(env: &Env, _identity: &Identity, member_id: &str, device: &
 }
 
 // ── DO plumbing ─────────────────────────────────────────────────────
+
+/// `/api/v1/collect/…` for a collector (commit 37a, docs/COLLECTORS.md).
+/// Every request asks the registry which ACTIVE collector the service token
+/// is — a pending, revoked or unknown one is refused here, before any route.
+async fn route_collector(_req: Request, env: Env, common_name: &str, method: &str, rest: &[&str]) -> Result<Response> {
+	// (The name becomes part of a registry path: the same shape the registry
+	// accepts at registration, nothing else.)
+	if !(1..=128).contains(&common_name.len()) || !common_name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
+		return json_error(403, "this service token is not a registered, active collector");
+	}
+	let mut who = forward_family(&env, "", "GET", format!("collector-auth/{common_name}"), None).await?;
+	if who.status_code() != 200 {
+		return json_error(403, "this service token is not a registered, active collector");
+	}
+	let collector: serde_json::Value = who.json().await?;
+	match (method, rest) {
+		// Who am I, and where may I drop — a collector's first call, and a
+		// way to check a deployment end to end.
+		("GET", ["whoami"]) => Response::from_json(&collector),
+		_ => json_error(404, "no such drop route"),
+	}
+}
 
 async fn forward_family(env: &Env, actor: &str, method: &str, path: impl Into<String>, body: Option<serde_json::Value>) -> Result<Response> {
 	let namespace = env.durable_object("FAMILY")?;

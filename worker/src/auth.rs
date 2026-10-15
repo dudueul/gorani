@@ -35,6 +35,11 @@ use worker::*;
 #[derive(Debug, Clone)]
 pub struct Identity {
 	pub email: String,
+	/// A COLLECTOR, not a member (commit 37a, docs/COLLECTORS.md): the
+	/// `common_name` of an Access service token (its JWT carries no email).
+	/// The router lets such an identity reach the drop routes and nothing
+	/// else — `email` is empty, and no member rule ever sees it.
+	pub collector: Option<String>,
 	/// A case grant ALREADY CHECKED for this request (routes.rs ›
 	/// route_case, commit 26), so the member-scope code reuses it instead of
 	/// asking the registry a second time. Only the router sets it, from the
@@ -155,8 +160,12 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 		return Err(Error::RustError("GORANI_DEV=1 but Access is configured: remove the dev var".into()));
 	}
 	if dev_mode {
+		// (Dev mode's twin of a service token: `x-gorani-dev-collector`.)
+		if let (None, Some(cn)) = (req.headers().get("x-gorani-dev-email")?, req.headers().get("x-gorani-dev-collector")?) {
+			return Ok(Identity { email: String::new(), collector: Some(cn), granted: None });
+		}
 		let email = req.headers().get("x-gorani-dev-email")?.ok_or_else(|| Error::RustError("dev mode: set x-gorani-dev-email".into()))?;
-		return Ok(Identity { email, granted: None });
+		return Ok(Identity { email, collector: None, granted: None });
 	}
 	if !access_configured {
 		// Fail closed: a production deployment without Access serves nothing.
@@ -207,8 +216,16 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 	if exp < now {
 		return Err(Error::RustError("token expired".into()));
 	}
-	let email = t.claims.get("email").and_then(|v| v.as_str()).ok_or_else(|| Error::RustError("token has no email".into()))?.to_string();
-	Ok(Identity { email, granted: None })
+	// A member's token names their email. A SERVICE token's names a
+	// `common_name` and no email (commit 37a): that is a collector — or no
+	// one, if the registry has no active collector for it (routes.rs asks).
+	if let Some(email) = t.claims.get("email").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+		return Ok(Identity { email: email.to_string(), collector: None, granted: None });
+	}
+	match t.claims.get("common_name").and_then(|v| v.as_str()).filter(|c| !c.is_empty()) {
+		Some(cn) => Ok(Identity { email: String::new(), collector: Some(cn.to_string()), granted: None }),
+		None => Err(Error::RustError("token has no email".into())),
+	}
 }
 
 /// A member id as the registry names it: a short slug, lowercase, no tricks

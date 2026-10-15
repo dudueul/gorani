@@ -17,6 +17,8 @@ import { startDev, api } from "../api/_dev.mjs";
 import { createCodeVault, createVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
 import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
 import { storeSealer } from "../lib/placed.mjs";
+import { member, pinIdentity, trustOf } from "../lib/team.mjs";
+import { approveCollector } from "../../web/src/vault/collectors.ts";
 import { sealChunked, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
 
@@ -512,6 +514,36 @@ try {
 		await page.locator("text=all 2 versions re-hashed and verified").first().waitFor({ timeout: 60_000 });
 		const rv = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/reverify", { email: "mom@family.test" });
 		assert.deepEqual([rv.json.overdue, rv.json.last?.checked, rv.json.last?.failed], [false, 2, 0], "the store recorded it");
+		// Collectors (commit 37a): mom registers one through the form — her
+		// browser signs the registration — and a second lead approves it.
+		// The tab then says whether MOM's client counts it: not yet, since
+		// she never verified the lead who approved.
+		const cpair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+		const cjwk = await crypto.subtle.exportKey("jwk", cpair.publicKey);
+		await page.getByRole("button", { name: "Collectors" }).click();
+		await page.locator('[data-test="collector-id"]').fill("edr-e2e");
+		await page.locator('[data-test="collector-name"]').fill("EDR drop");
+		await page.locator('[data-test="collector-cn"]').fill("e2e0000.access");
+		await page.locator('[data-test="collector-key"]').fill(JSON.stringify({ publicKey: { kty: cjwk.kty, crv: cjwk.crv, x: cjwk.x, y: cjwk.y } }));
+		await page.locator('[data-test="collector-request"]').click();
+		const verdict = page.locator('[data-test="collector-verdict-edr-e2e"]');
+		await verdict.waitFor({ timeout: 30_000 });
+		assert.match(await verdict.textContent(), /not counted: the collector is pending/);
+		const ana = await member(dev, "ana", "lead", { by: { email: "mom@family.test" } });
+		const regIds = (await api(dev.base, "GET", "/api/v1/family/identities", { email: ana.email })).json.identities;
+		await pinIdentity(dev, ana, { id: "mom", record: { keyId: regIds.find((e) => e.member === "mom").keyId } });
+		const asAna = async (method, path, body) => {
+			const r = await api(dev.base, method, path, { email: ana.email, body });
+			if (r.status >= 400) throw new Error(`${r.status} ${r.text}`);
+			return r.json;
+		};
+		const pendingRow = (await asAna("GET", "/api/v1/family/collectors")).collectors.find((c) => c.id === "edr-e2e");
+		await approveCollector(asAna, ana.signer, await trustOf(dev, ana), pendingRow);
+		await teamButton.click(); // back to the files…
+		await teamButton.click(); // …and a fresh Team panel
+		await page.getByRole("button", { name: "Collectors" }).click();
+		await page.locator('[data-test="collector-verdict-edr-e2e"]').filter({ hasText: "ana, who approved it" }).waitFor({ timeout: 30_000 });
+		assert.match(await page.locator('[data-test="collector-verdict-edr-e2e"]').textContent(), /⚠ not counted: ana, who approved it, is not an identity you verified/, "active, but not counted by a member who never verified its approver");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
 		await ctx.close();
 	}
@@ -537,7 +569,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel (with Devices: protection shown, a lost laptop revoked) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

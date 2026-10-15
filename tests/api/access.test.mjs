@@ -11,9 +11,11 @@
  *      token` yields, and what the desktop client now sends) is the member:
  *      their email, their rules;
  *   2. a service token's JWT — Access's machine identity, with a
- *      `common_name` and NO email — is refused. This is the production gap
- *      docs/DESKTOP.md records: the desktop client used to sign in this
- *      way, and every request it made was refused;
+ *      `common_name` and NO email — is no member: the desktop client used
+ *      to sign in this way, and every request it made was refused
+ *      (docs/DESKTOP.md). Since commit 37a it is a COLLECTOR identity —
+ *      refused on every member route, and on the drop routes until two
+ *      leads registered it (api:collectors);
  *   3. the checks around them hold: no token, a wrong audience, an expired
  *      token, another issuer, a forged signature, an unknown key, `alg`
  *      other than ES256 — each refused.
@@ -71,9 +73,17 @@ try {
 	assert.notEqual((await call("GET", "/api/v1/family", member("stranger@elsewhere.test"))).status, 200, "a valid token of someone the team never registered is no one here");
 
 	// ── 2. A service token is not a member ─────────────────────────────
+	// Since commit 37a it is a COLLECTOR identity (its JWT names a
+	// common_name, no email): refused on every member route, and on the drop
+	// routes too until two leads have registered it (api:collectors).
 	const svc = await call("GET", "/api/v1/family", service());
-	assert.notEqual(svc.status, 200, "a service token's JWT carries no email — the Worker cannot say whose request it is");
-	assert.match(svc.text, /no email/, `refused for exactly that reason: ${svc.text}`);
+	assert.equal(svc.status, 403, "a service token's JWT carries no email — it is no member");
+	assert.match(svc.text, /only the drop routes/, `refused as a collector: ${svc.text}`);
+	const unregistered = await call("GET", "/api/v1/collect/whoami", service());
+	assert.equal(unregistered.status, 403);
+	assert.match(unregistered.text, /not a registered, active collector/);
+	const nobody = await call("GET", "/api/v1/family", jwt({ iss: TEAM, aud: AUD, sub: "", iat: now(), exp: now() + 600, type: "app" }));
+	assert.match(nobody.text, /no email/, "a token naming neither an email nor a common_name is no one");
 
 	// ── 3. Every check around them ───────────────────────────────────────
 	const refused = async (token, why) => {
@@ -92,7 +102,7 @@ try {
 	const [h, , s] = member("ana@team.test").split(".");
 	assert.match(await refused(`${h}.${b64u(JSON.stringify({ iss: TEAM, aud: AUD, email: "mallory@team.test", exp: now() + 600 }))}.${s}`, "claims edited after signing"), /bad signature/);
 
-	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused, as the desktop client's used to be; missing, foreign-audience, expired, foreign-issuer, forged, unknown-key and non-ES256 tokens each refused by name");
+	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused on member routes and, unregistered, on the drop routes; missing, foreign-audience, expired, foreign-issuer, forged, unknown-key and non-ES256 tokens each refused by name");
 } finally {
 	await dev.close();
 	await new Promise((r) => jwks.close(r));

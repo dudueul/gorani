@@ -27,11 +27,12 @@ import type { TeamCall, TeamContext } from "../vault/team.ts";
 import { approveRequest, requestApproval, verifyApproval, type Approval, type ApprovalCheck, type TwoPersonAction } from "../vault/approvals.ts";
 import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
 import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
+import { approveCollector, collectorVerdict, requestCollector, type CollectorRow } from "../vault/collectors.ts";
 import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
-type Tab = "people" | "cases" | "recovery" | "devices";
+type Tab = "people" | "cases" | "recovery" | "devices" | "collectors";
 
 /** One of the member's computers, as `GET /api/v1/members/<id>/devices` lists it. */
 interface DeviceRow {
@@ -92,6 +93,9 @@ export class GoraniTeam extends LitElement {
 	@state() private tsaProbe: TsaIdentity | null = null;
 	/** This member's computers (commit 34): what protects each, and revocation. */
 	@state() private devices: DeviceRow[] = [];
+	/** The team's collectors (commit 37a), each with THIS member's verdict on it (null = counted). */
+	@state() private collectors: (CollectorRow & { verdict: string | null })[] = [];
+	@state() private collectorDraft = { id: "", name: "", commonName: "", key: "" };
 	/** Ephemeral keys of the ceremonies THIS tab coordinates (memory only). */
 	private ephemerals = new Map<string, VaultPrivateKey>();
 	private caseKeys = new Map<string, VaultPrivateKey>();
@@ -134,9 +138,11 @@ export class GoraniTeam extends LitElement {
 		};
 		this.identities = (await quiet(() => this.call<{ identities: RegistryIdentity[] }>("GET", "/api/v1/family/identities"), { identities: [] })).identities;
 		this.devices = await quiet(() => this.call<DeviceRow[]>("GET", `/api/v1/members/${this.team.memberId}/devices`), []);
+		const collectorRows = (await quiet(() => this.call<{ collectors: CollectorRow[] }>("GET", "/api/v1/family/collectors"), { collectors: [] })).collectors;
 		// Externals do not see the registry (stage 2): names fall back to ids.
 		this.members = (await quiet(() => this.call<{ members: Member[] }>("GET", "/api/v1/family"), { members: [] as Member[] })).members;
 		this.team = { ...this.team, identities: this.identities, trust: await buildTrust(this.team.memberId, this.session.root, this.team.settings.identity!, this.identities) };
+		this.collectors = await Promise.all(collectorRows.map(async (c) => ({ ...c, verdict: await collectorVerdict(this.team.trust, c) })));
 		this.tsa = await quiet(() => this.call<{ configured: boolean; certs: TsaCert[] }>("GET", "/api/v1/family/tsa"), null);
 		this.tsaTrusted = await trustedTsas(this.team.trust, this.tsa?.certs ?? []);
 		const cases = (await quiet(() => this.call<{ cases: CaseRow[] }>("GET", "/api/v1/cases"), { cases: [] })).cases;
@@ -186,7 +192,7 @@ export class GoraniTeam extends LitElement {
 	// ── render ────────────────────────────────────────────────────────
 
 	protected override render() {
-		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"]];
+		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"], ...(this.member.role === "external" ? [] : ([["collectors", "Collectors"]] as [Tab, string][]))];
 		return html`
 			<div class="mx-auto flex h-full max-w-4xl flex-col gap-3 overflow-y-auto p-4 text-sm" data-test="team">
 				<nav class="flex gap-1">
@@ -195,8 +201,90 @@ export class GoraniTeam extends LitElement {
 				</nav>
 				${this.error ? html`<p class="rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-red-300" data-test="team-error">${this.error}</p>` : nothing}
 				${this.status ? html`<p class="text-xs text-neutral-400" data-test="team-status">${this.status}</p>` : nothing}
-				${this.tab === "people" ? this.renderPeople() : this.tab === "cases" ? this.renderCases() : this.tab === "devices" ? this.renderDevices() : this.renderRecovery()}
+				${this.tab === "people" ? this.renderPeople() : this.tab === "cases" ? this.renderCases() : this.tab === "devices" ? this.renderDevices() : this.tab === "collectors" ? this.renderCollectors() : this.renderRecovery()}
 			</div>
+		`;
+	}
+
+	// ── Collectors (commit 37a, docs/COLLECTORS.md) ───────────────────
+
+	/**
+	 * The machines that drop evidence into case inboxes. Two leads register
+	 * one (the second agrees only after this client checked the first's
+	 * signature); any lead revokes; a manager of a case lets it drop there.
+	 * Each row says whether THIS member's client counts it — both leads'
+	 * signatures verifying under their own trust — and if not, why.
+	 */
+	private renderCollectors() {
+		const d = this.collectorDraft;
+		const managed = this.cases.filter((c) => c.grant?.permission === "manage" && !c.closed);
+		const parseKey = (): JsonWebKey => {
+			const v = JSON.parse(d.key) as { publicKey?: JsonWebKey } & JsonWebKey;
+			const k = v.publicKey ?? v;
+			if (k.kty !== "EC" || k.crv !== "P-256" || !k.x || !k.y) throw new Error("paste the collector's public key — the JSON `gorani-sync collector init` prints");
+			return { kty: k.kty, crv: k.crv, x: k.x, y: k.y };
+		};
+		return html`
+			<section class="rounded-xl border border-neutral-800 p-3">
+				<h3 class="font-medium">Collectors</h3>
+				<p class="mt-1 text-xs text-neutral-400">Machines that drop evidence into a case's inbox with no one signed in — an acquisition server, an EDR drop. They hold only the inbox's public key: they cannot read anything, not even what they sent. A person accepts each item into the case.</p>
+				<ul class="mt-2 divide-y divide-neutral-800">
+					${this.collectors.map((c) => html`<li class="py-2" data-test="collector-${c.id}">
+						<div class="flex items-start gap-3">
+							<div class="min-w-0 flex-1">
+								<p>${c.name} <span class="text-xs text-neutral-500">${c.id} · ${c.status}</span></p>
+								<p class="text-xs text-neutral-500">service token ${c.commonName} · key <code class="font-mono">${fingerprint(c.keyId)}</code></p>
+								<p class="text-xs text-neutral-500">asked by ${this.nameOf(c.requestedBy)}${c.approvedBy ? html` · approved by ${this.nameOf(c.approvedBy)}` : nothing}${c.cases.length ? html` · drops into ${c.cases.join(", ")}` : nothing}</p>
+								<p class="text-xs ${c.verdict ? "text-amber-400" : "text-emerald-400"}" data-test="collector-verdict-${c.id}">${c.verdict ? `⚠ not counted: ${c.verdict}` : `counted — vouched for by ${this.nameOf(c.requestedBy)} and ${this.nameOf(c.approvedBy ?? "")}`}</p>
+							</div>
+							${this.isLead && c.status === "pending" && c.requestedBy !== this.team.memberId
+								? html`<button class=${primary} ?disabled=${this.busy} data-test="collector-approve-${c.id}" @click=${() => window.confirm(`Approve collector “${c.name}” (${c.commonName})? Compare its key fingerprint with the machine first: ${fingerprint(c.keyId)}`) && this.act(`Approving ${c.id}`, async () => {
+										await approveCollector(this.call, this.team.signer, this.team.trust, c);
+										return `${c.name} is active`;
+									})}>Approve</button>`
+								: nothing}
+							${this.isLead && (c.status === "active" || c.status === "pending")
+								? html`<button class=${button} ?disabled=${this.busy} data-test="collector-revoke-${c.id}" @click=${() => window.confirm(`Revoke collector “${c.name}”? Its service token is refused from the next request on.`) && this.act(`Revoking ${c.id}`, async () => {
+										await this.call("DELETE", `/api/v1/family/collectors/${c.id}`);
+										return `${c.name} is revoked`;
+									})}>Revoke</button>`
+								: nothing}
+						</div>
+						${c.status === "active" && managed.some((m) => !c.cases.includes(m.id))
+							? html`<div class="mt-1 flex items-center gap-2 text-xs">
+									<span class="text-neutral-500">Let it drop into</span>
+									${managed.filter((m) => !c.cases.includes(m.id)).map((m) => html`<button class=${button} ?disabled=${this.busy || !!c.verdict} title=${c.verdict ?? ""} data-test="collector-grant-${c.id}-${m.id}" @click=${() => this.act(`Granting ${m.id}`, async () => {
+											await this.call("PUT", `/api/v1/cases/${m.id}/collectors/${c.id}`);
+											return `${c.name} may drop into ${m.id}`;
+										})}>${m.id}</button>`)}
+								</div>`
+							: nothing}
+					</li>`)}
+				</ul>
+				${this.collectors.length === 0 ? html`<p class="mt-2 text-xs text-neutral-500">No collector is registered.</p>` : nothing}
+			</section>
+			${this.isLead
+				? html`<section class="rounded-xl border border-neutral-800 p-3">
+						<h3 class="font-medium">Register a collector</h3>
+						<p class="mt-1 text-xs text-neutral-400">Give its Access service token's Client ID and paste the public key its machine printed. A second lead approves it.</p>
+						<form class="mt-2 grid gap-2" @submit=${(e: Event) => {
+							e.preventDefault();
+							void this.act(`Registering ${d.id}`, async () => {
+								await requestCollector(this.call, this.team.signer, { id: d.id.trim(), name: d.name.trim(), commonName: d.commonName.trim(), publicKey: parseKey() });
+								this.collectorDraft = { id: "", name: "", commonName: "", key: "" };
+								return `${d.name.trim()} is waiting for a second lead`;
+							});
+						}}>
+							<div class="flex gap-2">
+								<input class=${input} placeholder="id (edr-drop)" .value=${d.id} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, id: (e.target as HTMLInputElement).value })} data-test="collector-id" />
+								<input class="${input} flex-1" placeholder="name" .value=${d.name} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, name: (e.target as HTMLInputElement).value })} data-test="collector-name" />
+							</div>
+							<input class=${input} placeholder="service token Client ID (…​.access)" .value=${d.commonName} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, commonName: (e.target as HTMLInputElement).value })} data-test="collector-cn" />
+							<textarea class="${input} font-mono text-xs" rows="3" placeholder='{"publicKey": {"kty": "EC", …}}' .value=${d.key} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, key: (e.target as HTMLTextAreaElement).value })} data-test="collector-key"></textarea>
+							<button class=${primary} ?disabled=${this.busy || !d.id.trim() || !d.commonName.trim() || !d.key.trim()} data-test="collector-request">Ask a second lead</button>
+						</form>
+					</section>`
+				: nothing}
 		`;
 	}
 

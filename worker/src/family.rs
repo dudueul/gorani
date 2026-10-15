@@ -27,6 +27,7 @@ use worker::{durable_object, DurableObject, Env, Error, Request, Response, Resul
 use crate::auth;
 
 mod approvals;
+mod collectors;
 mod recovery;
 mod tsa_certs;
 
@@ -190,6 +191,31 @@ pub const MIGRATIONS: &[&str] = &[
 		signature TEXT NOT NULL,
 		at TEXT NOT NULL,
 		PRIMARY KEY (spki, by_member)
+	)",
+	// Migration v9 (commit 37a, family/collectors.rs): the machines that drop
+	// evidence into case inboxes — two leads' signed registration each — and
+	// the cases each may drop into.
+	"CREATE TABLE IF NOT EXISTS collectors (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		common_name TEXT NOT NULL,
+		key_id TEXT NOT NULL,
+		public_key TEXT NOT NULL,
+		requested_by TEXT NOT NULL,
+		requested_at TEXT NOT NULL,
+		request_signature TEXT NOT NULL,
+		approved_by TEXT,
+		approved_at TEXT,
+		approve_signature TEXT,
+		revoked_by TEXT,
+		revoked_at TEXT
+	)",
+	"CREATE TABLE IF NOT EXISTS collector_grants (
+		collector_id TEXT NOT NULL,
+		case_id TEXT NOT NULL,
+		granted_by TEXT NOT NULL,
+		granted_at TEXT NOT NULL,
+		PRIMARY KEY (collector_id, case_id)
 	)",
 ];
 
@@ -397,6 +423,28 @@ impl GoraniFamilyDO {
 				Some((case, approval)) => self.approval_cancel(&actor, case, approval).await,
 				None => json_error(400, "case-approvals/<case>/<approval>"),
 			},
+			// ── Collectors (commit 37a, family/collectors.rs) ──
+			("GET", "collectors") => self.collectors_list(&actor).await,
+			("POST", "collectors") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.collector_request(&actor, body).await
+			}
+			("POST", id) if id.starts_with("collector-approve/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.collector_approve(&actor, &id["collector-approve/".len()..], body).await
+			}
+			("DELETE", id) if id.starts_with("collectors/") => self.collector_revoke(&actor, &id["collectors/".len()..]).await,
+			("PUT", id) if id.starts_with("collector-grants/") => match id["collector-grants/".len()..].split_once('/') {
+				Some((case, collector)) => self.collector_grant(&actor, case, collector).await,
+				None => json_error(400, "collector-grants/<case>/<collector>"),
+			},
+			("DELETE", id) if id.starts_with("collector-grants/") => match id["collector-grants/".len()..].split_once('/') {
+				Some((case, collector)) => self.collector_ungrant(&actor, case, collector).await,
+				None => json_error(400, "collector-grants/<case>/<collector>"),
+			},
+			// The Worker's question for every service-token request (no actor:
+			// Access already validated the token; this says whose it is).
+			("GET", id) if id.starts_with("collector-auth/") => self.collector_auth(&id["collector-auth/".len()..]).await,
 			// ── The timestamp authority (commit 29j, family/tsa_certs.rs) ──
 			("GET", "tsa") => self.tsa_get(&actor).await,
 			("PUT", "tsa") => {

@@ -50,7 +50,16 @@ function describeProtection(p: string | null): { text: string; weak: boolean } {
 	if (!p || p === "cli") return { text: "not recorded — enrolled before protection was tracked", weak: true };
 	if (p === "file") return { text: "a file — anyone who copies its profile, with your sign-in, can open this computer's copy", weak: true };
 	const names: Record<string, string> = { tpm: "the TPM", keyring: "the login keyring" };
-	return { text: p.split("+").map((k) => names[k] ?? k).join(" + "), weak: false };
+	// A TPM part's options (commit 36): `tpm[pin,pcr:7]`.
+	const part = (k: string) => {
+		const m = /^(\w+)(?:\[([^\]]*)\])?$/.exec(k);
+		if (!m) return k;
+		const opts = (m[2] ?? "").split(",").filter(Boolean);
+		const pcrs = opts.filter((o) => o.startsWith("pcr:")).map((o) => o.slice(4));
+		const how = [opts.includes("pin") ? "with a PIN" : "", pcrs.length ? `sealed to the boot state (PCR ${pcrs.join(", ")})` : ""].filter(Boolean);
+		return [names[m[1]!] ?? m[1], ...how].join(", ");
+	};
+	return { text: p.split("+").map(part).join(" + "), weak: false };
 }
 
 const input = "rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-sm outline-none focus:border-accent";

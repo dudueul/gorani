@@ -21,7 +21,11 @@
  *      server took the new copy is finished by the next one; replaced
  *      keyring parts are forgotten;
  *   5. `devices` lists every computer's protection, and a lost one is
- *      revoked from another (the web app's Team › Devices does the same — e2e:app).
+ *      revoked from another (the web app's Team › Devices does the same — e2e:app);
+ *   6. (commit 36) a TPM part with a PIN and sealed to the boot state
+ *      (PCR 7): a wrong PIN refused, a changed boot state refused until
+ *      `protect --secret` seals again, PIN guessing locking the chip out —
+ *      the right PIN too — without locking out parts that have no PIN.
  *
  * Skipped without the binaries, swtpm, tpm2-tools, secret-tool,
  * gnome-keyring or dbus-daemon (apt: swtpm tpm2-tools libsecret-tools
@@ -206,7 +210,45 @@ try {
 	assert.notEqual(lost.status, 0, "a revoked computer never unlocks again — whatever its TPM holds");
 	assert.equal((await ls(profile)).status, 0, "the others still do");
 
-	console.log("ok  api:device-protect — TPM + keyring hold the device secret (none in the profile; unlocks without a password; the server records the label), a copied profile fails on another TPM and another login, no protector refuses setup unless --protect file, protect moves an in-file secret into the TPM (old secret dead), finishes a run that died mid-way, and forgets replaced keyring parts; devices lists every computer's protection, and a lost one is revoked from another");
+	// ── 6. A PIN and the boot state (commit 36) ──────────────────────────
+	const tcti = { ...process.env, TPM2TOOLS_TCTI: env.TPM2TOOLS_TCTI };
+	const pinned = path.join(work, "pinned.json");
+	const withPin = (pin: string) => ({ ...env, GORANI_TPM_PIN: pin });
+	const sealed = await cli(setupArgs(pinned, ["--protect", "tpm", "--tpm-pin", "--tpm-pcrs", "7"]), withPin("246810"));
+	assert.equal(sealed.status, 0, sealed.out);
+	assert.match(sealed.out, /protected by: tpm\[pin,pcr:7\]/);
+	assert.equal((await devices()).find((d) => d.id === JSON.parse(fs.readFileSync(pinned, "utf8")).deviceId)?.protection, "tpm[pin,pcr:7]");
+	assert.equal((await ls(pinned, withPin("246810"))).status, 0, "the PIN, in this boot state: unlocks");
+	const wrongPin = await ls(pinned, withPin("135790"));
+	assert.notEqual(wrongPin.status, 0);
+	assert.match(wrongPin.out, /wrong TPM PIN/, wrongPin.out);
+	const tooShort = await cli(setupArgs(path.join(work, "short.json"), ["--protect", "tpm", "--tpm-pin"]), withPin("12345"));
+	assert.match(tooShort.out, /at least 6 characters/);
+	// The boot state changes (another OS, Secure Boot turned off — here, PCR 7 extended).
+	assert.equal(spawnSync("tpm2_pcrextend", [`7:sha256=${"0".repeat(63)}1`], { env: tcti }).status, 0);
+	const booted = await ls(pinned, withPin("246810"));
+	assert.notEqual(booted.status, 0, "the right PIN, another boot state: nothing opens");
+	assert.match(booted.out, /boot state changed .*gorani-sync protect --secret/, booted.out);
+	assert.equal((await ls(profile)).status, 0, "a part not sealed to the boot state is unaffected");
+	// Recovery: the recovery code opens the root, and the part is sealed to the state the machine is in now.
+	const resealed = await cli(["protect", "--protect", "tpm", "--tpm-pin", "--tpm-pcrs", "7", "--secret", ana.recoveryCode, "--profile", pinned, "--dev-email", ana.email], withPin("246810"));
+	assert.equal(resealed.status, 0, resealed.out);
+	assert.equal((await ls(pinned, withPin("246810"))).status, 0, "sealed again to the new state");
+	// Hammering the PIN: the TPM locks itself out — the right PIN too, for a while.
+	let lockedOut = "";
+	for (let i = 0; i < 10 && !lockedOut; i++) {
+		const r = await ls(pinned, withPin("000000"));
+		if (/locked out/.test(r.out)) lockedOut = r.out;
+	}
+	assert.ok(lockedOut, "the TPM's dictionary-attack lockout engages");
+	const rightDuringLockout = await ls(pinned, withPin("246810"));
+	assert.notEqual(rightDuringLockout.status, 0);
+	assert.match(rightDuringLockout.out, /locked out/, "even the right PIN waits out the lockout");
+	assert.equal((await ls(profile)).status, 0, "…but parts without a PIN are not locked out with it (the noda storage key)");
+	assert.equal(spawnSync("tpm2_dictionarylockout", ["-c"], { env: tcti }).status, 0, "the chip's administrator clears the lockout");
+	assert.equal((await ls(pinned, withPin("246810"))).status, 0);
+
+	console.log("ok  api:device-protect — TPM + keyring hold the device secret (none in the profile; unlocks without a password; the server records the label), a copied profile fails on another TPM and another login, no protector refuses setup unless --protect file, protect moves an in-file secret into the TPM (old secret dead), finishes a run that died mid-way, and forgets replaced keyring parts; devices lists every computer's protection, and a lost one is revoked from another; a TPM PIN (wrong one refused, guessing locks the chip out — without locking out PIN-less parts) and sealing to the boot state (a changed PCR 7 opens nothing until protect --secret seals again)");
 	login.stop();
 	await tpm.stop();
 } finally {

@@ -59,7 +59,23 @@ use crate::Error;
 pub enum Protector {
 	/// Sealed by the TPM: TPM2B_PUBLIC and TPM2B_PRIVATE (base64), the
 	/// latter encrypted under the chip's storage key.
-	Tpm { public: String, private: String },
+	Tpm {
+		public: String,
+		private: String,
+		/// Which storage-key template sealed it (commit 36): 0 the first
+		/// (subject to the chip's lockout), 1 the `noda` one — a lockout from
+		/// PIN guessing must not lock out every other part on the chip.
+		#[serde(default)]
+		srk: u8,
+		/// Unsealing needs a PIN (the object's authorization value), which
+		/// the TPM's dictionary-attack lockout protects (commit 36).
+		#[serde(default)]
+		pin: bool,
+		/// Unsealing needs these PCRs (SHA-256 bank) to hold the values they
+		/// held at sealing: the machine's boot state (commit 36).
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		pcrs: Vec<u8>,
+	},
 	/// An item in the login keyring, found by this reference.
 	Keyring { item: String },
 	/// The part itself, in the clear (dev and CI only).
@@ -103,11 +119,78 @@ impl std::str::FromStr for Want {
 	}
 }
 
+/// How a TPM part is sealed (commit 36): a PIN, and the PCRs whose values
+/// it is bound to. Both off by default.
+#[derive(Default)]
+pub struct TpmOptions {
+	pub pin: Option<Zeroizing<String>>,
+	pub pcrs: Vec<u8>,
+}
+
+impl TpmOptions {
+	/// `--tpm-pcrs 7` or `0,7`: PCR indexes 0–23.
+	pub fn parse_pcrs(s: &str) -> Result<Vec<u8>, Error> {
+		let mut out = Vec::new();
+		for x in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+			let n: u8 = x.parse().ok().filter(|n| *n <= 23).ok_or_else(|| Error::Config(format!("--tpm-pcrs {s}: PCR indexes are 0–23 (7 is the Secure Boot state)")))?;
+			if !out.contains(&n) {
+				out.push(n);
+			}
+		}
+		out.sort_unstable();
+		Ok(out)
+	}
+}
+
 /// The label the server records for the device (its `protection`): the
-/// kinds, joined. The client's word — shown to the member and their leads,
-/// not attested (a TPM attestation of the sealing key is future work).
+/// kinds, joined, a TPM's options in brackets — `tpm[pin,pcr:7]+keyring`.
+/// The client's word — shown to the member and their leads, not attested
+/// (a TPM attestation of the sealing key is future work).
 pub fn label(protectors: &[Protector]) -> String {
-	protectors.iter().map(Protector::kind).collect::<Vec<_>>().join("+")
+	protectors
+		.iter()
+		.map(|p| match p {
+			Protector::Tpm { pin, pcrs, .. } if *pin || !pcrs.is_empty() => {
+				let mut opts: Vec<String> = Vec::new();
+				if *pin {
+					opts.push("pin".into());
+				}
+				opts.extend(pcrs.iter().map(|n| format!("pcr:{n}")));
+				format!("tpm[{}]", opts.join(","))
+			}
+			other => other.kind().to_string(),
+		})
+		.collect::<Vec<_>>()
+		.join("+")
+}
+
+/// A PIN for unsealing: `GORANI_TPM_PIN` (automation, tests), else asked on
+/// the terminal. Never an argument: argv is readable by other users.
+pub fn ask_pin(prompt: &str) -> Result<Zeroizing<String>, Error> {
+	if let Ok(p) = std::env::var("GORANI_TPM_PIN") {
+		return Ok(Zeroizing::new(p));
+	}
+	rpassword::prompt_password(prompt).map(Zeroizing::new).map_err(|e| Error::Config(format!("no TPM PIN given ({e}) — run it on a terminal, or set GORANI_TPM_PIN")))
+}
+
+/// A new PIN: asked twice (or `GORANI_TPM_PIN`), at least 6 characters —
+/// the TPM's lockout limits guessing, length limits the luck.
+pub fn choose_pin() -> Result<Zeroizing<String>, Error> {
+	let pin = match std::env::var("GORANI_TPM_PIN") {
+		Ok(p) => Zeroizing::new(p),
+		Err(_) => {
+			let a = ask_pin("Choose a PIN for this computer's TPM: ")?;
+			let b = ask_pin("The same PIN again: ")?;
+			if *a != *b {
+				return Err(Error::Config("the two PINs differ".into()));
+			}
+			a
+		}
+	};
+	if pin.chars().count() < 6 {
+		return Err(Error::Config("a TPM PIN is at least 6 characters".into()));
+	}
+	Ok(pin)
 }
 
 /// Combine parts into the device secret.
@@ -125,7 +208,7 @@ fn combine(parts: &[(&'static str, Zeroizing<[u8; 32]>)]) -> Zeroizing<[u8; 32]>
 /// Make the protectors `want` names (each with a fresh random part) and
 /// the device secret they give. Nothing is written but into the TPM blobs
 /// returned and the keyring.
-pub fn create(want: Want, label_text: &str) -> Result<(Vec<Protector>, Zeroizing<[u8; 32]>), Error> {
+pub fn create(want: Want, label_text: &str, tpm_options: &TpmOptions) -> Result<(Vec<Protector>, Zeroizing<[u8; 32]>), Error> {
 	let kinds: Vec<&'static str> = match want {
 		Want::Tpm => vec!["tpm"],
 		Want::Keyring => vec!["keyring"],
@@ -151,7 +234,7 @@ pub fn create(want: Want, label_text: &str) -> Result<(Vec<Protector>, Zeroizing
 		let mut part = Zeroizing::new([0u8; 32]);
 		rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut part[..]);
 		let p = match kind {
-			"tpm" => tpm::seal(&part)?,
+			"tpm" => tpm::seal(&part, tpm_options)?,
 			"keyring" => keyring::store(&part, label_text)?,
 			_ => Protector::File { part: crate::transfer::hex(&part[..]) },
 		};
@@ -169,7 +252,10 @@ pub fn open(protectors: &[Protector]) -> Result<Zeroizing<[u8; 32]>, Error> {
 	let mut parts = Vec::new();
 	for p in protectors {
 		let part = match p {
-			Protector::Tpm { public, private } => tpm::unseal(public, private)?,
+			Protector::Tpm { public, private, srk, pin, pcrs } => {
+				let pin = if *pin { Some(ask_pin("TPM PIN for this computer: ")?) } else { None };
+				tpm::unseal(public, private, *srk, pin.as_deref().map(String::as_str), pcrs)?
+			}
 			Protector::Keyring { item } => keyring::lookup(item)?,
 			Protector::File { part } => hex32(part).ok_or(Error::Format("a file protector's part is not 32 bytes of hex"))?,
 		};
@@ -215,9 +301,11 @@ fn run(program: &str, args: &[&str], input: Option<&[u8]>, dir: Option<&std::pat
 	}
 	let out = child.wait_with_output()?;
 	if !out.status.success() {
+		// Every line: the TPM's reason (a lockout, a policy check) is often
+		// above the tool's own last word.
 		let why = String::from_utf8_lossy(&out.stderr);
-		let why = why.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("no reason given").trim().to_string();
-		return Err(Error::Config(format!("{program} failed: {why}")));
+		let why = why.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" | ");
+		return Err(Error::Config(format!("{program} failed: {}", if why.is_empty() { "no reason given" } else { &why })));
 	}
 	Ok(Zeroizing::new(out.stdout))
 }
@@ -235,13 +323,41 @@ fn run(program: &str, args: &[&str], input: Option<&[u8]>, dir: Option<&std::pat
 /// flushed: the kernel's resource manager does that on its own, a raw or
 /// simulated TPM runs out of object slots without it.
 ///
-/// Not yet: an authorization value (a PIN, which the TPM's dictionary-
-/// attack lockout would protect) or a PCR policy (sealing to the boot
-/// state). Both are options of the same `tpm2_create`.
+/// Options (commit 36), each a property of the sealed object itself:
+///
+/// | option | the object | unsealing needs | what it adds |
+/// |---|---|---|---|
+/// | — | empty auth, `noda` | this chip | the machine binding |
+/// | PIN | an authorization value, DA-protected | this chip and the PIN | a person; guesses lock the chip out (after a few, for its recovery time) |
+/// | PCRs | a policy (PolicyPCR), `noda` | this chip in the boot state it was sealed in | a disk moved to another boot (another OS, Secure Boot off) opens nothing |
+/// | both | PolicyPCR + PolicyAuthValue, DA-protected | all of the above | |
+///
+/// The PIN never travels in argv (readable by every user): unsealing reads
+/// it from stdin (`file:-`); sealing — tpm2-tools needs a seekable file
+/// there — from a 0600 file in the 0700 working directory, on the per-user
+/// tmpfs (`XDG_RUNTIME_DIR`) where there is one, removed at once.
+///
+/// When the boot state changes on purpose (a firmware update that changes
+/// the Secure Boot keys), the part stops unsealing: unlock with the
+/// password or recovery code and seal again —
+/// `gorani-sync protect --secret … --tpm-pcrs 7`.
 pub mod tpm {
 	use super::*;
 
-	const PRIMARY: [&str; 9] = ["tpm2_createprimary", "-Q", "-C", "o", "-g", "sha256", "-G", "ecc256:aes128cfb", "-c"];
+	/// The storage key's template, by `srk` version. 1 adds `noda`: the
+	/// key's own (empty) authorization is not subject to the lockout, so PIN
+	/// guessing on one part cannot lock out every other part on the chip.
+	fn primary_args(srk: u8) -> Vec<&'static str> {
+		let mut a = vec!["-Q", "-C", "o", "-g", "sha256", "-G", "ecc256:aes128cfb"];
+		if srk >= 1 {
+			a.extend(["-a", "restricted|decrypt|fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda"]);
+		}
+		a.extend(["-c", "primary.ctx"]);
+		a
+	}
+
+	/// The template new parts are sealed under.
+	const SRK: u8 = 1;
 
 	/// A private working directory (0700), removed when dropped.
 	struct Workdir(std::path::PathBuf);
@@ -259,6 +375,20 @@ pub mod tpm {
 			b.create(&dir)?;
 			Ok(Self(dir))
 		}
+
+		/// A 0600 file in the working directory (for the one value
+		/// tpm2-tools will only read from a seekable file: a new PIN).
+		fn secret_file(&self, name: &str, bytes: &[u8]) -> Result<(), Error> {
+			let mut o = std::fs::OpenOptions::new();
+			o.write(true).create_new(true);
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::OpenOptionsExt;
+				o.mode(0o600);
+			}
+			o.open(self.0.join(name))?.write_all(bytes)?;
+			Ok(())
+		}
 	}
 
 	impl Drop for Workdir {
@@ -269,13 +399,11 @@ pub mod tpm {
 
 	fn flush() {
 		let _ = run("tpm2_flushcontext", &["-t"], None, None);
+		let _ = run("tpm2_flushcontext", &["-s"], None, None);
 	}
 
-	fn primary(dir: &std::path::Path) -> Result<(), Error> {
-		let (program, args) = PRIMARY.split_first().expect("non-empty");
-		let mut args = args.to_vec();
-		args.push("primary.ctx");
-		let r = run(program, &args, None, Some(dir));
+	fn primary(dir: &std::path::Path, srk: u8) -> Result<(), Error> {
+		let r = run("tpm2_createprimary", &primary_args(srk), None, Some(dir));
 		flush();
 		r.map(|_| ())
 	}
@@ -287,27 +415,95 @@ pub mod tpm {
 		ok
 	}
 
-	pub fn seal(part: &[u8; 32]) -> Result<Protector, Error> {
+	fn pcr_list(pcrs: &[u8]) -> String {
+		format!("sha256:{}", pcrs.iter().map(u8::to_string).collect::<Vec<_>>().join(","))
+	}
+
+	/// What the TPM's refusal means, for a person.
+	fn explain(e: Error, pcrs: &[u8]) -> Error {
+		let text = e.to_string();
+		let low = text.to_ascii_lowercase();
+		if low.contains("0x921") || low.contains("lockout") {
+			Error::Open("the TPM is locked out after too many wrong PINs — wait for the chip's recovery time, or have its administrator clear it (tpm2_dictionarylockout -c)")
+		} else if low.contains("policy") || low.contains("0x99d") {
+			Error::Config(format!("the boot state changed since this computer's part was sealed (PCR {}) — unlock with your password or recovery code and seal it again: gorani-sync protect --secret … --tpm-pcrs {}", pcr_list(pcrs).trim_start_matches("sha256:"), pcr_list(pcrs).trim_start_matches("sha256:")))
+		} else if low.contains("authorization") || low.contains("auth_fail") || low.contains("bad_auth") || low.contains("98e") || low.contains("9a2") {
+			Error::Open("wrong TPM PIN (the TPM counts wrong PINs, and locks out after a few)")
+		} else {
+			e
+		}
+	}
+
+	pub fn seal(part: &[u8; 32], o: &TpmOptions) -> Result<Protector, Error> {
 		let w = Workdir::new()?;
-		primary(&w.0)?;
-		let r = run("tpm2_create", &["-Q", "-C", "primary.ctx", "-g", "sha256", "-i", "-", "-u", "seal.pub", "-r", "seal.priv"], Some(part), Some(&w.0));
+		primary(&w.0, SRK)?;
+		let mut args: Vec<String> = ["-Q", "-C", "primary.ctx", "-g", "sha256", "-i", "-", "-u", "seal.pub", "-r", "seal.priv"].iter().map(|s| s.to_string()).collect();
+		if !o.pcrs.is_empty() {
+			// The policy digest, computed in a trial session: PolicyPCR over the
+			// PCRs' values NOW (+ PolicyAuthValue when there is a PIN).
+			let r = run("tpm2_startauthsession", &["-S", "trial.ctx"], None, Some(&w.0)).and_then(|_| {
+				let mut pcr = vec!["-Q", "-S", "trial.ctx"];
+				let list = pcr_list(&o.pcrs);
+				pcr.extend(["-l", &list]);
+				if o.pin.is_none() {
+					pcr.extend(["-L", "seal.policy"]);
+				}
+				run("tpm2_policypcr", &pcr, None, Some(&w.0))?;
+				if o.pin.is_some() {
+					run("tpm2_policyauthvalue", &["-Q", "-S", "trial.ctx", "-L", "seal.policy"], None, Some(&w.0))?;
+				}
+				Ok(())
+			});
+			let _ = run("tpm2_flushcontext", &["trial.ctx"], None, Some(&w.0));
+			flush();
+			r?;
+			args.extend(["-L".into(), "seal.policy".into(), "-a".into(), if o.pin.is_some() { "fixedtpm|fixedparent".into() } else { "fixedtpm|fixedparent|noda".into() }]);
+		} else if o.pin.is_none() {
+			args.extend(["-a".into(), "fixedtpm|fixedparent|userwithauth|noda".into()]);
+		}
+		if let Some(pin) = &o.pin {
+			w.secret_file("auth", pin.as_bytes())?;
+			args.extend(["-p".into(), "file:auth".into()]);
+		}
+		let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+		let r = run("tpm2_create", &argv, Some(part), Some(&w.0));
+		let _ = std::fs::remove_file(w.0.join("auth"));
 		flush();
 		r?;
 		let b64 = |name: &str| -> Result<String, Error> { Ok(crate::encode(&std::fs::read(w.0.join(name))?)) };
-		Ok(Protector::Tpm { public: b64("seal.pub")?, private: b64("seal.priv")? })
+		Ok(Protector::Tpm { public: b64("seal.pub")?, private: b64("seal.priv")?, srk: SRK, pin: o.pin.is_some(), pcrs: o.pcrs.clone() })
 	}
 
-	pub fn unseal(public: &str, private: &str) -> Result<Zeroizing<[u8; 32]>, Error> {
+	pub fn unseal(public: &str, private: &str, srk: u8, pin: Option<&str>, pcrs: &[u8]) -> Result<Zeroizing<[u8; 32]>, Error> {
 		let w = Workdir::new()?;
 		std::fs::write(w.0.join("seal.pub"), &*crate::decode(public)?)?;
 		std::fs::write(w.0.join("seal.priv"), &*crate::decode(private)?)?;
-		primary(&w.0).map_err(|e| Error::Config(format!("no TPM to unseal this computer's part ({e})")))?;
+		primary(&w.0, srk).map_err(|e| explain(Error::Config(format!("no TPM to unseal this computer's part ({e})")), pcrs))?;
 		let loaded = run("tpm2_load", &["-Q", "-C", "primary.ctx", "-u", "seal.pub", "-r", "seal.priv", "-c", "seal.ctx"], None, Some(&w.0));
 		flush();
-		loaded.map_err(|_| Error::Open("this TPM cannot load the sealed part — it was sealed by another machine's TPM (or this one's was cleared)"))?;
-		let out = run("tpm2_unseal", &["-Q", "-c", "seal.ctx"], None, Some(&w.0));
+		if let Err(e) = loaded {
+			let e = explain(e, pcrs);
+			return Err(if matches!(e, Error::Config(_)) { Error::Open("this TPM cannot load the sealed part — it was sealed by another machine's TPM (or this one's was cleared)") } else { e });
+		}
+		let stdin = pin.map(str::as_bytes);
+		let out = if pcrs.is_empty() {
+			run("tpm2_unseal", if pin.is_some() { &["-Q", "-c", "seal.ctx", "-p", "file:-"][..] } else { &["-Q", "-c", "seal.ctx"][..] }, stdin, Some(&w.0))
+		} else {
+			// A policy session that satisfies the sealing policy — if, and only
+			// if, the PCRs hold the values they held then.
+			let r = run("tpm2_startauthsession", &["--policy-session", "-S", "s.ctx"], None, Some(&w.0)).and_then(|_| {
+				let list = pcr_list(pcrs);
+				run("tpm2_policypcr", &["-Q", "-S", "s.ctx", "-l", &list], None, Some(&w.0))?;
+				if pin.is_some() {
+					run("tpm2_policyauthvalue", &["-Q", "-S", "s.ctx"], None, Some(&w.0))?;
+				}
+				run("tpm2_unseal", &["-Q", "-c", "seal.ctx", "-p", if pin.is_some() { "session:s.ctx+file:-" } else { "session:s.ctx" }], stdin, Some(&w.0))
+			});
+			let _ = run("tpm2_flushcontext", &["s.ctx"], None, Some(&w.0));
+			r
+		};
 		flush();
-		let out = out?;
+		let out = out.map_err(|e| explain(e, pcrs))?;
 		if out.len() != 32 {
 			return Err(Error::Open("the TPM unsealed something that is not a 32-byte part"));
 		}
@@ -374,13 +570,23 @@ mod tests {
 
 	#[test]
 	fn a_file_protector_round_trips_and_labels_say_what_protects() {
-		let (ps, secret) = create(Want::File, "test").unwrap();
+		let (ps, secret) = create(Want::File, "test", &TpmOptions::default()).unwrap();
 		assert_eq!(label(&ps), "file");
 		assert_eq!(*open(&ps).unwrap(), *secret);
 		let json = serde_json::to_string(&ps).unwrap();
 		assert!(json.contains("\"kind\":\"file\""), "{json}");
-		assert_eq!(label(&[Protector::Tpm { public: String::new(), private: String::new() }, Protector::Keyring { item: "x".into() }]), "tpm+keyring");
+		let tpm = |pin, pcrs: Vec<u8>| Protector::Tpm { public: String::new(), private: String::new(), srk: 1, pin, pcrs };
+		assert_eq!(label(&[tpm(false, vec![]), Protector::Keyring { item: "x".into() }]), "tpm+keyring");
+		assert_eq!(label(&[tpm(true, vec![0, 7])]), "tpm[pin,pcr:0,pcr:7]");
+		assert_eq!(TpmOptions::parse_pcrs("7, 0,7").unwrap(), vec![0, 7]);
+		assert!(TpmOptions::parse_pcrs("24").is_err());
 		assert!("tpm+keyring".parse::<Want>().is_ok() && "usb".parse::<Want>().is_err());
 		assert!(open(&[]).is_err(), "no protectors, no secret");
+	}
+
+	#[test]
+	fn a_commit_34_tpm_part_still_reads_as_the_first_template_without_options() {
+		let old: Protector = serde_json::from_str(r#"{"kind":"tpm","public":"AA==","private":"AA=="}"#).unwrap();
+		assert!(matches!(old, Protector::Tpm { srk: 0, pin: false, ref pcrs, .. } if pcrs.is_empty()), "its blob loads under the storage key it was sealed under");
 	}
 }

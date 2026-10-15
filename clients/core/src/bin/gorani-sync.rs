@@ -35,7 +35,7 @@ fn main() {
 const WHOLE_LIMIT: u64 = 48 * 1024 * 1024;
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["accept-unverified"];
+const SWITCHES: &[&str] = &["accept-unverified", "tpm-pin"];
 
 fn profile_path() -> PathBuf {
 	let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
@@ -70,6 +70,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 	//        --source --collector --method --collected-at --notes (intake, 33c)
 	//        --accept-unverified (a switch)
 	//        --protect auto|tpm|keyring|tpm+keyring|file (where the device secret lives — commit 34)
+	//        --tpm-pin (a switch) --tpm-pcrs 7 (the TPM part's PIN and boot state — commit 36)
 	let mut flags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 	let mut pos: Vec<String> = Vec::new();
 	let mut i = 0;
@@ -113,7 +114,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			// Where the device secret lives (commit 34): the TPM and/or the login
 			// keyring by default — never silently a file.
 			let want: devicekey::Want = flag("protect").as_deref().unwrap_or("auto").parse()?;
-			let sess = session::enrol(&mut profile, &name, &secret, want)?;
+			let sess = session::enrol(&mut profile, &name, &secret, want, &tpm_options(&flag)?)?;
 			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
 			session::save_profile(&path, &profile)?;
 			let protection = if profile.device_secret.is_some() { "file".to_string() } else { devicekey::label(&profile.device_protectors) };
@@ -131,7 +132,10 @@ fn run(args: &[String]) -> Result<(), Error> {
 				profile.dev_email = Some(e);
 			}
 			let want: devicekey::Want = flag("protect").as_deref().unwrap_or("auto").parse()?;
-			let label = session::protect(&path, &mut profile, want)?;
+			// --secret: open the root with the password or recovery code instead
+			// of the device copy — after the boot state a TPM part was sealed to
+			// changed (commit 36).
+			let label = session::protect(&path, &mut profile, want, &tpm_options(&flag)?, flag("secret").as_deref())?;
 			println!("device {} — device secret now protected by: {label}", profile.device_id);
 		}
 		Some("devices") => {
@@ -357,7 +361,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push> [--protect auto|tpm|keyring|tpm+keyring|file] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified]");
+			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified]");
 			std::process::exit(2);
 		}
 	}
@@ -408,6 +412,15 @@ fn judge_content(area: &Area, id: &str, version: u64, hash: Option<&str>, sha256
 		HashCheck::Untrusted { .. } | HashCheck::Unsigned if area.is_evidence() && !accept_unverified => Err(Error::Config("refusing to write unverified evidence — pass --accept-unverified to write it anyway".into())),
 		_ => Ok(()),
 	}
+}
+
+/// The TPM part's options (commit 36): `--tpm-pin` (a PIN, asked twice — or
+/// GORANI_TPM_PIN) and `--tpm-pcrs 7` (sealed to the boot state).
+fn tpm_options(flag: &dyn Fn(&str) -> Option<String>) -> Result<devicekey::TpmOptions, Error> {
+	Ok(devicekey::TpmOptions {
+		pin: if flag("tpm-pin").is_some() { Some(devicekey::choose_pin()?) } else { None },
+		pcrs: flag("tpm-pcrs").as_deref().map(devicekey::TpmOptions::parse_pcrs).transpose()?.unwrap_or_default(),
+	})
 }
 
 fn with_dev_email(mut profile: DeviceProfile, flag: &dyn Fn(&str) -> Option<String>) -> DeviceProfile {

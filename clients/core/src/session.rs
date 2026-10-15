@@ -104,10 +104,18 @@ fn check_root(root: &[u8], key_id: &str, settings: &api::VaultSettings) -> Resul
 /// ```
 ///
 /// Returns the new protection label (also recorded by the server).
-pub fn protect(path: &std::path::Path, profile: &mut DeviceProfile, want: devicekey::Want) -> Result<String, Error> {
+///
+/// `typed`: a password or recovery code to open the root with INSTEAD of
+/// the device copy — for when the current protectors cannot give their parts
+/// any more (commit 36: the boot state a TPM part was sealed to changed, or
+/// the chip was cleared). The device token still has to be this computer's.
+pub fn protect(path: &std::path::Path, profile: &mut DeviceProfile, want: devicekey::Want, tpm_options: &devicekey::TpmOptions, typed: Option<&str>) -> Result<String, Error> {
 	let client = api::Client::new(profile.clone());
 	let (key_id, wrapped, salt, settings) = client.unlock(&profile.device_id, &profile.token)?;
-	let (root, which) = open_copy(profile, &wrapped, &salt)?;
+	let (root, which) = match typed {
+		Some(secret) => (unlock_root(&settings, secret)?, Opened::Current),
+		None => open_copy(profile, &wrapped, &salt)?,
+	};
 	check_root(&root, &key_id, &settings)?;
 	if which == Opened::Pending {
 		// A run that died after step 4: finish it before starting this one.
@@ -120,7 +128,7 @@ pub fn protect(path: &std::path::Path, profile: &mut DeviceProfile, want: device
 		// A run that died before step 4: its parts were never used.
 		devicekey::forget(&std::mem::take(&mut profile.pending_protectors));
 	}
-	let (fresh, secret) = devicekey::create(want, &keyring_label(profile))?;
+	let (fresh, secret) = devicekey::create(want, &keyring_label(profile), tpm_options)?;
 	let label = devicekey::label(&fresh);
 	profile.pending_protectors = fresh;
 	save_profile(path, profile)?;
@@ -184,7 +192,7 @@ fn to_core_method(m: &UnlockMethod) -> UnlockMethod {
 /// secret whose parts `want` puts in the TPM and/or the keyring (commit 34).
 /// A profile that already carries `device_secret` (`--device-secret`, dev
 /// and CI) keeps it, protected by nothing but the file.
-pub fn enrol(profile: &mut DeviceProfile, device_name: &str, secret_text: &str, want: devicekey::Want) -> Result<Session, Error> {
+pub fn enrol(profile: &mut DeviceProfile, device_name: &str, secret_text: &str, want: devicekey::Want, tpm_options: &devicekey::TpmOptions) -> Result<Session, Error> {
 	let client = api::Client::new(profile.clone());
 	let settings = client.vault()?;
 	let root = unlock_root(&settings, secret_text)?;
@@ -192,7 +200,7 @@ pub fn enrol(profile: &mut DeviceProfile, device_name: &str, secret_text: &str, 
 	let (device_secret, protection): (Zeroizing<Vec<u8>>, String) = match legacy_secret(profile) {
 		Some(hex) => (Zeroizing::new(decode_hex(hex)?), "file".into()),
 		None => {
-			let (protectors, secret) = devicekey::create(want, &keyring_label(profile))?;
+			let (protectors, secret) = devicekey::create(want, &keyring_label(profile), tpm_options)?;
 			let label = devicekey::label(&protectors);
 			profile.device_protectors = protectors;
 			(Zeroizing::new(secret.to_vec()), label)

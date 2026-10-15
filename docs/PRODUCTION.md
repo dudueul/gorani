@@ -141,7 +141,12 @@ memory.
    to the `tss` group so they may use `/dev/tpmrm0`; `gorani-sync setup`
    then picks `tpm+keyring` by itself. A computer with neither is refused
    unless the person types `--protect file` (dev and CI) — and an already
-   enrolled computer moves to the TPM with `gorani-sync protect`.
+   enrolled computer moves to the TPM with `gorani-sync protect`. For
+   evidence workstations add `--tpm-pin --tpm-pcrs 7` (commit 36): the
+   TPM part then needs a PIN — guessing it locks the chip out — and the
+   machine's Secure Boot state; after a firmware update that changes that
+   state, `gorani-sync protect --secret <recovery code> --tpm-pcrs 7`
+   seals it again.
    `gorani-sync devices` shows what protects each computer (the client's
    word, recorded by the server — not attested), and `gorani-sync revoke
    --device <id>` deletes a lost one's copy from any other — as does the

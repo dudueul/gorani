@@ -106,9 +106,9 @@ revoked device's chip opens nothing because the server's copy is gone.
   revoke a lost laptop but the raw API. Commit 35 adds it: Team › Devices
   lists the member's computers with what protects each (a file-held secret
   flagged), when each was last seen, and Revoke.
-- Not yet: a TPM PIN (an authorization value the chip's lockout would
-  protect) or sealing to the boot state (a PCR policy); attestation of the
-  protection label (the server records the client's word).
+- Not yet: attestation of the protection label (the server records the
+  client's word). *(A TPM PIN and sealing to the boot state arrived in
+  commit 36 — below.)*
 - `api:device-protect` runs it against a real software TPM (swtpm) and a
   real GNOME Keyring on a private D-Bus session: no secret in the profile;
   another TPM cannot load the blob; another login's keyring has no part;
@@ -286,6 +286,38 @@ gorani-mount script [--case C]           the same engine over JSON lines (tests;
   then mounts it for real: Node's async `fs` reads, writes, renames and
   unlinks through the kernel, and the browser's own code checks what
   arrived.
+
+### Commit 36 as built: a PIN, and the boot state
+
+Two options of the TPM part, each a property of the sealed object itself
+(`gorani-sync setup|protect --protect tpm --tpm-pin --tpm-pcrs 7`):
+
+| option | unsealing needs | what it adds |
+|---|---|---|
+| `--tpm-pin` | this chip **and** the PIN | a person at the keyboard; the chip counts wrong PINs and locks itself out after a few (for its recovery time) — the right PIN too |
+| `--tpm-pcrs 7` | this chip in the boot state it was sealed in (PCR 7: Secure Boot on, with these keys) | a disk moved under another OS, or the same machine booted with Secure Boot off, opens nothing |
+
+- **The PIN never travels in argv** (readable by every user): unsealing
+  reads it from stdin; sealing — where tpm2-tools wants a seekable file —
+  from a 0600 file in the 0700 working directory on the per-user tmpfs,
+  removed at once. It is asked on the terminal (twice when chosen, at
+  least 6 characters), or taken from `GORANI_TPM_PIN` for automation.
+- **Found on the way:** the storage key commit 34 sealed under was itself
+  subject to the chip's lockout, so guessing one part's PIN would have
+  locked out *every* part on the chip, PIN or not. New parts use a `noda`
+  storage key (template 1, recorded per part as `srk`, so commit-34 blobs
+  still load under theirs); parts without a PIN are `noda` too. The live
+  suite proves a PIN lockout leaves them working.
+- **A boot state that changes on purpose** (a firmware update changing the
+  Secure Boot keys) stops the part unsealing — the message says how to
+  recover: `gorani-sync protect --secret <password or recovery code>
+  --tpm-pcrs 7` opens the root with the typed secret instead of the
+  device copy and seals again to the state the machine is in now.
+- The protection label carries the options: `tpm[pin,pcr:7]+keyring`, and
+  Team › Devices says it in words.
+- PCR 7 only, deliberately: PCRs 0–6 move with every firmware and boot
+  loader update, and a part that dies at each one teaches people to turn
+  the option off.
 
 ## Testing (the pattern the port follows)
 

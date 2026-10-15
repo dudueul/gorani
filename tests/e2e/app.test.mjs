@@ -430,6 +430,7 @@ try {
 		};
 		const desk = await enrolDevice("mom's desktop", "tpm+keyring");
 		const oldLaptop = await enrolDevice("old laptop", "file");
+		const vaultPc = await enrolDevice("evidence workstation", "tpm[pin,pcr:7]+keyring"); // commit 36
 		await teamButton.click();
 		const fp = (await page.locator('[data-test="my-fingerprint"]').textContent())?.trim() ?? "";
 		assert.match(fp, /^([0-9A-F]{4} ){7}[0-9A-F]{4}$/, "the fingerprint people read to each other");
@@ -440,6 +441,7 @@ try {
 		await deskProtection.waitFor({ timeout: 30_000 });
 		assert.equal((await deskProtection.textContent()).trim(), "Protected by the TPM + the login keyring");
 		assert.match(await page.locator(`[data-test="device-protection-${oldLaptop}"]`).textContent(), /⚠ Protected by a file/, "a file-held secret is flagged");
+		assert.equal((await page.locator(`[data-test="device-protection-${vaultPc}"]`).textContent()).trim(), "Protected by the TPM, with a PIN, sealed to the boot state (PCR 7) + the login keyring", "a TPM part's PIN and boot state, in words");
 		page.once("dialog", (d) => void d.accept());
 		await page.locator(`[data-test="device-revoke-${oldLaptop}"]`).click();
 		await page.locator(`[data-test="device-revoked-${oldLaptop}"]`).waitFor({ timeout: 30_000 });

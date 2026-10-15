@@ -546,6 +546,33 @@ What Explorer and Finder show of a Gorani folder:
   in sync with its state shown. `swift test` checks each badge and that an
   ordinary file has none.
 
+### 39f as built
+
+`.github/workflows/package.yml` makes what a person installs, and installs
+or runs it there, as they would:
+
+| | Windows | macOS |
+|---|---|---|
+| what | an MSIX (`clients/windows/packaging`): gorani-cloud and gorani-sync, full trust, each a console command on PATH through an execution alias; logos drawn by `logos.py` (no image committed) | Gorani.app (`clients/macos/packaging/package.sh`): the app, its File Provider extension, the CLI (`Contents/MacOS/gorani-sync`) and two copies of the keystore helper — the CLI's, and the extension's signed to inherit its sandbox |
+| signed with secrets | `WINDOWS_CERT_PFX`, `WINDOWS_CERT_PASSWORD`; the package's publisher is the certificate's subject; timestamped | `GORANI_TEAM_ID` (variable or secret), `APPLE_CERT_P12`, `APPLE_CERT_PASSWORD`: Developer ID, inside-out, hardened runtime, the app group `<team>.io.gorani`; notarized and stapled with `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` |
+| without them | signed with a throwaway certificate made and trusted on that runner only — so installing is tested as a signed package's would be | ad-hoc signed, for testing (Gatekeeper will not open it from a download) |
+| checked | installed with Add-AppxPackage, both aliases answer, removed again | the bundled CLI answers, the helper probes, the extension's binary holds the core |
+
+- **When**: release tags (`v*`), by hand, and when the packaging changes —
+  not on every push.
+- **The one outside tool.** XcodeGen (Homebrew) runs in a job that holds
+  no secret; the signing job takes only the project it generated, and
+  refuses one holding a script phase or a build rule — where a tampered
+  generator could hide a command next to the signing identity.
+- **The secrets** are read only in the steps that sign, never printed;
+  the macOS identity lives in a throwaway keychain deleted when the step
+  ends. They are never asked for: set them in the repository's settings
+  when the certificates exist, and the next tag ships signed packages.
+- **The Mac's helpers and the Keychain.** Both keystore copies are signed
+  with one identifier, so the login Keychain's rule for the CLI's items
+  admits the extension's helper too. Apple silicon only for now (the core
+  is built for arm64).
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

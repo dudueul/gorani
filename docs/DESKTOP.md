@@ -541,10 +541,21 @@ What Explorer and Finder show of a Gorani folder:
   `NSFileProviderDecorations`): a badge on a sample (warning), on every
   item of a read-only area (locked), and on a name that did not open in
   its place (warning) — named under the extension's bundle id.
-- **Tests**: the Windows smoke test says which registration the runner
-  gave and, when the shell's, that the id names the area; the sample stays
-  in sync with its state shown. `swift test` checks each badge and that an
-  ordinary file has none.
+- **Found on the runner** (Windows Server, a non-interactive session):
+  `StorageFolder` refuses a `\\?\` path (the form `canonicalize` gives); a
+  sample's state is refused while the placeholder is read-only (lifted for
+  the write, as for every write the shell makes — cf.rs ›
+  read_only_lifted); and the shell's queries — by id, by folder, the list —
+  answer nothing for a root `Register` has just taken. The registration is
+  real: the shell writes it down at `HKLM\…\Explorer\SyncRootManager\<id>\
+  UserSyncRoots` (the user's SID naming the folder), so lookups — and
+  `unregister`, which must remove that entry or leave a stale one in the
+  navigation pane — fall back to reading it.
+- **Tests**: the Windows smoke test finds the folder under its id and
+  checks the shell's folder is this one (failing, where the shell supports
+  sync roots, instead of only saying so), sees the sample stay in sync with
+  its state shown, and proves `unregister` leaves nothing under the id.
+  `swift test` checks each badge and that an ordinary file has none.
 
 ### 39f as built
 

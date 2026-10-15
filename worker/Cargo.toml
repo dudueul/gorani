@@ -40,7 +40,10 @@ worker = "0.8.7"
 # host targets (clients, tests) it is inert.
 getrandom = { version = "0.2", features = ["js"] }
 base64 = "0.22"
-p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 hex = "0.4.3"
 rand_core = "0.6"
+# Cloudflare Access signs its JWTs RS256 (auth.rs, commit 39k) — RustCrypto's
+# RSA, used to VERIFY only. (It replaced p256 here, the ES256 that had been
+# assumed.)
+rsa = { version = "0.9", features = ["sha2"] }

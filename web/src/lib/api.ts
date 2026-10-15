@@ -31,8 +31,8 @@ export class ApiError extends Error {
 	}
 }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
-	const headers: Record<string, string> = { ...devIdentityHeaders(), ...(body === undefined ? {} : { "content-type": "application/json" }) };
+async function call<T>(method: string, path: string, body?: unknown, extra: Record<string, string> = {}): Promise<T> {
+	const headers: Record<string, string> = { ...devIdentityHeaders(), ...(body === undefined ? {} : { "content-type": "application/json" }), ...extra };
 	const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
 	const text = await res.text();
 	let json: unknown = null;
@@ -51,7 +51,8 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 export const api = {
 	get: <T>(path: string) => call<T>("GET", path),
 	put: <T>(path: string, body: unknown) => call<T>("PUT", path, body),
-	post: <T>(path: string, body?: unknown) => call<T>("POST", path, body),
+	/** `headers`: one request's own, e.g. the bootstrap token (app-root.ts). */
+	post: <T>(path: string, body?: unknown, headers?: Record<string, string>) => call<T>("POST", path, body, headers),
 	del: <T>(path: string) => call<T>("DELETE", path),
 };
 

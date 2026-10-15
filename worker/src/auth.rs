@@ -1,11 +1,18 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 
 //! Who is calling? Cloudflare Access sits in front of the Worker in
-//! production: every request carries `CF-Access-JWT-Assertion`, an ES256
-//! JWT signed by the team's keys. This module verifies it — issuer, audience
-//! (the Access application's `POLICY_AUD`), expiry, and the signature against
-//! the team's JWKS — and fails **closed**: if Access is not configured, no
-//! production request passes.
+//! production: every request carries `CF-Access-JWT-Assertion`, an RS256
+//! JWT (RSASSA-PKCS1-v1_5, SHA-256) signed by the team's RSA keys. This
+//! module verifies it — issuer, audience (the Access application's
+//! `POLICY_AUD`), expiry, and the signature against the team's JWKS — and
+//! fails **closed**: if Access is not configured, no production request
+//! passes.
+//!
+//! (Until commit 39k this said ES256, and the code accepted nothing else:
+//! the suite's stub team signed ES256 too, so every test passed while no
+//! real Access token could — the first deployment answered every request
+//! with "signature is not 64 bytes", an RSA-2048 signature being 256. The
+//! stub now signs as Access does; docs/DESKTOP.md › 39k.)
 //!
 //! In local development (`GORANI_DEV=1` in .dev.vars) there is no Access; a
 //! request identifies itself with `x-gorani-dev-email`. The var only exists
@@ -26,8 +33,13 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
+// RustCrypto's RSA, for VERIFYING only: its advisory (RUSTSEC-2023-0071, a
+// timing side channel) concerns private-key operations, which nothing here
+// performs — a public key and a public signature have no secret to leak.
+use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::sha2::Sha256;
+use rsa::signature::Verifier;
+use rsa::{BigUint, RsaPublicKey};
 use serde::Deserialize;
 use worker::*;
 
@@ -64,14 +76,19 @@ struct JwksCache {
 	keys: Vec<Jwk>,
 }
 
+/// One key of the team's JWKS. Access publishes RSA keys (`n`, `e`); the
+/// other members are optional so that a key of another type in the set —
+/// should Access ever add one — is ignored, not a reason to refuse them all.
 #[derive(Debug, Clone, Deserialize)]
 struct Jwk {
 	kid: String,
 	kty: String,
-	crv: String,
-	x: String,
-	y: String,
+	#[serde(default)]
 	alg: Option<String>,
+	#[serde(default)]
+	n: Option<String>,
+	#[serde(default)]
+	e: Option<String>,
 }
 
 static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCache>>> = std::sync::OnceLock::new();
@@ -95,10 +112,14 @@ fn certs_url(team_domain: &str) -> String {
 	}
 }
 
-async fn fetch_jwks(env: &Env) -> Result<Vec<Jwk>> {
+/// The team's keys: from the cache while it is younger than ten minutes —
+/// or, with `fresher_than` (a token named a key the cache lacks: Access
+/// rotated its key), only while younger than that, so a new key is seen
+/// within a minute and a stream of made-up key ids costs one fetch a minute.
+async fn fetch_jwks(env: &Env, fresher_than: Option<u64>) -> Result<Vec<Jwk>> {
 	if let Ok(cached) = cache().lock() {
 		if let Some(c) = cached.as_ref() {
-			if now_ms().saturating_sub(c.fetched_at) < 600_000 {
+			if now_ms().saturating_sub(c.fetched_at) < fresher_than.unwrap_or(600_000) {
 				return Ok(c.keys.clone());
 			}
 		}
@@ -122,7 +143,9 @@ struct Token<'a> {
 	claims: serde_json::Value,
 	/// The raw bytes of `header.payload` (what the signature covers).
 	signing_input: &'a [u8],
-	signature: [u8; 64],
+	/// As long as the key's modulus (256 bytes for RSA-2048) — checked by
+	/// the verification itself.
+	signature: Vec<u8>,
 }
 
 fn parse_token(token: &str) -> Result<Token<'_>> {
@@ -143,14 +166,17 @@ fn parse_token(token: &str) -> Result<Token<'_>> {
 		.map_err(|_| Error::RustError("bad token header JSON".into()))?;
 	let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(claims_b64).map_err(|_| Error::RustError("bad token claims".into()))?)
 		.map_err(|_| Error::RustError("bad token claims JSON".into()))?;
-	let sig = URL_SAFE_NO_PAD.decode(sig_b64).map_err(|_| Error::RustError("bad token signature".into()))?;
-	let signature: [u8; 64] = sig.try_into().map_err(|_| Error::RustError("signature is not 64 bytes".into()))?;
+	let signature = URL_SAFE_NO_PAD.decode(sig_b64).map_err(|_| Error::RustError("bad token signature".into()))?;
+	// (RSA-4096 is 512 bytes; nothing longer is a signature of ours.)
+	if signature.is_empty() || signature.len() > 512 {
+		return Err(Error::RustError("token signature has no plausible length".into()));
+	}
 	Ok(Token { header, claims, signing_input: &full[..signing_input_len], signature })
 }
 
 /// Verify one request's Access token and return the identity. The chain is:
 /// dev mode (explicitly enabled, and Access explicitly absent) → JWT present
-/// → header alg ES256 → signature against the team JWKS → iss/aud/exp.
+/// → header alg RS256 → signature against the team JWKS → iss/aud/exp.
 pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 	let dev_var = env.var("GORANI_DEV").map(|v| v.to_string()).ok();
 	let dev_mode = dev_var.as_deref() == Some("1");
@@ -176,27 +202,35 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 
 	let token = req.headers().get("CF-Access-JWT-Assertion")?.ok_or_else(|| Error::RustError("missing Access token".into()))?;
 	let t = parse_token(&token)?;
-	if t.header.get("alg").and_then(|a| a.as_str()) != Some("ES256") {
-		return Err(Error::RustError("token is not ES256".into()));
+	if t.header.get("alg").and_then(|a| a.as_str()) != Some("RS256") {
+		return Err(Error::RustError("token is not RS256".into()));
 	}
-	// The signature, against the team's P-256 keys.
+	// The signature, against the team's RSA keys.
 	let kid = t.header.get("kid").and_then(|k| k.as_str()).unwrap_or("").to_string();
-	let keys = fetch_jwks(env).await?;
-	let jwk = keys.iter().find(|k| k.kid == kid).ok_or_else(|| Error::RustError("unknown token key".into()))?;
-	// The key must be what the header claimed: P-256, and — when the JWKS
-	// names an algorithm — ES256. (alg confusion is the classic JWT bug: a
-	// verifier that lets the token pick its own algorithm.)
-	if jwk.kty != "EC" || jwk.crv != "P-256" || jwk.alg.as_deref().is_some_and(|a| a != "ES256") {
-		return Err(Error::RustError("token key is not an ES256 P-256 key".into()));
+	let mut keys = fetch_jwks(env, None).await?;
+	if !keys.iter().any(|k| k.kid == kid) {
+		keys = fetch_jwks(env, Some(60_000)).await?;
 	}
-	let x = URL_SAFE_NO_PAD.decode(jwk.x.trim_end_matches('=')).map_err(|_| Error::RustError("bad key x".into()))?;
-	let y = URL_SAFE_NO_PAD.decode(jwk.y.trim_end_matches('=')).map_err(|_| Error::RustError("bad key y".into()))?;
-	let mut point = vec![0x04u8];
-	point.extend_from_slice(&x);
-	point.extend_from_slice(&y);
-	let vk = VerifyingKey::from_sec1_bytes(&point).map_err(|_| Error::RustError("bad team key".into()))?;
-	vk.verify(t.signing_input, &Signature::from_slice(&t.signature).map_err(|_| Error::RustError("bad signature shape".into()))?)
-		.map_err(|_| Error::RustError("bad signature".into()))?;
+	let jwk = keys.iter().find(|k| k.kid == kid).ok_or_else(|| Error::RustError("unknown token key".into()))?;
+	// The key must be what the header claimed: RSA and — when the JWKS names
+	// an algorithm — RS256. (alg confusion is the classic JWT bug: a
+	// verifier that lets the token pick its own algorithm, or verifies with
+	// a key of another kind.)
+	if jwk.kty != "RSA" || jwk.alg.as_deref().is_some_and(|a| a != "RS256") {
+		return Err(Error::RustError("token key is not an RS256 RSA key".into()));
+	}
+	let part = |v: &Option<String>, what: &str| -> Result<BigUint> {
+		let bytes = URL_SAFE_NO_PAD.decode(v.as_deref().unwrap_or("").trim_end_matches('=')).map_err(|_| Error::RustError(format!("bad key {what}")))?;
+		Ok(BigUint::from_bytes_be(&bytes))
+	};
+	// RsaPublicKey::new refuses moduli over 4096 bits and exponents out of
+	// range; under 2048 bits is no key Access would use.
+	let public = RsaPublicKey::new(part(&jwk.n, "n")?, part(&jwk.e, "e")?).map_err(|_| Error::RustError("bad team key".into()))?;
+	if rsa::traits::PublicKeyParts::n(&public).bits() < 2048 {
+		return Err(Error::RustError("team key is shorter than 2048 bits".into()));
+	}
+	let signature = Signature::try_from(t.signature.as_slice()).map_err(|_| Error::RustError("bad signature shape".into()))?;
+	VerifyingKey::<Sha256>::new(public).verify(t.signing_input, &signature).map_err(|_| Error::RustError("bad signature".into()))?;
 
 	// The claims, once the bytes are trusted.
 	let now = now_ms() / 1000;
@@ -209,12 +243,24 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 	if !iss.starts_with(&team_origin) {
 		return Err(Error::RustError(format!("token issuer {iss} is not the team")));
 	}
-	if t.claims.get("aud").and_then(|v| v.as_str()) != Some(aud.as_str()) {
+	// Access sends `aud` as an ARRAY holding the application's tag (RFC
+	// 7519 allows either form; until commit 39k only a string was read, so
+	// a real token would have failed here next).
+	let audience_ok = match t.claims.get("aud") {
+		Some(serde_json::Value::String(a)) => *a == aud,
+		Some(serde_json::Value::Array(all)) => all.iter().any(|a| a.as_str() == Some(aud.as_str())),
+		_ => false,
+	};
+	if !audience_ok {
 		return Err(Error::RustError("token audience does not match POLICY_AUD".into()));
 	}
 	let exp = t.claims.get("exp").and_then(|v| v.as_u64()).unwrap_or(0);
 	if exp < now {
 		return Err(Error::RustError("token expired".into()));
+	}
+	// Not before (Access sets it to the issue time); a minute of clock skew.
+	if t.claims.get("nbf").and_then(|v| v.as_u64()).is_some_and(|nbf| nbf > now + 60) {
+		return Err(Error::RustError("token is not valid yet".into()));
 	}
 	// A member's token names their email. A SERVICE token's names a
 	// `common_name` and no email (commit 37a): that is a collector — or no

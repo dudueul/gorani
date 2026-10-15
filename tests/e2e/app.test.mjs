@@ -58,8 +58,36 @@ if (!chromium) {
 
 const dev = await startDev();
 try {
+	const browser = await chromium.launch({ headless: true });
+
+	// ── 00. A fresh deployment: the first lead, from the browser (39k) ────
+	// Until commit 39k an empty registry showed "No members yet" and nothing
+	// to do about it; the first lead needed a hand-made API call with the
+	// bootstrap token. (This dev server sets no BOOTSTRAP_TOKEN, which dev
+	// mode allows — api:bootstrap and api:access prove the token itself.)
+	{
+		const ctx = await guardedContext(browser, "mom@family.test");
+		const page = await ctx.newPage();
+		await page.goto(dev.base);
+		await page.getByText("Create the first lead").waitFor({ timeout: 30_000 });
+		await page.locator('input[name="member-id"]').fill("Mom!");
+		await page.getByRole("button", { name: "Create" }).click();
+		await page.getByText("Member id: 2–32 characters").waitFor();
+		await page.locator('input[name="member-id"]').fill("mom");
+		await page.locator('input[name="member-name"]').fill("Mom");
+		await page.locator('input[name="bootstrap-token"]').fill("any — dev mode");
+		await page.getByRole("button", { name: "Create" }).click();
+		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
+		await page.getByText("Mom", { exact: false }).first().waitFor();
+		await assertNoViolations(page, "the first-lead screen");
+		await ctx.close();
+		const team = await api(dev.base, "GET", "/api/v1/family", { email: "mom@family.test" });
+		const first = team.json.members.find((m) => m.id === "mom");
+		assert.equal(first?.role, "lead", "the first member is a lead");
+		assert.deepEqual(first?.emails, ["mom@family.test"], "the first lead's email is the signed-in one, not a typed one");
+	}
+
 	// ── seed: mom (password vault), jinu (recovery vault), sora (none) ──
-	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] } });
 	const mom = await createVault("correct horse battery staple 42");
 	const momSaved = await api(dev.base, "PUT", "/api/v1/members/mom/vault", { body: { settings: { enabled: true, keyId: mom.keyId, publicKey: mom.publicKey, pqPublicKey: mom.pqPublicKey, methods: mom.methods } } });
 	assert.equal(momSaved.status, 200, JSON.stringify(momSaved.json));
@@ -70,8 +98,6 @@ try {
 	const saved = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { enabled: true, keyId: jinu.keyId, publicKey: jinu.publicKey, pqPublicKey: jinu.pqPublicKey, methods: jinu.methods, stores: { files: own } } } });
 	assert.equal(saved.status, 200);
 	await api(dev.base, "POST", "/api/v1/family/members", { body: { id: "sora", name: "Sora", role: "analyst", emails: ["sora@family.test"] } });
-
-	const browser = await chromium.launch({ headless: true });
 
 	// ── 0. The headers are DELIVERED (they were promised for 22 commits and
 	// never sent: static assets bypass the Worker) ─────────────────────────

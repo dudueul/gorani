@@ -46,6 +46,18 @@ pub enum Registration {
 	Plain { why: String },
 }
 
+/// A path as WinRT's StorageFolder and StorageFile take it: without the
+/// `\\?\` verbatim prefix `canonicalize` gives (found in CI: with it, the
+/// shell answers "the specified path is invalid", 0x800700A1).
+fn plain(p: &Path) -> HSTRING {
+	let s = p.to_string_lossy();
+	let s = match s.strip_prefix(r"\\?\UNC\") {
+		Some(rest) => format!(r"\\{rest}"),
+		None => s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
+	};
+	HSTRING::from(s)
+}
+
 fn text(e: windows::core::Error) -> String {
 	format!("{} (0x{:08x})", e.message(), e.code().0)
 }
@@ -93,13 +105,18 @@ pub fn register(root: &Path, area: &str, read_only: bool) -> Registration {
 	}
 }
 
+/// Whether this Windows registers sync roots with the shell at all.
+pub fn supported() -> bool {
+	StorageProviderSyncRootManager::IsSupported().unwrap_or(false)
+}
+
 fn register_shell(root: &Path, area: &str, read_only: bool) -> Result<String, String> {
-	if !StorageProviderSyncRootManager::IsSupported().unwrap_or(false) {
+	if !supported() {
 		return Err("this Windows has no shell sync-root support".into());
 	}
 	let id = sync_root_id(area)?;
 	let info = StorageProviderSyncRootInfo::new().map_err(text)?;
-	let folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(root)).and_then(|op| op.get()).map_err(text)?;
+	let folder = StorageFolder::GetFolderFromPathAsync(&plain(root)).and_then(|op| op.get()).map_err(text)?;
 	let name = if read_only { format!("Gorani — {area} (read-only)") } else { format!("Gorani — {area}") };
 	let defs = StorageProviderItemPropertyDefinition::new().map_err(text)?;
 	defs.SetId(SAMPLE_STATE).map_err(text)?;
@@ -129,7 +146,7 @@ fn register_shell(root: &Path, area: &str, read_only: bool) -> Result<String, St
 
 /// The shell's id for the folder, if the shell registered it (ours).
 pub fn registered_id(root: &Path) -> Option<String> {
-	let folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(root)).and_then(|op| op.get()).ok()?;
+	let folder = StorageFolder::GetFolderFromPathAsync(&plain(root)).and_then(|op| op.get()).ok()?;
 	let id = StorageProviderSyncRootManager::GetSyncRootInformationForFolder(&folder).and_then(|i| i.Id()).ok()?.to_string();
 	id.starts_with("Gorani!").then_some(id)
 }
@@ -146,7 +163,7 @@ pub fn unregister(root: &Path) -> Result<(), String> {
 /// Show a malware sample's state beside its name. (Written through the
 /// shell's property store; the caller marks the placeholder in sync after.)
 pub fn mark_sample(path: &Path) -> Result<(), String> {
-	let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path)).and_then(|op| op.get()).map_err(text)?;
+	let file = StorageFile::GetFileFromPathAsync(&plain(path)).and_then(|op| op.get()).map_err(text)?;
 	let state = StorageProviderItemProperty::new().map_err(text)?;
 	state.SetId(SAMPLE_STATE).map_err(text)?;
 	state.SetValue(&HSTRING::from("Malware sample — never opened raw")).map_err(text)?;

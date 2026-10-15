@@ -96,7 +96,11 @@ fn a_cloud_files_folder_over_the_replica() {
 			eprintln!("Explorer knows the folder as {id}");
 			assert!(id.ends_with("!ana"), "named for the area: {id}");
 		}
-		None => eprintln!("the shell did not register the folder here — cldapi's sync root only (the start said why)"),
+		None => {
+			// (Only a Windows without the shell's support may fall back.)
+			assert!(!shell::supported(), "the shell supports sync roots here, yet did not register the folder (the start said why)");
+			eprintln!("this Windows has no shell sync-root support — cldapi's sync root only");
+		}
 	}
 
 	// 1. Listed, sized, identified — nothing fetched yet.

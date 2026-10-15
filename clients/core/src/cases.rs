@@ -59,6 +59,9 @@ pub struct CaseRow {
 	/// The caller's own grant — None for a lead's or auditor's structure view.
 	#[serde(default)]
 	pub grant: Option<CaseGrant>,
+	/// The case's inbox keys (commit 37b, inbox.rs): what collectors seal to.
+	#[serde(default)]
+	pub inbox_keys: Vec<crate::inbox::InboxKeyRow>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

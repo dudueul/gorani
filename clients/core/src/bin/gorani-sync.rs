@@ -14,6 +14,12 @@
 //!        --method M --collected-at T      (where it came from, who collected it, how, when)
 //!        --notes X]
 //!
+//! inbox  --case C                        what collectors dropped into case C, each opened
+//!                                        with the inbox key and judged (commit 37c)
+//! accept --case C --item I [--name N]    file a VERIFIED item: its bytes re-read and checked,
+//!                                        your signed hash and intake, the collector's record kept
+//! reject --case C --item I --reason R    turn it away (the reason sealed)
+//!
 //! collector init --server S --id I       a COLLECTOR on this machine (commit 37b,
 //!       --pins ana:FP,bo:FP              docs/COLLECTORS.md): its identity key, sealed under
 //!       [--access-id ID]                 the TPM/keyring; prints what the leads register.
@@ -31,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use gorani_client_core::area::{self, open_area, open_team, Area};
 use gorani_client_core::cases::{self, CaseRow, HashCheck, IntakeFields};
-use gorani_client_core::{api, devicekey, session, transfer, DeviceProfile, Error, Session};
+use gorani_client_core::{api, devicekey, inbox, session, transfer, DeviceProfile, Error, Session};
 use gorani_formats::formats::VaultPrivateKey;
 use gorani_formats::placed::{self, Place};
 
@@ -302,6 +308,47 @@ fn run(args: &[String]) -> Result<(), Error> {
 				}
 			}
 		}
+		// ── A case's inbox (commit 37c, inbox.rs) ──
+		Some(cmd @ ("inbox" | "accept" | "reject")) => {
+			let (profile, sess) = unlocked(&flag)?;
+			let member = profile.member.clone();
+			let client = api::Client::new(profile);
+			let case = req_flag("case")?;
+			let area = open_area(&client, &sess, &member, Some(&case))?;
+			let client = client.in_area(&area.name);
+			let keys = inbox::open_inbox_keys(&area)?;
+			let trust = &area.team.as_ref().ok_or(Error::Config("your vault needs its identity".into()))?.1;
+			let collectors: Vec<inbox::CollectorRow> = serde_json::from_value(client.team_get("family/collectors")?["collectors"].clone()).map_err(|e| Error::Config(format!("collectors: {e}")))?;
+			let items: Vec<inbox::InboxItem> = serde_json::from_value(client.inbox()?["items"].clone()).map_err(|e| Error::Config(format!("inbox: {e}")))?;
+			if cmd == "inbox" {
+				for item in &items {
+					let (name, verdict) = match inbox::open_item(&keys, &case, item, trust, &collectors) {
+						Ok(o) => (o.meta.name.clone(), o.problem.map(|p| format!("⚠ unverified: {p}")).unwrap_or_else(|| "✓ signed by its collector".into())),
+						Err(e) => (item.id.clone(), format!("⚠ does not open: {e}")),
+					};
+					println!("{}	{}	{} bytes	from {}	{}	{verdict}", item.id, name, item.size, item.collector, item.status);
+				}
+				return Ok(());
+			}
+			let id = req_flag("item")?;
+			let item = items.iter().find(|i| i.id == id).ok_or_else(|| Error::Config(format!("no item {id} in {case}'s inbox")))?;
+			if item.status != "waiting" {
+				return Err(Error::Config(format!("item {id} was already {}", item.status)));
+			}
+			if cmd == "reject" {
+				let r = inbox::reject(&client, &area, &id, &req_flag("reason")?)?;
+				println!("rejected {id}{}", if r["objectKept"] == true { " (an evidence case keeps the object — write-once)" } else { " (its bytes deleted)" });
+				return Ok(());
+			}
+			let opened = inbox::open_item(&keys, &case, item, trust, &collectors)?;
+			if let Some(p) = &opened.problem {
+				return Err(Error::Config(format!("refusing to accept an item that is not verified: {p}")));
+			}
+			let key = gorani_formats::formats::import_content_key(&opened.content_key);
+			let (sha256, size) = inbox::hash_item(&client, item, &key, |_| Ok(()))?;
+			let r = inbox::accept(&client, &area, item, &opened, (&sha256, size), flag("name").as_deref())?;
+			println!("accepted {id} as file {} — SHA-256 {sha256}, signed by {} (collected) and {} (accepted)", r["file"]["id"].as_str().unwrap_or("?"), item.collector, member);
+		}
 		Some("push") => {
 			let (profile, sess) = unlocked(&flag)?;
 			let path = req_flag("file")?;
@@ -380,7 +427,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified]");
+			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified]");
 			std::process::exit(2);
 		}
 	}

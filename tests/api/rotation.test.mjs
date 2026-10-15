@@ -84,7 +84,7 @@ try {
 	const b = await storeSealer(storeB.bundle, "jinu");
 	const privB = b.priv;
 	const report = await resealStore(call, "jinu", privA, privB);
-	assert.deepEqual(report.resealed, { version: 2, file: 1, folder: 1, music: 1, share: 1, secrets: 1, hash: 1, intake: 0, custody: 0 }, "every kind, every row — older versions included (intake and custody live in evidence cases: api:custody walks them)");
+	assert.deepEqual(report.resealed, { version: 2, file: 1, folder: 1, music: 1, share: 1, secrets: 1, hash: 1, intake: 0, custody: 0, collection: 0, reject: 0 }, "every kind, every row — older versions included (intake and custody live in evidence cases: api:custody walks them; collection records and rejections in case inboxes: api:collect)");
 
 	// ── 2. The proof: the old key opens NOTHING; the new key everything ─
 	assert.equal(await opensAnything(call, "jinu", privA), 0, "the departed member's old store key opens nothing in the store");
@@ -101,7 +101,7 @@ try {
 
 	// ── 3. Idempotent, and the old form is gone ─────────────────────────
 	const again = await resealStore(call, "jinu", privA, privB);
-	assert.deepEqual(again.resealed, { version: 0, file: 0, folder: 0, music: 0, share: 0, secrets: 0, hash: 0, intake: 0, custody: 0 }, "a second walk re-seals nothing");
+	assert.deepEqual(again.resealed, { version: 0, file: 0, folder: 0, music: 0, share: 0, secrets: 0, hash: 0, intake: 0, custody: 0, collection: 0, reject: 0 }, "a second walk re-seals nothing");
 	assert.equal(again.alreadyNew.version, 2);
 	const oldForm = await api(dev.base, "PUT", "/api/v1/members/jinu/files/reseal", { email, body: { keys: { [fileId]: { ck: "GV03:x" } } } });
 	assert.equal(oldForm.status, 400, "the living-version-only reseal form is refused (clean break)");

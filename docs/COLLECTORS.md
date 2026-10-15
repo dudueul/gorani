@@ -3,7 +3,8 @@
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > Status: designed (decisions below, 2026-10-15); built in stages 37a–37d —
 > 37a landed (registry, the service-token path, Team › Collectors); 37b
-> landed (inbox keys, drops, the collector client).
+> landed (inbox keys, drops, the collector client); 37c landed (accept and
+> reject, in the web app and the CLI).
 
 ## The problem
 
@@ -169,6 +170,48 @@ is one two leads the MEMBER trusts registered (collectors.ts); its
 signature verifies over every field; the stamp imprint is over that
 signature; and, after decryption, the bytes hash to what it signed
 (`checkInboxContent`). Each failure is reported as what failed.
+
+## 37c as built
+
+```text
+accept   POST /api/v1/cases/<case>/inbox/<item>/accept   (write)
+         { fileId, name, type, ck, hash, stamp, intake, collection }
+reject   POST /api/v1/cases/<case>/inbox/<item>/reject   (write)   { reason }
+```
+
+- **Only a verified item is accepted** (`inbox.ts › acceptInboxItem`,
+  `clients/core/src/inbox.rs › accept`): the collector counted by the
+  accepting member, its signature over every field, the stamp over that
+  signature — and the bytes, re-read from the store and decrypted as they
+  stream, hashing to what it signed. What cannot be tied to a collector the
+  member trusts is turned away, not filed.
+- **The file is an ordinary evidence file**, with two signatures over the
+  same bytes: the accepter's content hash (and its timestamp imprint) and
+  intake record — whose `collector` is `collector:<id>`, its other fields
+  the collector's — and the collector's own record, sealed with the case
+  key into place `file.collection(area, file)` and returned by `files/keys`
+  as `collection` (`checkCollection` verifies it against the file's bytes).
+  The version points at the inbox object: nothing is copied, and the
+  store's own size and frame size are used, not the client's.
+- **Once.** The store claims the item before anything awaits — two people
+  accepting at once cannot make two files of one item — and releases the
+  claim if the file is refused (an evidence file without its hash or
+  intake, a closed case).
+- **Rejecting** seals the reason into place `inbox.reject(area, item)` (it
+  may name what the item is); an evidence case keeps the object
+  (write-once), a working case's is deleted.
+- Both new sealed values join the rotation walk (`files/sealed` kinds
+  `collection` and `reject`): a case-key rotation leaves nothing that opens
+  under the old key.
+- The decider is the Worker's word (`by`: the member id it authenticated),
+  not the client's. The store, as everywhere, checks shapes and policy and
+  verifies no signature: a writer COULD file an item their client would
+  call unverified — by sending a forged decision, under their own name, on
+  the case's trail. The client's checks are what stop honest mistakes; the
+  trail and both signatures are what make a dishonest one visible.
+- **Team › Cases › Inbox** lists each item with this member's verdict,
+  Accept (enabled only for a verified item) and Reject (asks for the
+  reason). The CLI: `gorani-sync inbox|accept|reject --case C`.
 
 ## Stages
 

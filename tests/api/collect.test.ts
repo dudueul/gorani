@@ -26,9 +26,16 @@
  *   6. an item id cannot be taken twice (the first item's bytes survive the
  *      attempt), a drop to a retired inbox key is refused, and a large file
  *      goes up as GC01 frames;
- *   7. a case-key rotation must carry every inbox key re-sealed (one short
- *      is refused), and the inbox still opens under the new key;
- *   8. a revoked collector's next drop is refused; the machine's own log
+ *   7. (37c) a member accepts only a verified item whose bytes hash to what
+ *      the collector signed — in the browser's code and in the CLI (Rust
+ *      signs, TS verifies) — and the file carries both signatures: the
+ *      accepter's content hash and intake, the collector's record beside
+ *      them; the bytes never move; an item is decided once; a rejection's
+ *      reason is sealed and an evidence case keeps the object;
+ *   8. a case-key rotation must carry every inbox key re-sealed (one short
+ *      is refused), and the inbox, the collection records and the
+ *      rejection reasons all move to the new key;
+ *   9. a revoked collector's next drop is refused; the machine's own log
  *      holds a line per drop.
  *
  * Skipped when the debug binary is not built (cargo build -p gorani-client-core).
@@ -42,12 +49,15 @@ import { fileURLToPath } from "node:url";
 import { suiteDev, api } from "./_dev.mjs";
 import { member, vouch, openCase, trustOf } from "../lib/team.mjs";
 import { approveCollector, requestCollector, type CollectorRow } from "../../web/src/vault/collectors.ts";
-import { checkInboxContent, createInboxKey, inboxStatements, openInboxItem, openInboxKeys, type InboxItem, type InboxKeyRow } from "../../web/src/vault/inbox.ts";
+import { acceptInboxItem, checkCollection, checkInboxContent, createInboxKey, hashInboxBytes, hashInboxContent, inboxStatements, openInboxItem, openInboxKeys, openRejectReason, type InboxItem, type InboxKeyRow } from "../../web/src/vault/inbox.ts";
+import { checkContentHash } from "../../web/src/vault/content-hash.ts";
+import { checkIntake } from "../../web/src/vault/intake.ts";
+import { places } from "../../web/src/vault/places.ts";
 import { openCaseKey, rotateCase, type CaseRow } from "../../web/src/vault/cases.ts";
 import { fingerprint, identityKeyId } from "../../web/src/vault/identity.ts";
 import { sha256Hex } from "../../web/src/vault/content-hash.ts";
 import { openChunked } from "../../web/src/vault/chunked-file.ts";
-import { importContentKey, newContentKey, openWith, sealText, sealWith, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { importContentKey, newContentKey, openWith, sealText, sealWith, unwrapPlacedKey, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const BIN = path.join(ROOT, "target/debug/gorani-sync");
@@ -67,8 +77,8 @@ const BASE = `/api/v1/cases/${CASE}`;
 const enc = new TextEncoder();
 
 /** Run the CLI (spawn, not spawnSync: this process may run the S3 stub). */
-function sync(args: string[]): Promise<{ status: number; out: string; stdout: string }> {
-	const c = spawn(BIN, [...args, "--profile", PROFILE], { cwd: ROOT, env: { ...process.env, HOME: home } });
+function sync(args: string[], profile = PROFILE): Promise<{ status: number; out: string; stdout: string }> {
+	const c = spawn(BIN, [...args, "--profile", profile], { cwd: ROOT, env: { ...process.env, HOME: home } });
 	let out = "";
 	let stdout = "";
 	c.stdout.on("data", (d) => {
@@ -161,6 +171,7 @@ try {
 		const item = (await inbox()).find((i) => i.id === id)!;
 		return { item, o: await openInboxItem(keys, CASE, item, await trustOf(dev, bo), await collectors()) };
 	};
+	const sealedOf = async (id: string) => new Uint8Array(await (await fetch(`${dev.base}${BASE}/inbox/${id}`, { headers: { "x-gorani-dev-email": bo.email } })).arrayBuffer());
 	let { item, o } = await opened(boCaseKey, first.item);
 	assert.equal(item.status, "waiting");
 	assert.equal(item.collector, "edr-1");
@@ -233,9 +244,75 @@ try {
 	assert.ok(item.chunk && item.chunk > 0);
 	const bigBack = await openChunked(o.contentKey, new Uint8Array(await (await fetch(`${dev.base}${BASE}/inbox/${second.item}`, { headers: { "x-gorani-dev-email": bo.email } })).arrayBuffer()), item.chunk!);
 	assert.equal(checkInboxContent(o, await sha256Hex(bigBack), bigBack.length), null, "the frames decrypt to what the collector signed");
+	const bigResp = await fetch(`${dev.base}${BASE}/inbox/${second.item}`, { headers: { "x-gorani-dev-email": bo.email } });
+	assert.deepEqual(await hashInboxContent(o, item, bigResp.body!), await hashInboxBytes(o, item.chunk, await sealedOf(second.item)), "streamed frame by frame = opened whole");
 	fs.rmSync(big);
 
-	// ── 7. A case-key rotation carries every inbox key ──────────────────
+	// ── 7. Deciding: accept (browser and CLI), reject ───────────────────
+	// bo accepts the first item in the browser's code: bytes re-read and
+	// hashed, bo's own signatures, the collector's record kept beside.
+	const boKeys = await openInboxKeys(boCaseKey, CASE, (await caseOf(bo)).inboxKeys as InboxKeyRow[]);
+	({ item, o } = await opened(boCaseKey, first.item));
+	const firstResp = await fetch(`${dev.base}${BASE}/inbox/${first.item}`, { headers: { "x-gorani-dev-email": bo.email } });
+	const content = await hashInboxContent(o, item, firstResp.body!);
+	assert.equal(content.sha256, first.sha256, "streamed and hashed (the browser's path)");
+	const unverified = (await opened(boCaseKey, "fake-sig")).o;
+	await assert.rejects(acceptInboxItem(call(bo), boCaseKey, boKeys, CASE, (await inbox()).find((i) => i.id === "fake-sig")!, unverified, content, bo.signer), /not verified: the collector's signature does not verify/, "an unverified item is not accepted");
+	await assert.rejects(acceptInboxItem(call(bo), boCaseKey, boKeys, CASE, item, o, { ...content, sha256: "0".repeat(64) }, bo.signer), /not what the collector signed/, "…nor bytes that differ from what it signed");
+	const acc = await acceptInboxItem<{ file: { id: string } }>(call(bo), boCaseKey, boKeys, CASE, item, o, content, bo.signer);
+	const fileId = acc.file.id;
+	assert.equal((await inbox()).find((i) => i.id === first.item)!.status, "accepted");
+	await assert.rejects(acceptInboxItem(call(bo), boCaseKey, boKeys, CASE, item, o, content, bo.signer), /409.*already decided/, "an item is decided once");
+	// The file is an ordinary evidence file now — read like one, with BOTH signatures.
+	const keysOf = async (id: string) => (await api(dev.base, "POST", `${BASE}/files/keys`, { email: ana.email, body: { ids: [id] } })).json.keys[id];
+	const k1 = await keysOf(fileId);
+	const fileBytes = await (await fetch(`${dev.base}${BASE}/files/${fileId}`, { headers: { "x-gorani-dev-email": ana.email } })).arrayBuffer();
+	const fileKey = await unwrapPlacedKey(anaCaseKey, places.fileKey(`case:${CASE}`, fileId, 1), k1.key);
+	assert.deepEqual(await openWith(fileKey, new Uint8Array(fileBytes)), plain, "the bytes did not move; the file opens them with the case key");
+	const anaTrust = await trustOf(dev, ana);
+	const hashCheck = await checkContentHash(anaCaseKey, anaTrust, `case:${CASE}`, fileId, 1, k1.hash, { sha256: first.sha256, size: first.size });
+	assert.equal(hashCheck.status, "verified");
+	assert.equal((hashCheck as { signer: string }).signer, "bo", "the person who accepted signed the content hash");
+	const intake = await checkIntake(anaCaseKey, anaTrust, `case:${CASE}`, fileId, k1.intake);
+	assert.equal(intake.status, "verified");
+	assert.equal((intake as { record: { collector: string; source: string } }).record.collector, "collector:edr-1", "the intake names the collector");
+	const col = await checkCollection(anaCaseKey, CASE, fileId, k1.collection, anaTrust, await collectors(), { sha256: first.sha256, size: first.size });
+	assert.equal(col.problem, null, `the collector's record verifies for ana too: ${col.problem}`);
+	assert.equal(col.record.acceptedBy, "bo");
+	assert.match((await checkCollection(anaCaseKey, CASE, fileId, k1.collection, anaTrust, await collectors(), { sha256: "1".repeat(64), size: first.size })).problem ?? "", /not the bytes the collector signed/);
+	// The CLI, as dan: lists the inbox with its own verdicts, refuses the
+	// unverified, accepts the large item (streamed and hashed frame by frame),
+	// rejects the moved record with a sealed reason.
+	const danProfile = path.join(home, "dan.json");
+	const asDan = (args: string[]) => sync([...args, "--secret", dan.recoveryCode, "--dev-email", dan.email], danProfile);
+	assert.equal((await sync(["setup", "--server", dev.base, "--member", "dan", "--name", "dan's workstation", "--secret", dan.recoveryCode, "--device-secret", "d".repeat(64), "--dev-email", dan.email], danProfile)).status, 0);
+	const listed = await asDan(["inbox", "--case", CASE]);
+	assert.equal(listed.status, 0, listed.out);
+	assert.match(listed.out, new RegExp(`${second.item}\tdisk.img\t${49 * 1024 * 1024} bytes\tfrom edr-1\twaiting\t✓ signed by its collector`));
+	assert.match(listed.out, /fake-sig	.*⚠ unverified: the collector's signature does not verify/);
+	assert.match(listed.out, new RegExp(`${first.item}\ttriage.zip\t.*accepted`));
+	assert.match((await asDan(["accept", "--case", CASE, "--item", "fake-sig"])).out, /refusing to accept an item that is not verified/);
+	const cliAccept = await asDan(["accept", "--case", CASE, "--item", second.item, "--name", "WS-0412 disk.img"]);
+	assert.equal(cliAccept.status, 0, cliAccept.out);
+	const cliFile = cliAccept.out.match(/as file (\S+)/)![1];
+	const k2 = await keysOf(cliFile);
+	assert.ok(k2.chunk > 0, "a framed item stays framed");
+	const col2 = await checkCollection(anaCaseKey, CASE, cliFile, k2.collection, anaTrust, await collectors());
+	assert.equal(col2.problem, null, `Rust sealed the collector's record, TS verifies it: ${col2.problem}`);
+	assert.equal(col2.record.acceptedBy, "dan");
+	assert.equal((await checkContentHash(anaCaseKey, anaTrust, `case:${CASE}`, cliFile, 1, k2.hash, { sha256: col2.record.meta.sha256, size: col2.record.meta.size })).status, "verified", "dan's content hash, signed in Rust, verifies in TS");
+	const rejected = await asDan(["reject", "--case", CASE, "--item", "moved-record", "--reason", "a record lifted from another item"]);
+	assert.equal(rejected.status, 0, rejected.out);
+	assert.match(rejected.out, /keeps the object/, "an evidence case keeps a rejected object");
+	const rej = (await inbox()).find((i) => i.id === "moved-record")!;
+	assert.equal(rej.status, "rejected");
+	assert.match(rej.rejected!.reason, /^GV04:/, "the reason is sealed");
+	assert.equal(await openRejectReason(boCaseKey, CASE, "moved-record", rej.rejected!.reason), "a record lifted from another item");
+	assert.match((await asDan(["reject", "--case", CASE, "--item", "moved-record", "--reason", "again"])).out, /already rejected/);
+	const trail = JSON.stringify((await api(dev.base, "GET", `${BASE}/audit`, { email: ana.email })).json);
+	for (const ev of ["inbox.receive", "inbox.accept", "inbox.reject"]) assert.ok(trail.includes(ev), `${ev} is on the case's trail`);
+
+	// ── 8. A case-key rotation carries every inbox key ──────────────────
 	const c = await caseOf(ana);
 	const roots = await Promise.all(c.grantees.map(async (g) => (await api(dev.base, "GET", `/api/v1/members/${g.member}/root`, { email: ana.email })).json));
 	await assert.rejects(rotateCase(call(ana), ana.root, { ...c, inboxKeys: c.inboxKeys!.slice(1) }, roots, ana.signer, await trustOf(dev, ana)), /409.*inbox key/, "one inbox key short is refused");
@@ -243,15 +320,18 @@ try {
 	const boNewKey = await openCaseKey(bo.root, await caseOf(bo), await trustOf(dev, bo));
 	assert.equal((await opened(boNewKey, first.item)).o.problem, null, "the first item opens under the new case key");
 	await assert.rejects(opened(boCaseKey, first.item), "…and no longer under the old one");
+	const k1new = await keysOf(fileId);
+	assert.equal((await checkCollection(boNewKey, CASE, fileId, k1new.collection, await trustOf(dev, bo), await collectors())).problem, null, "the collection record moved to the new key");
+	assert.equal(await openRejectReason(boNewKey, CASE, "moved-record", (await inbox()).find((i) => i.id === "moved-record")!.rejected!.reason), "a record lifted from another item", "…and the rejection's reason");
 
-	// ── 8. Revoked: the next drop is refused; the machine kept a log ─────
+	// ── 9. Revoked: the next drop is refused; the machine kept a log ─────
 	assert.equal((await api(dev.base, "DELETE", "/api/v1/family/collectors/edr-1", { email: cy.email })).status, 200);
 	assert.match((await collect(evidence)).out, /403.*not a registered, active collector/);
 	const log = fs.readFileSync(path.join(home, "collector.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
 	assert.deepEqual(log.map((l) => l.item), [first.item, second.item], "a line per drop, nothing for refusals");
 	assert.equal(log[0].sha256, first.sha256);
 
-	console.log("ok    api:collect (init + two-lead registration, pins decide the inbox key, sealed + signed drops verified by members, forgeries named, retired keys, frames, rotation, revocation)");
+	console.log("ok    api:collect (init + two-lead registration, pins decide the inbox key, sealed + signed drops verified by members, forgeries named, retired keys, frames, accept in browser and CLI with both signatures, sealed rejections, rotation, revocation)");
 } finally {
 	await dev.close();
 }

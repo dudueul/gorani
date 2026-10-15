@@ -329,6 +329,11 @@ pub const MIGRATIONS: &[&str] = &[
 		rejected_by TEXT,
 		reject_reason TEXT
 	)",
+	// Migration v17 (commit 37c, inbox.rs › inbox_accept): an accepted item's
+	// collection record — the collector's signed fields, sealed with the case
+	// key into place file.collection(area, file), kept beside the file so the
+	// collector's signature travels with it (exports, docs/COLLECTORS.md).
+	"ALTER TABLE files ADD COLUMN collection_sealed TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -522,10 +527,13 @@ impl GoraniMemberDO {
 			}
 		}
 		// Collected evidence is write-once from receipt (commit 37b): the
-		// inbox objects of an evidence case are locked the same way.
+		// inbox objects of an evidence case are locked the same way — all but
+		// an item ACCEPTED before its lock (commit 37c): its object is now a
+		// version's, locked above until a later date, and COMPLIANCE refuses
+		// a shorter retention on an object (the pass would fail every night).
 		let items: Vec<Unlocked> = self
 			.sql
-			.exec(&format!("SELECT id AS file_id, 0 AS version, object_key, strftime('%Y-%m-%dT%H:%M:%SZ', received_at, '+{days} days') AS until FROM inbox_items WHERE locked_until IS NULL ORDER BY received_at LIMIT 100"), None)?
+			.exec(&format!("SELECT id AS file_id, 0 AS version, object_key, strftime('%Y-%m-%dT%H:%M:%SZ', received_at, '+{days} days') AS until FROM inbox_items WHERE locked_until IS NULL AND accepted_file IS NULL ORDER BY received_at LIMIT 100"), None)?
 			.to_array()?;
 		for r in items {
 			match crate::s3::put_retention(&self.env, &r.object_key, &r.until).await {
@@ -543,7 +551,7 @@ impl GoraniMemberDO {
 				}
 			}
 		}
-		report.pending = self.sql.exec("SELECT (SELECT COUNT(*) FROM file_versions WHERE locked_until IS NULL) + (SELECT COUNT(*) FROM inbox_items WHERE locked_until IS NULL) AS n", None)?.one::<crate::files_store::TotalCount>()?.n as u64;
+		report.pending = self.sql.exec("SELECT (SELECT COUNT(*) FROM file_versions WHERE locked_until IS NULL) + (SELECT COUNT(*) FROM inbox_items WHERE locked_until IS NULL AND accepted_file IS NULL) AS n", None)?.one::<crate::files_store::TotalCount>()?.n as u64;
 		Ok(report)
 	}
 }
@@ -812,6 +820,14 @@ impl GoraniMemberDO {
 				self.inbox_receive(&actor, body).await
 			}
 			("GET", "inbox/list") => self.inbox_list().await,
+			("POST", id) if id.starts_with("inbox/accept/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.inbox_accept(&actor, &id["inbox/accept/".len()..], body).await
+			}
+			("POST", id) if id.starts_with("inbox/reject/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.inbox_reject(&actor, &id["inbox/reject/".len()..], body).await
+			}
 			("GET", id) if id.starts_with("inbox-object/") => {
 				let q = crate::files_store::urlquery(req.url()?.query().unwrap_or(""));
 				self.inbox_object(&id["inbox-object/".len()..], &actor, q.get("client").map(String::as_str)).await

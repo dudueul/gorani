@@ -121,13 +121,13 @@ pub fn fingerprint(key_id: &str) -> String {
 	key_id.chars().take(32).collect::<Vec<_>>().chunks(4).map(|c| c.iter().collect::<String>().to_uppercase()).collect::<Vec<_>>().join(" ")
 }
 
-fn verifying_key(public_key: &Jwk) -> Result<VerifyingKey, Error> {
+pub(crate) fn verifying_key(public_key: &Jwk) -> Result<VerifyingKey, Error> {
 	// from_sec1_bytes checks the point is on the curve — a JWK that is not
 	// a real P-256 key never becomes a verifier.
 	VerifyingKey::from_sec1_bytes(&ec_raw_of_jwk(public_key)?).map_err(|_| Error::Format("not a P-256 public key"))
 }
 
-fn verify_with(key: &VerifyingKey, statement: &[u8], signature_b64: &str) -> bool {
+pub(crate) fn verify_with(key: &VerifyingKey, statement: &[u8], signature_b64: &str) -> bool {
 	let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(signature_b64) else { return false };
 	// P1363 only (64 bytes): WebCrypto's encoding. A DER signature is refused
 	// here exactly as the browser refuses it.

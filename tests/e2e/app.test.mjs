@@ -15,7 +15,9 @@
 import assert from "node:assert/strict";
 import { startDev, api } from "../api/_dev.mjs";
 import { createCodeVault, createVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
-import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith, sealText, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { inboxStatements } from "../../web/src/vault/inbox.ts";
+import { sha256Hex } from "../../web/src/vault/content-hash.ts";
 import { storeSealer } from "../lib/placed.mjs";
 import { member, pinIdentity, trustOf } from "../lib/team.mjs";
 import { approveCollector } from "../../web/src/vault/collectors.ts";
@@ -552,6 +554,32 @@ try {
 		await page.getByRole("button", { name: "Collectors" }).click();
 		await page.locator('[data-test="collector-verdict-edr-e2e"]').filter({ hasText: "ana, who approved it" }).waitFor({ timeout: 30_000 });
 		assert.match(await page.locator('[data-test="collector-verdict-edr-e2e"]').textContent(), /⚠ not counted: ana, who approved it, is not an identity you verified/, "active, but not counted by a member who never verified its approver");
+		// Its drop (commit 37c), signed with the collector's key and sealed to
+		// the case's inbox key: mom's inbox lists it, says why SHE does not
+		// believe it (and offers no Accept), and turns it away with a reason.
+		assert.equal((await api(dev.base, "PUT", "/api/v1/cases/ir-e2e/collectors/edr-e2e", { email: "mom@family.test" })).status, 200);
+		const ik = (await api(dev.base, "GET", "/api/v1/cases", { email: "mom@family.test" })).json.cases.find((c) => c.id === "ir-e2e").inboxKeys[0];
+		const dropped = new TextEncoder().encode("collected by a machine mom has not verified");
+		const dck = newContentKey();
+		const dm = { case: "ir-e2e", item: "e2e-drop", collector: "edr-e2e", name: "triage.txt", type: "text/plain", size: dropped.length, sha256: await sha256Hex(dropped), source: "WS-1", method: "script", collectedAt: "2026-10-15T09:00:00Z", notes: "" };
+		const dsig = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, cpair.privateKey, inboxStatements.collect(dm)))));
+		const dform = new FormData();
+		for (const [k, v] of Object.entries({ item_id: "e2e-drop", inbox_key_id: ik.keyId, size: String(dropped.length), ck: await wrapContentKey(ik.publicKey, dck), meta: await sealText(ik.publicKey, JSON.stringify({ ...dm, signature: dsig })) })) dform.append(k, v);
+		dform.append("file", new Blob([await sealWith(await importContentKey(dck), dropped)]));
+		const drop = await fetch(`${dev.base}/api/v1/collect/cases/ir-e2e/items`, { method: "POST", headers: { "x-gorani-dev-collector": "e2e0000.access" }, body: dform });
+		assert.equal(drop.status, 200, await drop.text());
+		await page.getByRole("button", { name: "Cases" }).click();
+		await page.locator('[data-test="inbox-show-ir-e2e"]').click();
+		const dv = page.locator('[data-test="inbox-verdict-e2e-drop"]');
+		await dv.waitFor({ timeout: 30_000 });
+		assert.match(await dv.textContent(), /⚠ unverified: collector edr-e2e is not one you count/, "mom does not count the collector, so she does not count its item");
+		assert.equal(await page.locator('[data-test="inbox-accept-e2e-drop"]').isDisabled(), true, "no accepting what you cannot tie to a collector you trust");
+		page.once("dialog", (d) => void d.accept("not a collector we verified"));
+		await page.locator('[data-test="inbox-reject-e2e-drop"]').click();
+		await page.locator('[data-test="inbox-item-e2e-drop"]').filter({ hasText: "rejected" }).waitFor({ timeout: 30_000 });
+		const rejectedRow = (await api(dev.base, "GET", "/api/v1/cases/ir-e2e/inbox", { email: "mom@family.test" })).json.items.find((i) => i.id === "e2e-drop");
+		assert.equal(rejectedRow.status, "rejected");
+		assert.match(rejectedRow.rejected.reason, /^GV04:/, "the reason went sealed");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
 		await ctx.close();
 	}

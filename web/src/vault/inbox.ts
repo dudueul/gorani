@@ -41,11 +41,14 @@
 
 import { createStoreKey } from "./keys.ts";
 import { checkRecordMatches } from "./records.ts";
-import { places } from "./places.ts";
+import { newItemId, places } from "./places.ts";
 import { hybridDigest, stmt, type Signer, type Trust } from "./identity.ts";
 import { collectorTrust, type CollectorRow } from "./collectors.ts";
 import { stampImprint } from "./timestamp.ts";
-import { importVaultKey, openPlacedText, openSealedText, sealPlacedText, unwrapContentKey, type VaultPrivateKey } from "./vault-crypto.ts";
+import { sha256Stream, signContentHashStamped } from "./content-hash.ts";
+import { signIntake } from "./intake.ts";
+import { openChunked, openChunkedStream, sealedSize } from "./chunked-file.ts";
+import { importVaultKey, openPlacedText, openSealedText, openWith, sealPlacedText, unwrapContentKey, wrapPlacedKey, type VaultPrivateKey } from "./vault-crypto.ts";
 import { fromBase64, toBase64 } from "../lib/encoding.ts";
 import { caseArea } from "../lib/area.ts";
 
@@ -219,4 +222,115 @@ export async function openInboxKeys(caseKey: VaultPrivateKey, caseId: string, ke
 	const out = new Map<string, VaultPrivateKey>();
 	for (const k of keys) out.set(k.keyId, await openInboxKey(caseKey, caseId, k));
 	return out;
+}
+
+// ── deciding an item (commit 37c) ─────────────────────────────────────
+
+/**
+ * Decrypt an item's bytes as they arrive and hash them — never held whole
+ * when framed (a 255 GiB disk image streams through). `body` is the
+ * response of `GET …/inbox/<item>`. The frame count comes from the item's
+ * own size and frame size, not from a Content-Length header: a streamed
+ * response may carry none, and a frame boundary must not hang on one.
+ */
+export async function hashInboxContent(opened: OpenedItem, item: Pick<InboxItem, "size" | "chunk">, body: ReadableStream<Uint8Array>, sink?: (plain: Uint8Array) => Promise<void> | void): Promise<{ sha256: string; size: number }> {
+	const chunk = item.chunk;
+	const h = await sha256Stream();
+	let size = 0;
+	const feed = async (p: Uint8Array) => {
+		h.update(p);
+		size += p.length;
+		if (sink) await sink(p);
+	};
+	if (chunk) await openChunkedStream(opened.contentKey, body, chunk, sealedSize(item.size, chunk), feed);
+	else await feed(await openWith(opened.contentKey, new Uint8Array(await new Response(body).arrayBuffer())));
+	return { sha256: h.hex(), size };
+}
+
+/** (The same over bytes in memory — a test's, a small item's.) */
+export async function hashInboxBytes(opened: OpenedItem, chunk: number | null, sealed: Uint8Array): Promise<{ sha256: string; size: number }> {
+	const plain = chunk ? await openChunked(opened.contentKey, sealed, chunk) : await openWith(opened.contentKey, sealed);
+	const h = await sha256Stream();
+	h.update(plain);
+	return { sha256: h.hex(), size: plain.length };
+}
+
+/** What `file.collection(area, file)` holds: the collector's word, kept whole. */
+export interface CollectionRecord {
+	v: 1;
+	item: string;
+	collector: string;
+	inboxKeyId: string;
+	receivedAt: string;
+	/** The RFC 3161 token over SHA-256(the collector's signature), when the store had one. */
+	stamp: { imprint: string | null; token: string | null; at: string | null };
+	meta: CollectMeta;
+	acceptedBy: string;
+}
+
+/**
+ * Accept an item into the case as a NEW file — the body of `POST
+ * …/inbox/<item>/accept`, sent. Only a VERIFIED item whose bytes were
+ * checked (`content`, from `hashInboxContent`) is accepted: a person files
+ * what they could tie to a collector they trust, and turns the rest away.
+ *
+ * What the file carries is what a person's upload carries — name, type and
+ * content key placed with the case key, THEIR signed content hash (with
+ * its timestamp imprint) and a signed intake record repeating the
+ * collector's fields — plus the collector's record, placed beside it. Two
+ * signatures over the same bytes: the machine that collected them and the
+ * person who accepted them. The bytes stay where they landed.
+ */
+export async function acceptInboxItem<T>(call: InboxCall, caseKey: VaultPrivateKey, inboxKeys: Map<string, VaultPrivateKey>, caseId: string, item: InboxItem, opened: OpenedItem, content: { sha256: string; size: number }, signer: Signer, opts: { name?: string; folderId?: string } = {}): Promise<T> {
+	if (opened.problem) throw new Error(`refusing to accept an item that is not verified: ${opened.problem}`);
+	const bad = checkInboxContent(opened, content.sha256, content.size);
+	if (bad) throw new Error(`refusing to accept it: ${bad}`);
+	const inboxKey = inboxKeys.get(item.inboxKeyId);
+	if (!inboxKey) throw new Error(`no inbox key ${item.inboxKeyId}`);
+	const area = caseArea(caseId);
+	const file = newItemId();
+	const m = opened.meta;
+	const raw = fromBase64(await openSealedText(inboxKey, item.ck));
+	const record: CollectionRecord = { v: 1, item: item.id, collector: item.collector, inboxKeyId: item.inboxKeyId, receivedAt: item.receivedAt, stamp: item.stamp, meta: m, acceptedBy: signer.member };
+	const hash = await signContentHashStamped(signer, caseKey, area, file, 1, content.sha256, content.size);
+	const body = {
+		fileId: file,
+		name: await sealPlacedText(caseKey, places.fileName(area, file), opts.name ?? m.name),
+		type: await sealPlacedText(caseKey, places.fileType(area, file, 1), m.type || "application/octet-stream"),
+		ck: await wrapPlacedKey(caseKey, places.fileKey(area, file, 1), raw),
+		hash: hash.sealed,
+		stamp: hash.stamp,
+		intake: await signIntake(signer, caseKey, area, file, { source: m.source, collector: `collector:${m.collector}`, method: m.method, collectedAt: m.collectedAt, notes: m.notes }),
+		collection: await sealPlacedText(caseKey, places.fileCollection(area, file), JSON.stringify(record)),
+		...(opts.folderId ? { folderId: opts.folderId } : {}),
+	};
+	raw.fill(0);
+	return call<T>("POST", `/api/v1/cases/${caseId}/inbox/${item.id}/accept`, body);
+}
+
+/** Turn an item away, saying why — the reason sealed (it may name what the item is). */
+export async function rejectInboxItem<T>(call: InboxCall, caseKey: VaultPrivateKey, caseId: string, itemId: string, reason: string): Promise<T> {
+	if (!reason.trim()) throw new Error("a rejection says why");
+	return call<T>("POST", `/api/v1/cases/${caseId}/inbox/${itemId}/reject`, { reason: await sealPlacedText(caseKey, places.inboxReject(caseArea(caseId), itemId), reason.trim()) });
+}
+
+/** A rejection's reason, opened in its place. */
+export function openRejectReason(caseKey: VaultPrivateKey, caseId: string, itemId: string, sealed: string): Promise<string> {
+	return openPlacedText(caseKey, places.inboxReject(caseArea(caseId), itemId), sealed);
+}
+
+/**
+ * A file's collection record, opened in its place and checked: the
+ * collector this member counts signed exactly these fields for this case,
+ * and they vouch for THESE bytes (`content`: the file's verified SHA-256
+ * and size). The file's own content hash names the person who accepted it;
+ * this names the machine that collected it.
+ */
+export async function checkCollection(caseKey: VaultPrivateKey, caseId: string, file: string, sealed: string, trust: Trust, collectors: CollectorRow[], content?: { sha256: string; size: number }): Promise<{ record: CollectionRecord; problem: string | null }> {
+	const record = JSON.parse(await openPlacedText(caseKey, places.fileCollection(caseArea(caseId), file), sealed)) as CollectionRecord;
+	const m = record.meta;
+	const asItem = { id: record.item, collector: record.collector, size: m.size, stamp: record.stamp } as InboxItem;
+	let problem = await itemProblem(caseId, asItem, m, trust, collectors);
+	if (!problem && content && (content.sha256 !== m.sha256 || content.size !== m.size)) problem = "the file is not the bytes the collector signed";
+	return { record, problem };
 }

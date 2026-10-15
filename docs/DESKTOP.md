@@ -333,6 +333,13 @@ gorani-sync collect --case ir-2026-014 --file triage.zip \
     --source WS-0412 --method "EDR live response" --collected-at 2026-10-15T08:30:00Z
 ```
 
+A member decides what landed (commit 37c): `gorani-sync inbox --case C`
+lists each item with this member's own verdict; `accept --case C --item I
+[--name N]` re-reads and hashes the bytes (frame by frame), refuses an
+unverified item, and files it with the member's signed hash and intake and
+the collector's record; `reject --case C --item I --reason R` seals the
+reason.
+
 The device-secret machinery is commit 34's, reused: the identity key and the
 service token's secret are sealed under a key from the device secret (TPM
 and/or keyring), the profile — pins included — MAC'd under another. The

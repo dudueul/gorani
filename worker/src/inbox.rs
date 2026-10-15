@@ -103,6 +103,78 @@ impl GoraniMemberDO {
 	}
 }
 
+impl GoraniMemberDO {
+	/// `POST inbox/accept/<item> { fileId, by, name, type, ck, hash, stamp,
+	/// intake, collection, folderId? }` — a person files an item (commit 37c,
+	/// docs/COLLECTORS.md › accept). The client opened it with the inbox key,
+	/// checked the collector's signature and the bytes, and now sends what a
+	/// NEW file's upload sends — name, type and content key placed with the
+	/// case key, their own signed content hash and intake — plus the
+	/// collector's record, placed as `file.collection(area, file)`.
+	///
+	/// The bytes do not move: the version points at the inbox object, whose
+	/// size and frame size are the store's own count, not the client's.
+	pub(crate) async fn inbox_accept(&self, actor: &str, item: &str, body: serde_json::Value) -> Result<Response> {
+		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+		let Some(collection) = get("collection").filter(|c| gorani_formats::placed::is_placed_text(c)) else {
+			return json_error(400, "collection: the collector's record, sealed into its place (GV04)");
+		};
+		let Some(file_id) = get("fileId").filter(|f| crate::auth::valid_object_id(f)) else { return json_error(400, "fileId: the new file's id, chosen by the client") };
+		let by = get("by").unwrap_or_default();
+		let rows: Vec<InboxRow> = self.sql.exec(&format!("SELECT {ROW} FROM inbox_items WHERE id = ?1"), Some(vec![item.into()]))?.to_array()?;
+		let Some(r) = rows.into_iter().next() else { return json_error(404, "no such inbox item") };
+		if r.accepted_at.is_some() || r.rejected_at.is_some() {
+			return json_error(409, "this item was already decided — accepted or rejected, once");
+		}
+		// Claim it before anything awaits: two people accepting at once must
+		// not make two files of one item. (The SELECT above and this UPDATE
+		// run with no await between them — nothing interleaves.)
+		self.sql.exec(
+			"UPDATE inbox_items SET accepted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), accepted_by = ?1, accepted_file = ?2 WHERE id = ?3 AND accepted_at IS NULL AND rejected_at IS NULL",
+			Some(vec![by.clone().into(), file_id.clone().into(), item.into()]),
+		)?;
+		let mut file = body.clone();
+		file["id"] = file_id.clone().into();
+		file["objectKey"] = r.object_key.clone().into();
+		file["size"] = r.size.into();
+		file["chunkSize"] = r.chunk_size.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+		// (The Worker checked the bytes' shape when the collector dropped them.)
+		file["bytesSealed"] = true.into();
+		let mut made = self.file_put(actor, file).await?;
+		if made.status_code() >= 400 {
+			self.sql.exec("UPDATE inbox_items SET accepted_at = NULL, accepted_by = NULL, accepted_file = NULL WHERE id = ?1", Some(vec![item.into()]))?;
+			return Ok(made);
+		}
+		self.sql.exec("UPDATE files SET collection_sealed = ?1 WHERE id = ?2", Some(vec![collection.into(), file_id.clone().into()]))?;
+		self.audit(actor, "inbox.accept", item, None, Some(&serde_json::json!({ "file": file_id, "collector": r.collector_id }).to_string())).await?;
+		let row: serde_json::Value = made.json().await?;
+		Ok(Response::from_json(&serde_json::json!({ "item": item, "file": row }))?)
+	}
+
+	/// `POST inbox/reject/<item> { reason, by }` — a person declines an item,
+	/// with a reason sealed into place `inbox.reject(area, item)` (it may name
+	/// what the item is). Returns the object key and whether the case keeps
+	/// it: an evidence case's objects are write-once; a working case's go.
+	pub(crate) async fn inbox_reject(&self, actor: &str, item: &str, body: serde_json::Value) -> Result<Response> {
+		let Some(reason) = body.get("reason").and_then(|v| v.as_str()).filter(|r| gorani_formats::placed::is_placed_text(r)).map(str::to_string) else {
+			return json_error(400, "reason: sealed into its place (GV04) — a rejection says why");
+		};
+		let by = body.get("by").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+		let rows: Vec<InboxRow> = self.sql.exec(&format!("SELECT {ROW} FROM inbox_items WHERE id = ?1"), Some(vec![item.into()]))?.to_array()?;
+		let Some(r) = rows.into_iter().next() else { return json_error(404, "no such inbox item") };
+		if r.accepted_at.is_some() || r.rejected_at.is_some() {
+			return json_error(409, "this item was already decided — accepted or rejected, once");
+		}
+		self.sql.exec(
+			"UPDATE inbox_items SET rejected_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), rejected_by = ?1, reject_reason = ?2 WHERE id = ?3 AND accepted_at IS NULL AND rejected_at IS NULL",
+			Some(vec![by.into(), reason.into(), item.into()]),
+		)?;
+		let keep = self.is_evidence().await?;
+		self.audit(actor, "inbox.reject", item, None, Some(&serde_json::json!({ "collector": r.collector_id, "objectKept": keep }).to_string())).await?;
+		Ok(Response::from_json(&serde_json::json!({ "item": item, "rejected": true, "objectKey": r.object_key, "keep": keep }))?)
+	}
+}
+
 const ROW: &str = "id, collector_id, inbox_key_id, object_key, size, chunk_size, ck_sealed, meta_sealed, stamp_imprint, stamp_token, stamped_at, received_at, accepted_at, accepted_by, accepted_file, rejected_at, rejected_by, reject_reason";
 
 #[derive(serde::Deserialize)]

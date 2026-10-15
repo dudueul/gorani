@@ -431,6 +431,9 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		// The inbox (commit 37b): anyone on the case may look at what
 		// collectors dropped — it is sealed to a key every grantee opens.
 		("GET", ["inbox"] | ["inbox", _]) => Some(Need::Read),
+		// Deciding an item (commit 37c) files it into the case, or turns it
+		// away: a writer's act.
+		("POST", ["inbox", _, "accept" | "reject"]) => Some(Need::Write),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
 		// Custody (commit 29g) is a record of responsibility, not access:
@@ -797,6 +800,7 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// ── A case's inbox (commit 37b, inbox.rs) — case areas only ──
 		("GET", ["members", id, "inbox"]) if crate::area::case_of(id).is_some() => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "inbox/list", None, actor)).await,
 		("GET", ["members", id, "inbox", item]) if crate::area::case_of(id).is_some() => inbox_download(req, env, &identity, id, item).await,
+		("POST", ["members", id, "inbox", item, decision @ ("accept" | "reject")]) if crate::area::case_of(id).is_some() => inbox_decide(req, env, &identity, id, item, decision).await,
 
 		_ => json_error(404, "no such route"),
 	}
@@ -842,6 +846,36 @@ async fn inbox_download(req: Request, env: Env, identity: &Identity, area: &str,
 		}
 	}
 	Ok(Response::from_stream(s3_resp.stream()?)?.with_status(status).with_headers(headers))
+}
+
+/// Accept or reject an inbox item (commit 37c). The decider is named by the
+/// Worker (`by`, their member id — never the client's word); a working
+/// case's rejected object is deleted here, after the store recorded the
+/// decision (an evidence case keeps it: write-once).
+async fn inbox_decide(mut req: Request, env: Env, identity: &Identity, area: &str, item: &str, decision: &str) -> Result<Response> {
+	let actor = match member_ctx(&env, identity, area).await {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	if !auth::valid_object_id(item) {
+		return json_error(400, "item id: [A-Za-z0-9_-], ≤ 64");
+	}
+	let mut body = req.json::<serde_json::Value>().await?;
+	if !body.is_object() {
+		return json_error(400, "a JSON object");
+	}
+	body["by"] = actor.id.clone().into();
+	let mut done = forward_member(&env, area, "POST", format!("inbox/{decision}/{item}"), Some(body), &actor.email).await?;
+	if decision == "accept" || done.status_code() != 200 {
+		return Ok(done);
+	}
+	let v: serde_json::Value = done.json().await?;
+	if v["keep"] == false {
+		if let Some(key) = v["objectKey"].as_str() {
+			let _ = s3::delete(&env, key).await;
+		}
+	}
+	Response::from_json(&serde_json::json!({ "item": item, "rejected": true, "objectKept": v["keep"] }))
 }
 
 /// Complete a recovery ceremony. A case's outcome (a signed grant) is the

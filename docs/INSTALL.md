@@ -2,12 +2,12 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > For team members installing the desktop clients, and for the release
-> manager who publishes them (commit 39g; how they are built:
-> [DESKTOP.md](DESKTOP.md) › 39f–g).
+> manager who publishes them (commits 39g, 39i; how they are built:
+> [DESKTOP.md](DESKTOP.md) › 39f–g, 39i).
 
 The browser needs nothing installed. The desktop clients — Gorani as a
-folder in Explorer or Finder, and the `gorani-sync` command — come one of
-these ways:
+folder in Explorer or Finder, the `gorani-sync` command, and on Linux
+`gorani-mount` — come one of these ways:
 
 | System | The way | What you get | What vouches for it |
 |---|---|---|---|
@@ -16,6 +16,23 @@ these ways:
 | Windows 10/11 | `gorani-windows-x64.zip` | the two programs, nothing installed; run them from where you unpack them | **you**: the signed checksum, below |
 | macOS (Apple silicon) | `Gorani-macOS-arm64.zip`, when the release has it | the app and its Finder integration, signed and notarized | Apple's notarization, and the signed checksum |
 | macOS (Apple silicon) | `gorani-macos-arm64-cli.tar.gz` | `gorani-sync` and its keystore helper | **you**: the signed checksum, below |
+| Linux (x86-64) | `gorani-linux-x64.tar.gz` | `gorani-sync`, and `gorani-mount` (the folder, through FUSE) | **you**: the signed checksum, below |
+
+Everything but the Store's comes from the repository's **Releases** page.
+The release marked **Latest** is always the newest build — of `main`, or a
+version tag (`v1.2.3`), whichever came last; older builds of `main` are
+kept (the newest 10), version releases for good. The newest of any file
+also has a fixed address, for a bookmark or a script:
+
+```
+https://github.com/dudueul/gorani/releases/latest/download/gorani-windows-x64.zip
+https://github.com/dudueul/gorani/releases/latest/download/SHA256SUMS
+https://github.com/dudueul/gorani/releases/latest/download/SHA256SUMS.sig
+```
+
+(The repository is private: these open for people with access to it,
+signed in. Others get the files from you — the signed checksum still
+holds, whoever carries them.)
 
 Whichever way, the computer is then enrolled once: `gorani-sync setup`
 (DESKTOP.md › 33a, 34, 39d).
@@ -24,8 +41,7 @@ Whichever way, the computer is then enrolled once: `gorani-sync setup`
 
 Everything outside the Store is unsigned, on purpose: what it carries
 instead is a list of every file's SHA-256 (`SHA256SUMS`), signed by the
-release manager's own key (`SHA256SUMS.sig`) — a key that never touches
-GitHub or the build machines. Check before you run anything:
+release key (`SHA256SUMS.sig`). Check before you run anything:
 
 1. **Once: get the release key, and compare its fingerprint with the one
    the release manager gives you in person** (or over a channel you
@@ -47,13 +63,18 @@ GitHub or the build machines. Check before you run anything:
 
    It says which key signed — **that fingerprint must be the one you were
    given** — then `ok` for each file. Anything else ends with
-   `DO NOT RUN anything from this download`, and you don't.
+   `DO NOT RUN anything from this download`, and you don't. A release
+   whose notes say **Not signed** has no `SHA256SUMS.sig`, and the check
+   refuses it: wait for the next one, or ask the release manager.
 
-What this does and does not prove: that the files are the ones the
-release manager approved, whoever handed them to you and whatever
-happened to GitHub after. It does not prove the build machine was honest —
-the release manager signs what CI built (tools/release/sign.sh checks
-every file against the list before asking).
+What this does and does not prove: that the files are the ones this
+repository's own build (GitHub Actions, from `main` or a version tag)
+made and signed, wherever they were copied afterwards. It does not prove
+a person looked at them first, and it does not hold against someone able
+to change the repository's workflows on `main` or read its secrets — the
+key lives there (DESKTOP.md › 39i). If the release manager says the key
+changed, compare the new fingerprint the same way and save the new
+`allowed_signers`.
 
 ## Then, per system
 
@@ -83,19 +104,50 @@ login Keychain are reached through it (DESKTOP.md › 39d). An unsigned
 helper makes the Keychain ask for permission again whenever it is replaced
 by a new version — expected; a signed app does not.
 
-## For the release manager
-
-**Once — the release key.** On your own machine, a hardware key if you have
-one:
+**Linux**: verify, then
 
 ```sh
-ssh-keygen -t ed25519-sk -f ~/.ssh/gorani-release -C "gorani release key"
+mkdir -p ~/gorani && tar -C ~/gorani -xzf gorani-linux-x64.tar.gz
+~/gorani/gorani-sync setup …
+~/gorani/gorani-mount ~/Gorani               # the folder, through FUSE (fusermount3)
 ```
 
-Add a line to `tools/release/allowed_signers` —
-`release@gorani namespaces="gorani-release" <the contents of ~/.ssh/gorani-release.pub>` —
-commit it, and give each team member its fingerprint
-(`ssh-keygen -lf ~/.ssh/gorani-release.pub`) yourself.
+Built on a current Ubuntu: an older distribution's C library may be too
+old for it.
+
+## For the release manager
+
+**Once — the release key.** On your own machine, in a checkout of the
+repository (macOS or Linux; on Windows, Git Bash), with
+[`gh`](https://cli.github.com) signed in:
+
+```sh
+tools/release/new-key.sh
+```
+
+It makes the key, sets it as the repository's Actions secret
+`RELEASE_SIGNING_KEY` (the private half is never shown or kept — there is
+nothing to back up; a lost key is replaced by a new one), writes the
+public half into `tools/release/allowed_signers`, and prints the key's
+fingerprint. Then:
+
+1. commit and push `tools/release/allowed_signers` (until it is on main,
+   builds stop at signing — CI refuses a key the repository does not pin);
+2. give each team member the fingerprint yourself.
+
+Without `gh`: `ssh-keygen -t ed25519 -C "gorani release key (CI)" -f gorani-release`,
+pressing Enter twice at the passphrase (CI has no one to type one); then
+in the repository's *Settings › Secrets and variables › Actions*, a
+new repository secret `RELEASE_SIGNING_KEY` holding the whole of the
+file `gorani-release` (the private one); add
+`release@gorani namespaces="gorani-release" <the contents of gorani-release.pub>`
+as the last line of `tools/release/allowed_signers`, in place of any older
+key's line; `ssh-keygen -lf gorani-release.pub` gives the fingerprint;
+then delete both files.
+
+Run it again to change the key — at once if it may have leaked. On a plan
+with environments for private repositories, also limit the secret to
+`main` and `v*` tags (DESKTOP.md › 39i).
 
 **Once — the Store listing.** In Partner Center (an individual account is
 free; it asks for an ID and a selfie): reserve the name "Gorani"; under
@@ -109,20 +161,20 @@ asks for full trust (`runFullTrust`): give the justification *"A Win32
 Cloud Files sync provider and its command-line client; full trust is
 required to register and serve a sync root."*
 
-**Each release.**
+**Releases.**
 
-1. Tag it: `git tag v1.2.3 && git push origin v1.2.3`. The package workflow
-   builds everything, checks it, and leaves a **draft** release with the
-   files and `SHA256SUMS`.
-2. Sign it: `tools/release/sign.sh v1.2.3`. It downloads the draft, checks
-   each file against the list, shows you the list, asks, signs, checks the
-   signature against `allowed_signers`, uploads `SHA256SUMS.sig` and
-   publishes the release.
-3. The Store: download the workflow's `windows-store-upload` artifact
-   (`gorani-store.msix`, unsigned — Microsoft signs it) and upload it as a
-   new submission. Certification takes hours to days, so a security fix
-   reaches unsigned-build users first.
+- **Every build of main** is published by itself: a push that changes the
+  programs (anything under `clients/`, `crates/`, `Cargo.toml` /
+  `Cargo.lock`, `tools/release/`, or the package workflow) builds, checks,
+  signs and publishes a release "Gorani main · date · commit", marked
+  Latest. Older main builds beyond the newest 10 are removed.
+- **A version**: `git tag v1.2.3 && git push origin v1.2.3`. The same,
+  as "Gorani v1.2.3" — kept for good.
+- **The Store**: from that run, download the workflow artifact
+  `windows-store-upload` (`gorani-store.msix`, unsigned — Microsoft signs
+  it) and upload it as a new submission. Certification takes hours to
+  days, so a security fix reaches the unsigned builds' users first.
 
-The repository is private: a release's files reach people with read
-access to it. Others get the files from you — the signed checksum still
-holds, whoever carries them.
+A run can also be started by hand (*Actions › package › Run workflow*) on
+main or a tag; on any other branch it builds and checks, but publishes
+nothing.

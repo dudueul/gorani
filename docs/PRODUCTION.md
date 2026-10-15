@@ -422,15 +422,19 @@ member's machine (docs/REQUESTS.md › Scanning).
 
 ### The desktop installers (commit 39f, docs/DESKTOP.md › 39f)
 
-`.github/workflows/package.yml` builds the installers on release tags
-(`v*`), by hand, and when the packaging changes; docs/INSTALL.md is the
-person-facing side (installing, checking a download, and the release
-manager's steps — the release key, the private Store listing, signing each
-release with `tools/release/sign.sh`). The settings it reads, none ever
+`.github/workflows/package.yml` builds the installers and publishes them
+as GitHub releases (commit 39i): every push to main that changes the
+programs — a new release each time, marked Latest, the newest 10 kept —
+and every release tag (`v*`); by hand too, and pull requests that change
+the packaging build everything and only say what they would publish.
+docs/INSTALL.md is the person-facing side (downloading, checking a
+download, and the release manager's steps — the release key, the private
+Store listing, tagging a version). The settings it reads, none ever
 asked for, each read only by the step that needs it:
 
 | name | what |
 |---|---|
+| `RELEASE_SIGNING_KEY` | the release key (an Ed25519 private key, no passphrase) that signs SHA256SUMS — made and set by `tools/release/new-key.sh`, its public half committed in `tools/release/allowed_signers`; read only by the sign job, which cannot write. Without it releases go out marked unsigned |
 | `STORE_IDENTITY_NAME`, `STORE_PUBLISHER`, `STORE_PUBLISHER_NAME` | Actions **variables**: the package identity Partner Center assigns when the name is reserved (public values) — without them no Store package is built |
 | `GORANI_TEAM_ID` | the Apple Developer team (variable or secret) — the app group is `<team>.io.gorani` |
 | `APPLE_CERT_P12` | the Developer ID Application identity, as base64 of the .p12 |
@@ -438,8 +442,9 @@ asked for, each read only by the step that needs it:
 | `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | an App Store Connect API key (the .p8's text, its id, the issuer) — to notarize |
 
 Windows needs no certificate: the Store signs its package, and the
-unsigned builds (and the macOS CLI) are vouched for by the release
-manager's signature on SHA256SUMS, made on their own machine. Without the
+unsigned builds (the macOS and Linux CLIs too) are vouched for by the
+release key's signature on SHA256SUMS, made in CI (DESKTOP.md › 39i: what
+that proves, and how to keep other branches away from the key). Without the
 Apple secrets the Mac app is ad-hoc signed and stays a test artifact. Each
 computer then
 enrols as before (`gorani-sync setup`; the default protectors are the TPM

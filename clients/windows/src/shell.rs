@@ -202,7 +202,9 @@ fn same_form(p: &Path) -> String {
 	plain(&p).to_string().trim_end_matches('\\').to_lowercase()
 }
 
-/// Every Gorani sync root the shell lists for this user: (id, path).
+/// Every Gorani sync root the shell holds for this user: (id, path) — as
+/// it lists them, or, where its list is empty, as its registry records
+/// them (the Server runner's case, `registered_path`).
 pub fn roots() -> Result<Vec<(String, String)>, String> {
 	let mut out = Vec::new();
 	for info in StorageProviderSyncRootManager::GetCurrentSyncRoots().map_err(text)? {
@@ -212,7 +214,38 @@ pub fn roots() -> Result<Vec<(String, String)>, String> {
 			out.push((id, path));
 		}
 	}
+	if out.is_empty() {
+		out = registry_roots();
+	}
 	Ok(out)
+}
+
+/// The Gorani roots the registry records for this user.
+fn registry_roots() -> Vec<(String, String)> {
+	use windows::Win32::System::Registry::{RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+	let mut key = HKEY::default();
+	// SAFETY: `key` is written by the call and closed below.
+	if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, &HSTRING::from(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager"), None, KEY_READ, &mut key) }.is_err() {
+		return Vec::new();
+	}
+	let mut out = Vec::new();
+	for i in 0u32.. {
+		let mut name = vec![0u16; 512];
+		let mut len = name.len() as u32;
+		// SAFETY: a name buffer of `len` characters; the key we opened.
+		if unsafe { RegEnumKeyExW(key, i, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None) }.is_err() {
+			break;
+		}
+		let id = String::from_utf16_lossy(&name[..(len as usize).min(name.len())]);
+		if id.starts_with("Gorani!") {
+			if let Some(path) = registry_path(&id) {
+				out.push((id, path));
+			}
+		}
+	}
+	// SAFETY: closed once.
+	let _ = unsafe { RegCloseKey(key) };
+	out
 }
 
 /// The folder stops being a Gorani folder — the shell's registration if it

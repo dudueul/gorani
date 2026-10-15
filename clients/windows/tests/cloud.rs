@@ -185,6 +185,11 @@ fn a_cloud_files_folder_over_the_replica() {
 	assert!(std::fs::read(root.join("docs").join("a.txt")).is_err(), "its bytes are gone: nothing serves them now");
 	assert!(mem.lock().unwrap().find(&docs.id, "moved.txt (removed elsewhere)").is_none(), "nothing came back from the dead");
 	cleanup(&root);
+	// (Unregistering removes the shell's record too — no stale entry left in
+	// Explorer's navigation pane.)
+	if shell::supported() {
+		assert_eq!(shell::registered_path(&id), Ok(None), "the shell still holds {id} after unregister");
+	}
 }
 
 #[test]

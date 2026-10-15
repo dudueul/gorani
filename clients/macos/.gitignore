@@ -1,0 +1,9 @@
+# Generated (xcodegen generate) and built — never committed.
+Gorani.xcodeproj/
+GoraniKit/.build/
+GoraniKit/.swiftpm/
+App/Info.plist
+App/Gorani.entitlements
+Extension/Info.plist
+Extension/GoraniFileProvider.entitlements
+build/

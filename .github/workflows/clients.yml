@@ -13,9 +13,11 @@
 # same branch; Cargo's downloads and build outputs are cached.
 #
 # Supply chain: first-party actions only (actions/checkout, actions/cache,
-# actions/upload-artifact),
-# the job token read-only. The toolchains are the runner images' own
-# (rustup + stable Rust, Xcode on macOS) — nothing fetched from a third party.
+# actions/upload-artifact), the job token read-only, no secrets in this
+# workflow. The toolchains are the runner images' own (rustup + stable Rust,
+# Xcode on macOS). One tool comes from outside: XcodeGen, from the image's
+# own Homebrew (a checksummed bottle), to generate the Xcode project the
+# unsigned macOS build needs — a build that holds nothing worth stealing.
 
 name: clients
 
@@ -84,3 +86,32 @@ jobs:
             target/debug/gorani-cloud.exe
             target/debug/gorani-sync.exe
           retention-days: 7
+      # ── 39c: the macOS shell — the Rust bridge, the Swift logic, the app ──
+      - name: The C bridge's unit tests (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p gorani-macos
+      # (Built as the static library GoraniKit links; the note printed is what
+      # else a program linking it needs — Package.swift and project.yml say so.)
+      - name: Build the bridge library (macOS)
+        if: runner.os == 'macOS'
+        run: cargo rustc --locked -p gorani-macos --lib -- --print native-static-libs
+      - name: The File Provider logic's tests (macOS)
+        if: runner.os == 'macOS'
+        working-directory: clients/macos/GoraniKit
+        run: swift test
+      - name: Build the app and its File Provider extension, unsigned (macOS)
+        if: runner.os == 'macOS'
+        working-directory: clients/macos
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate
+          xcodebuild -project Gorani.xcodeproj -scheme Gorani -configuration Debug \
+            -destination 'platform=macOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO build
+          # (What came out: the app, the extension inside it, the core inside that.)
+          app=build/Build/Products/Debug/Gorani.app
+          ls "$app/Contents/PlugIns/GoraniFileProvider.appex/Contents/MacOS/"
+          nm -gU "$app/Contents/PlugIns/GoraniFileProvider.appex/Contents/MacOS/GoraniFileProvider" | grep -c gorani_call

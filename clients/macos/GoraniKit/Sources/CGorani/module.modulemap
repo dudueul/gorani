@@ -1,0 +1,5 @@
+module CGorani [system] {
+	header "gorani.h"
+	link "gorani_macos"
+	export *
+}

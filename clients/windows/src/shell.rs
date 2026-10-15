@@ -149,16 +149,28 @@ fn register_shell(root: &Path, area: &str, read_only: bool) -> Result<String, St
 /// GetSyncRootInformationForFolder, answered nothing for a root registered
 /// a moment before — found in CI.)
 pub fn registered_id(root: &Path) -> Result<Option<String>, String> {
-	let want = plain(root).to_string().trim_end_matches('\\').to_lowercase();
-	let roots = StorageProviderSyncRootManager::GetCurrentSyncRoots().map_err(text)?;
-	for info in roots {
+	let want = same_form(root);
+	Ok(roots()?.into_iter().find(|(_, path)| same_form(Path::new(path)) == want).map(|(id, _)| id))
+}
+
+/// A path in one form for comparing: canonical where it exists (long
+/// names, not 8.3), without the verbatim prefix, folded, no trailing `\`.
+fn same_form(p: &Path) -> String {
+	let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+	plain(&p).to_string().trim_end_matches('\\').to_lowercase()
+}
+
+/// Every Gorani sync root the shell lists for this user: (id, path).
+pub fn roots() -> Result<Vec<(String, String)>, String> {
+	let mut out = Vec::new();
+	for info in StorageProviderSyncRootManager::GetCurrentSyncRoots().map_err(text)? {
 		let id = info.Id().map_err(text)?.to_string();
-		let path = info.Path().and_then(|f| f.cast::<IStorageItem>()).and_then(|i| i.Path()).map_err(text)?.to_string();
-		if id.starts_with("Gorani!") && path.trim_end_matches('\\').to_lowercase() == want {
-			return Ok(Some(id));
+		if id.starts_with("Gorani!") {
+			let path = info.Path().and_then(|f| f.cast::<IStorageItem>()).and_then(|i| i.Path()).map_err(text)?.to_string();
+			out.push((id, path));
 		}
 	}
-	Ok(None)
+	Ok(out)
 }
 
 /// The folder stops being a Gorani folder — the shell's registration if it

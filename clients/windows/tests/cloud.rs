@@ -98,7 +98,7 @@ fn a_cloud_files_folder_over_the_replica() {
 		}
 		Ok(None) => {
 			// (Only a Windows without the shell's support may fall back.)
-			assert!(!shell::supported(), "the shell supports sync roots here, yet did not register the folder (the start said why)");
+			assert!(!shell::supported(), "the shell supports sync roots here, yet does not list {} among its Gorani roots: {:?}", root.display(), shell::roots());
 			eprintln!("this Windows has no shell sync-root support — cldapi's sync root only");
 		}
 		Err(e) => panic!("the shell's list of sync roots: {e}"),

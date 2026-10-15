@@ -193,8 +193,11 @@ jobs:
         run: |
           prefix=""
           [ -n "$TEAM_ID" ] && prefix="$TEAM_ID."
+          # (arm64 only: the core is built for it — Release would otherwise
+          # build x86_64 too, and find no core to link there.)
           xcodebuild -project Gorani.xcodeproj -scheme Gorani -configuration Release \
             -destination 'platform=macOS,arch=arm64' -derivedDataPath build \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO "TeamIdentifierPrefix=$prefix" "GORANI_TEAM_ID=$TEAM_ID" build
       - name: Assemble, sign, notarize
         env:

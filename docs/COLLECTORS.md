@@ -4,7 +4,8 @@
 > Status: designed (decisions below, 2026-10-15); built in stages 37a–37d —
 > 37a landed (registry, the service-token path, Team › Collectors); 37b
 > landed (inbox keys, drops, the collector client); 37c landed (accept and
-> reject, in the web app and the CLI).
+> reject, in the web app and the CLI); 37d landed (exports carry and the
+> standalone verifier checks it all; PRODUCTION.md's setup).
 
 ## The problem
 
@@ -212,6 +213,28 @@ reject   POST /api/v1/cases/<case>/inbox/<item>/reject   (write)   { reason }
 - **Team › Cases › Inbox** lists each item with this member's verdict,
   Accept (enabled only for a verified item) and Reject (asks for the
   reason). The CLI: `gorani-sync inbox|accept|reject --case C`.
+
+## 37d as built
+
+- **The export** (`export.ts`): each file accepted from an inbox carries
+  `collection: { record, check, why }` — the collector's record, checked
+  against the file's VERSION 1 bytes (what it dropped) under the
+  exporter's trust; anything unverified is listed in `problems`. The
+  manifest adds `collectors`: each named collector's registration (its
+  key, its service token's name, both leads' signatures), and the two
+  leads join `identities`. Re-verification counts collection records too.
+- **The standalone verifier** (`tools/verify-export.mjs`, no gorani code):
+  the collector's key id is its key's hash; two DIFFERENT leads in the
+  package signed its registration; its signature covers every field it
+  recorded, for this case and item; those fields are version 1's size and
+  SHA-256 (which it hashed from the package itself); and the timestamp is
+  over that signature. A collector revoked since is a note, not a failure:
+  what it signed before still stands.
+- api:collect re-signs an edited manifest as the exporter: the exporter's
+  check passes and the collector's signature still refuses the edit.
+- docs/PRODUCTION.md › Access › 7: the service token per machine, the
+  Service Auth policy, `collector init`, the two-lead registration and the
+  known gaps.
 
 ## Stages
 

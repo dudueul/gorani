@@ -32,6 +32,10 @@
  *      accepter's content hash and intake, the collector's record beside
  *      them; the bytes never move; an item is decided once; a rejection's
  *      reason is sealed and an evidence case keeps the object;
+ *   7b. (37d) an approved export carries each accepted file's collection
+ *      record, checked against its bytes, and the collector's registration;
+ *      tools/verify-export.mjs checks both leads' signatures on it and the
+ *      collector's own — which still catches an edit the exporter re-signed;
  *   8. a case-key rotation must carry every inbox key re-sealed (one short
  *      is refused), and the inbox, the collection records and the
  *      rejection reasons all move to the new key;
@@ -42,7 +46,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,7 +58,10 @@ import { checkContentHash } from "../../web/src/vault/content-hash.ts";
 import { checkIntake } from "../../web/src/vault/intake.ts";
 import { places } from "../../web/src/vault/places.ts";
 import { openCaseKey, rotateCase, type CaseRow } from "../../web/src/vault/cases.ts";
-import { fingerprint, identityKeyId } from "../../web/src/vault/identity.ts";
+import { fingerprint, identityKeyId, statements } from "../../web/src/vault/identity.ts";
+import { approveRequest, requestApproval } from "../../web/src/vault/approvals.ts";
+import { buildExport } from "../../web/src/vault/export.ts";
+import { zipEntries } from "../../web/src/vault/zip.ts";
 import { sha256Hex } from "../../web/src/vault/content-hash.ts";
 import { openChunked } from "../../web/src/vault/chunked-file.ts";
 import { importContentKey, newContentKey, openWith, sealText, sealWith, unwrapPlacedKey, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
@@ -103,6 +110,17 @@ const call = (who: { email: string }) => async <T>(method: string, p: string, bo
 	if (r.status >= 300) throw new Error(`${method} ${p}: ${r.status} ${r.text.slice(0, 300)}`);
 	return r.json as T;
 };
+
+/** The export's view of the API, as `who`'s browser has it (export.ts › ExportSource). */
+const sourceAs = (who: { email: string }) => ({
+	get: <T>(p: string) => call(who)<T>("GET", p),
+	post: <T>(p: string, body: unknown) => call(who)<T>("POST", p, body),
+	async object(p: string) {
+		const r = await fetch(`${dev.base}${p}`, { headers: { "x-gorani-dev-email": who.email } });
+		if (!r.ok) throw new Error(`${r.status} ${p}`);
+		return { body: new Uint8Array(await r.arrayBuffer()), ck: r.headers.get("x-gorani-ck") ?? "", chunk: Number(r.headers.get("x-gorani-chunk")) || null, version: Number(r.headers.get("x-gorani-version")), hash: r.headers.get("x-gorani-hash") };
+	},
+});
 
 /** A drop as the collector sends it, by hand — what a forging server or a
  * hostile collector could send. */
@@ -312,6 +330,46 @@ try {
 	const trail = JSON.stringify((await api(dev.base, "GET", `${BASE}/audit`, { email: ana.email })).json);
 	for (const ev of ["inbox.receive", "inbox.accept", "inbox.reject"]) assert.ok(trail.includes(ev), `${ev} is on the case's trail`);
 
+	// ── 7b. (37d) The export carries both signatures, checkably ────────
+	// An approved export: each accepted file's collection record checked
+	// against its version-1 bytes, the collector's registration listed — and
+	// the standalone verifier checks the machine's word with no registry.
+	const asked = await requestApproval(call(ana), ana.signer, CASE, "case.export");
+	await approveRequest(call(cy), cy.signer, await trustOf(dev, cy), asked);
+	const built = await buildExport(sourceAs(ana), ana.signer, anaTrust, anaCaseKey, CASE, asked.id);
+	assert.deepEqual(built.problems, [], "every record checked out while building");
+	const mf = built.manifest as { files: { id: string; collection: { check: string; record: { collector: string; acceptedBy: string } } | null }[]; collectors: { id: string; requestedBy: string; approvedBy: string }[]; identities: { member: string }[] };
+	const exported = mf.files.find((f) => f.id === fileId)!;
+	assert.equal(exported.collection?.check, "verified");
+	assert.deepEqual([exported.collection!.record.collector, exported.collection!.record.acceptedBy], ["edr-1", "bo"]);
+	assert.deepEqual(mf.collectors.map((c) => [c.id, c.requestedBy, c.approvedBy]), [["edr-1", "ana", "cy"]], "the registration travels");
+	assert.ok(["ana", "cy"].every((m) => mf.identities.some((e) => e.member === m)), "…with both leads' identities");
+	const pkgDir = fs.mkdtempSync(path.join(home, "export-"));
+	const pkg = Buffer.concat(built.parts.map((p) => Buffer.from(p)));
+	const verifyPkg = (bytes: Buffer) => {
+		fs.writeFileSync(path.join(pkgDir, "package.zip"), bytes);
+		const r = spawnSync(process.execPath, [path.join(ROOT, "tools/verify-export.mjs"), path.join(pkgDir, "package.zip")], { encoding: "utf8" });
+		return { status: r.status, out: r.stdout + r.stderr };
+	};
+	const good = verifyPkg(pkg);
+	assert.equal(good.status, 0, good.out);
+	assert.match(good.out, /✔ triage\.zip: collector edr-1 registered by two leads \(ana, cy\), both signed/);
+	assert.match(good.out, /✔ triage\.zip: collected by edr-1 — its signature over every field it recorded/);
+	assert.match(good.out, /✔ triage\.zip: version 1 is the bytes the collector signed/);
+	assert.match(good.out, /✔ WS-0412 disk\.img: collected by edr-1/, "the file the CLI accepted, too");
+	// A manifest whose collected fields were edited — and RE-SIGNED by the
+	// exporter, so only the collector's own signature can catch it.
+	const mm = JSON.parse(JSON.stringify(built.manifest)) as typeof mf & { exportId: string };
+	(mm.files.find((f) => f.id === fileId)!.collection!.record as unknown as { meta: { notes: string } }).meta.notes = "ticket IR-999";
+	const mmBytes = enc.encode(JSON.stringify(mm, null, 2));
+	const mmDigest = await sha256Hex(mmBytes);
+	const mmSig = { case: CASE, exportId: mm.exportId, exporter: "ana", keyId: ana.signer.keyId, digest: mmDigest, signature: await ana.signer.sign(statements.exportManifest(CASE, mm.exportId, mmDigest)) };
+	const edited = verifyPkg(Buffer.concat(zipEntries([{ name: "manifest.json", data: mmBytes }, { name: "manifest.sig.json", data: enc.encode(JSON.stringify(mmSig)) }]).map((p) => Buffer.from(p))));
+	assert.equal(edited.status, 1);
+	assert.match(edited.out, /✔ the exporter's signature \(ana\)/, "the exporter vouched for the edited manifest…");
+	assert.match(edited.out, /✘ triage\.zip: collected by edr-1 — its signature/, "…and the collector's signature still refuses it");
+	fs.rmSync(pkgDir, { recursive: true, force: true });
+
 	// ── 8. A case-key rotation carries every inbox key ──────────────────
 	const c = await caseOf(ana);
 	const roots = await Promise.all(c.grantees.map(async (g) => (await api(dev.base, "GET", `/api/v1/members/${g.member}/root`, { email: ana.email })).json));
@@ -331,7 +389,7 @@ try {
 	assert.deepEqual(log.map((l) => l.item), [first.item, second.item], "a line per drop, nothing for refusals");
 	assert.equal(log[0].sha256, first.sha256);
 
-	console.log("ok    api:collect (init + two-lead registration, pins decide the inbox key, sealed + signed drops verified by members, forgeries named, retired keys, frames, accept in browser and CLI with both signatures, sealed rejections, rotation, revocation)");
+	console.log("ok    api:collect (init + two-lead registration, pins decide the inbox key, sealed + signed drops verified by members, forgeries named, retired keys, frames, accept in browser and CLI with both signatures, sealed rejections, exported and verified standalone, rotation, revocation)");
 } finally {
 	await dev.close();
 }

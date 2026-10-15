@@ -452,6 +452,10 @@ anyone      tools/verify-export.mjs package.zip — Node only, no gorani code, n
 - `tools/verify-export.mjs` — a second implementation in plain Node: its
   own zip reader and ZipCrypto, its own statement encoding, ECDSA through
   `node:crypto`; reports every check and exits non-zero on any failure.
+  (Commit 37d: a file a collector dropped also carries the collector's
+  record and registration — docs/COLLECTORS.md › 37d — and the tool
+  checks the two leads' signatures on the registration, the collector's
+  over its fields, and those fields against version 1's bytes.)
 - `reverifyCase` walks the same way and `POST …/reverify { checked,
   failed }`; the store keeps the last run (`vault › reverified`) and the
   audit line; `GET …/reverify` says whether one is overdue

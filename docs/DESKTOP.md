@@ -363,6 +363,7 @@ never in the repository), and all four parts in this phase:
 | 39e | **Explorer and Finder**: the navigation-pane entry and sync states (StorageProviderSyncRootManager), Finder decorations. |
 | 39f | **Installers**: an MSIX and a signed, notarized app — signed in CI only when the signing secrets exist. |
 | 39g | **Distribution** (asked 2026-10-15): Windows through the Microsoft Store as a private app (Microsoft signs it); beside it, unsigned builds — a Windows 11 MSIX, a Windows ZIP, the macOS CLI — whose users check a SHA256SUMS the release manager signs with their own key. |
+| 39i | **Releases** (asked 2026-10-15): every build of main that changes the programs, and every `v*` tag, published to GitHub Releases as Latest — the newest 10 main builds kept — with SHA256SUMS signed in CI by a key held as an Actions secret; a Linux tarball joins the files. |
 
 ### 39a as built
 
@@ -602,7 +603,8 @@ No code-signing certificate is bought for Windows; the 39f
 | `gorani-macos-arm64-cli.tar.gz` | — (ad-hoc, as the linker leaves it) | nobody: SHA256SUMS |
 | `Gorani-macOS-arm64.zip` | Developer ID (39f) — in the release only when signed: unsigned, the extension cannot run | Apple's notarization, and SHA256SUMS |
 
-**The checksum's trust.** `SHA256SUMS` lists every release file; on a tag
+**The checksum's trust** (as 39g built it — 39i moved the signing into
+CI, below). `SHA256SUMS` lists every release file; on a tag
 the workflow leaves a **draft** release holding them. The release manager
 runs `tools/release/sign.sh <tag>` on their own machine: it downloads the
 draft, checks each file against the list (and that nothing is unlisted or
@@ -635,6 +637,52 @@ probed; and on each platform the user's own check (`test-verify.sh` /
 `.ps1`, a throwaway key) passing a signed list and refusing a changed
 file, a list signed by another key, an edited list, an unsigned one, and
 the right key signing for another purpose.
+
+### 39i as built
+
+Asked 2026-10-15: the built programs, unsigned, published to **GitHub
+Releases** by CI for easy downloading, from tags and from main — each
+build of main a new release. The release manager chose to hold the
+release key as an **Actions secret** rather than sign by hand.
+
+| | |
+|---|---|
+| **When** | a push to main that changes what the programs are built from (`clients/`, `crates/`, `Cargo.toml`, `Cargo.lock`, `tools/release/`, package.yml); every `v*` tag; by hand on either. A push of only the web app, the worker or the docs builds nothing: the programs would be the same |
+| **Which release** | a tag `vX.Y.Z` → "Gorani vX.Y.Z"; main → "Gorani main · date · commit" on a tag `main-YYYYMMDD-commit` made by CI (the commit's own date, so a re-run names the same release and only replaces its files) |
+| **Latest** | every new release is marked Latest, so `…/releases/latest/download/<file>` is always the newest build, from main or a tag |
+| **Kept** | the newest 10 main builds; older ones are deleted with their tags. Releases from `v*` tags are never deleted, and the script deletes only tag names of its own exact form |
+| **Files** | the 39g set, plus `gorani-linux-x64.tar.gz` (`gorani-sync`, `gorani-mount`; built on the runner's Ubuntu, so its glibc or newer) |
+
+**The key in CI.** `tools/release/new-key.sh`, on the release manager's
+machine, makes an Ed25519 key with no passphrase (CI has no one to type
+one, and cannot use a hardware key), sets it as the secret
+`RELEASE_SIGNING_KEY` with `gh` — the private half never shown, never
+saved outside a temporary folder it removes — and writes the public half
+into `tools/release/allowed_signers`, replacing any older key. The jobs
+split the powers:
+
+- **sign** holds the key and nothing that can write: it signs SHA256SUMS,
+  then runs the user's own `verify.sh` against the committed
+  `allowed_signers` — a key the repository does not pin is refused, since
+  a signature nobody can check is worse than none. Without the secret it
+  says so and the release goes out unsigned, which `verify.sh` refuses.
+- **publish** can write releases and never sees the key
+  (`tools/release/publish.sh`).
+- Both run only for main and `v*` tags, never for a pull request; there
+  `publish.sh --dry-run` reads the release list and prints what main
+  would publish and delete. A started run on main or a tag is never
+  cancelled by a newer push (it may be publishing); publishing itself
+  runs one at a time.
+
+**What the signature now proves.** That the files are the ones this
+repository's CI built from main or a tag — wherever they were copied to
+afterwards. It no longer proves that a person looked before signing (the
+39g design), and anyone who can read the secret or change a workflow that
+runs on main could sign. On a plan with environments for private
+repositories (GitHub Pro, Team, Enterprise), move the secret into an
+environment `release` limited to main and `v*` tags, and add
+`environment: release` to the sign job: then no other branch's workflow
+can reach the key. Rotate with `new-key.sh` when the key may have leaked.
 
 ## Testing (the pattern the port follows)
 

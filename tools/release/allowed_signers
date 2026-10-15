@@ -1,17 +1,17 @@
-# The Gorani release key (commit 39g, docs/INSTALL.md › Checking a download).
+# The Gorani release key (commits 39g, 39i; docs/INSTALL.md › Checking a download).
 #
 # verify.sh / verify.ps1 accept a release only if SHA256SUMS.sig was made by
 # a key listed here, for the principal "release@gorani" and the namespace
 # "gorani-release" — one line per key:
 #
-#   release@gorani namespaces="gorani-release" ssh-ed25519 AAAA… gorani release key
+#   release@gorani namespaces="gorani-release" ssh-ed25519 AAAA… gorani release key (CI)
 #
-# The release manager makes the key on their own machine — never in CI — a
-# hardware key if they have one:
+# The key signs every release in CI (package.yml › sign), from the Actions
+# secret RELEASE_SIGNING_KEY. tools/release/new-key.sh makes it on the
+# release manager's machine, sets the secret and writes its line here
+# (replacing any older key's); commit the file. Until a line is here, every
+# release is refused, and CI refuses to sign with a key not listed here.
 #
-#   ssh-keygen -t ed25519-sk -f ~/.ssh/gorani-release -C "gorani release key"
-#
-# and adds its .pub here with the prefix above. Until a line is here, every
-# release is refused. Whoever installs compares the fingerprint verify
-# prints with the one the release manager gave them in person — a key read
-# from the same place as the download proves nothing on its own.
+# Whoever installs compares the fingerprint verify prints with the one the
+# release manager gave them in person — a key read from the same place as
+# the download proves nothing on its own.

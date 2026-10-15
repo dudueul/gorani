@@ -34,8 +34,18 @@ https://github.com/dudueul/gorani/releases/latest/download/SHA256SUMS.sig
 signed in. Others get the files from you — the signed checksum still
 holds, whoever carries them.)
 
-Whichever way, the computer is then enrolled once: `gorani-sync setup`
-(DESKTOP.md › 33a, 34, 39d).
+Whichever way, the computer is then enrolled once against the team's
+server, **https://gorani.at.day** (the default — `--server` only for
+another deployment), signing in through Cloudflare Access with
+[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/):
+
+```sh
+gorani-sync setup --member <your member id> \
+  --access-token-cmd "cloudflared access token -app=https://gorani.at.day"
+```
+
+(DESKTOP.md › 33a, 34, 39d.) The browser needs only the address:
+https://gorani.at.day.
 
 ## Checking a download
 

@@ -75,8 +75,11 @@ console differs from the MinIO steps above.
   shortening it and deleting the locked version are refused with **400
   InvalidRequest** (AWS: 403), and the version survives. (Those probes were
   signed by the TEST's signer, tests/lib/sigv4.mjs — not the Worker's.)
-- **The full `api:s3-live` against e2** (2026-10-15, the Worker itself,
-  without the lock probe) — passes, after three fixes it found:
+- **The full `api:s3-live` against e2** (2026-10-15, the Worker itself)
+  — passes, with `GORANI_LIVE_S3_LOCK=1` too: the Worker's evidence upload
+  carried a COMPLIANCE retention it set itself (e2 answered the retention
+  write 204), the retention read back, and e2 refused to delete the locked
+  version. It passed after three fixes it found:
   1. **The Worker's SigV4 left the region out of the string-to-sign's
      credential scope** (crates/s3). Every real S3 server answers that
      with `SignatureDoesNotMatch`: before this fix NO S3-backed deployment

@@ -117,10 +117,18 @@ export class GoraniApp extends LitElement {
 			this.firstError = "Member id: 2–32 characters — lowercase letters, digits and dashes.";
 			return;
 		}
+		const token = this.firstToken.trim();
+		// A header carries Latin-1 only (fetch throws a TypeError otherwise),
+		// and the token wrangler holds is base64 — so anything else is a
+		// paste gone wrong, said in words.
+		if (!/^[\x21-\x7e]+$/.test(token)) {
+			this.firstError = "The bootstrap token is the value you gave wrangler: letters, digits and + / = only, no spaces.";
+			return;
+		}
 		this.firstBusy = true;
 		this.firstError = "";
 		try {
-			await api.post("/api/v1/family/members", { id: this.firstId, name: this.firstName.trim() || this.firstId, role: "lead" }, { "x-gorani-bootstrap": this.firstToken.trim() });
+			await api.post("/api/v1/family/members", { id: this.firstId, name: this.firstName.trim() || this.firstId, role: "lead" }, { "x-gorani-bootstrap": token });
 			this.firstToken = "";
 			await this.boot();
 		} catch (err) {

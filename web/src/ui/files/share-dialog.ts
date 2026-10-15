@@ -64,6 +64,19 @@ export class GoraniShare extends LitElement {
 		return this;
 	}
 
+	// Escape closes it, as every dialog does (commit 39l: it did not).
+	private onKey = (e: KeyboardEvent) => {
+		if (e.key === "Escape") this.close();
+	};
+	override connectedCallback(): void {
+		super.connectedCallback();
+		document.addEventListener("keydown", this.onKey);
+	}
+	override disconnectedCallback(): void {
+		document.removeEventListener("keydown", this.onKey);
+		super.disconnectedCallback();
+	}
+
 	protected override render() {
 		return html`
 			<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60" @click=${(e: Event) => e.target === e.currentTarget && this.close()}>

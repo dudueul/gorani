@@ -87,9 +87,18 @@ export class GoraniRequests extends LitElement {
 
 	private call: InboxCall = (method, path, body) => (method === "GET" ? this.model.api.apiGet(path) : this.model.api.apiSend(method, path, body));
 
+	// Escape closes it, as every dialog does (commit 39l: it did not).
+	private onKey = (e: KeyboardEvent) => {
+		if (e.key === "Escape") this.close();
+	};
 	override connectedCallback(): void {
 		super.connectedCallback();
+		document.addEventListener("keydown", this.onKey);
 		void this.reload();
+	}
+	override disconnectedCallback(): void {
+		document.removeEventListener("keydown", this.onKey);
+		super.disconnectedCallback();
 	}
 
 	private async run(what: () => Promise<string | void>): Promise<void> {

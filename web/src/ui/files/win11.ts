@@ -25,10 +25,9 @@
 
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import { styleMap } from "lit/directives/style-map.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, type MenuItem } from "./shared.ts";
+import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -216,7 +215,7 @@ export class GoraniWin11 extends LitElement {
 					{ label: "Open", run: () => void this.openEntry(kind, id, name), disabled: many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
 					{ label: "Verify signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },
-					{ label: "Custody…", run: () => void custodyAction(this.model, id, name), disabled: kind === "folder" || many },
+					{ label: "Custody…", run: () => void custodyAction(this.model, id, name), disabled: kind === "folder" || many || this.model.areaKind() !== "evidence" },
 					{ separator: true, label: "" },
 					{ label: "Cut", run: () => this.model.cut() },
 					{ label: "Copy", run: () => this.model.copy() },
@@ -275,7 +274,7 @@ export class GoraniWin11 extends LitElement {
 	@state() private recentRows: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; updatedAt: number; size?: number }[] = [];
 
 	private onKeydown(e: KeyboardEvent): void {
-		if (this.renaming) return;
+		if (this.renaming || typingInField(e)) return;
 		const s = this.s();
 		const { folders, files } = this.visible();
 		const order = [...folders.map((f) => ({ kind: "folder" as const, id: f.id })), ...files.map((f) => ({ kind: "file" as const, id: f.id }))];
@@ -576,7 +575,7 @@ export class GoraniWin11 extends LitElement {
 					<div>
 						<button
 							class="flex w-full items-center gap-1.5 rounded-lg py-1.5 pr-2.5 hover:bg-neutral-800 ${s.folderId === f.id && !s.trashMode ? "bg-neutral-800" : ""}"
-							style=${styleMap({ paddingLeft: `${8 + depth * 14}px` })}
+							${cssom({ "padding-left": `${8 + depth * 14}px` })}
 							@click=${() => void this.model.setFolder(f.id)}
 							@drop=${(e: DragEvent) => this.onDropIntoFolder(e, f.id)}
 							@dragover=${(e: DragEvent) => e.preventDefault()}

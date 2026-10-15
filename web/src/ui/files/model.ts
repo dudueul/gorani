@@ -258,12 +258,17 @@ export class FilesModel {
 				return;
 			}
 			const l = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[] }>(`${areaPath(this.memberId)}/files/list?folder=${folderId ?? "root"}&limit=1000`);
-			this.set({
-				folders: await this.decryptFolders(l.folders),
-				files: await this.decryptFiles(l.files),
-				selection: [],
-				loading: false,
-			});
+			const folders = await this.decryptFolders(l.folders);
+			const files = await this.decryptFiles(l.files);
+			this.set({ folders, files, selection: [], loading: false });
+			// The local index learns every listing (names decrypted here, in
+			// this browser only). Until commit 39l nothing fed it: search found
+			// nothing and Recents stayed empty, whatever the vault held.
+			const when = (iso: string) => Date.parse(iso) || Date.now();
+			this.index?.upsert([
+				...folders.map((f) => ({ id: f.id, kind: "folder" as const, folderId: f.parent ?? null, name: f.name, updatedAt: when(f.updatedAt || f.createdAt) })),
+				...files.map((f) => ({ id: f.id, kind: "file" as const, folderId: f.folder ?? null, name: f.name, updatedAt: when(f.updatedAt || f.createdAt), size: f.size })),
+			]);
 		} catch (e) {
 			this.set({ loading: false, error: e instanceof Error ? e.message : String(e) });
 		}
@@ -370,6 +375,12 @@ export class FilesModel {
 	}
 
 	// ── operations ──────────────────────────────────────────────────────
+
+	/** What kind of area this is (the shell knows; "own" outside a case). The
+	 * menus offer custody only where it exists: an evidence case. */
+	areaKind(): "evidence" | "working" | "own" | null {
+		return this.bridge.areaKind?.() ?? null;
+	}
 
 	async rename(kind: "file" | "folder", id: string, newName: string): Promise<void> {
 		if (!newName.trim()) return;

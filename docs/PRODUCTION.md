@@ -21,7 +21,20 @@ settings are in § 3 › The desktop installers.)
 3. **Access** (§ 2): a self-hosted application for `gorani.at.day`; an
    Allow policy for the team; a Bypass for `/s/*`, `/s.html`, `/r.html` and
    `/api/healthz`; its *Application Audience (AUD) Tag* is `POLICY_AUD`.
-4. **Deploy** (§ 3):
+4. **Deploy** (§ 3), from a machine that can build the Worker. On Ubuntu
+   (WSL too — keep the checkout in the Linux file system, e.g. `~/work`,
+   not under `/mnt/c`): Node.js 22 or later (wrangler needs it), Rust
+   through [rustup](https://rustup.rs), and what the Rust build needs
+   beside it — a C toolchain for build scripts (without it: ``linker `cc`
+   not found``) and OpenSSL's headers (`worker-build` links OpenSSL):
+
+   ```sh
+   sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev
+   rustup target add wasm32-unknown-unknown
+   ```
+
+   (The first build also downloads `worker-build`'s own tools — esbuild,
+   wasm-bindgen, wasm-opt — into `~/.cache/worker-build`.) Then:
 
    ```sh
    npm install && npm --prefix web install

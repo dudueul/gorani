@@ -422,24 +422,26 @@ member's machine (docs/REQUESTS.md › Scanning).
 
 ### The desktop installers (commit 39f, docs/DESKTOP.md › 39f)
 
-`.github/workflows/package.yml` builds the Windows MSIX and the Mac app on
-release tags (`v*`), by hand, and when the packaging changes. Signing
-needs these in the repository's settings (Actions secrets — the team id may
-be a variable); none is ever asked for, and each is read only by the step
-that signs:
+`.github/workflows/package.yml` builds the installers on release tags
+(`v*`), by hand, and when the packaging changes; docs/INSTALL.md is the
+person-facing side (installing, checking a download, and the release
+manager's steps — the release key, the private Store listing, signing each
+release with `tools/release/sign.sh`). The settings it reads, none ever
+asked for, each read only by the step that needs it:
 
 | name | what |
 |---|---|
-| `WINDOWS_CERT_PFX` | a code-signing certificate with its key, as base64 of the .pfx |
-| `WINDOWS_CERT_PASSWORD` | its password |
+| `STORE_IDENTITY_NAME`, `STORE_PUBLISHER`, `STORE_PUBLISHER_NAME` | Actions **variables**: the package identity Partner Center assigns when the name is reserved (public values) — without them no Store package is built |
 | `GORANI_TEAM_ID` | the Apple Developer team (variable or secret) — the app group is `<team>.io.gorani` |
 | `APPLE_CERT_P12` | the Developer ID Application identity, as base64 of the .p12 |
 | `APPLE_CERT_PASSWORD` | its password |
 | `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | an App Store Connect API key (the .p8's text, its id, the issuer) — to notarize |
 
-Without them the workflow still builds and tests both: the MSIX signed
-with a throwaway certificate trusted only on its runner, the Mac app
-ad-hoc signed — artifacts for testing, not for people. Each computer then
+Windows needs no certificate: the Store signs its package, and the
+unsigned builds (and the macOS CLI) are vouched for by the release
+manager's signature on SHA256SUMS, made on their own machine. Without the
+Apple secrets the Mac app is ad-hoc signed and stays a test artifact. Each
+computer then
 enrols as before (`gorani-sync setup`; the default protectors are the TPM
 and DPAPI on Windows, the Secure Enclave and the login Keychain on a Mac —
 docs/DESKTOP.md › 39d).

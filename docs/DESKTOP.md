@@ -362,6 +362,7 @@ never in the repository), and all four parts in this phase:
 | 39d | **The hardware device key**: Windows Hello (a TPM-backed key, its deterministic RSA signature) and the Secure Enclave (CryptoKit key agreement) as protectors. |
 | 39e | **Explorer and Finder**: the navigation-pane entry and sync states (StorageProviderSyncRootManager), Finder decorations. |
 | 39f | **Installers**: an MSIX and a signed, notarized app — signed in CI only when the signing secrets exist. |
+| 39g | **Distribution** (asked 2026-10-15): Windows through the Microsoft Store as a private app (Microsoft signs it); beside it, unsigned builds — a Windows 11 MSIX, a Windows ZIP, the macOS CLI — whose users check a SHA256SUMS the release manager signs with their own key. |
 
 ### 39a as built
 
@@ -565,7 +566,7 @@ or runs it there, as they would:
 | | Windows | macOS |
 |---|---|---|
 | what | an MSIX (`clients/windows/packaging`): gorani-cloud and gorani-sync, full trust, each a console command on PATH through an execution alias; logos drawn by `logos.py` (no image committed) | Gorani.app (`clients/macos/packaging/package.sh`): the app, its File Provider extension, the CLI (`Contents/MacOS/gorani-sync`) and two copies of the keystore helper — the CLI's, and the extension's signed to inherit its sandbox |
-| signed with secrets | `WINDOWS_CERT_PFX`, `WINDOWS_CERT_PASSWORD`; the package's publisher is the certificate's subject; timestamped | `GORANI_TEAM_ID` (variable or secret), `APPLE_CERT_P12`, `APPLE_CERT_PASSWORD`: Developer ID, inside-out, hardened runtime, the app group `<team>.io.gorani`; notarized and stapled with `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` |
+| signed with secrets | (39f: `WINDOWS_CERT_PFX`, `WINDOWS_CERT_PASSWORD` — replaced in 39g: the Store signs its package, the unsigned builds carry a signed checksum) | `GORANI_TEAM_ID` (variable or secret), `APPLE_CERT_P12`, `APPLE_CERT_PASSWORD`: Developer ID, inside-out, hardened runtime, the app group `<team>.io.gorani`; notarized and stapled with `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` |
 | without them | signed with a throwaway certificate made and trusted on that runner only — so installing is tested as a signed package's would be | ad-hoc signed, for testing (Gatekeeper will not open it from a download) |
 | checked | installed with Add-AppxPackage, both aliases answer, removed again | the bundled CLI answers, the helper probes, the extension's binary holds the core |
 
@@ -583,6 +584,48 @@ or runs it there, as they would:
   with one identifier, so the login Keychain's rule for the CLI's items
   admits the extension's helper too. Apple silicon only for now (the core
   is built for arm64).
+
+### 39g as built
+
+Asked 2026-10-15: Windows ships through the **Microsoft Store as a private
+app** (personal Microsoft accounts in a known-user group; uploaded by hand),
+and beside it **unsigned builds whose users verify a signed checksum** —
+for Windows a ZIP and a Windows 11 MSIX, for macOS the CLI and its helper.
+No code-signing certificate is bought for Windows; the 39f
+`WINDOWS_CERT_PFX` path is gone.
+
+| File | Identity | Signed by |
+|---|---|---|
+| `gorani-store.msix` (a workflow artifact, for Partner Center) | as Partner Center assigned it (variables `STORE_IDENTITY_NAME`, `STORE_PUBLISHER`, `STORE_PUBLISHER_NAME`); version `a.b.c.0` — the Store keeps the fourth number | Microsoft, on certification |
+| `gorani-windows-x64-unsigned.msix` | `Gorani.Client`, publisher `CN=Gorani Unsigned, OID.2.25.311729368913984317654407730594956997722=1` — the OID Windows requires before `Add-AppxPackage -AllowUnsigned` (Windows 11, as administrator) will take a package, and which no signed package can carry | nobody: SHA256SUMS |
+| `gorani-windows-x64.zip` | — | nobody: SHA256SUMS |
+| `gorani-macos-arm64-cli.tar.gz` | — (ad-hoc, as the linker leaves it) | nobody: SHA256SUMS |
+| `Gorani-macOS-arm64.zip` | Developer ID (39f) — in the release only when signed: unsigned, the extension cannot run | Apple's notarization, and SHA256SUMS |
+
+**The checksum's trust.** `SHA256SUMS` lists every release file; on a tag
+the workflow leaves a **draft** release holding them. The release manager
+runs `tools/release/sign.sh <tag>` on their own machine: it downloads the
+draft, checks each file against the list (and that nothing is unlisted or
+missing), shows the list and asks, signs it (`ssh-keygen -Y sign`,
+namespace `gorani-release`), checks that signature against the published
+key (`tools/release/allowed_signers`), uploads `SHA256SUMS.sig` and only
+then publishes. Users run `verify.sh` / `verify.ps1`: the signature by a
+pinned key for the principal `release@gorani`, then every file. Why SSH
+signatures: the tool is already on every Windows 11 and Mac (OpenSSH 8.1+),
+the key can live on a hardware token, and nothing new is installed to
+check a download. Why not GitHub's artifact attestations: in a private
+repository they need GitHub Enterprise Cloud — and they would vouch for
+the build, not for the person who approved the release.
+
+**Tested** in package.yml, on every run: the unsigned MSIX installed with
+`-AllowUnsigned`, both commands asked through their aliases, removed; the
+ZIP unpacked and both programs asked; the Store package signed by a
+throwaway certificate of the Store's publisher, installed, asked, removed
+(when the variables exist); the macOS CLI unpacked, asked, the helper
+probed; and on each platform the user's own check (`test-verify.sh` /
+`.ps1`, a throwaway key) passing a signed list and refusing a changed
+file, a list signed by another key, an edited list, an unsigned one, and
+the right key signing for another purpose.
 
 ## Testing (the pattern the port follows)
 

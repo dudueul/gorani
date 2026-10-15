@@ -26,7 +26,7 @@ import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, Selection } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { fmtSize, fmtDate, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, type MenuItem } from "./shared.ts";
+import { fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -70,6 +70,23 @@ export class GoraniFinder extends LitElement {
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
+	}
+
+	// Escape closes Get Info and Quick Look wherever the focus is (commit 39l:
+	// after a menu item, focus is on the page, not in the Finder — the key
+	// never reached its own handler, and the panel stayed over the files).
+	private onDocKey = (e: KeyboardEvent) => {
+		if (e.key !== "Escape") return;
+		if (this.info) this.info = null;
+		else if (this.quickLook) this.quickLook = null;
+	};
+	override connectedCallback(): void {
+		super.connectedCallback();
+		document.addEventListener("keydown", this.onDocKey);
+	}
+	override disconnectedCallback(): void {
+		document.removeEventListener("keydown", this.onDocKey);
+		super.disconnectedCallback();
 	}
 
 	protected override firstUpdated(): void {
@@ -191,7 +208,7 @@ export class GoraniFinder extends LitElement {
 					{ label: "Duplicate", run: () => { this.model.copy(); void this.model.paste(); }, disabled: kind === "folder" || many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
 					{ label: "Verify Signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },
-					{ label: "Custody…", run: () => void custodyAction(this.model, id, name), disabled: kind === "folder" || many },
+					{ label: "Custody…", run: () => void custodyAction(this.model, id, name), disabled: kind === "folder" || many || this.model.areaKind() !== "evidence" },
 					{ separator: true, label: "" },
 					{ label: "Rename…", run: () => void this.renameSelection(), disabled: many },
 					{ label: "Move to Trash", run: () => void this.deleteSelection() },
@@ -228,6 +245,7 @@ export class GoraniFinder extends LitElement {
 	}
 
 	private onKeydown(e: KeyboardEvent): void {
+		if (typingInField(e)) return;
 		if (this.renaming || this.quickLook) {
 			if (this.quickLook && (e.key === "Escape" || e.key === " " || e.key === "q")) {
 				this.quickLook = null;
@@ -548,7 +566,7 @@ export class GoraniFinder extends LitElement {
 				@dragstart=${(e: DragEvent) => setDragIds(e.dataTransfer!, [{ kind, id }])}
 			>
 				${icon(k, "h-4 w-4 shrink-0 text-neutral-400")}
-				<span class="truncate ${this.isSelected(kind, id) ? "text-white" : ""}">${name}</span>
+				<span data-rename="${id}" class="truncate ${this.isSelected(kind, id) ? "text-white" : ""}">${name}</span>
 				${kind === "folder" ? html`<span class="ml-auto text-neutral-600">›</span>` : nothing}
 			</div>
 		`;

@@ -11,8 +11,34 @@
 
 import { LitElement, html, nothing } from "lit";
 import { customElement, property } from "lit/decorators.js";
-import { styleMap } from "lit/directives/style-map.js";
+import { Directive, directive, PartType, type ElementPart, type PartInfo } from "lit/directive.js";
 import type { FileKind } from "./icons.ts";
+
+// ── cssom(): styles through the CSSOM, never the style attribute ─────
+//
+// The CSP says `style-src 'self'` (web/public/_headers): a `style="…"`
+// attribute is refused. Lit's styleMap writes one on its FIRST render (a
+// string, through setAttribute) and uses the CSSOM only after — so every
+// styleMap'd element rendered unstyled: the context menu had no position
+// and opened below the page, out of sight (commit 39l; the e2e watches
+// every CSP violation, but never opened a menu). `el.style.setProperty` is
+// the CSSOM, which the policy allows. Keys are CSS property names
+// ("padding-left").
+class CssomStyle extends Directive {
+	constructor(part: PartInfo) {
+		super(part);
+		if (part.type !== PartType.ELEMENT) throw new Error("cssom() belongs on an element: <div ${cssom({...})}>");
+	}
+	render(_styles: Record<string, string>) {
+		return nothing;
+	}
+	override update(part: ElementPart, [styles]: [Record<string, string>]) {
+		const el = part.element as HTMLElement;
+		for (const [name, value] of Object.entries(styles)) el.style.setProperty(name, value);
+		return nothing;
+	}
+}
+export const cssom = directive(CssomStyle);
 
 export function fmtSize(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
@@ -116,14 +142,23 @@ export class GoraniMenu extends LitElement {
 				buttons[(at + (e.key === "ArrowDown" ? 1 : buttons.length - 1)) % buttons.length]?.focus();
 			}
 		});
+		// Where it goes: at the pointer, moved in by its measured size so it
+		// never hangs off the window (the estimate this replaced guessed 34 px
+		// a row).
+		const box = this.querySelector<HTMLElement>('[role="menu"]');
+		if (box) {
+			const { width, height } = box.getBoundingClientRect();
+			box.style.setProperty("left", `${Math.max(8, Math.min(this.x, innerWidth - width - 8))}px`);
+			box.style.setProperty("top", `${Math.max(8, Math.min(this.y, innerHeight - height - 8))}px`);
+		}
 		requestAnimationFrame(() => (this.querySelector("button") as HTMLElement | null)?.focus());
 	}
 
 	protected override render() {
 		return html`
 			<div
-				class="fixed z-50 min-w-52 rounded-xl border border-neutral-700 bg-neutral-900/95 py-1.5 shadow-2xl backdrop-blur"
-				style=${styleMap({ left: `${Math.min(this.x, innerWidth - 240)}px`, top: `${Math.min(this.y, innerHeight - this.items.length * 34 - 24)}px` })}
+				class="fixed left-0 top-0 z-50 max-h-[calc(100vh-16px)] min-w-52 overflow-y-auto rounded-xl border border-neutral-700 bg-neutral-900/95 py-1.5 shadow-2xl backdrop-blur"
+				${cssom({ left: `${this.x}px`, top: `${this.y}px` })}
 				role="menu"
 				tabindex="-1"
 			>
@@ -163,6 +198,16 @@ export function showMenu(items: MenuItem[], x: number, y: number): void {
 // ── small shared bits ───────────────────────────────────────────────
 
 export const isMac = () => navigator.platform.toLowerCase().includes("mac");
+
+/** Is this key for a text field? The explorers' shortcuts (Delete, Backspace,
+ * arrows, Enter…) listen on the whole window, and until commit 39l they
+ * took keys typed INTO the search box too: Delete in the search field moved
+ * the selected files to the Trash, Backspace went up a folder instead of
+ * deleting a character. A key whose target is a field is the field's. */
+export function typingInField(e: KeyboardEvent): boolean {
+	const t = e.target as HTMLElement | null;
+	return !!t?.closest?.("input, textarea, select, [contenteditable]:not([contenteditable=false])");
+}
 export const modKey = () => (isMac() ? "metaKey" : "ctrlKey");
 
 /** Inline rename: replaces a row's label with an input, resolves on Enter/blur. */
@@ -174,6 +219,7 @@ export function startRename(container: HTMLElement, selector: string, current: s
 	}
 	const input = document.createElement("input");
 	input.className = "w-full rounded border border-accent bg-neutral-950 px-1 text-sm outline-none";
+	input.dataset.renaming = ""; // (what a test finds it by)
 	input.value = current;
 	const ext = current.includes(".") && !current.startsWith(".") ? current.lastIndexOf(".") : current.length;
 	input.setSelectionRange(0, ext);

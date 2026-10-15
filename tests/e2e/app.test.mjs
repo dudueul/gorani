@@ -199,6 +199,80 @@ try {
 		await page.keyboard.press("Escape");
 		await assertNoViolations(page, "unlock → upload → open");
 
+		// ── The context menus, in both explorers (commit 39l) ───────────
+		// Reported as "all broken": the menu's position was a styleMap, whose
+		// first render is a style ATTRIBUTE — refused by the CSP — so it opened
+		// below the page, out of sight. Behind it: search answered with the
+		// worker's envelope (every search threw); keys typed into the search
+		// box drove the explorer (Delete trashed the selection); Escape closed
+		// neither the share dialog nor Finder's Get Info; Rename did nothing in
+		// Finder's column view; Custody… was offered where it cannot exist.
+		// This suite never opened a menu — now it opens them, and the CSP
+		// watcher (assertNoViolations) sees each.
+		{
+			await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "menu-a.txt", mimeType: "text/plain", buffer: Buffer.from("a file for the menus") });
+			await page.locator("text=menu-a.txt").first().waitFor({ timeout: 60_000 });
+			const row = (host, name) => page.locator(`${host} [data-item^="file:"]`, { hasText: name }).first();
+			const openMenu = async (host, name) => {
+				await row(host, name).click({ button: "right" });
+				const menu = page.locator('gorani-menu [role="menu"]');
+				await menu.waitFor({ timeout: 10_000 });
+				const box = await menu.boundingBox();
+				const vp = page.viewportSize();
+				assert.ok(box && box.x >= 0 && box.y >= 0 && box.x + box.width <= vp.width && box.y + box.height <= vp.height, `${host}: the menu opens inside the window, at the pointer (${JSON.stringify(box)})`);
+				return page.locator("gorani-menu");
+			};
+			const choose = async (host, name, label) => (await openMenu(host, name)).getByRole("menuitem", { name: label, exact: true }).click();
+
+			// Windows: Rename, Download, Share, and what Custody… says outside a case.
+			await choose("gorani-win11", "menu-a.txt", "Rename");
+			const rename = page.locator("gorani-win11 input[data-renaming]");
+			await rename.fill("menu-b.txt");
+			await rename.press("Enter");
+			await row("gorani-win11", "menu-b.txt").waitFor({ timeout: 30_000 });
+			const download = page.waitForEvent("download");
+			await choose("gorani-win11", "menu-b.txt", "Download");
+			assert.equal((await download).suggestedFilename(), "menu-b.txt", "Download from the menu downloads the file");
+			await choose("gorani-win11", "menu-b.txt", "Share…");
+			await page.locator("gorani-share").waitFor({ state: "attached" });
+			await page.keyboard.press("Escape");
+			await page.locator("gorani-share").waitFor({ state: "detached" });
+			const menu = await openMenu("gorani-win11", "menu-b.txt");
+			assert.equal(await menu.getByRole("menuitem", { name: "Custody…", exact: true }).isDisabled(), true, "custody exists in an evidence case only — not offered in My files");
+			await page.keyboard.press("Escape");
+			await page.mouse.click(5, 5);
+
+			// The search box: its keys are its own, and it finds.
+			await row("gorani-win11", "menu-b.txt").click();
+			const search = page.locator('gorani-win11 input[placeholder^="Search"]');
+			await search.click();
+			await search.pressSequentially("menu-b");
+			await page.locator("gorani-win11 div.absolute button", { hasText: "menu-b.txt" }).first().waitFor({ timeout: 10_000 });
+			await search.press("Backspace");
+			await search.press("Home");
+			await search.press("Delete");
+			assert.equal(await search.inputValue(), "enu-", "Backspace, Home and Delete edit the search text");
+			await search.fill("");
+			await row("gorani-win11", "menu-b.txt").waitFor({ timeout: 5_000 });
+
+			// Finder (column view): Get Info, Rename…, Move to Trash.
+			await page.getByRole("button", { name: "Finder", exact: true }).click();
+			await choose("gorani-finder", "menu-b.txt", "Get Info");
+			await page.getByText("the server stored none of these values").waitFor();
+			await page.keyboard.press("Escape");
+			await page.getByText("the server stored none of these values").waitFor({ state: "detached" });
+			await choose("gorani-finder", "menu-b.txt", "Rename…");
+			const renameF = page.locator("gorani-finder input[data-renaming]");
+			await renameF.fill("menu-c.txt");
+			await renameF.press("Enter");
+			await row("gorani-finder", "menu-c.txt").waitFor({ timeout: 30_000 });
+			await choose("gorani-finder", "menu-c.txt", "Move to Trash");
+			await row("gorani-finder", "menu-c.txt").waitFor({ state: "detached", timeout: 30_000 });
+			await page.getByRole("button", { name: "Windows", exact: true }).click();
+			await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached" });
+			await assertNoViolations(page, "the context menus, both explorers");
+		}
+
 		// ── Streaming media through the service worker (O11) ───────────
 		// A video over the 8 MiB streaming threshold opens as /media/<id>,
 		// answered by the media service worker with decrypted bytes. Before

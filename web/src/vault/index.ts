@@ -64,7 +64,7 @@ export class LocalIndex implements LocalIndexLike {
 		this.worker = worker;
 		void count;
 		this.worker.onmessage = (event: MessageEvent) => {
-			const msg = event.data as { type: string; id?: number; message?: string; ciphertext?: ArrayBuffer };
+			const msg = event.data as { type: string; id?: number; message?: string; ciphertext?: ArrayBuffer; hits?: SearchHit[]; entries?: IndexEntry[] };
 			// The snapshot lands in IndexedDB here, then resolves the save call.
 			if (msg.type === "snapshot" && msg.ciphertext) void idbStore(this.memberId, msg.ciphertext);
 			if (msg.type === "error") {
@@ -79,7 +79,11 @@ export class LocalIndex implements LocalIndexLike {
 				const p = this.pending.get(msg.id);
 				if (p) {
 					this.pending.delete(msg.id);
-					p.resolve(msg as never);
+					// The ANSWER, not the envelope: search wants the hits, recents
+					// the entries. (Until commit 39l the whole message resolved —
+					// every search threw "hits.map is not a function" and Recents
+					// showed nothing; no test ran either in a browser.)
+					p.resolve((msg.type === "results" ? (msg.hits ?? []) : msg.type === "recents" ? (msg.entries ?? []) : undefined) as never);
 				}
 			}
 		};

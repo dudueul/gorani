@@ -153,6 +153,35 @@ memory.
    web app's Team › Devices tab (commit 35), which flags a computer whose
    secret sits in a file.
 
+7. **Collectors** (commit 37, docs/COLLECTORS.md) — the one place a
+   service token IS the identity. For each machine that drops evidence
+   (an acquisition server, an EDR export):
+   - In Zero Trust › Access › Service Auth, create a **service token**
+     for it. Its Client ID is what the JWT carries as `common_name`; the
+     Client Secret is shown once. Give the Access application a policy
+     with the action **Service Auth** that includes that token (one token
+     per machine; never share one between collectors).
+   - On the machine: `gorani-sync collector init --server https://<host>
+     --id <id> --pins <lead>:<fingerprint>,… --access-id <Client ID>`,
+     with the Client Secret in `GORANI_COLLECTOR_SECRET` or typed when
+     asked (never a flag). Pins are the leads whose fingerprints you
+     compared at the machine; it believes a case's inbox key only through
+     them. It prints `{ id, publicKey, keyId, fingerprint }`.
+   - In the web app, Team › Collectors: one lead registers it (pasting
+     that JSON and the Client ID), a SECOND lead compares the fingerprint
+     with the machine's screen and approves. Then a case's manager makes
+     the case's inbox key (Team › Cases) and grants the collector the
+     case. `gorani-sync collector whoami` on the machine checks it all
+     end to end.
+   - The Worker lets a collector reach `/api/v1/collect/…` only, and asks
+     the registry on every request — revoking it in Team › Collectors (or
+     deleting the service token in Access) stops it at once.
+   - A collector holds no case key: it cannot read what it, or anyone,
+     put in a case. What a compromised one leaks is what it collects from
+     then on; what it can forge is items in an inbox — which members'
+     clients name as unverified unless the collector's signature holds,
+     and which a person accepts or rejects.
+
 ## 3. Deploy
 
 ```sh
@@ -352,6 +381,12 @@ Object's SQLite size. Strategy: retention (built), the reserved
 `GoraniFilesDO` split, sharding — see `docs/ARCHITECTURE.md › Growth`.
 
 ## 6. Known gaps
+
+- Collectors (commit 37): a large drop does not resume (a stopped one is
+  sent again as a new item); the store can withhold an inbox item, which
+  only the collector's own log (`~/.gorani-collector.log`) shows; and the
+  store verifies no signature, so a writer on the case could file an item
+  their client would call unverified — under their own name, on the trail.
 
 - Worker request caps: uploads are chunked — 8 MiB frames, growing to
   32 MiB for files over 156 GiB (docs/LARGE-FILES.md) — and each part is

@@ -27,6 +27,8 @@ use worker::{durable_object, DurableObject, Env, Error, Request, Response, Resul
 use crate::auth;
 
 mod approvals;
+mod collectors;
+mod inbox;
 mod recovery;
 mod tsa_certs;
 
@@ -190,6 +192,45 @@ pub const MIGRATIONS: &[&str] = &[
 		signature TEXT NOT NULL,
 		at TEXT NOT NULL,
 		PRIMARY KEY (spki, by_member)
+	)",
+	// Migration v9 (commit 37a, family/collectors.rs): the machines that drop
+	// evidence into case inboxes — two leads' signed registration each — and
+	// the cases each may drop into.
+	"CREATE TABLE IF NOT EXISTS collectors (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		common_name TEXT NOT NULL,
+		key_id TEXT NOT NULL,
+		public_key TEXT NOT NULL,
+		requested_by TEXT NOT NULL,
+		requested_at TEXT NOT NULL,
+		request_signature TEXT NOT NULL,
+		approved_by TEXT,
+		approved_at TEXT,
+		approve_signature TEXT,
+		revoked_by TEXT,
+		revoked_at TEXT
+	)",
+	"CREATE TABLE IF NOT EXISTS collector_grants (
+		collector_id TEXT NOT NULL,
+		case_id TEXT NOT NULL,
+		granted_by TEXT NOT NULL,
+		granted_at TEXT NOT NULL,
+		PRIMARY KEY (collector_id, case_id)
+	)",
+	// Migration v10 (commit 37b, family/inbox.rs): each case's inbox keys —
+	// public halves signed by a manager, private halves sealed under the case
+	// key. Every key is kept: items stay sealed to the key they arrived under.
+	"CREATE TABLE IF NOT EXISTS case_inbox_keys (
+		case_id TEXT NOT NULL,
+		key_id TEXT NOT NULL,
+		public_key TEXT NOT NULL,
+		signature TEXT NOT NULL,
+		signed_by TEXT NOT NULL,
+		private_sealed TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		retired_at TEXT,
+		PRIMARY KEY (case_id, key_id)
 	)",
 ];
 
@@ -397,6 +438,41 @@ impl GoraniFamilyDO {
 				Some((case, approval)) => self.approval_cancel(&actor, case, approval).await,
 				None => json_error(400, "case-approvals/<case>/<approval>"),
 			},
+			// ── Collectors (commit 37a, family/collectors.rs) ──
+			("GET", "collectors") => self.collectors_list(&actor).await,
+			("POST", "collectors") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.collector_request(&actor, body).await
+			}
+			("POST", id) if id.starts_with("collector-approve/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.collector_approve(&actor, &id["collector-approve/".len()..], body).await
+			}
+			("DELETE", id) if id.starts_with("collectors/") => self.collector_revoke(&actor, &id["collectors/".len()..]).await,
+			("PUT", id) if id.starts_with("collector-grants/") => match id["collector-grants/".len()..].split_once('/') {
+				Some((case, collector)) => self.collector_grant(&actor, case, collector).await,
+				None => json_error(400, "collector-grants/<case>/<collector>"),
+			},
+			("DELETE", id) if id.starts_with("collector-grants/") => match id["collector-grants/".len()..].split_once('/') {
+				Some((case, collector)) => self.collector_ungrant(&actor, case, collector).await,
+				None => json_error(400, "collector-grants/<case>/<collector>"),
+			},
+			// ── Inbox keys (commit 37b, family/inbox.rs) ──
+			("PUT", id) if id.starts_with("case-inbox-key/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.inbox_key_put(&actor, &id["case-inbox-key/".len()..], body).await
+			}
+			("GET", id) if id.starts_with("collector-inbox/") => match id["collector-inbox/".len()..].split_once('/') {
+				Some((case, collector)) => self.collector_inbox(case, collector).await,
+				None => json_error(400, "collector-inbox/<case>/<collector>"),
+			},
+			("GET", id) if id.starts_with("inbox-key-current/") => match id["inbox-key-current/".len()..].split_once('/') {
+				Some((case, key)) => self.inbox_key_current(case, key).await,
+				None => json_error(400, "inbox-key-current/<case>/<key>"),
+			},
+			// The Worker's question for every service-token request (no actor:
+			// Access already validated the token; this says whose it is).
+			("GET", id) if id.starts_with("collector-auth/") => self.collector_auth(&id["collector-auth/".len()..]).await,
 			// ── The timestamp authority (commit 29j, family/tsa_certs.rs) ──
 			("GET", "tsa") => self.tsa_get(&actor).await,
 			("PUT", "tsa") => {
@@ -822,6 +898,9 @@ impl GoraniFamilyDO {
 					"prevKeySealed": g.prev_key_sealed, "prevSignature": g.prev_signature, "prevSignedBy": g.prev_signed_by,
 				})),
 				"grantees": grantees.into_iter().map(|g| serde_json::json!({ "member": g.member_id, "permission": g.permission, "expiresAt": g.expires_at })).collect::<Vec<_>>(),
+				// (commit 37b) every inbox key the case has had, the current one
+				// with no retiredAt; private halves sealed under the case key.
+				"inboxKeys": self.inbox_keys(&c.id)?.into_iter().map(|k| k.json).collect::<Vec<_>>(),
 			}));
 		}
 		Ok(Response::from_json(&serde_json::json!({ "cases": out }))?)
@@ -982,6 +1061,24 @@ impl GoraniFamilyDO {
 		if copies.values().any(|(k, sig)| !gorani_formats::formats::is_sealed_text(k) || !is_signature(sig)) {
 			return json_error(400, "every copy must be sealed text, with the rotating manager's signature");
 		}
+		// The inbox private halves (commit 37b) are sealed under the case key:
+		// all of them move to the new one in this same step, or the inbox
+		// would open only with a key the rotation is retiring.
+		let inbox: std::collections::BTreeMap<String, String> = body
+			.get("inboxKeys")
+			.and_then(|g| g.as_array())
+			.map(|list| list.iter().filter_map(|k| Some((k.get("keyId")?.as_str()?.to_string(), k.get("privateSealed")?.as_str()?.to_string()))).collect())
+			.unwrap_or_default();
+		let held: std::collections::BTreeSet<String> = self.inbox_keys(case)?.into_iter().map(|k| k.key_id).collect();
+		if held != inbox.keys().cloned().collect() {
+			return json_error(409, "a rotation re-seals every inbox key of the case under the new key — exactly the case's inbox keys, no more, no fewer");
+		}
+		if inbox.values().any(|p| !gorani_formats::placed::is_placed_text(p)) {
+			return json_error(400, "every inbox key must arrive sealed into its place (GV04)");
+		}
+		for (k, sealed) in &inbox {
+			self.sql.exec("UPDATE case_inbox_keys SET private_sealed = ?1 WHERE case_id = ?2 AND key_id = ?3", Some(vec![sealed.clone().into(), case.into(), k.clone().into()]))?;
+		}
 		for (member, (sealed, signature)) in &copies {
 			self.sql.exec(
 				"UPDATE case_grants SET prev_key_sealed = key_sealed, prev_signature = signature, prev_signed_by = signed_by, key_sealed = ?1, key_id = ?2, signature = ?5, signed_by = ?6 WHERE case_id = ?3 AND member_id = ?4",
@@ -1055,6 +1152,12 @@ impl GoraniFamilyDO {
 		if self.member_by_email(actor)?.is_none() {
 			return json_error(403, "not a team member");
 		}
+		Ok(Response::from_json(&serde_json::json!({ "identities": self.identities_json()? }))?)
+	}
+
+	/// Every registered identity with its certificates — public, and what
+	/// any client (a member's, a collector's) builds its trust from.
+	fn identities_json(&self) -> Result<Vec<serde_json::Value>> {
 		let rows: Vec<IdentityRow> = self
 			.sql
 			.exec("SELECT i.member_id, i.key_id, i.public_key, i.root_digest, i.signature, m.active FROM identities i JOIN members m ON m.id = i.member_id ORDER BY i.member_id", None)?
@@ -1068,7 +1171,7 @@ impl GoraniFamilyDO {
 				"certs": certs.into_iter().map(|c| serde_json::json!({ "by": c.by_member, "keyId": c.key_id, "rootDigest": c.root_digest, "signature": c.signature })).collect::<Vec<_>>(),
 			}));
 		}
-		Ok(Response::from_json(&serde_json::json!({ "identities": out }))?)
+		Ok(out)
 	}
 
 	async fn identity_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {

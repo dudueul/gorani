@@ -90,6 +90,8 @@ struct VersionSqlRow {
 	sample: i64,
 	#[serde(default)]
 	intake_sealed: Option<String>,
+	#[serde(default)]
+	collection_sealed: Option<String>,
 }
 
 impl GoraniMemberDO {
@@ -367,7 +369,7 @@ impl GoraniMemberDO {
 			let row: Option<VersionSqlRow> = self
 				.sql
 				.exec(
-					"SELECT v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.hash_sealed, f.sample AS sample, f.intake_sealed AS intake_sealed FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE v.file_id = ?1",
+					"SELECT v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.hash_sealed, f.sample AS sample, f.intake_sealed AS intake_sealed, f.collection_sealed AS collection_sealed FROM file_versions v JOIN files f ON f.id = v.file_id AND f.version = v.version WHERE v.file_id = ?1",
 					Some(vec![id.clone().into()]),
 				)?
 				.to_array::<VersionSqlRow>()
@@ -380,6 +382,8 @@ impl GoraniMemberDO {
 						"key": v.content_key, "vaultKeyId": v.vault_key_id, "chunk": v.chunk_size,
 						"version": v.version, "type": v.type_sealed, "size": v.size, "object": v.object_key,
 						"hash": v.hash_sealed, "sample": v.sample != 0, "intake": v.intake_sealed,
+						// (commit 37c) a file accepted from the inbox: the collector's record.
+						"collection": v.collection_sealed,
 					}),
 				);
 			}
@@ -1159,6 +1163,8 @@ impl GoraniMemberDO {
 	/// | `hash` | file_versions | the uploader's signed content hash (29d) |
 	/// | `intake` | files | an evidence file's signed intake record (29g) |
 	/// | `custody` | custody | each custody link's sealed reason (29g) |
+	/// | `collection` | files | an accepted inbox item's collection record (37c) |
+	/// | `reject` | inbox_items | a rejected item's sealed reason (37c) |
 	///
 	/// Before commit 24 the rotation walk could reach only each file's LIVING
 	/// version (via `files/keys`) and file names — so a departed member's old
@@ -1182,7 +1188,9 @@ impl GoraniMemberDO {
 			"hash" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, hash_sealed AS v1, NULL AS v2 FROM file_versions WHERE rowid > ?1 AND hash_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"intake" => "SELECT rowid AS row, id AS a, NULL AS b, intake_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 AND intake_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"custody" => "SELECT rowid AS row, file_id AS a, CAST(seq AS TEXT) AS b, reason_sealed AS v1, NULL AS v2 FROM custody WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
-			_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody"),
+			"collection" => "SELECT rowid AS row, id AS a, NULL AS b, collection_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 AND collection_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
+			"reject" => "SELECT rowid AS row, id AS a, NULL AS b, reject_reason AS v1, NULL AS v2 FROM inbox_items WHERE rowid > ?1 AND reject_reason IS NOT NULL ORDER BY rowid LIMIT ?2",
+			_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject"),
 		};
 		// `&file=<id>` narrows `version` to one file's versions (commit 29e:
 		// marking a sample re-seals each of ITS versions' types — a walk of
@@ -1241,7 +1249,9 @@ impl GoraniMemberDO {
 				"hash" => "UPDATE file_versions SET hash_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND hash_sealed IS NOT NULL",
 				"intake" => "UPDATE files SET intake_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND intake_sealed IS NOT NULL",
 				"custody" => "UPDATE custody SET reason_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
-				_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody"),
+				"collection" => "UPDATE files SET collection_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND collection_sealed IS NOT NULL",
+				"reject" => "UPDATE inbox_items SET reject_reason = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND reject_reason IS NOT NULL",
+				_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject"),
 			};
 			plan.push((sql, row, v1, v2));
 		}

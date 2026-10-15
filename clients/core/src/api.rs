@@ -334,6 +334,33 @@ impl Client {
 		Ok(out)
 	}
 
+	// ── a case's inbox (commit 37c, inbox.rs) ──────────────────────────
+
+	/// The area's inbox (a case's): every item, sealed halves and all.
+	pub fn inbox(&self) -> Result<Value, Error> {
+		self.area_json("GET", "/inbox", None)
+	}
+
+	/// An inbox item's sealed bytes (Range honoured, as `fetch`).
+	pub fn fetch_inbox(&self, item: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, Error> {
+		let mut r = self.req("GET", &self.area_url(&format!("/inbox/{item}"))).set("x-gorani-client", "cli");
+		if let Some((a, b)) = range {
+			r = r.set("Range", &format!("bytes={a}-{}", b.saturating_sub(1)));
+		}
+		let res = r.call().map_err(|e| match e {
+			ureq::Error::Status(code, resp) => Error::Http(code, resp.into_string().unwrap_or_default()),
+			other => Error::Config(other.to_string()),
+		})?;
+		let mut out = Vec::new();
+		res.into_reader().read_to_end(&mut out)?;
+		Ok(out)
+	}
+
+	/// `accept` or `reject` an inbox item.
+	pub fn inbox_decide(&self, item: &str, decision: &str, body: Value) -> Result<Value, Error> {
+		self.area_json("POST", &format!("/inbox/{item}/{decision}"), Some(body))
+	}
+
 	pub fn ck_of(&self, id: &str) -> Result<String, Error> {
 		let keys = self.keys(&[id.to_string()])?;
 		Ok(keys["keys"][id]["key"].as_str().unwrap_or_default().to_string())

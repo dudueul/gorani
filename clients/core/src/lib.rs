@@ -17,9 +17,11 @@
 pub mod api;
 pub mod area;
 pub mod cases;
+pub mod collector;
 pub mod devicekey;
 pub mod engine;
 pub mod identity;
+pub mod inbox;
 pub mod session;
 pub mod transfer;
 

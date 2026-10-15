@@ -31,6 +31,9 @@
  * | `share.name` | member | share id | — | the owner's copy of a link's name |
  * | `store.secrets` | member | — | — | fingerprint + index keys |
  * | `case.title` | `case:<id>` | — | — | a case's title (in the registry) |
+ * | `case.inbox` | `case:<id>` | inbox key id | — | an inbox key's private half (in the registry; inbox.ts) |
+ * | `file.collection` | `case:<id>` | file id | — | an accepted inbox item's collection record (inbox.ts) |
+ * | `inbox.reject` | `case:<id>` | item id | — | why an inbox item was rejected (inbox.ts) |
  *
  * The `store` column is an AREA (lib/area.ts): a member id, or `case:<id>`
  * for a case (commit 26) — the same kinds, in a different store.
@@ -67,6 +70,12 @@ export const places = {
 	shareName: (store: string, share: string) => place("share.name", store, share),
 	storeSecrets: (store: string) => place("store.secrets", store, ""),
 	caseTitle: (store: string) => place("case.title", store, ""),
+	/** A case inbox's private key (commit 37b): sealed with the case key, named by the inbox key's id. */
+	caseInbox: (store: string, keyId: string) => place("case.inbox", store, keyId),
+	/** An accepted inbox item's collection record (commit 37c): the collector's signed word, beside the file. */
+	fileCollection: (store: string, file: string) => place("file.collection", store, file),
+	/** Why an inbox item was turned away (commit 37c). */
+	inboxReject: (store: string, item: string) => place("inbox.reject", store, item),
 };
 
 /** A fresh client-chosen id (file, folder): 128 random bits, base64url — the

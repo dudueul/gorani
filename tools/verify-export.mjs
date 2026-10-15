@@ -23,7 +23,12 @@
  *     hashRecord's signature, a checkpoint's over the checkpoint's bytes —
  *     the TSA's signature (with Node's own X.509 parser), its signing-
  *     certificate binding and timestamping EKU, and its KEY certified by a
- *     lead in the package (tsa › certs) or named with --tsa.
+ *     lead in the package (tsa › certs) or named with --tsa;
+ *   - (commit 37d) every file that came in through a case inbox: its collector's
+ *     registration — two different leads in the package, both signatures over the
+ *     collector's id, service token and key — the collector's own signature over
+ *     every field it recorded, those fields against the file's version-1 bytes,
+ *     and the timestamp over that signature.
  *
  * What it cannot decide for you: whether the exporter's key is who it says,
  * or whether a TSA's key is the authority's. It prints both fingerprints —
@@ -412,6 +417,29 @@ for (const f of m.files) {
 	if (f.intake) {
 		const i = f.intake;
 		check(signedBy(i.signer, i.keyId, stmt("gorani-intake-v1", area, f.id, i.source, i.collector, i.method, i.collectedAt, i.notes), i.signature), `${f.name}: intake record signed by ${i.signer}`);
+	}
+	if (f.collection) {
+		// Collected by a machine (commit 37d, docs/COLLECTORS.md): the two
+		// leads who registered it are in the package; the machine signed every
+		// field; the fields are version 1's bytes.
+		const r = f.collection.record;
+		const c = (m.collectors ?? []).find((x) => x.id === r.collector);
+		const keyOk = !!c && sha256hex(stmt("gorani-identity-key-v1", rawPoint(c.publicKey))) === c.keyId;
+		const registered =
+			keyOk &&
+			c.approvedBy &&
+			c.approvedBy !== c.requestedBy &&
+			signedBy(c.requestedBy, null, stmt("gorani-collector-v1", c.id, c.commonName, c.keyId, c.requestedBy), c.requestSignature) &&
+			signedBy(c.approvedBy, null, stmt("gorani-collector-approve-v1", c.id, c.commonName, c.keyId, c.requestedBy, c.approvedBy), c.approveSignature);
+		check(registered, `${f.name}: collector ${r.collector} registered by two leads${c ? ` (${c.requestedBy}, ${c.approvedBy})` : " — not in the package"}, both signed`);
+		const x = r.meta;
+		const fields = x && x.case === m.case && x.item === r.item && x.collector === r.collector;
+		check(fields && keyOk && verifyWith(c.publicKey, stmt("gorani-collect-v1", x.case, x.item, x.collector, x.sha256, String(x.size), x.name, x.type, x.source, x.method, x.collectedAt, x.notes), x.signature), `${f.name}: collected by ${r.collector} — its signature over every field it recorded`);
+		const v1 = f.versions.find((v) => v.version === 1);
+		check(v1 && x && v1.sha256 === x.sha256 && v1.size === x.size, `${f.name}: version 1 is the bytes the collector signed`);
+		if (r.stamp?.token && x?.signature) stampCheck(`${f.name} (as collected)`, r.stamp.token, sha256hex(Buffer.from(x.signature, "base64")));
+		else notes.push(`${f.name}: its collection not timestamped`);
+		if (c && c.status !== "active") notes.push(`${f.name}: collector ${c.id} is ${c.status} now (its signatures from before still stand)`);
 	}
 	if (f.custody) {
 		let holder = f.custody.owner;

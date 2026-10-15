@@ -30,6 +30,12 @@
  * Re-verification walks the same files the same way and reports counts
  * only: what was checked, what failed.
  *
+ * Collected evidence (commit 37d, docs/COLLECTORS.md): a file accepted from
+ * a case inbox carries its collection record — the collector's signed
+ * fields and their timestamp — checked here against version 1's bytes; the
+ * package lists the collector's registration (its key, both leads'
+ * signatures), so a recipient checks the machine's word with no registry.
+ *
  * Trusted timestamps (commit 29j, timestamp.ts) travel with each version
  * and each audit checkpoint: the token as the TSA issued it, its imprint,
  * and — in `tsa.certs` — the leads' certifications of the TSA keys, whose
@@ -43,6 +49,8 @@ import { openPlacedText, openWith, unwrapPlacedKey, type VaultPrivateKey } from 
 import { openChunked, openChunkedStream } from "./chunked-file.ts";
 import { checkContentHash, openContentHash, sha256Hex, sha256Stream, type ContentHashRecord, type HashCheck } from "./content-hash.ts";
 import { checkIntake, type IntakeRecord } from "./intake.ts";
+import { checkCollection, type CollectionRecord } from "./inbox.ts";
+import type { CollectorRow } from "./collectors.ts";
 import { verifyChain, type CustodyChain } from "./custody.ts";
 import { isSampleType, SAMPLE_PASSWORD } from "./samples.ts";
 import { ZipStream, type ZipSink } from "./zip.ts";
@@ -84,6 +92,8 @@ export interface FileReport {
 	intakeCheck: string;
 	custody: { owner: string; custodian: string; ok: boolean; links: { seq: number; from: string; to: string; reason: string | null; offeredAt: string; offerSignature: string; acceptedAt: string | null; acceptSignature: string | null; ok: boolean; why: string }[] } | null;
 	versions: VersionReport[];
+	/** (commit 37d) Collected by a machine: its record (null when it did not open), and the exporter's check. */
+	collection: { record: CollectionRecord | null; check: "verified" | "unverified"; why: string } | null;
 }
 
 interface FileRow {
@@ -115,9 +125,10 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 		if (!page.files.length || offset >= page.total) break;
 	}
 	const out: FileReport[] = [];
+	let collectors: CollectorRow[] | null = null;
 	for (const row of rows) {
 		const name = await openPlacedText(store, places.fileName(area, row.id), row.name).catch(() => row.id);
-		const keys = (await source.post<{ keys: Record<string, { intake?: string | null; sample?: boolean }> }>(`${base}/files/keys`, { ids: [row.id] })).keys[row.id];
+		const keys = (await source.post<{ keys: Record<string, { intake?: string | null; sample?: boolean; collection?: string | null }> }>(`${base}/files/keys`, { ids: [row.id] })).keys[row.id];
 		const intake = await checkIntake(store, trust, area, row.id, keys?.intake ?? null);
 		let custody: FileReport["custody"] = null;
 		try {
@@ -191,7 +202,20 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 			if (page.next === null) break;
 			after = page.next;
 		}
-		out.push({ id: row.id, name, sample, intake: intake.status === "verified" || intake.status === "untrusted" ? intake.record : null, intakeCheck: intake.status, custody, versions });
+		// The collector's record answers for version 1 — the bytes it dropped.
+		let collection: FileReport["collection"] = null;
+		if (keys?.collection) {
+			const v1 = versions.find((v) => v.version === 1);
+			collectors ??= await source.get<{ collectors: CollectorRow[] }>("/api/v1/family/collectors").then((r) => r.collectors, () => []);
+			try {
+				const c = await checkCollection(store, caseId, row.id, keys.collection, trust, collectors, v1 ? { sha256: v1.sha256, size: v1.size } : undefined);
+				const why = c.problem ?? (v1 ? "" : "the file has no version 1");
+				collection = { record: c.record, check: why ? "unverified" : "verified", why };
+			} catch (e) {
+				collection = { record: null, check: "unverified", why: `the record does not open in its place (${e instanceof Error ? e.message : String(e)})` };
+			}
+		}
+		out.push({ id: row.id, name, sample, intake: intake.status === "verified" || intake.status === "untrusted" ? intake.record : null, intakeCheck: intake.status, custody, versions, collection });
 	}
 	return out;
 }
@@ -228,6 +252,7 @@ export async function reverifyCase(source: ExportSource, store: VaultPrivateKey,
 			if (sp) problems.push(`${f.name} v${v.version}: ${sp}`);
 			if (v.stampNote === "no-imprint" && v.hashCheck === "verified" && v.hashRecord) missing.push({ file: f.id, version: v.version, signature: v.hashRecord.signature });
 		}
+		if (f.collection?.check === "unverified") problems.push(`${f.name}: collection ${f.collection.why}`);
 	}
 	for (const m of missing) {
 		if (!source.put) break;
@@ -288,6 +313,7 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 	for (const f of files) {
 		if (f.intakeCheck !== "verified" && f.intakeCheck !== "none") problems.push(`${f.name}: intake ${f.intakeCheck}`);
 		if (f.custody && !f.custody.ok) problems.push(`${f.name}: custody chain does not verify`);
+		if (f.collection?.check === "unverified") problems.push(`${f.name}: collection ${f.collection.why}`);
 	}
 	// The whole audit trail, oldest first, with its base and the server's verification of it.
 	const base = `/api/v1/cases/${caseId}`;
@@ -316,6 +342,12 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 		if (f.custody) named.add(f.custody.owner);
 	}
 	for (const c of tsa.certs) named.add(c.by);
+	// The collectors the files name, with their registrations (and the two
+	// leads who signed each among the identities).
+	const collectorIds = new Set(files.flatMap((f) => (f.collection?.record ? [f.collection.record.collector] : [])));
+	const collectorRows = collectorIds.size ? (await source.get<{ collectors: CollectorRow[] }>("/api/v1/family/collectors")).collectors.filter((c) => collectorIds.has(c.id)) : [];
+	const collectors = collectorRows.map((c) => ({ id: c.id, name: c.name, commonName: c.commonName, status: c.status, keyId: c.keyId, publicKey: c.publicKey, requestedBy: c.requestedBy, requestSignature: c.requestSignature, approvedBy: c.approvedBy, approveSignature: c.approveSignature, revokedAt: c.revokedAt }));
+	for (const c of collectors) named.add(c.requestedBy).add(c.approvedBy ?? "");
 	const registry = (await source.get<{ identities: RegistryIdentity[] }>("/api/v1/family/identities")).identities;
 	const identities = registry.filter((e) => named.has(e.member)).map((e) => ({ member: e.member, keyId: e.keyId, publicKey: e.publicKey, rootDigest: e.rootDigest, signature: e.signature, active: e.active !== false, certs: e.certs }));
 	const manifest = {
@@ -331,6 +363,8 @@ export async function buildExport(source: ExportSource, signer: Signer, trust: T
 		audit: { base: auditBase, lines, verify: auditVerify },
 		// The leads' word on which TSA keys count (timestamp.ts › trustedTsas).
 		tsa: { certs: tsa.certs },
+		// (commit 37d) Each collector's registration: tools/verify-export.mjs checks both leads' signatures.
+		collectors,
 		identities,
 	};
 	const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest, null, 2));

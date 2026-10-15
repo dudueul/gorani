@@ -15,8 +15,12 @@
 import assert from "node:assert/strict";
 import { startDev, api } from "../api/_dev.mjs";
 import { createCodeVault, createVault, createStoreKey, sealStoreKeyToMember } from "../../web/src/vault/keys.ts";
-import { newContentKey, importContentKey, sealWith } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith, sealText, wrapContentKey } from "../../web/src/vault/vault-crypto.ts";
+import { inboxStatements } from "../../web/src/vault/inbox.ts";
+import { sha256Hex } from "../../web/src/vault/content-hash.ts";
 import { storeSealer } from "../lib/placed.mjs";
+import { member, pinIdentity, trustOf } from "../lib/team.mjs";
+import { approveCollector } from "../../web/src/vault/collectors.ts";
 import { sealChunked, DEFAULT_CHUNK } from "../../web/src/vault/chunked-file.ts";
 import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta } from "../../web/src/vault/share-crypto.ts";
 
@@ -512,6 +516,70 @@ try {
 		await page.locator("text=all 2 versions re-hashed and verified").first().waitFor({ timeout: 60_000 });
 		const rv = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/reverify", { email: "mom@family.test" });
 		assert.deepEqual([rv.json.overdue, rv.json.last?.checked, rv.json.last?.failed], [false, 2, 0], "the store recorded it");
+		// The case's inbox key (commit 37b): mom, its manager, makes it here —
+		// signed by her browser, the private half sealed under the case key.
+		await page.locator('[data-test="inbox-ir-e2e"]').filter({ hasText: "no key" }).waitFor({ timeout: 30_000 });
+		await page.locator('[data-test="inbox-key-ir-e2e"]').click();
+		await page.locator('[data-test="inbox-ir-e2e"]').filter({ hasText: "made by" }).waitFor({ timeout: 30_000 });
+		const inboxKeys = (await api(dev.base, "GET", "/api/v1/cases", { email: "mom@family.test" })).json.cases.find((c) => c.id === "ir-e2e").inboxKeys;
+		assert.deepEqual([inboxKeys.length, inboxKeys[0].signedBy, inboxKeys[0].retiredAt], [1, "mom", null], "one current key, signed by mom");
+		assert.match(inboxKeys[0].privateSealed, /^GV04:/, "its private half is placed under the case key");
+		// Collectors (commit 37a): mom registers one through the form — her
+		// browser signs the registration — and a second lead approves it.
+		// The tab then says whether MOM's client counts it: not yet, since
+		// she never verified the lead who approved.
+		const cpair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+		const cjwk = await crypto.subtle.exportKey("jwk", cpair.publicKey);
+		await page.getByRole("button", { name: "Collectors" }).click();
+		await page.locator('[data-test="collector-id"]').fill("edr-e2e");
+		await page.locator('[data-test="collector-name"]').fill("EDR drop");
+		await page.locator('[data-test="collector-cn"]').fill("e2e0000.access");
+		await page.locator('[data-test="collector-key"]').fill(JSON.stringify({ publicKey: { kty: cjwk.kty, crv: cjwk.crv, x: cjwk.x, y: cjwk.y } }));
+		await page.locator('[data-test="collector-request"]').click();
+		const verdict = page.locator('[data-test="collector-verdict-edr-e2e"]');
+		await verdict.waitFor({ timeout: 30_000 });
+		assert.match(await verdict.textContent(), /not counted: the collector is pending/);
+		const ana = await member(dev, "ana", "lead", { by: { email: "mom@family.test" } });
+		const regIds = (await api(dev.base, "GET", "/api/v1/family/identities", { email: ana.email })).json.identities;
+		await pinIdentity(dev, ana, { id: "mom", record: { keyId: regIds.find((e) => e.member === "mom").keyId } });
+		const asAna = async (method, path, body) => {
+			const r = await api(dev.base, method, path, { email: ana.email, body });
+			if (r.status >= 400) throw new Error(`${r.status} ${r.text}`);
+			return r.json;
+		};
+		const pendingRow = (await asAna("GET", "/api/v1/family/collectors")).collectors.find((c) => c.id === "edr-e2e");
+		await approveCollector(asAna, ana.signer, await trustOf(dev, ana), pendingRow);
+		await teamButton.click(); // back to the files…
+		await teamButton.click(); // …and a fresh Team panel
+		await page.getByRole("button", { name: "Collectors" }).click();
+		await page.locator('[data-test="collector-verdict-edr-e2e"]').filter({ hasText: "ana, who approved it" }).waitFor({ timeout: 30_000 });
+		assert.match(await page.locator('[data-test="collector-verdict-edr-e2e"]').textContent(), /⚠ not counted: ana, who approved it, is not an identity you verified/, "active, but not counted by a member who never verified its approver");
+		// Its drop (commit 37c), signed with the collector's key and sealed to
+		// the case's inbox key: mom's inbox lists it, says why SHE does not
+		// believe it (and offers no Accept), and turns it away with a reason.
+		assert.equal((await api(dev.base, "PUT", "/api/v1/cases/ir-e2e/collectors/edr-e2e", { email: "mom@family.test" })).status, 200);
+		const ik = (await api(dev.base, "GET", "/api/v1/cases", { email: "mom@family.test" })).json.cases.find((c) => c.id === "ir-e2e").inboxKeys[0];
+		const dropped = new TextEncoder().encode("collected by a machine mom has not verified");
+		const dck = newContentKey();
+		const dm = { case: "ir-e2e", item: "e2e-drop", collector: "edr-e2e", name: "triage.txt", type: "text/plain", size: dropped.length, sha256: await sha256Hex(dropped), source: "WS-1", method: "script", collectedAt: "2026-10-15T09:00:00Z", notes: "" };
+		const dsig = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, cpair.privateKey, inboxStatements.collect(dm)))));
+		const dform = new FormData();
+		for (const [k, v] of Object.entries({ item_id: "e2e-drop", inbox_key_id: ik.keyId, size: String(dropped.length), ck: await wrapContentKey(ik.publicKey, dck), meta: await sealText(ik.publicKey, JSON.stringify({ ...dm, signature: dsig })) })) dform.append(k, v);
+		dform.append("file", new Blob([await sealWith(await importContentKey(dck), dropped)]));
+		const drop = await fetch(`${dev.base}/api/v1/collect/cases/ir-e2e/items`, { method: "POST", headers: { "x-gorani-dev-collector": "e2e0000.access" }, body: dform });
+		assert.equal(drop.status, 200, await drop.text());
+		await page.getByRole("button", { name: "Cases" }).click();
+		await page.locator('[data-test="inbox-show-ir-e2e"]').click();
+		const dv = page.locator('[data-test="inbox-verdict-e2e-drop"]');
+		await dv.waitFor({ timeout: 30_000 });
+		assert.match(await dv.textContent(), /⚠ unverified: collector edr-e2e is not one you count/, "mom does not count the collector, so she does not count its item");
+		assert.equal(await page.locator('[data-test="inbox-accept-e2e-drop"]').isDisabled(), true, "no accepting what you cannot tie to a collector you trust");
+		page.once("dialog", (d) => void d.accept("not a collector we verified"));
+		await page.locator('[data-test="inbox-reject-e2e-drop"]').click();
+		await page.locator('[data-test="inbox-item-e2e-drop"]').filter({ hasText: "rejected" }).waitFor({ timeout: 30_000 });
+		const rejectedRow = (await api(dev.base, "GET", "/api/v1/cases/ir-e2e/inbox", { email: "mom@family.test" })).json.items.find((i) => i.id === "e2e-drop");
+		assert.equal(rejectedRow.status, "rejected");
+		assert.match(rejectedRow.rejected.reason, /^GV04:/, "the reason went sealed");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
 		await ctx.close();
 	}
@@ -537,7 +605,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel (with Devices: protection shown, a lost laptop revoked) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

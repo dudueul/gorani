@@ -27,11 +27,13 @@ import type { TeamCall, TeamContext } from "../vault/team.ts";
 import { approveRequest, requestApproval, verifyApproval, type Approval, type ApprovalCheck, type TwoPersonAction } from "../vault/approvals.ts";
 import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
 import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
+import { approveCollector, collectorVerdict, requestCollector, type CollectorRow } from "../vault/collectors.ts";
+import { acceptInboxItem, createInboxKey, hashInboxContent, openInboxItem, openInboxKeys, rejectInboxItem, type InboxItem, type OpenedItem } from "../vault/inbox.ts";
 import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
-type Tab = "people" | "cases" | "recovery" | "devices";
+type Tab = "people" | "cases" | "recovery" | "devices" | "collectors";
 
 /** One of the member's computers, as `GET /api/v1/members/<id>/devices` lists it. */
 interface DeviceRow {
@@ -92,6 +94,11 @@ export class GoraniTeam extends LitElement {
 	@state() private tsaProbe: TsaIdentity | null = null;
 	/** This member's computers (commit 34): what protects each, and revocation. */
 	@state() private devices: DeviceRow[] = [];
+	/** The team's collectors (commit 37a), each with THIS member's verdict on it (null = counted). */
+	@state() private collectors: (CollectorRow & { verdict: string | null })[] = [];
+	/** An open case inbox (commit 37c): its items, each opened with the inbox key. */
+	@state() private inboxes: Record<string, { item: InboxItem; opened: OpenedItem | null; error: string | null }[]> = {};
+	@state() private collectorDraft = { id: "", name: "", commonName: "", key: "" };
 	/** Ephemeral keys of the ceremonies THIS tab coordinates (memory only). */
 	private ephemerals = new Map<string, VaultPrivateKey>();
 	private caseKeys = new Map<string, VaultPrivateKey>();
@@ -134,9 +141,11 @@ export class GoraniTeam extends LitElement {
 		};
 		this.identities = (await quiet(() => this.call<{ identities: RegistryIdentity[] }>("GET", "/api/v1/family/identities"), { identities: [] })).identities;
 		this.devices = await quiet(() => this.call<DeviceRow[]>("GET", `/api/v1/members/${this.team.memberId}/devices`), []);
+		const collectorRows = (await quiet(() => this.call<{ collectors: CollectorRow[] }>("GET", "/api/v1/family/collectors"), { collectors: [] })).collectors;
 		// Externals do not see the registry (stage 2): names fall back to ids.
 		this.members = (await quiet(() => this.call<{ members: Member[] }>("GET", "/api/v1/family"), { members: [] as Member[] })).members;
 		this.team = { ...this.team, identities: this.identities, trust: await buildTrust(this.team.memberId, this.session.root, this.team.settings.identity!, this.identities) };
+		this.collectors = await Promise.all(collectorRows.map(async (c) => ({ ...c, verdict: await collectorVerdict(this.team.trust, c) })));
 		this.tsa = await quiet(() => this.call<{ configured: boolean; certs: TsaCert[] }>("GET", "/api/v1/family/tsa"), null);
 		this.tsaTrusted = await trustedTsas(this.team.trust, this.tsa?.certs ?? []);
 		const cases = (await quiet(() => this.call<{ cases: CaseRow[] }>("GET", "/api/v1/cases"), { cases: [] })).cases;
@@ -186,7 +195,7 @@ export class GoraniTeam extends LitElement {
 	// ── render ────────────────────────────────────────────────────────
 
 	protected override render() {
-		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"]];
+		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"], ...(this.member.role === "external" ? [] : ([["collectors", "Collectors"]] as [Tab, string][]))];
 		return html`
 			<div class="mx-auto flex h-full max-w-4xl flex-col gap-3 overflow-y-auto p-4 text-sm" data-test="team">
 				<nav class="flex gap-1">
@@ -195,8 +204,90 @@ export class GoraniTeam extends LitElement {
 				</nav>
 				${this.error ? html`<p class="rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-red-300" data-test="team-error">${this.error}</p>` : nothing}
 				${this.status ? html`<p class="text-xs text-neutral-400" data-test="team-status">${this.status}</p>` : nothing}
-				${this.tab === "people" ? this.renderPeople() : this.tab === "cases" ? this.renderCases() : this.tab === "devices" ? this.renderDevices() : this.renderRecovery()}
+				${this.tab === "people" ? this.renderPeople() : this.tab === "cases" ? this.renderCases() : this.tab === "devices" ? this.renderDevices() : this.tab === "collectors" ? this.renderCollectors() : this.renderRecovery()}
 			</div>
+		`;
+	}
+
+	// ── Collectors (commit 37a, docs/COLLECTORS.md) ───────────────────
+
+	/**
+	 * The machines that drop evidence into case inboxes. Two leads register
+	 * one (the second agrees only after this client checked the first's
+	 * signature); any lead revokes; a manager of a case lets it drop there.
+	 * Each row says whether THIS member's client counts it — both leads'
+	 * signatures verifying under their own trust — and if not, why.
+	 */
+	private renderCollectors() {
+		const d = this.collectorDraft;
+		const managed = this.cases.filter((c) => c.grant?.permission === "manage" && !c.closed);
+		const parseKey = (): JsonWebKey => {
+			const v = JSON.parse(d.key) as { publicKey?: JsonWebKey } & JsonWebKey;
+			const k = v.publicKey ?? v;
+			if (k.kty !== "EC" || k.crv !== "P-256" || !k.x || !k.y) throw new Error("paste the collector's public key — the JSON `gorani-sync collector init` prints");
+			return { kty: k.kty, crv: k.crv, x: k.x, y: k.y };
+		};
+		return html`
+			<section class="rounded-xl border border-neutral-800 p-3">
+				<h3 class="font-medium">Collectors</h3>
+				<p class="mt-1 text-xs text-neutral-400">Machines that drop evidence into a case's inbox with no one signed in — an acquisition server, an EDR drop. They hold only the inbox's public key: they cannot read anything, not even what they sent. A person accepts each item into the case.</p>
+				<ul class="mt-2 divide-y divide-neutral-800">
+					${this.collectors.map((c) => html`<li class="py-2" data-test="collector-${c.id}">
+						<div class="flex items-start gap-3">
+							<div class="min-w-0 flex-1">
+								<p>${c.name} <span class="text-xs text-neutral-500">${c.id} · ${c.status}</span></p>
+								<p class="text-xs text-neutral-500">service token ${c.commonName} · key <code class="font-mono">${fingerprint(c.keyId)}</code></p>
+								<p class="text-xs text-neutral-500">asked by ${this.nameOf(c.requestedBy)}${c.approvedBy ? html` · approved by ${this.nameOf(c.approvedBy)}` : nothing}${c.cases.length ? html` · drops into ${c.cases.join(", ")}` : nothing}</p>
+								<p class="text-xs ${c.verdict ? "text-amber-400" : "text-emerald-400"}" data-test="collector-verdict-${c.id}">${c.verdict ? `⚠ not counted: ${c.verdict}` : `counted — vouched for by ${this.nameOf(c.requestedBy)} and ${this.nameOf(c.approvedBy ?? "")}`}</p>
+							</div>
+							${this.isLead && c.status === "pending" && c.requestedBy !== this.team.memberId
+								? html`<button class=${primary} ?disabled=${this.busy} data-test="collector-approve-${c.id}" @click=${() => window.confirm(`Approve collector “${c.name}” (${c.commonName})? Compare its key fingerprint with the machine first: ${fingerprint(c.keyId)}`) && this.act(`Approving ${c.id}`, async () => {
+										await approveCollector(this.call, this.team.signer, this.team.trust, c);
+										return `${c.name} is active`;
+									})}>Approve</button>`
+								: nothing}
+							${this.isLead && (c.status === "active" || c.status === "pending")
+								? html`<button class=${button} ?disabled=${this.busy} data-test="collector-revoke-${c.id}" @click=${() => window.confirm(`Revoke collector “${c.name}”? Its service token is refused from the next request on.`) && this.act(`Revoking ${c.id}`, async () => {
+										await this.call("DELETE", `/api/v1/family/collectors/${c.id}`);
+										return `${c.name} is revoked`;
+									})}>Revoke</button>`
+								: nothing}
+						</div>
+						${c.status === "active" && managed.some((m) => !c.cases.includes(m.id))
+							? html`<div class="mt-1 flex items-center gap-2 text-xs">
+									<span class="text-neutral-500">Let it drop into</span>
+									${managed.filter((m) => !c.cases.includes(m.id)).map((m) => html`<button class=${button} ?disabled=${this.busy || !!c.verdict} title=${c.verdict ?? ""} data-test="collector-grant-${c.id}-${m.id}" @click=${() => this.act(`Granting ${m.id}`, async () => {
+											await this.call("PUT", `/api/v1/cases/${m.id}/collectors/${c.id}`);
+											return `${c.name} may drop into ${m.id}`;
+										})}>${m.id}</button>`)}
+								</div>`
+							: nothing}
+					</li>`)}
+				</ul>
+				${this.collectors.length === 0 ? html`<p class="mt-2 text-xs text-neutral-500">No collector is registered.</p>` : nothing}
+			</section>
+			${this.isLead
+				? html`<section class="rounded-xl border border-neutral-800 p-3">
+						<h3 class="font-medium">Register a collector</h3>
+						<p class="mt-1 text-xs text-neutral-400">Give its Access service token's Client ID and paste the public key its machine printed. A second lead approves it.</p>
+						<form class="mt-2 grid gap-2" @submit=${(e: Event) => {
+							e.preventDefault();
+							void this.act(`Registering ${d.id}`, async () => {
+								await requestCollector(this.call, this.team.signer, { id: d.id.trim(), name: d.name.trim(), commonName: d.commonName.trim(), publicKey: parseKey() });
+								this.collectorDraft = { id: "", name: "", commonName: "", key: "" };
+								return `${d.name.trim()} is waiting for a second lead`;
+							});
+						}}>
+							<div class="flex gap-2">
+								<input class=${input} placeholder="id (edr-drop)" .value=${d.id} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, id: (e.target as HTMLInputElement).value })} data-test="collector-id" />
+								<input class="${input} flex-1" placeholder="name" .value=${d.name} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, name: (e.target as HTMLInputElement).value })} data-test="collector-name" />
+							</div>
+							<input class=${input} placeholder="service token Client ID (…​.access)" .value=${d.commonName} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, commonName: (e.target as HTMLInputElement).value })} data-test="collector-cn" />
+							<textarea class="${input} font-mono text-xs" rows="3" placeholder='{"publicKey": {"kty": "EC", …}}' .value=${d.key} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, key: (e.target as HTMLTextAreaElement).value })} data-test="collector-key"></textarea>
+							<button class=${primary} ?disabled=${this.busy || !d.id.trim() || !d.commonName.trim() || !d.key.trim()} data-test="collector-request">Ask a second lead</button>
+						</form>
+					</section>`
+				: nothing}
 		`;
 	}
 
@@ -426,9 +517,102 @@ export class GoraniTeam extends LitElement {
 							: nothing}
 					</div>`
 					: nothing}
+				${c.grant ? this.inboxRow(c, manage) : nothing}
 				${this.twoPerson(c, manage)}
 			</section>
 		`;
+	}
+
+	/**
+	 * The case's inbox key (commit 37b, docs/COLLECTORS.md): what collectors
+	 * seal to. A manager makes it here — a fresh pair whose public halves
+	 * they sign and whose private half is sealed under the case key; a new
+	 * one retires the old (items sealed to it still open).
+	 */
+	private inboxRow(c: CaseRow, manage: boolean) {
+		const current = (c.inboxKeys ?? []).find((k) => !k.retiredAt);
+		return html`<div class="mt-2 flex flex-wrap items-center gap-2 text-xs" data-test="inbox-${c.id}">
+			<span class="text-neutral-400">Inbox:</span>
+			${current
+				? html`<span>key <code>${current.keyId.slice(0, 12)}</code> made by ${this.nameOf(current.signedBy)} · ${current.createdAt.slice(0, 10)}${(c.inboxKeys?.length ?? 0) > 1 ? ` · ${c.inboxKeys!.length - 1} retired` : ""}</span>`
+				: html`<span class="text-neutral-500">no key — collectors cannot drop into this case yet</span>`}
+			${current || (c.inboxKeys?.length ?? 0) > 0
+				? html`<button class=${button} ?disabled=${this.busy} data-test="inbox-show-${c.id}" @click=${() => this.act(`Opening ${c.id}'s inbox`, async () => {
+						if (this.inboxes[c.id]) {
+							const { [c.id]: _, ...rest } = this.inboxes;
+							this.inboxes = rest;
+							return "";
+						}
+						await this.loadInbox(c);
+						return "";
+					})}>${this.inboxes[c.id] ? "Hide the inbox" : "Inbox"}</button>`
+				: nothing}
+			${manage && !c.closed && !c.rotating
+				? html`<button class=${button} ?disabled=${this.busy} data-test="inbox-key-${c.id}" @click=${() => this.act(`Making ${c.id}'s inbox key`, async () => {
+						await createInboxKey(this.call, await this.caseKey(c), c.id, this.team.signer);
+						return `${c.id} has a new inbox key, signed by you. Collectors that pinned you (or a lead who certified you) seal to it from their next drop.`;
+					})}>${current ? "New inbox key" : "Make the inbox key"}</button>`
+				: nothing}
+		</div>
+		${this.inboxes[c.id] ? this.inboxList(c) : nothing}`;
+	}
+
+	/** Open every item of a case's inbox — and say, per item, whether THIS member believes it. */
+	private async loadInbox(c: CaseRow): Promise<void> {
+		const key = await this.caseKey(c);
+		const keys = await openInboxKeys(key, c.id, c.inboxKeys ?? []);
+		const { items } = await this.call<{ items: InboxItem[] }>("GET", `/api/v1/cases/${c.id}/inbox`);
+		this.inboxes = {
+			...this.inboxes,
+			[c.id]: await Promise.all(
+				items.map(async (item) => {
+					try {
+						return { item, opened: await openInboxItem(keys, c.id, item, this.team.trust, this.collectors), error: null };
+					} catch (e) {
+						return { item, opened: null, error: e instanceof Error ? e.message : String(e) };
+					}
+				}),
+			),
+		};
+	}
+
+	/**
+	 * The inbox, item by item: what the collector says it is, and whether it
+	 * verifies for this member. Accepting re-reads the bytes and checks their
+	 * SHA-256 before anything is signed; only a verified item can be accepted.
+	 */
+	private inboxList(c: CaseRow) {
+		const rows = this.inboxes[c.id] ?? [];
+		const write = c.grant?.permission === "write" || c.grant?.permission === "manage";
+		return html`<ul class="mt-2 space-y-1 text-xs" data-test="inbox-list-${c.id}">
+			${rows.length === 0 ? html`<li class="text-neutral-500">Nothing has been dropped here.</li>` : nothing}
+			${rows.map(({ item, opened, error }) => html`<li class="flex flex-wrap items-center gap-2 rounded-lg bg-neutral-900 px-2 py-1" data-test="inbox-item-${item.id}">
+				<span class="font-medium">${opened?.meta.name ?? item.id}</span>
+				<span class="text-neutral-400">${item.size} bytes · from ${item.collector} · ${item.receivedAt.slice(0, 16).replace("T", " ")}</span>
+				${opened ? html`<span class="text-neutral-400">${opened.meta.source} · ${opened.meta.method}</span>` : nothing}
+				<span class=${opened && !opened.problem ? "text-emerald-400" : "text-amber-400"} data-test="inbox-verdict-${item.id}">${error ? `⚠ does not open: ${error}` : opened?.problem ? `⚠ unverified: ${opened.problem}` : "✓ signed by its collector"}</span>
+				<span class="text-neutral-500">${item.status}${item.accepted ? ` → file ${item.accepted.file}` : ""}</span>
+				${write && item.status === "waiting" && !c.closed
+					? html`<button class=${primary} ?disabled=${this.busy || !opened || !!opened.problem} title=${opened?.problem ?? ""} data-test="inbox-accept-${item.id}" @click=${() => this.act(`Accepting ${opened!.meta.name}`, async () => {
+								const r = await fetch(`/api/v1/cases/${c.id}/inbox/${item.id}`, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web-inbox" } });
+								if (!r.ok || !r.body) throw new Error(`download failed: ${r.status}`);
+								const content = await hashInboxContent(opened!, item, r.body);
+								const keys = await openInboxKeys(await this.caseKey(c), c.id, c.inboxKeys ?? []);
+								await acceptInboxItem(this.call, await this.caseKey(c), keys, c.id, item, opened!, content, this.team.signer);
+								await this.loadInbox(c);
+								return `${opened!.meta.name} is in ${c.id}: its bytes matched what ${item.collector} signed, and you signed them too.`;
+							})}>Accept</button>
+						<button class=${button} ?disabled=${this.busy} data-test="inbox-reject-${item.id}" @click=${() => {
+							const reason = window.prompt(`Why is ${opened?.meta.name ?? item.id} turned away? (sealed — only people on the case read it)`);
+							if (reason) void this.act(`Rejecting ${item.id}`, async () => {
+								await rejectInboxItem(this.call, await this.caseKey(c), c.id, item.id, reason);
+								await this.loadInbox(c);
+								return c.kind === "evidence" ? `Rejected. On an evidence case the object stays (write-once); the reason is sealed.` : `Rejected, and its bytes deleted.`;
+							});
+						}}>Reject</button>`
+					: nothing}
+			</li>`)}
+		</ul>`;
 	}
 
 	/**

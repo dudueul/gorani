@@ -93,7 +93,8 @@ export interface FileReport {
 	custody: { owner: string; custodian: string; ok: boolean; links: { seq: number; from: string; to: string; reason: string | null; offeredAt: string; offerSignature: string; acceptedAt: string | null; acceptSignature: string | null; ok: boolean; why: string }[] } | null;
 	versions: VersionReport[];
 	/** (commit 37d) Collected by a machine: its record (null when it did not open), and the exporter's check. */
-	collection: { record: CollectionRecord | null; check: "verified" | "unverified"; why: string } | null;
+	/** `declared` (commit 38): an upload link's record — consistent, but nobody signed it. */
+	collection: { record: CollectionRecord | null; check: "verified" | "declared" | "unverified"; why: string } | null;
 }
 
 interface FileRow {
@@ -210,7 +211,7 @@ async function walk(source: ExportSource, store: VaultPrivateKey, trust: Trust, 
 			try {
 				const c = await checkCollection(store, caseId, row.id, keys.collection, trust, collectors, v1 ? { sha256: v1.sha256, size: v1.size } : undefined);
 				const why = c.problem ?? (v1 ? "" : "the file has no version 1");
-				collection = { record: c.record, check: why ? "unverified" : "verified", why };
+				collection = { record: c.record, check: why ? "unverified" : c.record.kind === "request" ? "declared" : "verified", why };
 			} catch (e) {
 				collection = { record: null, check: "unverified", why: `the record does not open in its place (${e instanceof Error ? e.message : String(e)})` };
 			}

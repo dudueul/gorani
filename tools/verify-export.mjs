@@ -418,7 +418,19 @@ for (const f of m.files) {
 		const i = f.intake;
 		check(signedBy(i.signer, i.keyId, stmt("gorani-intake-v1", area, f.id, i.source, i.collector, i.method, i.collectedAt, i.notes), i.signature), `${f.name}: intake record signed by ${i.signer}`);
 	}
-	if (f.collection) {
+	if (f.collection?.record?.kind === "request") {
+		// Sent through an upload link (commit 38, docs/REQUESTS.md): an
+		// outsider has no key, so there is no signature to check — only that
+		// the record is about this item from this link, and that version 1 is
+		// the bytes it declared. The accepter's content hash (above) is the
+		// first signature on them.
+		const r = f.collection.record;
+		const x = r.meta;
+		check(x && r.collector === `request:${x.request}` && x.item === r.item, `${f.name}: its upload-link record is about this item, from link ${x?.request ?? "?"}`);
+		const v1 = f.versions.find((v) => v.version === 1);
+		check(v1 && x && v1.sha256 === x.sha256 && v1.size === x.size, `${f.name}: version 1 is the bytes the sender declared`);
+		notes.push(`${f.name}: sent through an upload link by “${x?.sender || "unnamed"}” — the sender's word, unsigned; accepted by ${r.acceptedBy}`);
+	} else if (f.collection) {
 		// Collected by a machine (commit 37d, docs/COLLECTORS.md): the two
 		// leads who registered it are in the package; the machine signed every
 		// field; the fields are version 1's bytes.

@@ -37,6 +37,18 @@
  * reason content hashes are sealed too. The store checks shapes and nothing
  * else; trust is decided here, by the member, against collectors whose
  * registration two leads THEY trust signed (collectors.ts).
+ *
+ * Since commit 38 (docs/REQUESTS.md) an inbox also takes items from an
+ * UPLOAD LINK — an outsider's browser, collector `request:<link id>` — and
+ * a member's own area has an inbox too, its keys sealed under the files
+ * key (place store.inbox) rather than kept in the registry. An outsider
+ * has no identity key, so such an item carries no signature: its record
+ * says what the link-holder declared, the link says who could have sent
+ * it, and the person accepting it is the first to sign anything.
+ *
+ * Everything below takes an AREA (lib/area.ts) — `case:<id>` or a member
+ * id; the `…InboxItem`/`checkCollection` names of 37b–37d keep their case
+ * id parameter and call the area forms.
  */
 
 import { createStoreKey } from "./keys.ts";
@@ -50,13 +62,16 @@ import { signIntake } from "./intake.ts";
 import { openChunked, openChunkedStream, sealedSize } from "./chunked-file.ts";
 import { importVaultKey, openPlacedText, openSealedText, openWith, sealPlacedText, unwrapContentKey, wrapPlacedKey, type VaultPrivateKey } from "./vault-crypto.ts";
 import { fromBase64, toBase64 } from "../lib/encoding.ts";
-import { caseArea } from "../lib/area.ts";
+import { areaPath, caseArea } from "../lib/area.ts";
+import { sampleType } from "./samples.ts";
 
 export const inboxStatements = {
 	/** A manager's word that this is the case's inbox key. */
 	key: (caseId: string, keyDigest: string) => stmt("gorani-inbox-v1", caseId, keyDigest),
 	/** A collector's word for what it collected. */
 	collect: (m: Omit<CollectMeta, "signature">) => stmt("gorani-collect-v1", m.case, m.item, m.collector, m.sha256, String(m.size), m.name, m.type, m.source, m.method, m.collectedAt, m.notes),
+	/** A member's word that this is their own area's inbox key (commit 38a). */
+	areaKey: (member: string, keyDigest: string) => stmt("gorani-area-inbox-v1", member, keyDigest),
 };
 
 /** An inbox key as the case list carries it (`CaseRow.inboxKeys`). */
@@ -88,7 +103,32 @@ export interface CollectMeta {
 	signature: string;
 }
 
-/** An inbox item as `GET /api/v1/cases/<id>/inbox` lists it. */
+/**
+ * What an upload link's page sealed into an item's `meta` (commit 38b,
+ * web/src/request-page.ts). No signature — the sender has no identity key;
+ * every field is the link-holder's word.
+ */
+export interface RequestMeta {
+	/** The link's id: an item moved from another link's inbox names that link. */
+	request: string;
+	item: string;
+	name: string;
+	type: string;
+	size: number;
+	sha256: string;
+	/** Who the sender says they are, and what they wrote — as typed. */
+	sender: string;
+	message: string;
+	/** The sender's clock (the store's `receivedAt` is the one to cite). */
+	sentAt: string;
+}
+
+/** The collector field of an upload link's items. */
+export const requestCollector = (linkId: string) => `request:${linkId}`;
+/** The link id of an upload link's item, or null for a collector's. */
+export const linkOf = (item: Pick<InboxItem, "collector">) => (item.collector.startsWith("request:") ? item.collector.slice("request:".length) : null);
+
+/** An inbox item as `GET …/inbox` lists it. */
 export interface InboxItem {
 	id: string;
 	collector: string;
@@ -126,6 +166,52 @@ export async function createInboxKey<T>(call: InboxCall, caseKey: VaultPrivateKe
 }
 
 /**
+ * Make a member's own (next) inbox key (commit 38a): the body of `PUT
+ * /api/v1/members/<id>/inbox-key`. The same pair a case's is; the private
+ * half sealed under the member's FILES key into place store.inbox, kept in
+ * their own store (a store-key rotation re-seals it: rotation.ts).
+ */
+export async function newAreaInboxKey(filesKey: VaultPrivateKey, member: string, signer: Signer): Promise<{ keyId: string; publicKey: { ec: JsonWebKey; kem: string }; signature: string; signedBy: string; privateSealed: string }> {
+	const fresh = await createStoreKey();
+	const signature = await signer.sign(inboxStatements.areaKey(member, await hybridDigest(fresh.publicKey, fresh.pqPublicKey)));
+	const b64 = toBase64(fresh.bundle);
+	fresh.bundle.fill(0);
+	const privateSealed = await sealPlacedText(filesKey, places.storeInbox(member, fresh.keyId), b64);
+	return { keyId: fresh.keyId, publicKey: { ec: fresh.publicKey, kem: fresh.pqPublicKey }, signature, signedBy: signer.member, privateSealed };
+}
+
+/** Make it and send it. Returns this store's inbox keys (`{ inboxKeys }`). */
+export async function createAreaInboxKey(call: InboxCall, filesKey: VaultPrivateKey, member: string, signer: Signer): Promise<{ inboxKeys: InboxKeyRow[] }> {
+	return call("PUT", `/api/v1/members/${member}/inbox-key`, await newAreaInboxKey(filesKey, member, signer));
+}
+
+/** A member's own inbox keys, as their store lists them. */
+export async function areaInboxKeys(call: InboxCall, member: string): Promise<InboxKeyRow[]> {
+	return (await call<{ inboxKeys: InboxKeyRow[] }>("GET", `/api/v1/members/${member}/inbox-keys`)).inboxKeys;
+}
+
+/** Where an area's inbox key's private half is sealed: a case's under the
+ * case key (case.inbox), a member's under their files key (store.inbox). */
+const inboxPlace = (area: string, keyId: string) => (area.startsWith("case:") ? places.caseInbox(area, keyId) : places.storeInbox(area, keyId));
+
+/** Open every inbox key an area has, with the area's store key (a case
+ * key, or a member's files key) — each checked as `openInboxKey` checks. */
+export async function openAreaInboxKeys(storeKey: VaultPrivateKey, area: string, keys: InboxKeyRow[]): Promise<Map<string, VaultPrivateKey>> {
+	const out = new Map<string, VaultPrivateKey>();
+	for (const k of keys) out.set(k.keyId, (await openCheckedIn(storeKey, area, k)).key);
+	return out;
+}
+
+/** The area's current inbox key, opened and checked: what an upload link
+ * is made for (its digest goes in the link — requests.ts). */
+export async function currentInboxKey(storeKey: VaultPrivateKey, area: string, keys: InboxKeyRow[]): Promise<InboxKeyRow | null> {
+	const k = keys.find((x) => !x.retiredAt);
+	if (!k) return null;
+	await openCheckedIn(storeKey, area, k);
+	return k;
+}
+
+/**
  * Open an inbox key with the case key. Its place proves a case-key holder
  * sealed it there (a server cannot: GV04 needs the case's private key), and
  * the opened key must be the one the registry's public halves describe —
@@ -136,9 +222,13 @@ export async function openInboxKey(caseKey: VaultPrivateKey, caseId: string, k: 
 	return (await openChecked(caseKey, caseId, k)).key;
 }
 
-async function openChecked(caseKey: VaultPrivateKey, caseId: string, k: InboxKeyRow): Promise<{ key: VaultPrivateKey; b64: string }> {
-	if (!k.privateSealed) throw new Error(`inbox key ${k.keyId} came without its private half — you are not on case ${caseId}`);
-	const b64 = await openPlacedText(caseKey, places.caseInbox(caseArea(caseId), k.keyId), k.privateSealed);
+function openChecked(caseKey: VaultPrivateKey, caseId: string, k: InboxKeyRow): Promise<{ key: VaultPrivateKey; b64: string }> {
+	return openCheckedIn(caseKey, caseArea(caseId), k);
+}
+
+async function openCheckedIn(storeKey: VaultPrivateKey, area: string, k: InboxKeyRow): Promise<{ key: VaultPrivateKey; b64: string }> {
+	if (!k.privateSealed) throw new Error(`inbox key ${k.keyId} came without its private half — you are not on ${area}`);
+	const b64 = await openPlacedText(storeKey, inboxPlace(area, k.keyId), k.privateSealed);
 	const key = await importVaultKey(fromBase64(b64));
 	await checkRecordMatches(key, { keyId: k.keyId, publicKey: k.publicKey.ec, pqPublicKey: k.publicKey.kem });
 	return { key, b64 };
@@ -168,15 +258,20 @@ export async function resealInboxKeys(oldKey: VaultPrivateKey, newKey: VaultPriv
 	return out;
 }
 
-/** An item opened: what its collector said, and whether this member counts it. */
-export interface OpenedItem {
-	meta: CollectMeta;
+/** An item opened: what its sender said, and whether this member counts it. */
+export type OpenedItem = (
+	| { kind: "collector"; meta: CollectMeta }
+	/** An upload link's (commit 38): an outsider's declaration, unsigned. */
+	| { kind: "request"; meta: RequestMeta }
+) & {
 	/** The item's content key — open the object with it (GV02 or GC01). */
 	contentKey: CryptoKey;
-	/** Null when the item is VERIFIED: a collector this member trusts signed
-	 * exactly these fields, for this case and this item. Otherwise, why not. */
+	/** Null when the item is consistent and, for a collector's, VERIFIED: a
+	 * collector this member trusts signed exactly these fields, for this case
+	 * and this item. Otherwise, why not. (A link's item has no signature to
+	 * verify — null says only that its record is about THIS item.) */
 	problem: string | null;
-}
+};
 
 /**
  * Open an inbox item with the case's inbox keys, and decide whether to
@@ -185,15 +280,30 @@ export interface OpenedItem {
  * word that the collector exists. The SHA-256 is the collector's claim:
  * the caller compares it with what it decrypts (`checkInboxContent`).
  */
-export async function openInboxItem(inboxKeys: Map<string, VaultPrivateKey>, caseId: string, item: InboxItem, trust: Trust, collectors: CollectorRow[]): Promise<OpenedItem> {
-	const key = inboxKeys.get(item.inboxKeyId);
-	if (!key) throw new Error(`item ${item.id} is sealed to inbox key ${item.inboxKeyId}, which this case does not have`);
-	const meta = JSON.parse(await openSealedText(key, item.meta)) as CollectMeta;
-	const contentKey = await unwrapContentKey(key, item.ck);
-	return { meta, contentKey, problem: await itemProblem(caseId, item, meta, trust, collectors) };
+export function openInboxItem(inboxKeys: Map<string, VaultPrivateKey>, caseId: string, item: InboxItem, trust: Trust, collectors: CollectorRow[]): Promise<OpenedItem> {
+	return openItem(inboxKeys, caseArea(caseId), item, trust, collectors);
 }
 
-async function itemProblem(caseId: string, item: InboxItem, meta: CollectMeta, trust: Trust, collectors: CollectorRow[]): Promise<string | null> {
+/** The same in any area — a case's inbox, or a member's own (commit 38a).
+ * `trust` may be null before the member's identity is open: a link's item
+ * needs none; a collector's then says it cannot be checked yet. */
+export async function openItem(inboxKeys: Map<string, VaultPrivateKey>, area: string, item: InboxItem, trust: Trust | null, collectors: CollectorRow[]): Promise<OpenedItem> {
+	const key = inboxKeys.get(item.inboxKeyId);
+	if (!key) throw new Error(`item ${item.id} is sealed to inbox key ${item.inboxKeyId}, which ${area} does not have`);
+	const raw = JSON.parse(await openSealedText(key, item.meta));
+	const contentKey = await unwrapContentKey(key, item.ck);
+	if (linkOf(item)) {
+		const meta = raw as RequestMeta;
+		return { kind: "request", meta, contentKey, problem: requestProblem(item, meta) };
+	}
+	const meta = raw as CollectMeta;
+	return { kind: "collector", meta, contentKey, problem: await itemProblem(area, item, meta, trust, collectors) };
+}
+
+async function itemProblem(area: string, item: Pick<InboxItem, "id" | "collector" | "size" | "stamp">, meta: CollectMeta, trust: Trust | null, collectors: CollectorRow[]): Promise<string | null> {
+	// (Collectors drop into cases only — a member's own inbox takes links' items.)
+	if (!area.startsWith("case:")) return `a collector's item in ${area}'s own inbox — collectors drop into cases only`;
+	const caseId = area.slice("case:".length);
 	// The sealed record must be about THIS drop: a valid record lifted from
 	// another case, item or collector — or one whose size the store's own
 	// count contradicts — is not this item's.
@@ -202,6 +312,7 @@ async function itemProblem(caseId: string, item: InboxItem, meta: CollectMeta, t
 	if (meta.collector !== item.collector) return `its record names collector ${meta.collector}, but ${item.collector} dropped it`;
 	if (meta.size !== item.size) return `its record says ${meta.size} bytes, the store received ${item.size}`;
 	if (!/^[0-9a-f]{64}$/.test(meta.sha256 ?? "")) return "its record carries no SHA-256";
+	if (!trust) return "your identity is not open yet — a collector's signature is checked with it";
 	const who = (await collectorTrust(trust, collectors)).get(item.collector);
 	if (!who) return `collector ${item.collector} is not one you count — two leads you verified must have registered it (Team › Collectors)`;
 	const { signature, ...fields } = meta;
@@ -210,10 +321,28 @@ async function itemProblem(caseId: string, item: InboxItem, meta: CollectMeta, t
 	return null;
 }
 
-/** The last check, on the decrypted bytes: are they what the collector signed? */
+/**
+ * An upload link's item: its record must be about THIS item, from THIS
+ * link. That is all there is to check — no key signed it. (The store could
+ * move a sealed record between items or links of one area; the record
+ * names both, so a moved one is caught. Into another area it would not
+ * open at all: another area's inbox keys are other keys.)
+ */
+function requestProblem(item: Pick<InboxItem, "id" | "collector" | "size">, meta: RequestMeta): string | null {
+	const link = linkOf(item);
+	if (meta.request !== link) return `its record is for link ${meta.request}, not ${link}`;
+	if (meta.item !== item.id) return `its record is for item ${meta.item}, not ${item.id}`;
+	if (meta.size !== item.size) return `its record says ${meta.size} bytes, the store received ${item.size}`;
+	if (!/^[0-9a-f]{64}$/.test(meta.sha256 ?? "")) return "its record carries no SHA-256";
+	if (typeof meta.name !== "string" || !meta.name) return "its record carries no file name";
+	return null;
+}
+
+/** The last check, on the decrypted bytes: are they what the sender recorded? */
 export function checkInboxContent(opened: OpenedItem, sha256: string, size: number): string | null {
-	if (size !== opened.meta.size) return `decrypted ${size} bytes, the collector signed ${opened.meta.size}`;
-	if (sha256 !== opened.meta.sha256) return "the content is not what the collector signed (SHA-256 differs)";
+	const who = opened.kind === "collector" ? "the collector signed" : "the sender declared";
+	if (size !== opened.meta.size) return `decrypted ${size} bytes, ${who} ${opened.meta.size}`;
+	if (sha256 !== opened.meta.sha256) return `the content is not what ${who} (SHA-256 differs)`;
 	return null;
 }
 
@@ -255,18 +384,22 @@ export async function hashInboxBytes(opened: OpenedItem, chunk: number | null, s
 	return { sha256: h.hex(), size: plain.length };
 }
 
-/** What `file.collection(area, file)` holds: the collector's word, kept whole. */
-export interface CollectionRecord {
+/** What `file.collection(area, file)` holds: the sender's word, kept whole. */
+export type CollectionRecord = {
 	v: 1;
 	item: string;
+	/** The collector's id — or `request:<link id>` for an upload link's item. */
 	collector: string;
 	inboxKeyId: string;
 	receivedAt: string;
 	/** The RFC 3161 token over SHA-256(the collector's signature), when the store had one. */
 	stamp: { imprint: string | null; token: string | null; at: string | null };
-	meta: CollectMeta;
 	acceptedBy: string;
-}
+} & (
+	| { kind?: undefined; meta: CollectMeta }
+	/** (commit 38) An upload link's: the sender's declaration, no signature. */
+	| { kind: "request"; meta: RequestMeta }
+);
 
 /**
  * Accept an item into the case as a NEW file — the body of `POST
@@ -281,42 +414,92 @@ export interface CollectionRecord {
  * signatures over the same bytes: the machine that collected them and the
  * person who accepted them. The bytes stay where they landed.
  */
-export async function acceptInboxItem<T>(call: InboxCall, caseKey: VaultPrivateKey, inboxKeys: Map<string, VaultPrivateKey>, caseId: string, item: InboxItem, opened: OpenedItem, content: { sha256: string; size: number }, signer: Signer, opts: { name?: string; folderId?: string } = {}): Promise<T> {
+export function acceptInboxItem<T>(call: InboxCall, caseKey: VaultPrivateKey, inboxKeys: Map<string, VaultPrivateKey>, caseId: string, item: InboxItem, opened: OpenedItem, content: { sha256: string; size: number }, signer: Signer, opts: AcceptOptions = {}): Promise<T> {
+	return acceptItem<T>(call, caseKey, inboxKeys, caseArea(caseId), item, opened, content, signer, opts);
+}
+
+export interface AcceptOptions {
+	name?: string;
+	folderId?: string;
+	/**
+	 * File it as a malware sample (D8, commit 29e: the viewer refuses it,
+	 * it leaves only zipped under "infected", never by link). The DEFAULT
+	 * for an upload link's item (docs/REQUESTS.md › Untrusted content): an
+	 * outsider's bytes are untrusted until a person decides otherwise —
+	 * and a sample stays a sample (there is no unmarking).
+	 */
+	asSample?: boolean;
+	/** (An upload link's item) how the accepter names where it came from. */
+	linkLabel?: string;
+}
+
+/**
+ * The same in any area (commit 38a). An upload link's item is accepted
+ * when its record is about this item and its bytes hash to what the
+ * sender declared — there is no signature to require; the accepter's own
+ * content hash and intake are the first signatures on it. Its intake says
+ * so: collector `request:<link>`, the sender's name as they typed it.
+ */
+export async function acceptItem<T>(call: InboxCall, storeKey: VaultPrivateKey, inboxKeys: Map<string, VaultPrivateKey>, area: string, item: InboxItem, opened: OpenedItem, content: { sha256: string; size: number }, signer: Signer, opts: AcceptOptions = {}): Promise<T> {
 	if (opened.problem) throw new Error(`refusing to accept an item that is not verified: ${opened.problem}`);
 	const bad = checkInboxContent(opened, content.sha256, content.size);
 	if (bad) throw new Error(`refusing to accept it: ${bad}`);
 	const inboxKey = inboxKeys.get(item.inboxKeyId);
 	if (!inboxKey) throw new Error(`no inbox key ${item.inboxKeyId}`);
-	const area = caseArea(caseId);
 	const file = newItemId();
-	const m = opened.meta;
 	const raw = fromBase64(await openSealedText(inboxKey, item.ck));
-	const record: CollectionRecord = { v: 1, item: item.id, collector: item.collector, inboxKeyId: item.inboxKeyId, receivedAt: item.receivedAt, stamp: item.stamp, meta: m, acceptedBy: signer.member };
-	const hash = await signContentHashStamped(signer, caseKey, area, file, 1, content.sha256, content.size);
+	const base = { v: 1 as const, item: item.id, collector: item.collector, inboxKeyId: item.inboxKeyId, receivedAt: item.receivedAt, stamp: item.stamp, acceptedBy: signer.member };
+	let record: CollectionRecord;
+	let intake: { source: string; collector: string; method: string; collectedAt: string; notes: string };
+	let sample: boolean;
+	if (opened.kind === "collector") {
+		const m = opened.meta;
+		record = { ...base, meta: m };
+		intake = { source: m.source, collector: `collector:${m.collector}`, method: m.method, collectedAt: m.collectedAt, notes: m.notes };
+		sample = opts.asSample ?? false;
+	} else {
+		const m = opened.meta;
+		record = { ...base, kind: "request", meta: m };
+		// (The store's clock, not the sender's: `receivedAt` is what the store recorded.)
+		const from = m.sender.trim() || "an unnamed sender";
+		intake = { source: `${from}, through upload link ${opts.linkLabel?.trim() || m.request}`, collector: item.collector, method: "upload link (sealed in the sender's browser)", collectedAt: item.receivedAt, notes: m.message };
+		sample = opts.asSample ?? true;
+	}
+	const type = opened.meta.type || "application/octet-stream";
+	const hash = await signContentHashStamped(signer, storeKey, area, file, 1, content.sha256, content.size);
 	const body = {
 		fileId: file,
-		name: await sealPlacedText(caseKey, places.fileName(area, file), opts.name ?? m.name),
-		type: await sealPlacedText(caseKey, places.fileType(area, file, 1), m.type || "application/octet-stream"),
-		ck: await wrapPlacedKey(caseKey, places.fileKey(area, file, 1), raw),
+		name: await sealPlacedText(storeKey, places.fileName(area, file), opts.name ?? opened.meta.name),
+		type: await sealPlacedText(storeKey, places.fileType(area, file, 1), sample ? sampleType(type) : type),
+		ck: await wrapPlacedKey(storeKey, places.fileKey(area, file, 1), raw),
 		hash: hash.sealed,
 		stamp: hash.stamp,
-		intake: await signIntake(signer, caseKey, area, file, { source: m.source, collector: `collector:${m.collector}`, method: m.method, collectedAt: m.collectedAt, notes: m.notes }),
-		collection: await sealPlacedText(caseKey, places.fileCollection(area, file), JSON.stringify(record)),
+		intake: await signIntake(signer, storeKey, area, file, intake),
+		collection: await sealPlacedText(storeKey, places.fileCollection(area, file), JSON.stringify(record)),
+		...(sample ? { sample: true } : {}),
 		...(opts.folderId ? { folderId: opts.folderId } : {}),
 	};
 	raw.fill(0);
-	return call<T>("POST", `/api/v1/cases/${caseId}/inbox/${item.id}/accept`, body);
+	return call<T>("POST", `${areaPath(area)}/inbox/${item.id}/accept`, body);
 }
 
 /** Turn an item away, saying why — the reason sealed (it may name what the item is). */
-export async function rejectInboxItem<T>(call: InboxCall, caseKey: VaultPrivateKey, caseId: string, itemId: string, reason: string): Promise<T> {
+export function rejectInboxItem<T>(call: InboxCall, caseKey: VaultPrivateKey, caseId: string, itemId: string, reason: string): Promise<T> {
+	return rejectItem<T>(call, caseKey, caseArea(caseId), itemId, reason);
+}
+
+export async function rejectItem<T>(call: InboxCall, storeKey: VaultPrivateKey, area: string, itemId: string, reason: string): Promise<T> {
 	if (!reason.trim()) throw new Error("a rejection says why");
-	return call<T>("POST", `/api/v1/cases/${caseId}/inbox/${itemId}/reject`, { reason: await sealPlacedText(caseKey, places.inboxReject(caseArea(caseId), itemId), reason.trim()) });
+	return call<T>("POST", `${areaPath(area)}/inbox/${itemId}/reject`, { reason: await sealPlacedText(storeKey, places.inboxReject(area, itemId), reason.trim()) });
 }
 
 /** A rejection's reason, opened in its place. */
 export function openRejectReason(caseKey: VaultPrivateKey, caseId: string, itemId: string, sealed: string): Promise<string> {
 	return openPlacedText(caseKey, places.inboxReject(caseArea(caseId), itemId), sealed);
+}
+
+export function openItemRejectReason(storeKey: VaultPrivateKey, area: string, itemId: string, sealed: string): Promise<string> {
+	return openPlacedText(storeKey, places.inboxReject(area, itemId), sealed);
 }
 
 /**
@@ -326,11 +509,22 @@ export function openRejectReason(caseKey: VaultPrivateKey, caseId: string, itemI
  * and size). The file's own content hash names the person who accepted it;
  * this names the machine that collected it.
  */
-export async function checkCollection(caseKey: VaultPrivateKey, caseId: string, file: string, sealed: string, trust: Trust, collectors: CollectorRow[], content?: { sha256: string; size: number }): Promise<{ record: CollectionRecord; problem: string | null }> {
-	const record = JSON.parse(await openPlacedText(caseKey, places.fileCollection(caseArea(caseId), file), sealed)) as CollectionRecord;
+export function checkCollection(caseKey: VaultPrivateKey, caseId: string, file: string, sealed: string, trust: Trust, collectors: CollectorRow[], content?: { sha256: string; size: number }): Promise<{ record: CollectionRecord; problem: string | null }> {
+	return checkItemCollection(caseKey, caseArea(caseId), file, sealed, trust, collectors, content);
+}
+
+/**
+ * The same in any area. An upload link's record has nothing to verify but
+ * that it is about its own item and these bytes — `problem` null then
+ * means CONSISTENT, not signed (`record.kind === "request"` says which).
+ */
+export async function checkItemCollection(storeKey: VaultPrivateKey, area: string, file: string, sealed: string, trust: Trust, collectors: CollectorRow[], content?: { sha256: string; size: number }): Promise<{ record: CollectionRecord; problem: string | null }> {
+	const record = JSON.parse(await openPlacedText(storeKey, places.fileCollection(area, file), sealed)) as CollectionRecord;
 	const m = record.meta;
-	const asItem = { id: record.item, collector: record.collector, size: m.size, stamp: record.stamp } as InboxItem;
-	let problem = await itemProblem(caseId, asItem, m, trust, collectors);
-	if (!problem && content && (content.sha256 !== m.sha256 || content.size !== m.size)) problem = "the file is not the bytes the collector signed";
+	const asItem = { id: record.item, collector: record.collector, size: m.size, stamp: record.stamp };
+	const isLink = record.collector.startsWith("request:");
+	if (isLink !== (record.kind === "request")) return { record, problem: "its record's kind does not match who sent it" };
+	let problem = record.kind === "request" ? requestProblem(asItem, record.meta) : await itemProblem(area, asItem, record.meta, trust, collectors);
+	if (!problem && content && (content.sha256 !== m.sha256 || content.size !== m.size)) problem = record.kind === "request" ? "the file is not the bytes the sender declared" : "the file is not the bytes the collector signed";
 	return { record, problem };
 }

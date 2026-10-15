@@ -39,7 +39,10 @@ impl GoraniMemberDO {
 	pub(crate) async fn inbox_receive(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
 		let get = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
 		let Some(id) = get("id").filter(|i| crate::auth::valid_object_id(i)) else { return json_error(400, "item id: [A-Za-z0-9_-], ≤ 64 — chosen by the collector") };
-		let Some(collector) = get("collector").filter(|c| crate::auth::valid_member_id(c)) else { return json_error(400, "collector id") };
+		// From a collector (its id), or from an upload link (`request:<id>`, commit 38).
+		let Some(collector) = get("collector").filter(|c| crate::auth::valid_member_id(c) || c.strip_prefix("request:").is_some_and(crate::requests::is_request_id)) else {
+			return json_error(400, "collector id, or request:<link id>");
+		};
 		let Some(inbox_key) = get("inboxKeyId").filter(|k| crate::auth::valid_object_id(k)) else { return json_error(400, "inbox_key_id: the inbox key the item is sealed to") };
 		let Some(object_key) = get("objectKey") else { return json_error(400, "objectKey") };
 		let (Some(ck), Some(meta)) = (get("ck").filter(|v| sealed_to_inbox(v)), get("meta").filter(|v| sealed_to_inbox(v))) else {
@@ -54,6 +57,14 @@ impl GoraniMemberDO {
 		let taken = self.sql.exec("SELECT COUNT(*) AS n FROM inbox_items WHERE id = ?1", Some(vec![id.clone().into()]))?.one::<crate::files_store::TotalCount>()?.n;
 		if taken > 0 {
 			return json_error(409, "an item with this id was already received — choose a fresh id");
+		}
+		// An upload link's item is counted against the link here, with the
+		// insert below, in one synchronous step: two uploads racing for the
+		// last slot cannot both get it.
+		if let Some(link) = collector.strip_prefix("request:") {
+			if let Err((status, msg)) = self.request_take(link, &inbox_key, size)? {
+				return json_error(status, msg);
+			}
 		}
 		self.sql.exec(
 			"INSERT INTO inbox_items (id, collector_id, inbox_key_id, object_key, size, chunk_size, ck_sealed, meta_sealed, stamp_imprint, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",

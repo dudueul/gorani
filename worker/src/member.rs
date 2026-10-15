@@ -334,6 +334,39 @@ pub const MIGRATIONS: &[&str] = &[
 	// key into place file.collection(area, file), kept beside the file so the
 	// collector's signature travels with it (exports, docs/COLLECTORS.md).
 	"ALTER TABLE files ADD COLUMN collection_sealed TEXT",
+	// Migration v18 (commit 38a/38b, requests.rs, docs/REQUESTS.md): a
+	// member's own inbox keys (a case keeps its in the registry) — the
+	// private half sealed under the files key into place store.inbox — and
+	// the upload links that seal to them.
+	"CREATE TABLE IF NOT EXISTS area_inbox_keys (
+		key_id TEXT PRIMARY KEY,
+		public_key TEXT NOT NULL,
+		signature TEXT NOT NULL,
+		signed_by TEXT NOT NULL,
+		private_sealed TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		retired_at TEXT
+	)",
+	"CREATE TABLE IF NOT EXISTS upload_requests (
+		id TEXT PRIMARY KEY,
+		folder_id TEXT,
+		inbox_key_id TEXT NOT NULL,
+		inbox_public TEXT NOT NULL,
+		view_hash TEXT NOT NULL,
+		send_hash TEXT NOT NULL,
+		note_sealed TEXT NOT NULL,
+		label_sealed TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		max_files INTEGER NOT NULL,
+		max_bytes INTEGER NOT NULL,
+		files_received INTEGER NOT NULL,
+		bytes_received INTEGER NOT NULL,
+		failed_attempts INTEGER NOT NULL,
+		locked_at TEXT,
+		revoked_at TEXT,
+		created_by TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	)",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -820,6 +853,26 @@ impl GoraniMemberDO {
 				self.inbox_receive(&actor, body).await
 			}
 			("GET", "inbox/list") => self.inbox_list().await,
+			// ── Upload links and a member's own inbox keys (commit 38, requests.rs) ──
+			("GET", "inbox-keys") => self.area_inbox_keys().await,
+			("PUT", "inbox-key") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.area_inbox_key_put(&actor, body).await
+			}
+			("GET", "requests") => self.requests_list().await,
+			("POST", "requests") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.request_create(&actor, body).await
+			}
+			("DELETE", id) if id.starts_with("requests/") => self.request_revoke(&actor, &id["requests/".len()..]).await,
+			("POST", id) if id.starts_with("request-meta/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.request_public_meta(&id["request-meta/".len()..], body).await
+			}
+			("POST", id) if id.starts_with("request-send/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.request_check_send(&id["request-send/".len()..], body).await
+			}
 			("POST", id) if id.starts_with("inbox/accept/") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.inbox_accept(&actor, &id["inbox/accept/".len()..], body).await

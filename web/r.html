@@ -1,0 +1,61 @@
+<!doctype html>
+<!-- Copyright 2026- Seongwoo Hong. All rights reserved. -->
+
+<!--
+	The upload-link page (commit 38b, docs/REQUESTS.md) — for someone with
+	no account: the link is /s/r/<id>#<secret>.<inbox key digest>, and the
+	part after # never reaches any server. This page seals each file in the
+	browser to the recipient's INBOX key (checked against the digest first:
+	a server cannot slip in a key of its own), and sends the ciphertext with
+	a token derived from the link's secret and the password. What was sent
+	cannot be read back — not by the server, not by this page.
+
+	Served by the Worker at /s/r/<id> under the share page's CSP (scripts
+	from 'self' only, Trusted Types with no policy at all), so every DOM
+	write in web/src/request-page.ts is textContent or classList.
+-->
+<html lang="en" class="h-full">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="dark" />
+		<meta name="robots" content="noindex" />
+		<title>Send files · Gorani</title>
+		<link rel="stylesheet" href="/src/styles/share.css" />
+	</head>
+	<body class="min-h-full bg-neutral-950 text-neutral-100">
+		<main class="mx-auto flex min-h-full max-w-lg items-center px-4 py-10">
+			<section class="w-full rounded-2xl border border-neutral-800 bg-neutral-900 p-6 shadow-xl">
+				<p class="text-sm font-semibold text-[var(--color-accent)]">Gorani · send files</p>
+				<p id="status" class="mt-3 text-sm text-neutral-400" data-test="request-status">Opening the link…</p>
+				<div id="details" class="mt-4 hidden">
+					<p class="text-xs text-neutral-500">The person who sent you this link writes:</p>
+					<p id="note" class="mt-1 whitespace-pre-wrap break-words rounded-xl bg-neutral-950 p-3 text-sm text-neutral-200" data-test="request-note"></p>
+					<p id="limits" class="mt-2 text-xs text-neutral-500" data-test="request-limits"></p>
+					<label class="mt-4 block text-sm text-neutral-400">
+						Password <span class="text-neutral-600">(they gave it to you separately)</span>
+						<input id="password" type="password" autocomplete="off" class="mt-1 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-[var(--color-accent)]" data-test="request-password" />
+					</label>
+					<label class="mt-3 block text-sm text-neutral-400">
+						Your name
+						<input id="sender" type="text" maxlength="200" autocomplete="name" class="mt-1 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-[var(--color-accent)]" data-test="request-sender" />
+					</label>
+					<label class="mt-3 block text-sm text-neutral-400">
+						A message <span class="text-neutral-600">(optional)</span>
+						<textarea id="message" rows="2" maxlength="2000" class="mt-1 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-[var(--color-accent)]" data-test="request-message"></textarea>
+					</label>
+					<label class="mt-3 block text-sm text-neutral-400">
+						Files
+						<input id="files" type="file" multiple class="mt-1 block w-full text-sm text-neutral-300 file:mr-3 file:rounded-xl file:border-0 file:bg-neutral-800 file:px-3 file:py-2 file:text-neutral-100" data-test="request-files" />
+					</label>
+					<button id="send" class="mt-4 w-full rounded-xl bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-neutral-950 hover:opacity-90 disabled:opacity-50" data-test="request-send">Seal and send</button>
+					<ul id="sent" class="mt-4 space-y-2 text-xs" data-test="request-sent"></ul>
+					<p class="mt-4 text-xs text-neutral-500">
+						Each file is encrypted in this browser to the recipient's key before it leaves. The server stores ciphertext only; neither it, nor anyone else holding this link, can read what you send — including this page, once it is sent. Keep the SHA-256 shown for each file: it is your receipt.
+					</p>
+				</div>
+			</section>
+		</main>
+		<script type="module" src="/src/request-page.ts"></script>
+	</body>
+</html>

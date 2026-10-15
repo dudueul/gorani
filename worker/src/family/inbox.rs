@@ -120,6 +120,19 @@ impl GoraniFamilyDO {
 	}
 }
 
+impl GoraniFamilyDO {
+	/// `GET inbox-key-public/<case>/<key>` — the public halves of one of a
+	/// case's inbox keys (current or retired): what a new upload link into
+	/// the case must name (commit 38b).
+	pub(super) async fn inbox_key_public(&self, case: &str, key_id: &str) -> Result<Response> {
+		let rows: Vec<InboxKeyRow> = self.sql.exec(&format!("SELECT {COLUMNS} FROM case_inbox_keys WHERE case_id = ?1 AND key_id = ?2"), Some(vec![case.into(), key_id.into()]))?.to_array()?;
+		match rows.into_iter().next() {
+			Some(k) => Ok(Response::from_json(&k.json(false))?),
+			None => json_error(404, "no such inbox key on that case"),
+		}
+	}
+}
+
 /// An inbox key row as the case list carries it.
 pub(super) struct InboxKeyRowJson {
 	pub key_id: String,

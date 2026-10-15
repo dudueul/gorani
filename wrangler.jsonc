@@ -47,11 +47,19 @@
 	"vars": {
 		// The public URL the app is served from (used for CORS, share links).
 		"PUBLIC_ORIGIN": "https://gorani.example.com",
-		// Any S3-compatible endpoint, reachable over HTTPS from the internet.
-		// MinIO: your reverse-proxied (TLS) address; region can be any string MinIO accepts.
-		"S3_ENDPOINT": "https://minio.example.com",
-		"S3_REGION": "us-east-1",
-		"S3_BUCKET": "gorani",
+		// The S3 settings are SECRETS, not vars — all five:
+		//   wrangler secret put S3_ENDPOINT        (https://… or a bare host; MinIO: your TLS address)
+		//   wrangler secret put S3_REGION          (the region the endpoint names; MinIO: any string it accepts)
+		//   wrangler secret put S3_BUCKET
+		//   wrangler secret put S3_ACCESS_KEY_ID
+		//   wrangler secret put S3_SECRET_KEY
+		// A deployed Worker cannot hold a var and a secret of the same name:
+		// Cloudflare refuses the deploy (or the `secret put`) with "Binding
+		// name … already in use" — a secret does NOT override a var here.
+		// (Locally it does: `wrangler dev` lets .dev.vars override these vars,
+		// which is how tests/api/_dev.mjs points the Worker at its stub.) So
+		// a name moved to the secrets is DELETED from this block, never left
+		// beside it. The Worker reads secrets and vars alike (s3.rs › config).
 
 		// ── Object caching (worker/src/cache.rs) ──────────────────────────
 		// (These two lived at the TOP level of this file until commit 23,

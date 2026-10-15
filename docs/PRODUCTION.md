@@ -30,13 +30,19 @@ simulator so both branches stay tested.
    ONE small object for ONE day and asks the server to delete it. More:
    docs/SECURITY-REVIEW.md › Operational controls.
 
-`wrangler.jsonc` vars: `S3_ENDPOINT`, `S3_REGION` (any string MinIO
-accepts, e.g. `us-east-1`), `S3_BUCKET`. The endpoint must be `https://`
-— the worker refuses anything else outside `wrangler dev` (the signatures
-use UNSIGNED-PAYLOAD, so body integrity is TLS's job); a bare host
-(`s3.example.com`, as provider consoles print it) means `https://`.
-Secrets (`wrangler secret put`): `S3_ACCESS_KEY_ID`, `S3_SECRET_KEY`
-(`S3_SECRET_ACCESS_KEY`, the AWS spelling, is read too). The worker signs
+All five S3 settings are secrets (`wrangler secret put`): `S3_ENDPOINT`,
+`S3_REGION` (the region the endpoint names; MinIO accepts any string,
+e.g. `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_KEY`
+(`S3_SECRET_ACCESS_KEY`, the AWS spelling, is read too). None of them is
+in `wrangler.jsonc` › `vars`, and none may be: a deployed Worker cannot
+hold a var and a secret of the same name — Cloudflare refuses the deploy
+(or the `secret put`) with "Binding name … already in use"; a secret does
+not override a var. (`wrangler dev` is the exception: `.dev.vars`
+overrides vars of the same name, which is how the test harness points the
+Worker at its stub.) The endpoint must be `https://` — the worker refuses
+anything else outside `wrangler dev` (the signatures use UNSIGNED-PAYLOAD,
+so body integrity is TLS's job); a bare host (`s3.example.com`, as
+provider consoles print it) means `https://`. The worker signs
 SigV4 with path-style addressing (`https://endpoint/bucket/key`) —
 verified against golden vectors in `crates/s3`.
 

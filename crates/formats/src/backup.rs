@@ -1,5 +1,5 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// Portions derived from Mailflare's backup design (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
+// Portions derived from Mailflare's backup design (Seongwoo Hong's modified version; Apache 2.0, original © Cloudflare, Inc.); see NOTICE.
 
 //! The `.gbak` backup container (GB2): one encrypted file per backup, whose
 //! file key exists only in the owner's downloaded key file (sealed into the

@@ -1,5 +1,5 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// Pattern after Mailflare's vector tooling (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
+// Pattern after Mailflare's vector tooling (Seongwoo Hong's modified version; Apache 2.0, original © Cloudflare, Inc.); see NOTICE.
 
 /**
  * Generates `crates/formats/tests/vectors.json` with the TypeScript crypto

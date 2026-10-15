@@ -1,5 +1,5 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// Portions derived from Mailflare (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
+// Portions derived from Mailflare (Seongwoo Hong's modified version; Apache 2.0, original © Cloudflare, Inc.); see NOTICE.
 
 /**
  * Vault cryptography, as the browser and the tests run it.

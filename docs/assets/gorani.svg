@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t">
+  <title id="t">Gorani — a cute water deer</title>
+  <!-- Copyright 2026- Seongwoo Hong. All rights reserved.
+       The Gorani mark: a water deer (고라니, Hydropotes inermis) — no
+       antlers, big round ears, dark eyes, and the two small tusks that give
+       it away. One drawing for the README and every icon
+       (tools/icons/render.mjs makes them). -->
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c98f57"/>
+      <stop offset="1" stop-color="#b47643"/>
+    </linearGradient>
+    <linearGradient id="ear" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b9783f"/>
+      <stop offset="1" stop-color="#a5672f"/>
+    </linearGradient>
+  </defs>
+  <!-- ears, behind the head: big, round-tipped, set high -->
+  <g transform="rotate(-36 152 166)">
+    <ellipse cx="152" cy="166" rx="64" ry="88" fill="url(#ear)"/>
+    <ellipse cx="152" cy="176" rx="40" ry="62" fill="#f3d2b4"/>
+    <ellipse cx="152" cy="188" rx="22" ry="38" fill="#eab199" opacity=".6"/>
+  </g>
+  <g transform="rotate(36 360 166)">
+    <ellipse cx="360" cy="166" rx="64" ry="88" fill="url(#ear)"/>
+    <ellipse cx="360" cy="176" rx="40" ry="62" fill="#f3d2b4"/>
+    <ellipse cx="360" cy="188" rx="22" ry="38" fill="#eab199" opacity=".6"/>
+  </g>
+  <!-- the head: a wide brow narrowing to a deer's snout -->
+  <path d="M256 124 C342 124 392 176 392 244 C392 304 350 352 318 394 C300 418 280 430 256 430 C232 430 212 418 194 394 C162 352 120 304 120 244 C120 176 170 124 256 124 Z" fill="url(#fur)"/>
+  <!-- the pale muzzle -->
+  <path d="M256 294 C294 294 318 318 320 350 C322 388 294 428 256 428 C218 428 190 388 192 350 C194 318 218 294 256 294 Z" fill="#f6e3c6"/>
+  <!-- cheeks -->
+  <ellipse cx="166" cy="300" rx="24" ry="14" fill="#ef9a8a" opacity=".5"/>
+  <ellipse cx="346" cy="300" rx="24" ry="14" fill="#ef9a8a" opacity=".5"/>
+  <!-- eyes: big and dark, a light in each -->
+  <ellipse cx="190" cy="240" rx="31" ry="35" fill="#2a1a10"/>
+  <ellipse cx="322" cy="240" rx="31" ry="35" fill="#2a1a10"/>
+  <circle cx="201" cy="226" r="11" fill="#fff"/>
+  <circle cx="333" cy="226" r="11" fill="#fff"/>
+  <circle cx="181" cy="255" r="5" fill="#fff" opacity=".8"/>
+  <circle cx="313" cy="255" r="5" fill="#fff" opacity=".8"/>
+  <!-- the button nose -->
+  <path d="M256 322 C280 322 294 330 294 343 C294 359 274 370 256 370 C238 370 218 359 218 343 C218 330 232 322 256 322 Z" fill="#241610"/>
+  <ellipse cx="244" cy="334" rx="11" ry="5.5" fill="#fff" opacity=".45"/>
+  <!-- the smile -->
+  <path d="M256 370 L256 382 M230 382 C240 394 250 393 256 384 C262 393 272 394 282 382" fill="none" stroke="#241610" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- the tusks: what makes it a water deer — long, curving in, below the lip -->
+  <path d="M234 387 C233 400 236 413 244 422 C246 411 246 398 244 388 Z" fill="#fffdf8" stroke="#cdb99f" stroke-width="2.5" stroke-linejoin="round"/>
+  <path d="M278 387 C279 400 276 413 268 422 C266 411 266 398 268 388 Z" fill="#fffdf8" stroke="#cdb99f" stroke-width="2.5" stroke-linejoin="round"/>
+</svg>

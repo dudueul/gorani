@@ -1,7 +1,9 @@
 # Copyright 2026- Seongwoo Hong. All rights reserved.
 #
-# Make a Windows package (commit 39f–g): the release builds, the logos
-# (logos.py), the manifest filled in — packed by the Windows SDK's own
+# Make a Windows package (commit 39f–h): the release builds, the logos and
+# Explorer's icon (Assets/, gorani.ico — the water deer, rendered from
+# docs/assets/gorani.svg by tools/icons/render.mjs), the manifest filled
+# in — packed by the Windows SDK's own
 # makeappx, unsigned. Who signs it is the workflow's business
 # (package.yml): Microsoft, for the Store's identity; nobody, for the
 # unsigned one (its users check a signed checksum instead).
@@ -24,8 +26,9 @@ try {
 	foreach ($exe in 'gorani-cloud.exe', 'gorani-sync.exe') {
 		Copy-Item (Join-Path $repo "target\release\$exe") $layout
 	}
-	python -I (Join-Path $PSScriptRoot 'logos.py') (Join-Path $layout 'Assets')
-	if ($LASTEXITCODE -ne 0) { throw 'the logos were not drawn' }
+	Copy-Item (Join-Path $PSScriptRoot 'Assets\*.png') (Join-Path $layout 'Assets')
+	# (Beside the programs: shell.rs names it as Explorer's icon for the folder.)
+	Copy-Item (Join-Path $PSScriptRoot 'gorani.ico') $layout
 	# (The publisher is XML-escaped: a certificate subject may hold & or quotes.)
 	$manifest = (Get-Content (Join-Path $PSScriptRoot 'AppxManifest.xml') -Raw).
 		Replace('@VERSION@', $Version).

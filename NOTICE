@@ -1,4 +1,4 @@
-Gorani — a zero-trust encrypted family NAS
+Gorani — a zero-trust, end-to-end encrypted file store for a security-operations team
 Copyright 2026- Seongwoo Hong. All rights reserved.
 
 This product contains portions derived from third-party works, used under the
@@ -6,11 +6,20 @@ Apache License, Version 2.0 (the "Apache License"). You may obtain a copy of
 the Apache License at http://www.apache.org/licenses/LICENSE-2.0. Where those
 portions are marked, their original notices are retained in place.
 
-1. Mailflare (Cloudflare, Inc. — https://github.com/cloudflare/mailflare)
-   Portions of the file-management design, the vault encryption formats
-   (byte layouts), the desktop-sync protocol ideas and several document /
-   archive parsers were ported or adapted from Mailflare. The derived files
-   carry both the Gorani copyright header and the original notice.
+1. Mailflare, as modified by Seongwoo Hong
+   The Mailflare Gorani draws on is not the product Cloudflare publishes: it
+   is Seongwoo Hong's own, heavily modified version, reworked for his work
+   suites. Only his tweaked parts are here — portions of the file-management
+   design, the vault encryption formats (byte layouts), the desktop-sync
+   protocol ideas and several document / archive parsers, ported or adapted
+   into Gorani. Wherever this repository says "Mailflare", it means that
+   modified version.
+
+   His version began as a fork of Mailflare by Cloudflare, Inc.
+   (https://github.com/cloudflare/mailflare), under the Apache License. As
+   that license requires, Cloudflare's copyright notice stays with whatever
+   of its original code those parts still carry: each derived file says so
+   in its header, beside the Gorani copyright.
 
 2. mp4-hls-core (from the stream-worker project)
    The ISO-BMFF parser, keyframe index builder and fMP4 segment assembly

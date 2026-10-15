@@ -1,6 +1,6 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// The files store's shape follows Mailflare's files DO (Apache 2.0, ©
-// Cloudflare, Inc.); see NOTICE.
+// The files store's shape follows Mailflare's files DO (Seongwoo Hong's modified version; Apache 2.0,
+// original © Cloudflare, Inc.); see NOTICE.
 
 //! The files operations of `GoraniMemberDO` (the schema and the vault/audit
 //! core are in member.rs — same DO, one module per concern).

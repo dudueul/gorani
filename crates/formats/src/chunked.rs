@@ -1,5 +1,5 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// Portions derived from Mailflare's desktop core (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
+// Portions derived from Mailflare's desktop core (Seongwoo Hong's modified version; Apache 2.0, original © Cloudflare, Inc.); see NOTICE.
 
 //! Chunked files (GC01, docs/ENCRYPTION.md): a file too large for one request
 //! is sealed in chunks of `chunk` bytes, each its own AES-256-GCM frame under

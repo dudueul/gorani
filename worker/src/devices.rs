@@ -1,6 +1,6 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// The device-copy design follows Mailflare's desktop sync (Apache 2.0, ©
-// Cloudflare, Inc.); see NOTICE.
+// The device-copy design follows Mailflare's desktop sync (Seongwoo Hong's modified version; Apache 2.0,
+// original © Cloudflare, Inc.); see NOTICE.
 
 //! Devices (docs/DESKTOP.md): each enrolled computer holds its **own wrapped
 //! copy of the member's root key** — wrapped under a secret only that

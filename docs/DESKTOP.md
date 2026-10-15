@@ -565,7 +565,7 @@ or runs it there, as they would:
 
 | | Windows | macOS |
 |---|---|---|
-| what | an MSIX (`clients/windows/packaging`): gorani-cloud and gorani-sync, full trust, each a console command on PATH through an execution alias; logos drawn by `logos.py` (no image committed) | Gorani.app (`clients/macos/packaging/package.sh`): the app, its File Provider extension, the CLI (`Contents/MacOS/gorani-sync`) and two copies of the keystore helper — the CLI's, and the extension's signed to inherit its sandbox |
+| what | an MSIX (`clients/windows/packaging`): gorani-cloud and gorani-sync, full trust, each a console command on PATH through an execution alias; its logos and Explorer's icon are the water deer (39h: rendered from `docs/assets/gorani.svg` by `tools/icons/render.mjs`) | Gorani.app (`clients/macos/packaging/package.sh`): the app, its File Provider extension, the CLI (`Contents/MacOS/gorani-sync`) and two copies of the keystore helper — the CLI's, and the extension's signed to inherit its sandbox |
 | signed with secrets | (39f: `WINDOWS_CERT_PFX`, `WINDOWS_CERT_PASSWORD` — replaced in 39g: the Store signs its package, the unsigned builds carry a signed checksum) | `GORANI_TEAM_ID` (variable or secret), `APPLE_CERT_P12`, `APPLE_CERT_PASSWORD`: Developer ID, inside-out, hardened runtime, the app group `<team>.io.gorani`; notarized and stapled with `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` |
 | without them | signed with a throwaway certificate made and trusted on that runner only — so installing is tested as a signed package's would be | ad-hoc signed, for testing (Gatekeeper will not open it from a download) |
 | checked | installed with Add-AppxPackage, both aliases answer, removed again | the bundled CLI answers, the helper probes, the extension's binary holds the core |
@@ -616,6 +616,15 @@ the key can live on a hardware token, and nothing new is installed to
 check a download. Why not GitHub's artifact attestations: in a private
 repository they need GitHub Enterprise Cloud — and they would vouch for
 the build, not for the person who approved the release.
+
+**The mark** (39h): a cute water deer — no antlers, round ears, dark eyes,
+two little tusks — drawn once in `docs/assets/gorani.svg` (the README opens
+with it). `tools/icons/render.mjs` renders every icon from it with the
+browser the e2e suite installs, and the images are committed so no build
+machine needs a renderer: the web app's favicon, the MSIX logos and
+Explorer's `gorani.ico` (beside the programs in the package and the ZIP —
+shell.rs names it for the sync root), and the Mac app's icon set. Edit the
+drawing, run the script, commit both.
 
 **Tested** in package.yml, on every run: the unsigned MSIX installed with
 `-AllowUnsigned`, both commands asked through their aliases, removed; the

@@ -389,7 +389,15 @@ impl Client {
 	/// A multipart upload's plan (D12, commit 33b): the Worker checks it
 	/// against the limits (255 GiB, 64 MiB chunks, 10 000 parts).
 	pub fn upload_start(&self, size: u64, chunk: u64, new_file_id: &str) -> Result<(String, String, u64), Error> {
-		let v = self.area_json("POST", "/files/uploads", Some(json!({ "size": size, "chunk": chunk, "newFileId": new_file_id })))?;
+		self.upload_start_for(size, chunk, new_file_id, false)
+	}
+
+	/// The same plan for a new file (`existing` false: the client chose its
+	/// id) or a new VERSION of an existing one (commit 39a: a sync shell
+	/// saves large files that were edited in place).
+	pub fn upload_start_for(&self, size: u64, chunk: u64, file_id: &str, existing: bool) -> Result<(String, String, u64), Error> {
+		let body = if existing { json!({ "size": size, "chunk": chunk, "fileId": file_id }) } else { json!({ "size": size, "chunk": chunk, "newFileId": file_id }) };
+		let v = self.area_json("POST", "/files/uploads", Some(body))?;
 		Ok((v["uploadId"].as_str().unwrap_or_default().to_string(), v["key"].as_str().unwrap_or_default().to_string(), v["parts"].as_u64().unwrap_or(0)))
 	}
 

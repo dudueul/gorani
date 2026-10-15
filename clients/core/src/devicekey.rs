@@ -366,6 +366,7 @@ pub mod tpm {
 		fn new() -> Result<Self, Error> {
 			let base = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
 			let dir = base.join(format!("gorani-tpm-{}", crate::new_item_id()));
+			#[cfg_attr(not(unix), allow(unused_mut))]
 			let mut b = std::fs::DirBuilder::new();
 			#[cfg(unix)]
 			{

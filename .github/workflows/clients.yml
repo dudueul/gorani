@@ -1,0 +1,69 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+#
+# The native clients on the machines they run on (commit 39, docs/DESKTOP.md):
+# the core and its CLI built and unit-tested on Windows and macOS, and —
+# as they land — each platform's shell and its smoke test (39b Windows
+# Cloud Files, 39c macOS File Provider). The Linux side, the worker and the
+# browser are proven by `node tests/run.mjs` against `wrangler dev`; this
+# workflow is for what that machine cannot build.
+#
+# Cost (a private repository): Windows minutes count twice, macOS ten times
+# against the plan. Hence: only pushes and PRs that touch the clients, the
+# shared crates or this file run it; a newer push cancels an older run of the
+# same branch; Cargo's downloads and build outputs are cached.
+#
+# Supply chain: first-party actions only (actions/checkout, actions/cache),
+# the job token read-only. The toolchains are the runner images' own
+# (rustup + stable Rust, Xcode on macOS) — nothing fetched from a third party.
+
+name: clients
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths: ["clients/**", "crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/clients.yml"]
+  pull_request:
+    paths: ["clients/**", "crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/clients.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clients-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  core:
+    name: core (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup default stable
+          rustc --version && cargo --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Unit tests (formats, client core)
+        run: cargo test --locked -p gorani-formats -p gorani-client-core
+      - name: Build the CLI
+        run: cargo build --locked -p gorani-client-core --bin gorani-sync

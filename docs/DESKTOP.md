@@ -346,6 +346,57 @@ and/or keyring), the profile — pins included — MAC'd under another. The
 token's secret is read from `GORANI_COLLECTOR_SECRET` or asked for, never a
 flag (argv shows in `ps`).
 
+## Commit 39: Windows and macOS
+
+Asked 2026-10-15: built and tested on **GitHub Actions** (hosted
+`windows-latest` and `macos-latest` runners — `.github/workflows/clients.yml`;
+this repository's own machine cannot build either), **File Provider** on
+macOS (D16's choice), a paid Apple Developer team (its Team ID is a setting,
+never in the repository), and all four parts in this phase:
+
+| Stage | What |
+|---|---|
+| 39a | **The replica** (`clients/core/src/replica.rs`): what a shell that keeps real files on disk needs — items by server id, reads of one version, new files and versions from paths (whole or GC01 frames), conflicts kept, a diff to apply — over the server (`HttpRemote`) or in memory (`MemRemote`, what each platform's smoke test drives). One JSON protocol over either: `gorani-sync replica` speaks it on stdin/stdout, the macOS bridge across its C interface. CI builds and unit-tests the core on Windows and macOS. |
+| 39b | **Windows**: a Cloud Files sync root (`clients/windows`) — placeholders, hydration on read, local saves uploaded, renames and deletes, server changes applied, plaintext dropped when the shell stops. |
+| 39c | **macOS**: a File Provider extension and its host app (`clients/macos`) over the Rust core through a C bridge. |
+| 39d | **The hardware device key**: Windows Hello (a TPM-backed key, its deterministic RSA signature) and the Secure Enclave (CryptoKit key agreement) as protectors. |
+| 39e | **Explorer and Finder**: the navigation-pane entry and sync states (StorageProviderSyncRootManager), Finder decorations. |
+| 39f | **Installers**: an MSIX and a signed, notarized app — signed in CI only when the signing secrets exist. |
+
+### 39a as built
+
+```text
+gorani-sync replica [--case C]     one JSON request per line on stdin, one answer per line:
+  {"op":"items"}                   the tree by id ("" is the top), names opened in their places
+  {"op":"read","id","version","offset","len"}     bytes of THAT version only
+  {"op":"create","parent","name","path"}          a new file from a local path
+  {"op":"save","id","base","path"}                the version after `base` — or a conflict copy
+  {"op":"mkdir"|"rename"|"trash"|"poll", …}
+```
+
+- **Reads of one version.** A placeholder made for version N has N's size
+  and N's signed hash; filling it with N+1's bytes would corrupt it. The
+  engine's `read_at` refuses ("changed on the server") and the shell's
+  next poll updates the placeholder. The same rules as the mount: a sample
+  is never readable, evidence is checked against its uploader's signed hash
+  before a byte is served.
+- **Uploads from paths**, because these shells keep real files: up to
+  48 MiB read once and hashed and sealed from the same buffer; above, GC01
+  frames — now also as a new VERSION through the multipart path (the core
+  only sent new files that way) — re-hashed as they are sealed, so a file
+  that changed after it was hashed is never completed under a signature
+  for other bytes (`push_frames`' `expect`; the CLI's `push` checks it too).
+- **One protocol, two remotes.** `HttpRemote` is the engine — the same
+  naming, sample and evidence decisions as the Linux mount; `MemRemote`
+  keeps the rules a shell depends on (versions, conflicts, samples,
+  read-only areas, empty-folder trashing) and none of the crypto, so a
+  Windows or macOS runner proves its placeholder layer without a server.
+- `api:replica` drives it against `wrangler dev`: the tree by id, a range
+  across GC01 frames, a stale version refused, new files and versions
+  whole and framed (49 MiB), a conflict copy beside the browser's save,
+  folders, renames, the Trash, polling, an evidence case read-only with a
+  swapped record refused.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

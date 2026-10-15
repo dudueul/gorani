@@ -110,7 +110,8 @@ impl From<Error> for FsError {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
 	Dir,
 	File,
@@ -196,6 +197,84 @@ impl Engine {
 
 	pub fn read_only(&self) -> Option<&str> {
 		self.read_only.as_deref()
+	}
+
+	pub fn client(&self) -> &Client {
+		&self.client
+	}
+
+	/// The inode of a server id (the root's id is "").
+	pub fn ino_of(&self, id: &str) -> Option<u64> {
+		if id.is_empty() {
+			return Some(ROOT);
+		}
+		self.by_id.get(id).copied().filter(|i| self.nodes.contains_key(i))
+	}
+
+	/// The server id of an inode ("" for the root).
+	pub fn id_of(&self, ino: u64) -> Option<String> {
+		if ino == ROOT {
+			return Some(String::new());
+		}
+		self.nodes.get(&ino).and_then(|n| n.id.clone())
+	}
+
+	/// What the server has — the tree, by id, for a shell that keeps
+	/// placeholders (replica.rs). Files created here and not yet sent are
+	/// left out: they are the shell's, not the server's.
+	pub fn items(&self) -> Vec<crate::replica::Item> {
+		self.nodes
+			.values()
+			.filter(|n| n.ino != ROOT && !n.local)
+			.map(|n| crate::replica::Item {
+				id: n.id.clone().unwrap_or_default(),
+				parent: self.id_of(n.parent).unwrap_or_default(),
+				name: n.name.clone(),
+				kind: n.kind,
+				size: n.size,
+				version: n.version,
+				modified: n.modified,
+				sample: n.sample,
+				name_verified: !n.name.starts_with("⚠ unverified ‹"),
+			})
+			.collect()
+	}
+
+	/// `len` bytes of `id` from `offset`, but only of `version`: a shell
+	/// that put a placeholder down for version N must not be handed N+1's
+	/// bytes (its size and its hash are N's). The same rules as `read` — a
+	/// sample is refused, evidence is checked before a byte is served.
+	pub fn read_at(&mut self, id: &str, version: i64, offset: u64, len: u64) -> Result<Vec<u8>, FsError> {
+		let (current, chunk, size) = {
+			let m = self.meta_of(id)?;
+			(m.version, m.chunk, m.size)
+		};
+		if current != version {
+			return Err(FsError::Io(format!("changed on the server (version {current}, not {version}) — the placeholder is updated on the next refresh")));
+		}
+		if offset >= size || len == 0 {
+			return Ok(Vec::new());
+		}
+		let len = len.min(size - offset);
+		let key = Zeroizing::new(*self.meta[id].key);
+		match chunk {
+			Some(chunk) => {
+				let span = chunked::frames_for(offset, len, size, chunk);
+				let bytes = self.client.fetch(id, Some(version as u64), Some((span.start, span.end)))?;
+				let plain = chunked::open_span(&key, &bytes, span, size, chunk).map_err(|_| FsError::Io("content (altered, reordered or cut short)".into()))?;
+				let from = (offset - span.first * chunk) as usize;
+				Ok(plain[from..(from + len as usize).min(plain.len())].to_vec())
+			}
+			None => {
+				let plain = self.whole(id, version, &key)?;
+				Ok(plain[offset as usize..(offset + len) as usize].to_vec())
+			}
+		}
+	}
+
+	/// After an upload made elsewhere (replica.rs): the tree is read again.
+	pub fn relist_now(&mut self) -> Result<(), Error> {
+		self.relist()
 	}
 
 	// ── the tree ──────────────────────────────────────────────────────
@@ -776,7 +855,7 @@ fn shown(opened: Option<String>, id: &str) -> String {
 }
 
 /// "report.docx" → "report (conflict 2026-10-14 093005).docx".
-fn conflict_name(name: &str, now: u64) -> String {
+pub(crate) fn conflict_name(name: &str, now: u64) -> String {
 	let (days, secs) = ((now / 86_400) as i64, now % 86_400);
 	let (y, m, d) = civil_from_days(days);
 	let stamp = format!("{y:04}-{m:02}-{d:02} {:02}{:02}{:02}", secs / 3600, secs / 60 % 60, secs % 60);

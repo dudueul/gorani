@@ -28,6 +28,10 @@
 //!                                        exit; --check-hash refuses --as-file for a known hash
 //! reject [--case C] --item I --reason R  turn it away (the reason sealed)
 //!
+//! replica [--case C]                     the replica protocol (commit 39a, replica.rs) on
+//!                                        stdin/stdout, one JSON request per line — what the
+//!                                        Windows and macOS shells call; tests drive it
+//!
 //! collector init --server S --id I       a COLLECTOR on this machine (commit 37b,
 //!       --pins ana:FP,bo:FP              docs/COLLECTORS.md): its identity key, sealed under
 //!       [--access-id ID]                 the TPM/keyring; prints what the leads register.
@@ -434,6 +438,26 @@ fn run(args: &[String]) -> Result<(), Error> {
 				inbox::ItemMeta::Request(_) => println!("accepted {id} as file {filed}{} — SHA-256 {sha256}: the bytes the sender declared, signed by you ({member})", if sample { ", a malware sample" } else { "" }),
 			}
 		}
+		// ── The replica protocol (commit 39a) — JSON lines, any shell's view ──
+		Some("replica") => {
+			use std::io::{BufRead, Write};
+			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
+			let mut remote = gorani_client_core::replica::connect(&path, flag("case").as_deref(), flag("secret").as_deref(), flag("dev-email").as_deref(), flag("accept-unverified").is_some())?;
+			use gorani_client_core::replica::Remote as _;
+			println!("{}", serde_json::json!({ "ready": remote.area(), "readOnly": remote.read_only() }));
+			for line in std::io::stdin().lock().lines() {
+				let line = line?;
+				if line.trim().is_empty() {
+					continue;
+				}
+				let answer = match serde_json::from_str::<serde_json::Value>(&line) {
+					Ok(req) => gorani_client_core::replica::dispatch(&mut remote, &req),
+					Err(e) => serde_json::json!({ "error": format!("not JSON: {e}"), "code": "denied" }),
+				};
+				println!("{answer}");
+				std::io::stdout().flush().ok();
+			}
+		}
 		Some("push") => {
 			let (profile, sess) = unlocked(&flag)?;
 			let path = req_flag("file")?;
@@ -479,7 +503,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 						let key = placed::unwrap_placed_key(&area.key, &Place::file_key(&area.name, &prior.file_id, 1), &ck_sealed).map_err(|_| Error::Open("the journalled content key"))?;
 						eprintln!("resuming {name} from part {} of {}", prior.parts.len() + 1, gorani_formats::chunked::frame_count(size, prior.chunk));
 						let (file_id, chunk) = (prior.file_id.clone(), prior.chunk);
-						match transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, prior.fields.clone(), Some(prior), progress) {
+						match transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, prior.fields.clone(), Some(prior), Some(&sha256), progress) {
 							Err(Error::Http(404, body)) if body.contains("no such upload") => {
 								journal.delete(&jkey);
 								return Err(Error::Config("the server no longer has the earlier upload (its window passed) — run push again to start over".into()));
@@ -493,7 +517,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 						let key = gorani_formats::formats::import_content_key(&ck);
 						let mut fields = area.new_file_fields(&file_id, &name, &ck, size, &sha256, intake.as_ref())?;
 						fields.push(("chunk".into(), chunk.to_string()));
-						transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, fields, None, progress)?
+						transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, fields, None, Some(&sha256), progress)?
 					}
 				};
 				println!("pushed: {} ({size} bytes in {} parts, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), gorani_formats::chunked::frame_count(size, chunk), signed_note(&area, intake.is_some()));
@@ -512,7 +536,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash]");
+			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash]");
 			std::process::exit(2);
 		}
 	}

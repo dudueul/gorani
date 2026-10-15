@@ -116,15 +116,20 @@ impl Journal {
 /// Push a file as GC01 frames (D12), journalled so it can resume.
 /// `resume`: the record of the same file's stopped upload — the frames
 /// from its first missing part on are sealed with the SAME key and sent
-/// under the SAME upload. Returns the completed file row.
+/// under the SAME upload. Fields carrying `base_version` make it a new
+/// VERSION of `file_id` (commit 39a). `expect`: the SHA-256 the fields
+/// sign — the bytes are hashed again as they are sealed, and a file that
+/// changed since it was hashed is never completed (its signature would
+/// vouch for other bytes). Returns the completed file row.
 #[allow(clippy::too_many_arguments)]
-pub fn push_frames(client: &Client, journal: &Journal, journal_key: &str, path: &Path, key: &[u8; 32], member: &str, file_id: &str, chunk: u64, size: u64, fields: Vec<(String, String)>, resume: Option<UploadRecord>, mut progress: impl FnMut(u64, u64)) -> Result<serde_json::Value, Error> {
+pub fn push_frames(client: &Client, journal: &Journal, journal_key: &str, path: &Path, key: &[u8; 32], member: &str, file_id: &str, chunk: u64, size: u64, fields: Vec<(String, String)>, resume: Option<UploadRecord>, expect: Option<&str>, mut progress: impl FnMut(u64, u64)) -> Result<serde_json::Value, Error> {
 	let area = client.area().to_string();
 	let count = gorani_formats::chunked::frame_count(size, chunk);
+	let existing = fields.iter().any(|(k, _)| k == "base_version");
 	let mut rec = match resume {
 		Some(r) => r,
 		None => {
-			let (upload_id, object_key, parts) = client.upload_start(size, chunk, file_id)?;
+			let (upload_id, object_key, parts) = client.upload_start_for(size, chunk, file_id, existing)?;
 			if parts != count {
 				return Err(Error::Config(format!("the server planned {parts} parts for {count} frames")));
 			}
@@ -135,20 +140,38 @@ pub fn push_frames(client: &Client, journal: &Journal, journal_key: &str, path: 
 	};
 	let mut f = std::fs::File::open(path)?;
 	let first = rec.parts.len() as u64;
+	let mut h = expect.map(|_| <sha2::Sha256 as sha2::Digest>::new());
+	let mut buf = vec![0u8; chunk as usize];
+	if let Some(h) = h.as_mut() {
+		// (A resumed upload hashes the frames already sent too, from disk.)
+		for i in 0..first {
+			let want = if i == count - 1 { (size - i * chunk) as usize } else { chunk as usize };
+			f.read_exact(&mut buf[..want])?;
+			sha2::Digest::update(h, &buf[..want]);
+		}
+	}
 	{
 		use std::io::Seek;
 		f.seek(std::io::SeekFrom::Start(first * chunk))?;
 	}
-	let mut buf = vec![0u8; chunk as usize];
 	for i in first..count {
 		let want = if i == count - 1 { (size - i * chunk) as usize } else { chunk as usize };
 		f.read_exact(&mut buf[..want])?;
+		if let Some(h) = h.as_mut() {
+			sha2::Digest::update(h, &buf[..want]);
+		}
 		let frame = gorani_formats::chunked::seal_chunk(key, &buf[..want], i, i == count - 1);
 		test_fault(i)?;
 		let etag = client.upload_part(&rec.upload_id, &rec.object_key, i + 1, &frame)?;
 		rec.parts.push((i + 1, etag));
 		journal.put(journal_key, &rec)?;
 		progress(i + 1, count);
+	}
+	if let (Some(h), Some(want)) = (h, expect) {
+		if hex(&sha2::Digest::finalize(h)) != want {
+			journal.delete(journal_key);
+			return Err(Error::Config("the file changed while it was being sent — nothing was completed; send it again".into()));
+		}
 	}
 	let parts: Vec<serde_json::Value> = rec.parts.iter().map(|(n, e)| serde_json::json!({ "partNumber": n, "etag": e })).collect();
 	let mut form: Vec<(String, String)> = rec.fields.iter().filter(|(k, _)| k != "file_id").cloned().collect();

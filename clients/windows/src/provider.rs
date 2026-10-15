@@ -150,6 +150,8 @@ pub struct Provider {
 	stop: AtomicBool,
 	verbose: bool,
 	warned: Mutex<HashSet<String>>,
+	/// The shell registered the folder (shell.rs): custom states are shown.
+	explorer: bool,
 }
 
 /// A path as callbacks name it: without `\\?\` and the drive.
@@ -297,6 +299,9 @@ impl Provider {
 		match cf::create_placeholders(&dir, &[ph]).into_iter().next() {
 			Some(Ok(())) => {
 				self.log(&format!("placed {}", rel.display()));
+				if i.sample {
+					self.show_sample(&full);
+				}
 				self.state.lock().expect("lock").insert(Known { id: i.id.clone(), rel: rel.to_path_buf(), kind: i.kind, version: i.version, size: i.size, modified: Some(i.modified), sample: i.sample, stamp: stamp(&full) });
 			}
 			Some(Err(e)) => self.warn_once(&format!("place:{}", i.id), &format!("could not place {}: {e}", rel.display())),
@@ -376,8 +381,23 @@ impl Provider {
 		}
 	}
 
+	/// A sample says so in Explorer (39e) — then is marked in sync again, in
+	/// case the shell's write looked like a change.
+	fn show_sample(&self, full: &Path) {
+		if !self.explorer {
+			return;
+		}
+		if let Err(e) = crate::shell::mark_sample(full) {
+			self.log(&format!("{}: no sample state shown ({e})", full.display()));
+		}
+		let _ = cf::mark_in_sync(full);
+	}
+
 	fn retag_local(&self, k: &Known, i: &Item) {
 		let full = self.root.join(&k.rel);
+		if i.sample && !k.sample {
+			self.show_sample(&full);
+		}
 		if cf::update(&full, &identity(&i.id, k.version), Some((k.kind == Kind::Dir, k.size, i.modified, self.read_only_item(i))), i.sample && !k.sample).is_ok() {
 			self.state.lock().expect("lock").insert(Known { modified: Some(i.modified), sample: i.sample, stamp: stamp(&full), ..k.clone() });
 		}
@@ -714,7 +734,21 @@ pub fn start(root: &Path, remote: Arc<Mutex<dyn Remote + Send>>, opts: Options) 
 		let r = remote.lock().expect("lock");
 		(r.area(), r.read_only())
 	};
-	cf::register(&root, &area).map_err(|e| format!("could not make {} a sync root: {e}", root.display()))?;
+	// Explorer's registration first (39e); cldapi's alone where the shell
+	// will not — the folder works either way.
+	let explorer = match crate::shell::register(&root, &area, read_only.is_some()) {
+		crate::shell::Registration::Shell { id } => {
+			if opts.verbose {
+				eprintln!("gorani-cloud: Explorer knows {} as {id}", root.display());
+			}
+			true
+		}
+		crate::shell::Registration::Plain { why } => {
+			cf::register(&root, &area).map_err(|e| format!("could not make {} a sync root: {e}", root.display()))?;
+			eprintln!("gorani-cloud: {} is a sync root without Explorer's provider entry ({why})", root.display());
+			false
+		}
+	};
 	let provider = Arc::new(Provider {
 		root_vol: vol(&root),
 		root_chars: vol_raw(&root.to_string_lossy()).chars().count(),
@@ -728,6 +762,7 @@ pub fn start(root: &Path, remote: Arc<Mutex<dyn Remote + Send>>, opts: Options) 
 		stop: AtomicBool::new(false),
 		verbose: opts.verbose,
 		warned: Mutex::new(HashSet::new()),
+		explorer,
 	});
 	provider.scan(&root, false);
 	let connection = cf::connect(&root, cf::Callbacks { fetch_data: on_fetch_data, notify_delete: on_delete, notify_rename: on_rename }, Arc::as_ptr(&provider) as *const c_void).map_err(|e| format!("could not connect the sync root: {e}"))?;

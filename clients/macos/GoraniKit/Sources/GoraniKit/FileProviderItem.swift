@@ -7,14 +7,26 @@
 // grant) never writable. The version pair: CONTENT changes with the
 // version number (new bytes, fetched afresh), METADATA with it and the
 // modified time.
+//
+// Finder's badges (commit 39e): a sample, an item of a read-only area, and
+// a name that did not open in its place each carry a decoration — declared
+// in the extension's Info.plist (project.yml), named under its bundle id.
 
 import FileProvider
 import Foundation
 import UniformTypeIdentifiers
 
-public final class GoraniFileProviderItem: NSObject, NSFileProviderItem {
+public final class GoraniFileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDecorating {
 	public let item: GoraniItem
 	private let readOnly: Bool
+
+	/// The extension's bundle id: decorations are named under it (the
+	/// extension sets it at start; tests use the default).
+	public static var decorationPrefix = "io.gorani.app.fileprovider"
+
+	public static func decoration(_ name: String) -> NSFileProviderItemDecorationIdentifier {
+		NSFileProviderItemDecorationIdentifier(rawValue: "\(decorationPrefix).\(name)")
+	}
 
 	public init(_ item: GoraniItem, readOnly: Bool) {
 		self.item = item
@@ -56,6 +68,16 @@ public final class GoraniFileProviderItem: NSObject, NSFileProviderItem {
 
 	public var itemVersion: NSFileProviderItemVersion {
 		NSFileProviderItemVersion(contentVersion: Data("\(item.version)".utf8), metadataVersion: Data("\(item.version):\(item.modified):\(item.sample)".utf8))
+	}
+
+	/// What Finder badges: a sample (warning), a read-only area's item
+	/// (locked), a name the server could not show as verified (warning).
+	public var decorations: [NSFileProviderItemDecorationIdentifier]? {
+		var d: [NSFileProviderItemDecorationIdentifier] = []
+		if item.sample { d.append(Self.decoration("sample")) }
+		if readOnly { d.append(Self.decoration("readOnly")) }
+		if !item.nameVerified { d.append(Self.decoration("unverifiedName")) }
+		return d.isEmpty ? nil : d
 	}
 
 	public var documentSize: NSNumber? { item.isFolder ? nil : NSNumber(value: item.size) }

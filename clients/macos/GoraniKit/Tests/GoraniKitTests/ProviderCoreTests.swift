@@ -12,7 +12,8 @@
 //   4. a stale save leaves theirs at the name and a conflict copy beside it;
 //   5. changes since an anchor: additions, edits, deletions, and an
 //      anchor too old to answer;
-//   6. the enumerators answer the system's observers.
+//   6. the enumerators answer the system's observers;
+//   7. Finder's badges: a sample, a read-only area's items (39e).
 
 import FileProvider
 import UniformTypeIdentifiers
@@ -185,6 +186,16 @@ final class ProviderCoreTests: XCTestCase {
 		GoraniEnumerator(core: core, container: .workingSet, queue: queue).enumerateChanges(for: stale, from: NSFileProviderSyncAnchor(rawValue: ReplicaModel.anchorData(12345)))
 		wait(for: [stale.done], timeout: 5)
 		XCTAssertEqual((stale.error as? NSFileProviderError)?.code, .syncAnchorExpired)
+	}
+
+	func testFinderBadgesWhatDeservesOne() throws {
+		let decorations = { (id: String) in (try self.core.providerItem(id) as? GoraniFileProviderItem)?.decorations ?? [] }
+		XCTAssertEqual(try decorations(sample), [GoraniFileProviderItem.decoration("sample")])
+		XCTAssertEqual(try decorations(a), [], "an ordinary file: no badge")
+		try bridge.call(["op": "mem.readOnly", "why": "an evidence case is read-only"])
+		_ = try core.model.refresh(force: true)
+		XCTAssertEqual(try decorations(a), [GoraniFileProviderItem.decoration("readOnly")])
+		XCTAssertTrue(GoraniFileProviderItem.decoration("sample").rawValue.hasPrefix(GoraniFileProviderItem.decorationPrefix + "."), "named under the extension's id")
 	}
 
 	func testTheCoresRefusalsBecomeFileProviderErrors() {

@@ -67,7 +67,7 @@ fn run() -> Result<(), String> {
 		}
 		Some("unregister") => {
 			let dir = pos.get(1).ok_or("gorani-cloud unregister <folder>")?;
-			cf::unregister(std::path::Path::new(dir)).map_err(|e| e.to_string())?;
+			gorani_windows::shell::unregister(std::path::Path::new(dir))?;
 			println!("{dir} is no longer a Gorani folder");
 			Ok(())
 		}

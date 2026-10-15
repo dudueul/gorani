@@ -23,6 +23,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 	required init(domain: NSFileProviderDomain) {
 		self.domain = domain
 		super.init()
+		// (Decorations are named under this extension's own bundle id — the
+		// ones its Info.plist declares.)
+		if let id = Bundle.main.bundleIdentifier { GoraniFileProviderItem.decorationPrefix = id }
 		do {
 			guard let group = Bundle.main.object(forInfoDictionaryKey: "GoraniAppGroup") as? String,
 				let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)

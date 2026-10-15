@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gorani_client_core::replica::{MemRemote, Remote};
-use gorani_windows::{cf, provider};
+use gorani_windows::{cf, provider, shell};
 
 fn wait(what: &str, run: &provider::Running, mut done: impl FnMut() -> bool) {
 	let t = Instant::now();
@@ -69,7 +69,7 @@ fn fresh_root(tag: &str) -> PathBuf {
 }
 
 fn cleanup(root: &Path) {
-	let _ = cf::unregister(root);
+	let _ = shell::unregister(root);
 	let _ = std::fs::remove_dir_all(root);
 }
 
@@ -89,6 +89,16 @@ fn a_cloud_files_folder_over_the_replica() {
 	let run = provider::start(&fresh_root("main"), remote, provider::Options { poll: None, keep_local: false, verbose: true }).expect("start the sync root");
 	let root = run.root().to_path_buf();
 
+	// 0. Explorer's registration where the shell gives one (39e), said
+	// either way: a Server runner may give only cldapi's.
+	match shell::registered_id(&root) {
+		Some(id) => {
+			eprintln!("Explorer knows the folder as {id}");
+			assert!(id.ends_with("!ana"), "named for the area: {id}");
+		}
+		None => eprintln!("the shell did not register the folder here — cldapi's sync root only (the start said why)"),
+	}
+
 	// 1. Listed, sized, identified — nothing fetched yet.
 	assert_eq!(std::fs::metadata(root.join("big.bin")).unwrap().len(), 5 * 1024 * 1024 + 123);
 	assert!(root.join("docs").is_dir());
@@ -107,6 +117,7 @@ fn a_cloud_files_folder_over_the_replica() {
 		assert_eq!(b, pattern(5 * 1024 * 1024 + 123)[3 * 1024 * 1024 + 7..3 * 1024 * 1024 + 7 + 100_000]);
 	}
 	assert!(std::fs::read(root.join("bad.exe")).is_err(), "a malware sample is never served raw");
+	assert!(cf::info(&root.join("bad.exe")).is_some_and(|i| i.in_sync), "its state shown, it is still in sync — nothing to send");
 	let _ = (&big, &bad);
 
 	// 3. The member's own changes reach the server.

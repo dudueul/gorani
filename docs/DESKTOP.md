@@ -521,6 +521,31 @@ person's login on all three:
   — the enclave (or its stand-in) agreeing the same part again and another
   peer not, the Keychain holding the part until forgotten, `auto`.
 
+### 39e as built
+
+What Explorer and Finder show of a Gorani folder:
+
+- **Explorer** (`clients/windows/src/shell.rs`): the folder is registered
+  through the shell's StorageProviderSyncRootManager as
+  `Gorani!<the user's SID>!<area>` — its own entry in the navigation pane
+  ("Gorani — <area>", "(read-only)" for an evidence case), the Status
+  column's cloud and tick, "Always keep on this device" and "Free up
+  space"; a malware sample carries a custom state ("Malware sample — never
+  opened raw", a warning sign) and is marked in sync again after, so the
+  shell's write is not taken for an edit. The policies are cldapi's own
+  (cf.rs). Where the shell will not register it (a Server SKU, a
+  policy), cldapi's registration alone still makes it a working folder —
+  said once at start, with the reason; `gorani-cloud unregister` undoes
+  whichever it got.
+- **Finder** (`GoraniFileProviderItem.decorations`, the extension's
+  `NSFileProviderDecorations`): a badge on a sample (warning), on every
+  item of a read-only area (locked), and on a name that did not open in
+  its place (warning) — named under the extension's bundle id.
+- **Tests**: the Windows smoke test says which registration the runner
+  gave and, when the shell's, that the id names the area; the sample stays
+  in sync with its state shown. `swift test` checks each badge and that an
+  ordinary file has none.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

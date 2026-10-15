@@ -514,6 +514,7 @@ dependencies = [
  "gorani-client-core",
  "serde_json",
  "windows",
+ "windows-collections",
 ]
 
 [[package]]

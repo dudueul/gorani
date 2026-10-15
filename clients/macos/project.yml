@@ -64,6 +64,21 @@ targets:
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
           NSExtensionFileProviderDocumentGroup: $(TeamIdentifierPrefix)io.gorani
           NSExtensionFileProviderSupportsEnumeration: true
+          # Finder's badges (39e): named under the extension's bundle id,
+          # matched by GoraniFileProviderItem.decorations.
+          NSFileProviderDecorations:
+            - Identifier: $(PRODUCT_BUNDLE_IDENTIFIER).sample
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.warning
+              Label: Malware sample — never opened raw
+            - Identifier: $(PRODUCT_BUNDLE_IDENTIFIER).readOnly
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.locked
+              Label: Read-only (an evidence case or a read grant)
+            - Identifier: $(PRODUCT_BUNDLE_IDENTIFIER).unverifiedName
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.warning
+              Label: Name not verified — not what it claims to be
     entitlements:
       path: Extension/GoraniFileProvider.entitlements
       properties:

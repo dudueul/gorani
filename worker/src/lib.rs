@@ -40,6 +40,8 @@ mod family;
 mod files_store;
 mod inbox;
 mod member;
+mod malware;
+mod requests;
 mod routes;
 mod s3;
 mod schema;

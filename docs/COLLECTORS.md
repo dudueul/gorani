@@ -6,6 +6,9 @@
 > landed (inbox keys, drops, the collector client); 37c landed (accept and
 > reject, in the web app and the CLI); 37d landed (exports carry and the
 > standalone verifier checks it all; PRODUCTION.md's setup).
+> Commit 38 (docs/REQUESTS.md) reuses the inbox for UPLOAD LINKS — an
+> outsider's browser in the collector's place, unsigned, collector
+> `request:<link id>` — and gives a member's own area an inbox key too.
 
 ## The problem
 

@@ -1,9 +1,10 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 
-//! A case's inbox, from a member's side (commit 37c, docs/COLLECTORS.md) —
-//! the twin of `web/src/vault/inbox.ts` and of `collectors.ts`' verdict.
+//! An area's inbox, from a member's side (commit 37c, docs/COLLECTORS.md;
+//! a member's own area and upload links since commit 38, docs/REQUESTS.md)
+//! — the twin of `web/src/vault/inbox.ts` and of `collectors.ts`' verdict.
 //! The browser's modules are the specification; this one must agree byte
-//! for byte (api:collect drives both against one worker).
+//! for byte (api:collect and api:requests drive both against one worker).
 //!
 //! ```text
 //! open      an inbox key with the CASE key, from its place case.inbox(area, key id) —
@@ -15,6 +16,12 @@
 //!           member's own signed hash and intake, the collector's record beside it;
 //!           the bytes stay where they landed
 //! reject    with a reason sealed into place inbox.reject(area, item)
+//!
+//! a link's  an outsider's item (collector `request:<link>`): no signature — its record
+//!   item    must be about THIS item from THIS link; accepted as a malware SAMPLE
+//!           unless the person says otherwise (--as-file)
+//! scan      `--scan CMD`: the decrypted bytes in a private temporary file, CMD run on
+//!           it WITHOUT a shell, any non-zero exit refuses (scan.rs's caller, gorani-sync)
 //! ```
 
 use std::collections::BTreeMap;
@@ -98,15 +105,21 @@ pub fn counted(trust: &Trust, rows: &[CollectorRow]) -> BTreeMap<String, Verifyi
 	rows.iter().filter(|c| collector_verdict(trust, c).is_none()).filter_map(|c| Some((c.id.clone(), identity::verifying_key(&c.public_key).ok()?))).collect()
 }
 
-/// Open every inbox key of the area's case with the case key (inbox.ts › openInboxKeys).
-pub fn open_inbox_keys(area: &Area) -> Result<BTreeMap<String, VaultPrivateKey>, Error> {
-	let c = area.case.as_ref().ok_or(Error::Config("an inbox is a case's — pass --case".into()))?;
+/// Open every inbox key of the area (inbox.ts › openAreaInboxKeys): a
+/// case's from the registry's list, under the case key (place case.inbox);
+/// a member's own from their store, under their files key (store.inbox).
+pub fn open_inbox_keys(client: &Client, area: &Area) -> Result<BTreeMap<String, VaultPrivateKey>, Error> {
+	let rows: Vec<InboxKeyRow> = match &area.case {
+		Some(c) => c.inbox_keys.clone(),
+		None => serde_json::from_value(client.area_inbox_keys()?["inboxKeys"].clone()).map_err(|e| Error::Config(format!("inbox keys: {e}")))?,
+	};
 	let mut out = BTreeMap::new();
-	for k in &c.inbox_keys {
+	for k in &rows {
+		let place = if area.case.is_some() { Place::case_inbox(&area.name, &k.key_id) } else { Place::store_inbox(&area.name, &k.key_id) };
 		let sealed = k.private_sealed.as_deref().ok_or(Error::Open("an inbox key came without its private half"))?;
-		let b64 = placed::open_placed_text(&area.key, &Place::case_inbox(&area.name, &k.key_id), sealed).map_err(|_| Error::Open("an inbox key does not open in its place under the case key"))?;
+		let b64 = placed::open_placed_text(&area.key, &place, sealed).map_err(|_| Error::Open("an inbox key does not open in its place under the area's key"))?;
 		let key = VaultPrivateKey::from_bytes(&crate::decode(&b64)?).map_err(|_| Error::Open("an inbox key bundle"))?;
-		// The registry's public halves must be this private key's (inbox.ts ›
+		// The listed public halves must be this private key's (inbox.ts ›
 		// openInboxKey): both halves in full, then the id.
 		let VaultPublicKey::Hybrid { ec, kem } = formats::public_of(&key) else { return Err(Error::Open("inbox keys are hybrid")) };
 		if formats::raw_public_bytes(&ec)[..] != identity::ec_raw_of_jwk(&k.public_key.ec)?[..] || kem != crate::decode(&k.public_key.kem)?.as_slice() || formats::key_id(&formats::public_of(&key)) != k.key_id {
@@ -154,21 +167,113 @@ pub struct CollectMeta {
 	pub signature: String,
 }
 
+/// What an upload link's page sealed into `meta` (inbox.ts › RequestMeta) —
+/// the sender's word, unsigned.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestMeta {
+	pub request: String,
+	pub item: String,
+	pub name: String,
+	#[serde(rename = "type")]
+	pub mime: String,
+	pub size: u64,
+	pub sha256: String,
+	#[serde(default)]
+	pub sender: String,
+	#[serde(default)]
+	pub message: String,
+	#[serde(default)]
+	pub sent_at: String,
+}
+
+/// An item's record: a collector's (signed) or an upload link's (declared).
+#[derive(Debug, Clone)]
+pub enum ItemMeta {
+	Collect(CollectMeta),
+	Request(RequestMeta),
+}
+
+impl ItemMeta {
+	pub fn name(&self) -> &str {
+		match self {
+			ItemMeta::Collect(m) => &m.name,
+			ItemMeta::Request(m) => &m.name,
+		}
+	}
+	pub fn mime(&self) -> &str {
+		match self {
+			ItemMeta::Collect(m) => &m.mime,
+			ItemMeta::Request(m) => &m.mime,
+		}
+	}
+	pub fn size(&self) -> u64 {
+		match self {
+			ItemMeta::Collect(m) => m.size,
+			ItemMeta::Request(m) => m.size,
+		}
+	}
+	pub fn sha256(&self) -> &str {
+		match self {
+			ItemMeta::Collect(m) => &m.sha256,
+			ItemMeta::Request(m) => &m.sha256,
+		}
+	}
+}
+
+/// The link id of an upload link's item (`request:<id>`), or None for a collector's.
+pub fn link_of(item: &InboxItem) -> Option<&str> {
+	item.collector.strip_prefix("request:")
+}
+
 pub struct Opened {
-	pub meta: CollectMeta,
+	pub meta: ItemMeta,
 	pub content_key: formats::ContentKey,
-	/// None when VERIFIED; otherwise why not.
+	/// None when consistent and — for a collector's — VERIFIED; otherwise why not.
 	pub problem: Option<String>,
 }
 
-/// Open an item and decide whether to believe it (inbox.ts › openInboxItem).
-pub fn open_item(keys: &BTreeMap<String, VaultPrivateKey>, case_id: &str, item: &InboxItem, trust: &Trust, collectors: &[CollectorRow]) -> Result<Opened, Error> {
-	let key = keys.get(&item.inbox_key_id).ok_or(Error::Open("the item is sealed to an inbox key this case does not have"))?;
+/// Open an item and decide whether to believe it (inbox.ts › openItem).
+/// `area` is the area's name (`case:<id>` or a member id). `trust` may be
+/// None before the member's identity exists: a link's item needs none.
+pub fn open_item(keys: &BTreeMap<String, VaultPrivateKey>, area: &str, item: &InboxItem, trust: Option<&Trust>, collectors: &[CollectorRow]) -> Result<Opened, Error> {
+	let key = keys.get(&item.inbox_key_id).ok_or(Error::Open("the item is sealed to an inbox key this area does not have"))?;
 	let text = formats::open_text(key, &item.meta).map_err(|_| Error::Open("the item's record does not open with the inbox key"))?;
-	let meta: CollectMeta = serde_json::from_str(&text).map_err(|_| Error::Format("the item's record"))?;
 	let content_key = formats::unwrap_content_key(key, &item.ck).map_err(|_| Error::Open("the item's content key does not open with the inbox key"))?;
-	let problem = problem_of(case_id, item, &meta, trust, collectors);
-	Ok(Opened { meta, content_key, problem })
+	if link_of(item).is_some() {
+		let meta: RequestMeta = serde_json::from_str(&text).map_err(|_| Error::Format("the item's record"))?;
+		let problem = request_problem(item, &meta);
+		return Ok(Opened { meta: ItemMeta::Request(meta), content_key, problem });
+	}
+	let meta: CollectMeta = serde_json::from_str(&text).map_err(|_| Error::Format("the item's record"))?;
+	let problem = match (area.strip_prefix("case:"), trust) {
+		(None, _) => Some(format!("a collector's item in {area}'s own inbox — collectors drop into cases only")),
+		(Some(_), None) => Some("your vault needs its identity — a collector's signature is checked with it".into()),
+		(Some(case_id), Some(trust)) => problem_of(case_id, item, &meta, trust, collectors),
+	};
+	Ok(Opened { meta: ItemMeta::Collect(meta), content_key, problem })
+}
+
+/// An upload link's item (inbox.ts › requestProblem): its record about THIS
+/// item from THIS link — all there is to check, since nobody signed it.
+fn request_problem(item: &InboxItem, m: &RequestMeta) -> Option<String> {
+	let link = link_of(item).unwrap_or_default();
+	if m.request != link {
+		return Some(format!("its record is for link {}, not {link}", m.request));
+	}
+	if m.item != item.id {
+		return Some(format!("its record is for item {}, not {}", m.item, item.id));
+	}
+	if m.size != item.size {
+		return Some(format!("its record says {} bytes, the store received {}", m.size, item.size));
+	}
+	if m.sha256.len() != 64 || !m.sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+		return Some("its record carries no SHA-256".into());
+	}
+	if m.name.is_empty() {
+		return Some("its record carries no file name".into());
+	}
+	None
 }
 
 fn problem_of(case_id: &str, item: &InboxItem, m: &CollectMeta, trust: &Trust, collectors: &[CollectorRow]) -> Option<String> {
@@ -244,35 +349,86 @@ pub fn hash_item(client: &Client, item: &InboxItem, key: &[u8; 32], mut sink: im
 	Ok((hex(&h.finalize()), size))
 }
 
-/// Accept a VERIFIED item whose bytes were checked (inbox.ts ›
-/// acceptInboxItem): the member's signed fields for a new file, the
-/// collector's record beside it. Returns the store's answer.
-pub fn accept(client: &Client, area: &Area, item: &InboxItem, opened: &Opened, content: (&str, u64), name: Option<&str>) -> Result<Value, Error> {
+/// How an item is filed (inbox.ts › AcceptOptions).
+#[derive(Default)]
+pub struct AcceptOptions<'a> {
+	pub name: Option<&'a str>,
+	pub folder_id: Option<&'a str>,
+	/// File it as a malware sample (D8). None: the default — a sample for an
+	/// upload link's item (an outsider's bytes), a normal file for a collector's.
+	pub as_sample: Option<bool>,
+	/// (A link's item) the owner's label for the link, for the intake's source.
+	pub link_label: Option<&'a str>,
+}
+
+/// A sample's sealed type (samples.ts › sampleType): the mark, and the
+/// original type percent-encoded as `encodeURIComponent` does.
+pub fn sample_type(original: &str) -> String {
+	let original = if original.is_empty() { "application/octet-stream" } else { original };
+	let enc: String = original.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+	format!("application/x-gorani-sample; original={enc}")
+}
+
+/// Accept an item whose bytes were checked (inbox.ts › acceptItem): the
+/// member's signed fields for a new file, the sender's record beside it.
+/// A collector's item must be VERIFIED; a link's must be consistent — and
+/// is filed as a sample unless `opts.as_sample` says otherwise. Returns the
+/// store's answer.
+pub fn accept(client: &Client, area: &Area, item: &InboxItem, opened: &Opened, content: (&str, u64), opts: &AcceptOptions) -> Result<Value, Error> {
 	if let Some(p) = &opened.problem {
 		return Err(Error::Config(format!("refusing to accept an item that is not verified: {p}")));
 	}
-	if content.0 != opened.meta.sha256 || content.1 != opened.meta.size {
-		return Err(Error::Config("refusing to accept it: the content is not what the collector signed".into()));
+	if content.0 != opened.meta.sha256() || content.1 != opened.meta.size() {
+		let who = if matches!(opened.meta, ItemMeta::Collect(_)) { "the collector signed" } else { "the sender declared" };
+		return Err(Error::Config(format!("refusing to accept it: the content is not what {who}")));
 	}
 	let (signer, _) = area.team.as_ref().ok_or(Error::Config("accepting signs — your vault needs its identity".into()))?;
-	let m = &opened.meta;
 	let file = crate::new_item_id();
-	let record = json!({
-		"v": 1, "item": item.id, "collector": item.collector, "inboxKeyId": item.inbox_key_id,
-		"receivedAt": item.received_at, "stamp": item.stamp, "meta": m, "acceptedBy": signer.member,
-	});
-	let (hash, stamp) = cases::sign_content_hash(signer, &area.key, &area.name, &file, 1, &m.sha256, m.size)?;
-	let intake = IntakeFields { source: m.source.clone(), collector: format!("collector:{}", m.collector), method: m.method.clone(), collected_at: m.collected_at.clone(), notes: m.notes.clone() };
-	let body = json!({
+	let base = |kind: Option<&str>, meta: Value| {
+		let mut r = json!({
+			"v": 1, "item": item.id, "collector": item.collector, "inboxKeyId": item.inbox_key_id,
+			"receivedAt": item.received_at, "stamp": item.stamp, "meta": meta, "acceptedBy": signer.member,
+		});
+		if let Some(k) = kind {
+			r["kind"] = k.into();
+		}
+		r
+	};
+	let (record, intake, sample) = match &opened.meta {
+		ItemMeta::Collect(m) => (
+			base(None, json!(m)),
+			IntakeFields { source: m.source.clone(), collector: format!("collector:{}", m.collector), method: m.method.clone(), collected_at: m.collected_at.clone(), notes: m.notes.clone() },
+			opts.as_sample.unwrap_or(false),
+		),
+		ItemMeta::Request(m) => {
+			// (The store's clock, not the sender's: `receivedAt` is what the store recorded.)
+			let from = if m.sender.trim().is_empty() { "an unnamed sender" } else { m.sender.trim() };
+			let via = opts.link_label.map(str::trim).filter(|l| !l.is_empty()).unwrap_or(&m.request);
+			(
+				base(Some("request"), json!(m)),
+				IntakeFields { source: format!("{from}, through upload link {via}"), collector: item.collector.clone(), method: "upload link (sealed in the sender's browser)".into(), collected_at: item.received_at.clone(), notes: m.message.clone() },
+				opts.as_sample.unwrap_or(true),
+			)
+		}
+	};
+	let mime = if opened.meta.mime().is_empty() { "application/octet-stream" } else { opened.meta.mime() };
+	let (hash, stamp) = cases::sign_content_hash(signer, &area.key, &area.name, &file, 1, opened.meta.sha256(), opened.meta.size())?;
+	let mut body = json!({
 		"fileId": file,
-		"name": area.seal(&Place::file_name(&area.name, &file), name.unwrap_or(&m.name))?,
-		"type": area.seal(&Place::file_type(&area.name, &file, 1), if m.mime.is_empty() { "application/octet-stream" } else { &m.mime })?,
-		"ck": placed::wrap_placed_key(&area.key, &Place::file_key(&area.name, &file, 1), &opened.content_key).map_err(|_| Error::Open("the case key"))?,
+		"name": area.seal(&Place::file_name(&area.name, &file), opts.name.unwrap_or(opened.meta.name()))?,
+		"type": area.seal(&Place::file_type(&area.name, &file, 1), &if sample { sample_type(mime) } else { mime.to_string() })?,
+		"ck": placed::wrap_placed_key(&area.key, &Place::file_key(&area.name, &file, 1), &opened.content_key).map_err(|_| Error::Open("the area's key"))?,
 		"hash": hash,
 		"stamp": stamp,
 		"intake": cases::sign_intake(signer, &area.key, &area.name, &file, &intake)?,
 		"collection": area.seal(&Place::file_collection(&area.name, &file), &record.to_string())?,
 	});
+	if sample {
+		body["sample"] = true.into();
+	}
+	if let Some(f) = opts.folder_id {
+		body["folderId"] = f.into();
+	}
 	client.inbox_decide(&item.id, "accept", body)
 }
 

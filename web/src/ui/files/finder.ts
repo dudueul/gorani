@@ -32,6 +32,7 @@ import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import "../viewer/viewer.ts";
 import "./share-dialog.ts";
+import "./requests-dialog.ts";
 
 type ViewMode = "icon" | "list" | "column";
 
@@ -52,6 +53,12 @@ export class GoraniFinder extends LitElement {
 	@state() private quickLook: { id: string; name: string; url?: string; text?: string; kind: FileKind; meta?: { size: number; version: number; updatedAt: string } } | null = null;
 	@state() private info: Awaited<ReturnType<FilesModel["info"]>> = null;
 	@state() private shareTarget: { id: string; name: string; size: number; version: number } | null = null;
+	/** The upload-links dialog (commit 38): its tab, and the folder a new link files into. */
+	@state() private requests: { tab: "inbox" | "links"; folderId: string | null; folderName: string } | null = null;
+
+	private openRequests(tab: "inbox" | "links", folderId: string | null = this.s().folderId, folderName = folderId ? (this.model.names.get(folderId) ?? "") : ""): void {
+		this.requests = { tab, folderId, folderName };
+	}
 
 	private openShare(id: string): void {
 		const row = this.s().files.find((f) => f.id === id);
@@ -179,6 +186,7 @@ export class GoraniFinder extends LitElement {
 					{ label: "Get Info", run: () => void this.getInfo(id), disabled: many || kind === "folder" },
 					{ separator: true, label: "" },
 					{ label: "Share…", run: () => this.openShare(id), disabled: kind === "folder" || many || sample },
+					{ label: "Request Files into Folder…", run: () => this.openRequests("links", id, name), disabled: kind !== "folder" || many },
 					{ label: "Mark as Malware Sample…", run: () => void markSample(this.model, id, name), disabled: kind === "folder" || many || sample },
 					{ label: "Duplicate", run: () => { this.model.copy(); void this.model.paste(); }, disabled: kind === "folder" || many },
 					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
@@ -373,6 +381,7 @@ export class GoraniFinder extends LitElement {
 				${this.quickLook ? this.quickLookModal() : nothing}
 				${this.info ? this.infoPanel() : nothing}
 				${this.shareTarget ? html`<gorani-share .model=${this.model} .target=${this.shareTarget} @closed=${() => (this.shareTarget = null)}></gorani-share>` : nothing}
+				${this.requests ? html`<gorani-requests .model=${this.model} .tab=${this.requests.tab} .folderId=${this.requests.folderId} .folderName=${this.requests.folderName} @closed=${() => (this.requests = null)}></gorani-requests>` : nothing}
 				${s.loading ? html`<div class="pointer-events-none fixed right-4 top-4 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs text-neutral-300 shadow">Opening…</div>` : nothing}
 			</div>
 		`;
@@ -390,6 +399,7 @@ export class GoraniFinder extends LitElement {
 				<div class="mx-1 h-5 border-l border-neutral-800"></div>
 				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800" @click=${() => void this.newFolder()}>＋ New Folder</button>
 				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800 disabled:opacity-40" ?disabled=${!this.selection().length} @click=${() => void this.deleteSelection()}>🗑</button>
+				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800" title="Upload links for people outside the team, and what they sent" data-test="files-requests" @click=${() => this.openRequests("inbox")}>📥 Inbox</button>
 				<div class="flex-1"></div>
 				<div class="relative">
 					<input class="w-56 rounded-lg bg-neutral-950 px-3 py-1.5 text-sm outline-none placeholder:text-neutral-600 focus:ring-1 focus:ring-accent" placeholder="Search (local index)" .value=${this.query} @input=${(e: InputEvent) => void this.onSearch((e.target as HTMLInputElement).value)} />

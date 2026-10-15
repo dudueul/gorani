@@ -113,6 +113,17 @@ never sees the password itself; the dialog generates one (80 bits) or
 takes the owner's own of 8+ characters. Every claim of a download is
 audited (`share.claim`).
 
+*Inbound (commit 38, asked 2026-10-15):* the other direction — someone
+outside the team SENDING files in — is an upload link (docs/REQUESTS.md),
+and it is allowed into a member's folders and into cases, evidence
+included, because nothing leaves by it: the sender seals to the area's
+inbox key and can read nothing back. A link needs a password, lives at
+most 30 days, takes at most 1000 files, locks after ten wrong passwords;
+a case's is made by a manager. Each item waits for a person to accept or
+reject it, and is filed as a malware sample (D8) unless that person
+decides otherwise. Scanning is local (the CLI's `--scan` hook) or a
+hash-only lookup at MalwareBazaar on request.
+
 ## D12 — File size
 
 **Up to 255 GB per file.** S3 allows 10 000 parts, so 255 GiB needs parts

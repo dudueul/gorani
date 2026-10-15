@@ -140,6 +140,14 @@ impl Place {
 	pub fn inbox_reject(store: &str, item: &str) -> Self {
 		Self::new("inbox.reject", store, item, None)
 	}
+	/// A member's own inbox key's private half (commit 38a).
+	pub fn store_inbox(store: &str, key_id: &str) -> Self {
+		Self::new("store.inbox", store, key_id, None)
+	}
+	/// An upload link's label (commit 38b).
+	pub fn request_label(store: &str, request: &str) -> Self {
+		Self::new("request.label", store, request, None)
+	}
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.0
 	}

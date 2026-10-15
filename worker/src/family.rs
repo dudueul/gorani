@@ -232,6 +232,10 @@ pub const MIGRATIONS: &[&str] = &[
 		retired_at TEXT,
 		PRIMARY KEY (case_id, key_id)
 	)",
+	// Migration v11 (commit 38b, docs/REQUESTS.md): which area an upload
+	// link belongs to — a member's own (`<member>`) or a case (`case:<id>`).
+	// The public routes ask here first, as share links ask share_index.
+	"CREATE TABLE IF NOT EXISTS request_index (id TEXT PRIMARY KEY, area TEXT NOT NULL)",
 ];
 
 /// The four roles (docs/CASES.md). (The family's parent/child were accepted
@@ -379,6 +383,41 @@ impl GoraniFamilyDO {
 				self.share_index_release(&id["shares-index/".len()..], &member).await
 			}
 			("GET", id) if id.starts_with("share-owner/") => self.share_owner(&id["share-owner/".len()..]).await,
+			// The opt-in hash lookup (commit 38c, malware.rs): its audit line —
+			// who asked and whether the hash was known; never the hash itself.
+			("POST", "malware-lookup") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let member = body.get("member").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+				self.audit(&actor, "malware.lookup", &member, Some(&serde_json::json!({ "found": body.get("found").and_then(|v| v.as_bool()).unwrap_or(false) }))).await?;
+				Response::from_json(&serde_json::json!({ "ok": true }))
+			}
+			// ── Upload links (commit 38b): id → area ──
+			("POST", "request-index") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let (Some(id), Some(area)) = (body.get("id").and_then(|v| v.as_str()), body.get("area").and_then(|v| v.as_str())) else { return json_error(400, "id and area") };
+				let n = self.sql.exec("INSERT INTO request_index (id, area) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING", Some(vec![id.into(), area.into()]))?.rows_written();
+				if n == 0 {
+					return json_error(409, "that link id is taken");
+				}
+				Response::from_json(&serde_json::json!({ "ok": true }))
+			}
+			("DELETE", id) if id.starts_with("request-index/") => {
+				let area = req.headers().get("x-gorani-member")?.unwrap_or_default();
+				self.sql.exec("DELETE FROM request_index WHERE id = ?1 AND area = ?2", Some(vec![id["request-index/".len()..].into(), area.into()]))?;
+				Response::from_json(&serde_json::json!({ "ok": true }))
+			}
+			("GET", id) if id.starts_with("request-area/") => {
+				#[derive(serde::Deserialize)]
+				struct AreaRow {
+					area: String,
+				}
+				let rows: Vec<AreaRow> = self.sql.exec("SELECT area FROM request_index WHERE id = ?1", Some(vec![id["request-area/".len()..].into()]))?.to_array()?;
+				Response::from_json(&serde_json::json!({ "area": rows.into_iter().next().map(|r| r.area) }))
+			}
+			("GET", id) if id.starts_with("inbox-key-public/") => match id["inbox-key-public/".len()..].split_once('/') {
+				Some((case, key)) => self.inbox_key_public(case, key).await,
+				None => json_error(400, "inbox-key-public/<case>/<key>"),
+			},
 			// ── Cases (commit 26, docs/CASES.md) ──
 			("POST", "cases") => {
 				let body = req.json::<serde_json::Value>().await?;

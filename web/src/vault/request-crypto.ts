@@ -2,23 +2,25 @@
 // Portions derived from Mailflare (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
 
 /**
- * File request links (docs/APPS.md › File requests): someone uploads files
- * into one of your folders, sealed in their browser to your files key
- * exactly like your own uploads, so neither the server nor the link can
- * read them back.
+ * Upload-link cryptography (docs/REQUESTS.md, commit 38): the tokens and
+ * the note key a link's secret derives. Kept from the original design
+ * (commit ③), whose "seal to your files key" no longer fits — since GV04
+ * (commit 25) sealing into a store takes its PRIVATE key, so the sender
+ * seals to the area's INBOX key instead (inbox.ts, request-upload.ts).
  *
- *   link        = https://<host>/s/r/<id>#<secret>     secret: 32 random bytes, base64url, in the fragment
- *   view token  = HKDF-SHA256(secret, "gorani-request" ‖ id, "gorani-request-view-v1")   reads the request's
- *                 note and limits
+ *   link        = https://<host>/s/r/<id>#<secret>.<inbox key digest>   (requests.ts)
+ *                 secret: 32 random bytes, base64url, in the fragment
+ *   view token  = HKDF-SHA256(secret, "gorani-request" ‖ id, "gorani-request-view-v1")   reads the
+ *                 link's note, limits and inbox key
  *   send token  = HKDF-SHA256(secret ‖ SHA-256(NFKC(password))?, "gorani-request" ‖ id, "gorani-request-send-v1")
- *                 allows uploads; with a password, the password is needed too
+ *                 allows uploads; a link always has a password (the server refuses send = view)
  *   note key    = HKDF-SHA256(secret, "gorani-request" ‖ id, "gorani-request-note-v1"): the owner's message to the
- *                 uploader, sealed so the server cannot read it
+ *                 sender, sealed so the server cannot read it (GR01)
  *
  * The server keeps SHA-256 of each token (never the secret), checks the
- * tokens on each request, and locks a request after repeated wrong
- * passwords. The tokens only let someone add files; nothing lists or
- * downloads what was sent.
+ * send token on each upload, and locks a link after ten wrong passwords
+ * (worker/src/requests.rs). The tokens only let someone add files; nothing
+ * lists or downloads what was sent.
  */
 
 import { fromBase64, toBase64 } from "../lib/encoding.ts";

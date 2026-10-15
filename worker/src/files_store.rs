@@ -1165,6 +1165,8 @@ impl GoraniMemberDO {
 	/// | `custody` | custody | each custody link's sealed reason (29g) |
 	/// | `collection` | files | an accepted inbox item's collection record (37c) |
 	/// | `reject` | inbox_items | a rejected item's sealed reason (37c) |
+	/// | `inboxkey` | area_inbox_keys | a member's own inbox keys' private halves (38a) |
+	/// | `requestlabel` | upload_requests | an upload link's label (38b) |
 	///
 	/// Before commit 24 the rotation walk could reach only each file's LIVING
 	/// version (via `files/keys`) and file names — so a departed member's old
@@ -1190,7 +1192,9 @@ impl GoraniMemberDO {
 			"custody" => "SELECT rowid AS row, file_id AS a, CAST(seq AS TEXT) AS b, reason_sealed AS v1, NULL AS v2 FROM custody WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"collection" => "SELECT rowid AS row, id AS a, NULL AS b, collection_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 AND collection_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"reject" => "SELECT rowid AS row, id AS a, NULL AS b, reject_reason AS v1, NULL AS v2 FROM inbox_items WHERE rowid > ?1 AND reject_reason IS NOT NULL ORDER BY rowid LIMIT ?2",
-			_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject"),
+			"inboxkey" => "SELECT rowid AS row, key_id AS a, NULL AS b, private_sealed AS v1, NULL AS v2 FROM area_inbox_keys WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"requestlabel" => "SELECT rowid AS row, id AS a, NULL AS b, label_sealed AS v1, NULL AS v2 FROM upload_requests WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
 		};
 		// `&file=<id>` narrows `version` to one file's versions (commit 29e:
 		// marking a sample re-seals each of ITS versions' types — a walk of
@@ -1251,7 +1255,9 @@ impl GoraniMemberDO {
 				"custody" => "UPDATE custody SET reason_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"collection" => "UPDATE files SET collection_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND collection_sealed IS NOT NULL",
 				"reject" => "UPDATE inbox_items SET reject_reason = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND reject_reason IS NOT NULL",
-				_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject"),
+				"inboxkey" => "UPDATE area_inbox_keys SET private_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				"requestlabel" => "UPDATE upload_requests SET label_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
 			};
 			plan.push((sql, row, v1, v2));
 		}
@@ -1270,7 +1276,7 @@ impl GoraniMemberDO {
 	/// makes content sealed, so the store refuses writes that would land in
 	/// the clear (docs/VAULT.md › Pause sealing). Returns the refusal message
 	/// (a 400, an expectation) or None when the write may proceed.
-	async fn vault_gate(&self) -> Result<Option<String>> {
+	pub(crate) async fn vault_gate(&self) -> Result<Option<String>> {
 		Ok(match self.vault_settings().await? {
 			None => Some("the vault is not set up".into()),
 			Some(s) if s.get("enabled").and_then(|e| e.as_bool()) == Some(true) => None,

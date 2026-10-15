@@ -397,6 +397,81 @@ try {
 		await ctx.close();
 	}
 
+	// ── 4b. Upload links (commit 38, docs/REQUESTS.md) ─────────────────
+	// Rae makes a link in the explorer (her area's inbox key is made on the
+	// way); a sender with no account opens it in a browser of their own,
+	// under the share page's CSP — Trusted Types with no policy, the SHA-256
+	// in WebAssembly — seals two files and sends them; Rae checks one and
+	// accepts it, as a malware sample by default.
+	{
+		const rae = await member(dev, "rae", "analyst", { by: { email: "mom@family.test" } });
+		const ctx = await guardedContext(browser, rae.email);
+		const page = await ctx.newPage();
+		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
+		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
+		await page.goto(dev.base);
+		await page.getByText("Who's opening?").waitFor({ timeout: 30_000 });
+		await page.getByRole("button", { name: /rae/ }).click();
+		await page.getByPlaceholder(/Recovery code/).fill(rae.recoveryCode);
+		await page.getByRole("button", { name: "Unlock" }).click();
+		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
+		await page.locator('[data-test="files-requests"]').click();
+		await page.locator('[data-test="requests-tab-links"]').click();
+		await page.locator('[data-test="requests-label"]').fill("Partner CERT, case 77");
+		await page.locator('[data-test="requests-note"]').fill("The pcap and the dropper, please.");
+		// (The team context opens at unlock; until it does, making the inbox key says so.)
+		for (let i = 0; i < 20; i++) {
+			await page.locator('[data-test="requests-create"]').click();
+			if (await page.locator('[data-test="requests-made-link"]').waitFor({ timeout: 3_000 }).then(() => true, () => false)) break;
+		}
+		const link = (await page.locator('[data-test="requests-made-link"]').textContent()).trim();
+		const linkPassword = (await page.locator('[data-test="requests-made-password"]').textContent()).trim();
+		assert.match(link, /\/s\/r\/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/);
+		assert.equal((await api(dev.base, "GET", "/api/v1/members/rae/inbox-keys", { email: rae.email })).json.inboxKeys.length, 1, "her inbox key was made on the way");
+
+		const sctx = await guardedContext(browser, null);
+		const spage = await sctx.newPage();
+		spage.on("pageerror", (e) => console.error("PAGEERROR (sender):", String(e).slice(0, 250)));
+		const res = await spage.goto(link);
+		assert.match(res.headers()["content-security-policy"] ?? "", /trusted-types 'none'/, "the upload page: no Trusted Types policy at all");
+		await spage.locator('[data-test="request-note"]', { hasText: "The pcap and the dropper, please." }).waitFor({ timeout: 30_000 });
+		assert.equal(new URL(spage.url()).hash, "", "the link's secret is gone from the address bar once read");
+		await spage.locator('[data-test="request-files"]').setInputFiles([
+			{ name: "capture.pcap", mimeType: "application/vnd.tcpdump.pcap", buffer: Buffer.from("pcap bytes from the partner") },
+			{ name: "dropper.bin", mimeType: "application/octet-stream", buffer: Buffer.from("MZ not really a dropper") },
+		]);
+		await spage.locator('[data-test="request-sender"]').fill("Kim, Partner CERT");
+		await spage.locator('[data-test="request-password"]').fill("not the password");
+		await spage.locator('[data-test="request-send"]').click();
+		await spage.locator('[data-test="request-status"]', { hasText: "not this link's" }).waitFor({ timeout: 30_000 });
+		await spage.locator('[data-test="request-password"]').fill(linkPassword);
+		await spage.locator('[data-test="request-send"]').click();
+		await spage.locator('[data-test="request-status"]', { hasText: "Sent 2 files" }).waitFor({ timeout: 60_000 });
+		const receipts = await spage.locator('[data-test="request-sent-file"]').allTextContents();
+		assert.equal(receipts.length, 2);
+		const pcapSha = await sha256Hex(Buffer.from("pcap bytes from the partner"));
+		assert.ok(receipts.some((t) => t.includes(`SHA-256 ${pcapSha}`)), "the receipt is the SHA-256 of what left the sender's machine");
+		await assertNoViolations(spage, "upload page: open → verify the key → seal → send");
+		await sctx.close();
+
+		// Rae reviews: the dialog again, freshly loaded.
+		await page.getByRole("button", { name: "✕" }).click();
+		await page.locator('[data-test="files-requests"]').click();
+		const items = (await api(dev.base, "GET", "/api/v1/members/rae/inbox", { email: rae.email })).json.items;
+		assert.equal(items.length, 2);
+		const pcapItem = items.find((i) => i.size === "pcap bytes from the partner".length).id;
+		await page.locator(`[data-test="requests-verdict-${pcapItem}"]`, { hasText: "An outsider's upload" }).waitFor({ timeout: 30_000 });
+		await page.locator(`[data-test="requests-check-btn-${pcapItem}"]`).click();
+		await page.locator(`[data-test="requests-check-${pcapItem}"]`, { hasText: "the bytes are what the sender declared" }).waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator(`[data-test="requests-sample-${pcapItem}"]`).isChecked(), true, "a sample unless she says otherwise");
+		await page.locator(`[data-test="requests-accept-${pcapItem}"]`).click();
+		await page.locator('[data-test="requests-notice"]', { hasText: "filed as a malware sample" }).waitFor({ timeout: 60_000 });
+		const filed = (await api(dev.base, "GET", "/api/v1/members/rae/files/list?folder=root", { email: rae.email })).json.files;
+		assert.deepEqual(filed.map((f) => f.sample), [true], "one file, a sample");
+		await assertNoViolations(page, "upload links: make a link, review, check, accept");
+		await ctx.close();
+	}
+
 	// ── 5. The team screens (commit 27, docs/CASES.md › Stage 6) ───────
 	// Mom unlocked once already (section 3), which created and registered
 	// her identity; this unlock must OPEN it (its MAC verifies under her
@@ -605,7 +680,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

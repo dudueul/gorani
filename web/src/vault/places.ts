@@ -34,6 +34,8 @@
  * | `case.inbox` | `case:<id>` | inbox key id | — | an inbox key's private half (in the registry; inbox.ts) |
  * | `file.collection` | `case:<id>` | file id | — | an accepted inbox item's collection record (inbox.ts) |
  * | `inbox.reject` | `case:<id>` | item id | — | why an inbox item was rejected (inbox.ts) |
+ * | `store.inbox` | member | inbox key id | — | a member's own inbox key's private half (inbox.ts, 38a) |
+ * | `request.label` | area | link id | — | an upload link's label, for its owner's list (requests.ts, 38b) |
  *
  * The `store` column is an AREA (lib/area.ts): a member id, or `case:<id>`
  * for a case (commit 26) — the same kinds, in a different store.
@@ -76,6 +78,10 @@ export const places = {
 	fileCollection: (store: string, file: string) => place("file.collection", store, file),
 	/** Why an inbox item was turned away (commit 37c). */
 	inboxReject: (store: string, item: string) => place("inbox.reject", store, item),
+	/** A member's own inbox key's private half (commit 38a): sealed with their files key. */
+	storeInbox: (store: string, keyId: string) => place("store.inbox", store, keyId),
+	/** An upload link's label (commit 38b), sealed for its owner's list. */
+	requestLabel: (store: string, request: string) => place("request.label", store, request),
 };
 
 /** A fresh client-chosen id (file, folder): 128 random bits, base64url — the

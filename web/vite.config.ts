@@ -16,11 +16,12 @@ export default defineConfig({
 		// es2022 browsers all support <link rel=modulepreload>; the polyfill
 		// would only add a script to every page (the share page included).
 		modulePreload: { polyfill: false },
-		// Two pages: the app, and the public share recipient page (s.html).
-		// Both are built so both get their stylesheet compiled and hashed —
-		// the share page used to live in public/ and shipped with none.
+		// Three pages: the app, the public share recipient page (s.html) and
+		// the public upload-link page (r.html, commit 38b). All are built so
+		// all get their stylesheet compiled and hashed — the share page used
+		// to live in public/ and shipped with none.
 		rollupOptions: {
-			input: { main: "index.html", share: "s.html" },
+			input: { main: "index.html", share: "s.html", request: "r.html" },
 		},
 	},
 	// The Worker serves /api and /s; during web-only development, proxy them

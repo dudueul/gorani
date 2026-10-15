@@ -2,7 +2,7 @@
 // Portions derived from Mailflare (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
 
 /**
- * Share links for Files (docs/APPS.md › Share links): one file shared with
+ * Share links for Files (docs/DECISIONS.md › D11, docs/SECURITY-REVIEW.md): one file shared with
  * anyone who has the link, still end to end encrypted.
  *
  *   link     = https://<host>/s/f/<id>#<secret>       secret: 32 random bytes, base64url; browsers never send

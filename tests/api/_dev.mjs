@@ -47,7 +47,7 @@ function webBuildStale() {
 		if (st.isDirectory()) return fs.readdirSync(p).some((f) => newer(path.join(p, f)));
 		return st.mtimeMs > at;
 	};
-	return ["web/src", "web/public", "web/index.html", "web/s.html"].some((p) => fs.existsSync(path.join(ROOT, p)) && newer(path.join(ROOT, p)));
+	return ["web/src", "web/public", "web/index.html", "web/s.html", "web/r.html"].some((p) => fs.existsSync(path.join(ROOT, p)) && newer(path.join(ROOT, p)));
 }
 
 export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3, keepState = false, vars = {} } = {}) {

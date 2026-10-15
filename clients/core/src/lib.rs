@@ -22,6 +22,7 @@ pub mod devicekey;
 pub mod engine;
 pub mod identity;
 pub mod inbox;
+pub mod scan;
 pub mod session;
 pub mod transfer;
 

@@ -281,6 +281,10 @@ pub async fn route(req: Request, env: Env) -> Result<Response> {
 	let path = req.path();
 	if path.starts_with("/s/") {
 		let segments: Vec<&str> = path.trim_start_matches("/s/").split('/').collect();
+		// Upload links (commit 38b) — /s/r/<id>…; share links are /s/f/<id>….
+		if segments.first() == Some(&"r") {
+			return public_request(req, env, &segments).await;
+		}
 		return public_share(req, env, &segments).await;
 	}
 	if !path.starts_with("/api/v1/") {
@@ -434,6 +438,10 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		// Deciding an item (commit 37c) files it into the case, or turns it
 		// away: a writer's act.
 		("POST", ["inbox", _, "accept" | "reject"]) => Some(Need::Write),
+		// Upload links into the case (commit 38b): opening the door is a
+		// manager's act; anyone on the case may see which are open.
+		("GET", ["requests"]) => Some(Need::Read),
+		("POST", ["requests"]) | ("DELETE", ["requests", _]) => Some(Need::Manage),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
 		// Custody (commit 29g) is a record of responsibility, not access:
@@ -545,6 +553,19 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// A lead's client needs the TSA's certificate to show its fingerprint
 		// before certifying it: a token over a random imprint carries it.
 		("POST", ["family", "tsa", "probe"]) => tsa_probe(&env, &identity.email).await,
+		// The opt-in hash lookup (commit 38c, malware.rs): any active member,
+		// rate limited per member — a button, not a pipeline.
+		("POST", ["malware", "lookup"]) => {
+			let me = match actor_of(&env, &identity.email, None).await? {
+				Some(a) => a,
+				None => return json_error(403, "not a team member"),
+			};
+			if let Some(limited) = rate_limited(&env, "DEVICE_LIMITER", format!("malware:{}", me.id)).await {
+				return Ok(limited);
+			}
+			let body = req.json::<serde_json::Value>().await?;
+			crate::malware::lookup(&env, &me.id, &identity.email, body).await
+		}
 		("GET", ["family", "identities"]) => forward_family(&env, &identity.email, "GET", "identities", None).await,
 		("PUT", ["family", "identity"]) => {
 			let body = req.json::<serde_json::Value>().await?;
@@ -797,10 +818,20 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// The download: streamed from S3 with Range passthrough and the
 		// wrapped content key in a header (the client opens it, never us).
 		("GET", ["members", id, "files", file]) => file_download(req, env, &identity, id, file).await,
-		// ── A case's inbox (commit 37b, inbox.rs) — case areas only ──
-		("GET", ["members", id, "inbox"]) if crate::area::case_of(id).is_some() => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "inbox/list", None, actor)).await,
-		("GET", ["members", id, "inbox", item]) if crate::area::case_of(id).is_some() => inbox_download(req, env, &identity, id, item).await,
-		("POST", ["members", id, "inbox", item, decision @ ("accept" | "reject")]) if crate::area::case_of(id).is_some() => inbox_decide(req, env, &identity, id, item, decision).await,
+		// ── An area's inbox (commit 37b; a member's own area too since 38a) ──
+		("GET", ["members", id, "inbox"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "inbox/list", None, actor)).await,
+		("GET", ["members", id, "inbox", item]) => inbox_download(req, env, &identity, id, item).await,
+		("POST", ["members", id, "inbox", item, decision @ ("accept" | "reject")]) => inbox_decide(req, env, &identity, id, item, decision).await,
+		// A member's own inbox keys (38a; a case's are the registry's — PUT /cases/<id>/inbox-key).
+		("GET", ["members", id, "inbox-keys"]) if crate::area::case_of(id).is_none() => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "inbox-keys", None, actor)).await,
+		("PUT", ["members", id, "inbox-key"]) if crate::area::case_of(id).is_none() => {
+			let body = req.json::<serde_json::Value>().await?;
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", "inbox-key", Some(body), actor)).await
+		}
+		// ── Upload links (commit 38b, requests.rs, docs/REQUESTS.md) ──
+		("GET", ["members", id, "requests"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "requests", None, actor)).await,
+		("POST", ["members", id, "requests"]) => request_create(req, env, &identity, id).await,
+		("DELETE", ["members", id, "requests", rid]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "DELETE", format!("requests/{rid}"), None, actor)).await,
 
 		_ => json_error(404, "no such route"),
 	}
@@ -876,6 +907,237 @@ async fn inbox_decide(mut req: Request, env: Env, identity: &Identity, area: &st
 		}
 	}
 	Response::from_json(&serde_json::json!({ "item": item, "rejected": true, "objectKept": v["keep"] }))
+}
+
+/// Open an upload link (commit 38b): claim its id in the registry (one
+/// namespace for every area — the public routes look the area up there),
+/// check a case link's inbox key against the case's, then the store.
+async fn request_create(mut req: Request, env: Env, identity: &Identity, area: &str) -> Result<Response> {
+	let actor = match member_ctx(&env, identity, area).await {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	let mut body = req.json::<serde_json::Value>().await?;
+	let Some(id) = body.get("id").and_then(|v| v.as_str()).filter(|i| crate::requests::is_request_id(i)).map(str::to_string) else {
+		return json_error(400, "id: 22 characters of base64url");
+	};
+	if let Some(case) = crate::area::case_of(area) {
+		let key = body.get("inboxKeyId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+		if !auth::valid_object_id(&key) {
+			return json_error(400, "inboxKeyId");
+		}
+		let mut k = forward_family(&env, "", "GET", format!("inbox-key-public/{case}/{key}"), None).await?;
+		if k.status_code() != 200 {
+			return Ok(k);
+		}
+		let k: serde_json::Value = k.json().await?;
+		if k.get("publicKey") != body.get("inboxPublic") {
+			return json_error(409, "inboxPublic is not that inbox key's public halves");
+		}
+	}
+	let claimed = forward_family(&env, "internal", "POST", "request-index", Some(serde_json::json!({ "id": id, "area": area }))).await?;
+	if claimed.status_code() >= 400 {
+		return Ok(claimed);
+	}
+	body["by"] = actor.id.clone().into();
+	let made = forward_member(&env, area, "POST", "requests", Some(body), &actor.email).await?;
+	if made.status_code() >= 400 {
+		let _ = do_request(&env.durable_object("FAMILY")?.id_from_name("family")?.get_stub()?, "DELETE", format!("request-index/{id}"), None, Some("internal"), Some(area)).await;
+	}
+	Ok(made)
+}
+
+/// The public upload-link routes (commit 38b, docs/REQUESTS.md):
+///
+/// ```text
+/// GET  /s/r/<id>                              the upload page (r.html)
+/// POST /s/r/<id>/meta { view }                the sealed note, the limits, the inbox key
+/// POST /s/r/<id>/items                        a whole item (multipart form), x-gorani-request-send
+/// POST /s/r/<id>/uploads { itemId, size, chunk }       a large item's plan
+/// PUT  /s/r/<id>/uploads/<upload>/<n>                  one GC01 frame
+/// POST /s/r/<id>/uploads/<upload>/complete             the item recorded
+/// ```
+///
+/// Every upload request carries the SEND token (derived from the link's
+/// secret and its password) and is checked by the area's store, which
+/// counts wrong ones toward the link's lock. The bytes are sealed in the
+/// uploader's browser to the area's inbox key; nothing here can open them.
+async fn public_request(mut req: Request, env: Env, segs: &[&str]) -> Result<Response> {
+	let Some(id) = segs.get(1).filter(|i| crate::requests::is_request_id(i)).map(|i| i.to_string()) else { return http_text(404, "no such link").await };
+	// Rate limited per caller and link — except a large file's frames: one
+	// request per 8 MiB, so a 10 GiB file is 1 280 of them, and a limit of 60
+	// a minute would stop it halfway. Leaving them out costs nothing a limit
+	// was buying: each frame still carries the send token, a wrong one still
+	// counts toward the link's lock, and a frame names an upload that only a
+	// right token could have started.
+	let frame = req.method() == Method::Put && segs.len() == 5 && segs[2] == "uploads";
+	if !frame {
+		if let Some(limited) = rate_limited(&env, "SHARE_LIMITER", format!("request:{}:{id}", client_ip(&req))).await {
+			return Ok(limited);
+		}
+	}
+	let mut found = forward_family(&env, "", "GET", format!("request-area/{id}"), None).await?;
+	let found: serde_json::Value = found.json().await?;
+	let Some(area) = found.get("area").and_then(|a| a.as_str()).map(str::to_string) else { return http_text(404, "no such link").await };
+	let actor = format!("upload-link:{id}");
+	let segment = format!("request-{id}");
+	let source = format!("request:{id}");
+	let send = req.headers().get("x-gorani-request-send")?.unwrap_or_default();
+	let method = req.method().to_string();
+	// May this caller send (`size` more bytes)? The store's answer, refusals as they are.
+	let check = |size: u64| {
+		let (env, area, id, send, actor) = (&env, &area, &id, &send, &actor);
+		async move { forward_member(env, area, "POST", format!("request-send/{id}"), Some(serde_json::json!({ "send": send, "size": size })), actor.clone()).await }
+	};
+	match (method.as_str(), &segs[2..]) {
+		("GET", []) => {
+			let mut page = env.assets("ASSETS")?.fetch("https://assets.internal/r.html", None).await?;
+			if page.status_code() != 200 {
+				return http_text(500, "the upload page is missing from this deployment").await;
+			}
+			let body = page.bytes().await?;
+			let headers = Headers::new();
+			headers.set("Content-Type", "text/html; charset=utf-8")?;
+			headers.set("Cache-Control", "no-store")?;
+			// The page holds the link's secret while it runs — the share page's
+			// policy (Trusted Types with no policy at all; the DOM is written
+			// through textContent only). Kept in step with /r.html in _headers.
+			headers.set("Content-Security-Policy", SHARE_PAGE_CSP)?;
+			headers.set("Referrer-Policy", "no-referrer")?;
+			headers.set("X-Content-Type-Options", "nosniff")?;
+			Ok(Response::from_bytes(body)?.with_headers(headers))
+		}
+		("POST", ["meta"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			forward_member(&env, &area, "POST", format!("request-meta/{id}"), Some(serde_json::json!({ "view": body.get("view") })), actor).await
+		}
+		("POST", ["items"]) => {
+			let form = form_of(&mut req).await?;
+			if let Err(msg) = check_sealed(&form.file, form.fields.get("size"), &None, &None) {
+				return json_error(400, &msg);
+			}
+			let size: u64 = form.fields.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
+			let mut ok = check(size).await?;
+			if ok.status_code() != 200 {
+				return Ok(ok);
+			}
+			let link: serde_json::Value = ok.json().await?;
+			if form.fields.get("inbox_key_id").map(String::as_str) != link["inboxKeyId"].as_str() {
+				return json_error(409, "the item is not sealed to this link's inbox key");
+			}
+			let Some(item) = form.fields.get("item_id").filter(|f| auth::valid_object_id(f)).cloned() else {
+				return json_error(400, "item_id: chosen by the uploader's page ([A-Za-z0-9_-], ≤ 64)");
+			};
+			let object_key = inbox_object(&area, &segment, &item);
+			if let Some(taken) = drop_fresh(&env, &object_key).await? {
+				return Ok(taken);
+			}
+			s3::put(&env, &object_key, form.file.clone().unwrap_or_default()).await?;
+			let resp = forward_member(&env, &area, "POST", "inbox/receive", Some(drop_record(&item, &source, &object_key, size, None, &form.fields)), actor).await?;
+			if resp.status_code() >= 400 {
+				let _ = s3::delete(&env, &object_key).await;
+			}
+			Ok(resp)
+		}
+		("POST", ["uploads"]) => {
+			let body: serde_json::Value = req.json().await?;
+			let chunk = body.get("chunk").and_then(|v| v.as_u64()).unwrap_or(0);
+			let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+			const MIN_PART: u64 = 5 * 1024 * 1024;
+			if chunk < MIN_PART || chunk > gorani_formats::chunked::MAX_CHUNK {
+				return json_error(400, "chunk: between the backend's minimum part (5 MiB) and the largest the Worker streams (64 MiB)");
+			}
+			let parts = size.div_ceil(chunk).max(1);
+			if parts > 10_000 {
+				return json_error(400, "this plan needs more than 10 000 parts — raise the chunk size");
+			}
+			let ok = check(size).await?;
+			if ok.status_code() != 200 {
+				return Ok(ok);
+			}
+			let Some(item) = body.get("itemId").and_then(|v| v.as_str()).filter(|f| auth::valid_object_id(f)) else {
+				return json_error(400, "itemId: chosen by the uploader's page");
+			};
+			let object_key = inbox_object(&area, &segment, item);
+			if let Some(taken) = drop_fresh(&env, &object_key).await? {
+				return Ok(taken);
+			}
+			let mut started = forward_member(&env, &area, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key })), actor.clone()).await?;
+			if started.status_code() >= 400 {
+				return Ok(started);
+			}
+			let started_body: serde_json::Value = started.json().await?;
+			let upload_id = started_body.get("uploadId").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| Error::RustError("no uploadId".into()))?;
+			let s3_upload_id = s3::multipart_init(&env, &object_key).await?;
+			forward_member(&env, &area, "PUT", format!("uploads/{upload_id}/s3"), Some(serde_json::json!({ "s3UploadId": s3_upload_id })), actor).await?;
+			Response::from_json(&serde_json::json!({ "uploadId": upload_id, "parts": parts }))
+		}
+		("PUT", ["uploads", upload, part]) => {
+			let ok = check(0).await?;
+			if ok.status_code() != 200 {
+				return Ok(ok);
+			}
+			let meta = match drop_upload(&env, &area, &segment, upload).await {
+				Ok(m) => m,
+				Err(resp) => return Ok(resp),
+			};
+			let Some(n) = part_number(part) else { return json_error(400, "part numbers are 1–10000") };
+			let len = match part_length(&req)? {
+				Ok(len) => len,
+				Err(resp) => return Ok(resp),
+			};
+			let etag = s3::multipart_part_stream(&env, &meta.object_key, &meta.s3_upload_id, n, req.stream()?, len).await?;
+			Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
+		}
+		("POST", ["uploads", upload, "complete"]) => {
+			let form = form_of(&mut req).await?;
+			let size: u64 = form.fields.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
+			let mut ok = check(size).await?;
+			if ok.status_code() != 200 {
+				return Ok(ok);
+			}
+			let link: serde_json::Value = ok.json().await?;
+			if form.fields.get("inbox_key_id").map(String::as_str) != link["inboxKeyId"].as_str() {
+				return json_error(409, "the item is not sealed to this link's inbox key");
+			}
+			let meta = match drop_upload(&env, &area, &segment, upload).await {
+				Ok(m) => m,
+				Err(resp) => return Ok(resp),
+			};
+			let parts: Vec<(u32, String)> = form
+				.fields
+				.get("parts")
+				.and_then(|p| serde_json::from_str::<Vec<serde_json::Value>>(p).ok())
+				.map(|list| list.into_iter().filter_map(|p| Some((p.get("partNumber")?.as_u64()? as u32, p.get("etag")?.as_str()?.to_string()))).collect())
+				.unwrap_or_default();
+			if parts.is_empty() {
+				return json_error(400, "parts: [{ partNumber, etag }]");
+			}
+			let chunk: u64 = form.fields.get("chunk").and_then(|s| s.parse().ok()).unwrap_or(0);
+			if chunk == 0 {
+				return json_error(400, "chunk is required (the GC01 frame size the parts were sealed with)");
+			}
+			let item = meta.object_key.rsplit('/').next().unwrap_or_default().to_string();
+			if form.fields.get("item_id") != Some(&item) {
+				return json_error(400, "item_id must be the item this upload was started for");
+			}
+			if let Some(taken) = drop_fresh(&env, &meta.object_key).await? {
+				return Ok(taken);
+			}
+			s3::multipart_complete(&env, &meta.object_key, &meta.s3_upload_id, &parts).await?;
+			if s3::head(&env, &meta.object_key).await?.map(|h| h.size) != Some(gorani_formats::chunked::sealed_size(size, chunk)) {
+				let _ = s3::delete(&env, &meta.object_key).await;
+				return json_error(400, "the upload does not add up to its declared size");
+			}
+			let resp = forward_member(&env, &area, "POST", "inbox/receive", Some(drop_record(&item, &source, &meta.object_key, size, Some(chunk), &form.fields)), actor.clone()).await?;
+			let _ = forward_member(&env, &area, "DELETE", format!("uploads/{upload}"), None, actor).await;
+			if resp.status_code() >= 400 {
+				let _ = s3::delete(&env, &meta.object_key).await;
+			}
+			Ok(resp)
+		}
+		_ => json_error(404, "no such upload route"),
+	}
 }
 
 /// Complete a recovery ceremony. A case's outcome (a signed grant) is the

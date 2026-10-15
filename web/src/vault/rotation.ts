@@ -39,7 +39,8 @@ import { areaPath } from "../lib/area.ts";
 // the rest; the SIGNATURE inside does not change, it never named a key.)
 // (`intake`, `custody`: evidence's intake records and custody reasons — 29g.)
 // (`collection`, `reject`: an accepted inbox item's record, a rejection's reason — 37c.)
-export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets", "hash", "intake", "custody", "collection", "reject"] as const;
+// (`inboxkey`, `requestlabel`: a member's own inbox keys and upload-link labels — 38.)
+export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets", "hash", "intake", "custody", "collection", "reject", "inboxkey", "requestlabel"] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
 
 /** A JSON call against the API (the browser's bridge, or a test's helper). */
@@ -90,6 +91,10 @@ function placesOf(memberId: string, kind: SealedKind, it: SealedItem): [Uint8Arr
 			return [places.fileCollection(memberId, id), null];
 		case "reject":
 			return [places.inboxReject(memberId, id), null];
+		case "inboxkey":
+			return [places.storeInbox(memberId, id), null];
+		case "requestlabel":
+			return [places.requestLabel(memberId, id), null];
 	}
 }
 

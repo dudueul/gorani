@@ -341,6 +341,21 @@ impl Client {
 		self.area_json("GET", "/inbox", None)
 	}
 
+	/// A member's own inbox keys (commit 38a): `GET members/<id>/inbox-keys`.
+	pub fn area_inbox_keys(&self) -> Result<Value, Error> {
+		self.area_json("GET", "/inbox-keys", None)
+	}
+
+	/// The area's upload links (commit 38b) — their labels sealed with the area's key.
+	pub fn requests(&self) -> Result<Value, Error> {
+		self.area_json("GET", "/requests", None)
+	}
+
+	/// A team route, POSTed (`/api/v1/<path>`): the opt-in hash lookup.
+	pub fn team_post(&self, path: &str, body: Value) -> Result<Value, Error> {
+		self.json_at("POST", &format!("{}/api/v1/{path}", self.server()), Some(body))
+	}
+
 	/// An inbox item's sealed bytes (Range honoured, as `fetch`).
 	pub fn fetch_inbox(&self, item: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, Error> {
 		let mut r = self.req("GET", &self.area_url(&format!("/inbox/{item}"))).set("x-gorani-client", "cli");

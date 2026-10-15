@@ -28,7 +28,9 @@ import { approveRequest, requestApproval, verifyApproval, type Approval, type Ap
 import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
 import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
 import { approveCollector, collectorVerdict, requestCollector, type CollectorRow } from "../vault/collectors.ts";
-import { acceptInboxItem, createInboxKey, hashInboxContent, openInboxItem, openInboxKeys, rejectInboxItem, type InboxItem, type OpenedItem } from "../vault/inbox.ts";
+import { acceptInboxItem, createInboxKey, hashInboxContent, linkOf, openInboxItem, openInboxKeys, rejectInboxItem, type InboxItem, type OpenedItem } from "../vault/inbox.ts";
+import { listRequests, openRequestLabel } from "../vault/requests.ts";
+import { caseArea } from "../lib/area.ts";
 import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
@@ -589,18 +591,26 @@ export class GoraniTeam extends LitElement {
 			${rows.map(({ item, opened, error }) => html`<li class="flex flex-wrap items-center gap-2 rounded-lg bg-neutral-900 px-2 py-1" data-test="inbox-item-${item.id}">
 				<span class="font-medium">${opened?.meta.name ?? item.id}</span>
 				<span class="text-neutral-400">${item.size} bytes · from ${item.collector} · ${item.receivedAt.slice(0, 16).replace("T", " ")}</span>
-				${opened ? html`<span class="text-neutral-400">${opened.meta.source} · ${opened.meta.method}</span>` : nothing}
-				<span class=${opened && !opened.problem ? "text-emerald-400" : "text-amber-400"} data-test="inbox-verdict-${item.id}">${error ? `⚠ does not open: ${error}` : opened?.problem ? `⚠ unverified: ${opened.problem}` : "✓ signed by its collector"}</span>
+				${opened?.kind === "collector" ? html`<span class="text-neutral-400">${opened.meta.source} · ${opened.meta.method}</span>` : nothing}
+				${opened?.kind === "request" ? html`<span class="text-neutral-400">sent by “${opened.meta.sender || "unnamed"}” through an upload link${opened.meta.message ? ` — “${opened.meta.message}”` : ""}</span>` : nothing}
+				<span class=${opened && !opened.problem ? (opened.kind === "request" ? "text-amber-300" : "text-emerald-400") : "text-amber-400"} data-test="inbox-verdict-${item.id}">${error ? `⚠ does not open: ${error}` : opened?.problem ? `⚠ unverified: ${opened.problem}` : opened?.kind === "request" ? "an outsider's upload — unsigned; accepted as a malware sample" : "✓ signed by its collector"}</span>
 				<span class="text-neutral-500">${item.status}${item.accepted ? ` → file ${item.accepted.file}` : ""}</span>
 				${write && item.status === "waiting" && !c.closed
 					? html`<button class=${primary} ?disabled=${this.busy || !opened || !!opened.problem} title=${opened?.problem ?? ""} data-test="inbox-accept-${item.id}" @click=${() => this.act(`Accepting ${opened!.meta.name}`, async () => {
 								const r = await fetch(`/api/v1/cases/${c.id}/inbox/${item.id}`, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web-inbox" } });
 								if (!r.ok || !r.body) throw new Error(`download failed: ${r.status}`);
 								const content = await hashInboxContent(opened!, item, r.body);
-								const keys = await openInboxKeys(await this.caseKey(c), c.id, c.inboxKeys ?? []);
-								await acceptInboxItem(this.call, await this.caseKey(c), keys, c.id, item, opened!, content, this.team.signer);
+								const caseKey = await this.caseKey(c);
+								const keys = await openInboxKeys(caseKey, c.id, c.inboxKeys ?? []);
+								// An upload link's item goes into the link's folder, its label in the intake (commit 38).
+								const link = linkOf(item);
+								const row = link ? (await listRequests(this.call, caseArea(c.id))).find((r) => r.id === link) : undefined;
+								const linkLabel = row ? await openRequestLabel(caseKey, caseArea(c.id), row).catch(() => undefined) : undefined;
+								await acceptInboxItem(this.call, caseKey, keys, c.id, item, opened!, content, this.team.signer, { folderId: row?.folderId ?? undefined, linkLabel });
 								await this.loadInbox(c);
-								return `${opened!.meta.name} is in ${c.id}: its bytes matched what ${item.collector} signed, and you signed them too.`;
+								return opened!.kind === "request"
+									? `${opened!.meta.name} is in ${c.id} as a malware sample: its bytes matched what the sender declared, and you signed them.`
+									: `${opened!.meta.name} is in ${c.id}: its bytes matched what ${item.collector} signed, and you signed them too.`;
 							})}>Accept</button>
 						<button class=${button} ?disabled=${this.busy} data-test="inbox-reject-${item.id}" @click=${() => {
 							const reason = window.prompt(`Why is ${opened?.meta.name ?? item.id} turned away? (sealed — only people on the case read it)`);

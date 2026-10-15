@@ -61,7 +61,7 @@ line of glue in between quietly disagreed with it.
 | S20 | Medium | Backup download buffered the `.gbak` twice in a 128 MB isolate and cached it at the edge past its retention; `s3::get` cached every object the backup job read. | Manifest-only DO answer, streamed + uncached download; `s3::get` uncached. | A cache added for one read path was applied to all. |
 | S21 | Medium | One email could belong to two members; "who is calling" depended on row order. | Emails are unique across members (409). | — |
 | S22 | Low | `CACHE_MAX_OBJECT_MB`/`CACHE_TTL_DAYS` sat at the top level of wrangler.jsonc, which wrangler ignores with a warning. | Moved into `vars`. | Read your deploy warnings. |
-| S23 | Low | The JWKS `alg` was parsed and never checked. | Must be ES256 when present. | — |
+| S23 | Low | The JWKS `alg` was parsed and never checked. | Must be ES256 when present. *(Commit 39k: RS256 — the algorithm Access actually signs with; ES256 had been assumed, and no real token could pass. The rule stands: the key type and a named `alg` must match the token's.)* | — |
 | S24 | Medium | The public share page had no security headers. | `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `nosniff`. Full CSP: see O1. | — |
 
 ### Clients (clients/, web/)

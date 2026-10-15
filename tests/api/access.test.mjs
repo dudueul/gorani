@@ -3,7 +3,8 @@
 /**
  * api:access — the production perimeter (worker/src/auth.rs), with dev mode
  * OFF: its own server whose TEAM_DOMAIN is a stub Access team (a JWKS on
- * this machine), and ES256 tokens signed here as Access would sign them.
+ * this machine, in the shape Access serves it), and RS256 tokens signed
+ * here as Access signs them.
  * Until commit 33a no suite ran the Worker in this mode at all. What it
  * proves:
  *
@@ -18,7 +19,15 @@
  *      leads registered it (api:collectors);
  *   3. the checks around them hold: no token, a wrong audience, an expired
  *      token, another issuer, a forged signature, an unknown key, `alg`
- *      other than ES256 — each refused.
+ *      other than RS256 (HS256, and an ES256 token as this suite once
+ *      minted), a key of the wrong type under the token's key id — each
+ *      refused.
+ *
+ * (Until commit 39k the stub team signed ES256 — the algorithm auth.rs
+ * assumed. Access signs RS256, so every test here passed while no real
+ * token could: the first deployment refused every request, "signature is
+ * not 64 bytes". A stub is only as good as its likeness: this one now
+ * serves RSA keys, Access's response shape included.)
  */
 
 import assert from "node:assert/strict";
@@ -27,13 +36,29 @@ import http from "node:http";
 import os from "node:os";
 import { startDev } from "./_dev.mjs";
 
-// ── A stub Access team: one P-256 key behind /cdn-cgi/access/certs ────
-const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
-const other = generateKeyPairSync("ec", { namedCurve: "P-256" });
+// ── A stub Access team: RSA keys behind /cdn-cgi/access/certs ──────────
+// As Access serves them: `keys` (JWKs, RS256) beside `public_cert` and
+// `public_certs` (the same keys as PEM) — the Worker reads `keys` and must
+// not trip over the rest. A P-256 key sits in the set under its own id: an
+// ES256 token naming it, or an RS256 token claiming it, must be refused.
+const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const other = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const ec = generateKeyPairSync("ec", { namedCurve: "P-256" });
 const jwk = publicKey.export({ format: "jwk" });
+const ecJwk = ec.publicKey.export({ format: "jwk" });
 const KID = "gorani-test-key";
+const EC_KID = "gorani-test-ec-key";
+const pem = publicKey.export({ format: "pem", type: "spki" });
+const certsBody = JSON.stringify({
+	keys: [
+		{ kid: KID, kty: "RSA", alg: "RS256", use: "sig", e: jwk.e, n: jwk.n },
+		{ kid: EC_KID, kty: "EC", crv: "P-256", x: ecJwk.x, y: ecJwk.y },
+	],
+	public_cert: { kid: KID, cert: pem },
+	public_certs: [{ kid: KID, cert: pem }],
+});
 const jwks = http.createServer((req, res) => {
-	if (req.url === "/team/cdn-cgi/access/certs") res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ keys: [{ kid: KID, kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y, alg: "ES256" }] }));
+	if (req.url === "/team/cdn-cgi/access/certs") res.writeHead(200, { "content-type": "application/json" }).end(certsBody);
 	else res.writeHead(404).end();
 });
 await new Promise((r) => jwks.listen(0, "0.0.0.0", r));
@@ -47,11 +72,12 @@ const AUD = "gorani-test-aud";
 const BOOT = "a-bootstrap-token-for-the-access-suite";
 
 const b64u = (b) => Buffer.from(b).toString("base64url");
-/** A compact ES256 JWT, as Access mints them (P1363 signature). */
-function jwt(claims, { key = privateKey, kid = KID, alg = "ES256" } = {}) {
+/** A compact RS256 JWT, as Access mints them (PKCS #1 v1.5, SHA-256) — or,
+ * with an EC key, an ES256 one (P1363 signature) for the refusals. */
+function jwt(claims, { key = privateKey, kid = KID, alg = "RS256" } = {}) {
 	const head = b64u(JSON.stringify({ alg, kid, typ: "JWT" }));
 	const body = b64u(JSON.stringify(claims));
-	const sig = createSign("SHA256").update(`${head}.${body}`).sign({ key, dsaEncoding: "ieee-p1363" });
+	const sig = createSign("SHA256").update(`${head}.${body}`).sign(key.asymmetricKeyType === "ec" ? { key, dsaEncoding: "ieee-p1363" } : key);
 	return `${head}.${body}.${b64u(sig)}`;
 }
 const now = () => Math.floor(Date.now() / 1000);
@@ -97,12 +123,15 @@ try {
 	assert.match(await refused(member("ana@team.test", { iss: "https://evil.cloudflareaccess.com" }), "another team's issuer"), /issuer/);
 	assert.match(await refused(jwt({ iss: TEAM, aud: AUD, email: "ana@team.test", exp: now() + 600 }, { key: other.privateKey }), "signed by a key the team does not hold"), /bad signature/);
 	assert.match(await refused(jwt({ iss: TEAM, aud: AUD, email: "ana@team.test", exp: now() + 600 }, { kid: "unknown" }), "an unknown key id"), /unknown token key/);
-	assert.match(await refused(jwt({ iss: TEAM, aud: AUD, email: "ana@team.test", exp: now() + 600 }, { alg: "HS256" }), "alg confusion"), /not ES256/);
+	const claims = { iss: TEAM, aud: AUD, email: "ana@team.test", exp: now() + 600 };
+	assert.match(await refused(jwt(claims, { alg: "HS256" }), "alg confusion: HS256"), /not RS256/);
+	assert.match(await refused(jwt(claims, { key: ec.privateKey, kid: EC_KID, alg: "ES256" }), "an ES256 token (what this suite minted until 39k)"), /not RS256/);
+	assert.match(await refused(jwt(claims, { key: ec.privateKey, kid: EC_KID }), "an RS256 header over a key that is not RSA"), /not an RS256 RSA key/);
 	// A good token with one claim changed after signing: the signature covers the claims.
 	const [h, , s] = member("ana@team.test").split(".");
 	assert.match(await refused(`${h}.${b64u(JSON.stringify({ iss: TEAM, aud: AUD, email: "mallory@team.test", exp: now() + 600 }))}.${s}`, "claims edited after signing"), /bad signature/);
 
-	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused on member routes and, unregistered, on the drop routes; missing, foreign-audience, expired, foreign-issuer, forged, unknown-key and non-ES256 tokens each refused by name");
+	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused on member routes and, unregistered, on the drop routes; missing, foreign-audience, expired, foreign-issuer, forged, unknown-key, non-RS256 (HS256, ES256) and wrong-key-type tokens each refused by name — against a JWKS in Access's own shape");
 } finally {
 	await dev.close();
 	await new Promise((r) => jwks.close(r));

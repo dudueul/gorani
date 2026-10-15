@@ -573,6 +573,37 @@ impl Remote for MemRemote {
 	}
 }
 
+/// One version's whole plaintext into a new file at `path`, a window at a
+/// time (a 255 GiB file never in memory) — what a shell that is handed
+/// contents as a FILE needs (macOS File Provider's fetchContents). On Unix
+/// the file is created 0600; on any refusal it is removed.
+pub fn download(remote: &mut dyn Remote, id: &str, version: i64, path: &Path) -> Result<u64, FsError> {
+	use std::io::Write;
+	const WINDOW: u64 = 8 * 1024 * 1024;
+	let mut o = std::fs::OpenOptions::new();
+	o.write(true).create_new(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		o.mode(0o600);
+	}
+	let mut f = o.open(path).map_err(|e| FsError::Io(format!("{}: {e}", path.display())))?;
+	let mut at = 0u64;
+	let r = (|| loop {
+		let b = remote.read(id, version, at, WINDOW)?;
+		f.write_all(&b).map_err(|e| FsError::Io(e.to_string()))?;
+		at += b.len() as u64;
+		if (b.len() as u64) < WINDOW {
+			f.sync_all().map_err(|e| FsError::Io(e.to_string()))?;
+			return Ok(at);
+		}
+	})();
+	if r.is_err() {
+		let _ = std::fs::remove_file(path);
+	}
+	r
+}
+
 // ── one protocol over either ─────────────────────────────────────────
 
 /// A short code for an error, for a shell to map to its platform's.
@@ -596,6 +627,7 @@ pub fn error_code(e: &FsError) -> &'static str {
 /// { "op": "poll" }                                       → { "changed": bool }
 /// { "op": "items" }                                      → { "items": [Item], "readOnly": why|null, "area": name }
 /// { "op": "read", "id", "version", "offset", "len" }     → { "data": base64 }
+/// { "op": "download", "id", "version", "path" }          → { "size": n } (the whole version, into a new file)
 /// { "op": "create", "parent", "name", "path" }           → { "item": Item }
 /// { "op": "save", "id", "base", "path" }                 → { "outcome": "version", "item" } | { "outcome": "conflict", "copy" }
 /// { "op": "mkdir", "parent", "name" }                    → { "item": Item }
@@ -615,6 +647,7 @@ pub fn dispatch(remote: &mut dyn Remote, req: &Value) -> Value {
 			use base64::Engine as _;
 			json!({ "data": base64::engine::general_purpose::STANDARD.encode(b) })
 		})),
+		"download" => fs(download(remote, &s("id"), n("version"), Path::new(&s("path"))).map(|n| json!({ "size": n }))),
 		"create" => fs(remote.create_file(&s("parent"), &s("name"), Path::new(&s("path"))).map(|i| json!({ "item": i }))),
 		"save" => fs(remote.save_version(&s("id"), n("base"), Path::new(&s("path"))).map(|o| serde_json::to_value(o).unwrap_or_default())),
 		"mkdir" => fs(remote.mkdir(&s("parent"), &s("name")).map(|i| json!({ "item": i }))),
@@ -691,6 +724,12 @@ mod tests {
 		assert_eq!(r["items"][0]["name"], "a.txt");
 		assert_eq!(r["items"][0]["kind"], "file");
 		assert_eq!(dispatch(&mut m, &json!({ "op": "bogus" }))["code"], "denied");
+		let big = m.put("", "big.bin", &vec![7u8; 9 * 1024 * 1024 + 5]);
+		let to = std::env::temp_dir().join(format!("gorani-dl-{}", crate::new_item_id()));
+		assert_eq!(dispatch(&mut m, &json!({ "op": "download", "id": big.id, "version": 1, "path": to.to_string_lossy() }))["size"], 9 * 1024 * 1024 + 5);
+		assert_eq!(std::fs::read(&to).unwrap().len(), 9 * 1024 * 1024 + 5);
+		assert_eq!(dispatch(&mut m, &json!({ "op": "download", "id": big.id, "version": 1, "path": to.to_string_lossy() }))["code"], "io", "never over an existing file");
+		std::fs::remove_file(&to).ok();
 	}
 }
 

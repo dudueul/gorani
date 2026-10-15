@@ -3,7 +3,10 @@
 //! The Windows shell's smoke test (commit 39b), on a real Cloud Files sync
 //! root (the hosted Windows runner: .github/workflows/clients.yml) over the
 //! in-memory replica — the server's half is api:replica's, on Linux. What
-//! it proves, through std::fs only (what any program on the machine does):
+//! it proves, through what any program on the machine does — reads and
+//! writes from this process, renames and deletes from ANOTHER (found in CI:
+//! the platform sends no rename/delete notification for the provider's own
+//! process, and here the provider runs in the test's):
 //!
 //!   1. every item is listed with its size before a byte of it is fetched;
 //!   2. a read fetches it (a whole small file; a range of a large one), a
@@ -36,6 +39,20 @@ fn wait(what: &str, run: &provider::Running, mut done: impl FnMut() -> bool) {
 		std::thread::sleep(Duration::from_millis(200));
 	}
 	panic!("timed out waiting for: {what}");
+}
+
+/// A rename or delete as another program does it (PowerShell: its exit
+/// code says whether the operation was refused).
+fn elsewhere(command: &str) -> bool {
+	std::process::Command::new("powershell")
+		.args(["-NoProfile", "-NonInteractive", "-Command", &format!("$ErrorActionPreference='Stop'; {command}")])
+		.status()
+		.map(|s| s.success())
+		.unwrap_or(false)
+}
+
+fn ps(p: &Path) -> String {
+	format!("'{}'", p.display().to_string().replace('\'', "''"))
 }
 
 fn pattern(n: usize) -> Vec<u8> {
@@ -103,9 +120,9 @@ fn a_cloud_files_folder_over_the_replica() {
 	});
 	std::fs::write(root.join("docs").join("a.txt"), "hello again").unwrap();
 	wait("a.txt version 2", &run, || mem.lock().unwrap().content(&a.id).as_deref() == Some(&b"hello again"[..]));
-	std::fs::rename(root.join("docs").join("new.txt"), root.join("renamed.txt")).unwrap();
+	assert!(elsewhere(&format!("Move-Item -LiteralPath {} -Destination {}", ps(&root.join("docs").join("new.txt")), ps(&root.join("renamed.txt")))), "the rename went through");
 	assert!(mem.lock().unwrap().find("", "renamed.txt").is_some(), "the rename is the server's before it is the folder's");
-	std::fs::remove_file(root.join("renamed.txt")).unwrap();
+	assert!(elsewhere(&format!("Remove-Item -LiteralPath {}", ps(&root.join("renamed.txt")))), "the delete went through");
 	assert!(mem.lock().unwrap().find("", "renamed.txt").is_none(), "…and so is the delete");
 
 	// 4. The server's changes reach the folder.
@@ -150,7 +167,8 @@ fn a_read_only_area_refuses_deletes_and_keeps_new_files_local() {
 	let run = provider::start(&fresh_root("ro"), remote, provider::Options { poll: None, keep_local: false, verbose: true }).expect("start");
 	let root = run.root().to_path_buf();
 	assert_eq!(std::fs::read_to_string(root.join("memory.raw")).unwrap(), "evidence");
-	assert!(std::fs::remove_file(root.join("memory.raw")).is_err(), "the delete is refused");
+	assert!(!elsewhere(&format!("Remove-Item -LiteralPath {}", ps(&root.join("memory.raw")))), "the delete is refused");
+	assert!(root.join("memory.raw").exists());
 	assert!(mem.lock().unwrap().find("", "memory.raw").is_some_and(|i| i.id == kept.id));
 	std::fs::write(root.join("notes.txt"), "local only").unwrap();
 	run.sync_local();

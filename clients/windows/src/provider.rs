@@ -536,30 +536,32 @@ unsafe extern "system" fn on_fetch_data(info: *const CF_CALLBACK_INFO, params: *
 	let start = fd.RequiredFileOffset.max(0) as u64;
 	let size = info.FileSize.max(0) as u64;
 	let end = (start + fd.RequiredLength.max(0) as u64).min(size);
+	let fail = |at: u64, status: NTSTATUS| {
+		if let Err(e) = cf::fail_transfer(info, at, end.saturating_sub(at).max(1), status) {
+			p.log(&format!("could not fail the fetch at {at}: {e}"));
+		}
+	};
 	let Some((id, version)) = parse_identity(&cf::identity_of(info)) else {
-		let _ = cf::transfer(info, start, &[], cf::STATUS_CLOUD_FILE_UNSUCCESSFUL);
+		fail(start, cf::STATUS_CLOUD_FILE_UNSUCCESSFUL);
 		return;
 	};
+	p.log(&format!("fetch {id} v{version} [{start}, {end})"));
 	let mut at = start;
 	while at < end {
 		let want = CHUNK.min(end - at);
 		let got = p.remote.lock().expect("lock").read(&id, version, at, want);
 		match got {
 			Ok(data) if data.len() as u64 == want || (at + data.len() as u64 == size && !data.is_empty()) => {
-				if let Err(e) = cf::transfer(info, at, &data, cf::STATUS_SUCCESS) {
+				if let Err(e) = cf::transfer(info, at, &data) {
 					p.log(&format!("transfer of {id} at {at} failed: {e}"));
 					return;
 				}
 				at += data.len() as u64;
 			}
-			Ok(_) => {
-				let _ = cf::transfer(info, at, &[], cf::STATUS_CLOUD_FILE_UNSUCCESSFUL);
-				return;
-			}
+			Ok(_) => return fail(at, cf::STATUS_CLOUD_FILE_UNSUCCESSFUL),
 			Err(e) => {
 				p.warn_once(&format!("read:{id}"), &format!("{id}: {e}"));
-				let _ = cf::transfer(info, at, &[], status_of(&e));
-				return;
+				return fail(at, status_of(&e));
 			}
 		}
 	}
@@ -569,6 +571,7 @@ unsafe extern "system" fn on_delete(info: *const CF_CALLBACK_INFO, params: *cons
 	let (info, p) = unsafe { provider(info) };
 	let flags = unsafe { (*params).Anonymous.Delete.Flags };
 	let path = vol(Path::new(&cf::wide(info.NormalizedPath)));
+	p.log(&format!("delete {}", cf::wide(info.NormalizedPath)));
 	if p.self_ops.lock().expect("lock").contains(&path) || (flags.0 & CF_CALLBACK_DELETE_FLAG_IS_UNDELETE.0) != 0 {
 		let _ = cf::ack_delete(info, cf::STATUS_SUCCESS);
 		return;
@@ -591,13 +594,16 @@ unsafe extern "system" fn on_delete(info: *const CF_CALLBACK_INFO, params: *cons
 		},
 		_ => cf::STATUS_SUCCESS,
 	};
-	let _ = cf::ack_delete(info, status);
+	if let Err(e) = cf::ack_delete(info, status) {
+		p.log(&format!("could not answer the delete: {e}"));
+	}
 }
 
 unsafe extern "system" fn on_rename(info: *const CF_CALLBACK_INFO, params: *const CF_CALLBACK_PARAMETERS) {
 	let (info, p) = unsafe { provider(info) };
 	let rename = unsafe { (*params).Anonymous.Rename };
 	let source = vol(Path::new(&cf::wide(info.NormalizedPath)));
+	p.log(&format!("rename {} → {}", cf::wide(info.NormalizedPath), cf::wide(rename.TargetPath)));
 	if p.self_ops.lock().expect("lock").contains(&source) {
 		let _ = cf::ack_rename(info, cf::STATUS_SUCCESS);
 		return;
@@ -646,7 +652,9 @@ unsafe extern "system" fn on_rename(info: *const CF_CALLBACK_INFO, params: *cons
 			_ => cf::STATUS_CLOUD_FILE_UNSUCCESSFUL,
 		}
 	};
-	let _ = cf::ack_rename(info, status);
+	if let Err(e) = cf::ack_rename(info, status) {
+		p.log(&format!("could not answer the rename: {e}"));
+	}
 }
 
 // ── running it ───────────────────────────────────────────────────────

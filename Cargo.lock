@@ -489,6 +489,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gorani-macos"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "gorani-client-core",
+ "serde_json",
+]
+
+[[package]]
 name = "gorani-s3"
 version = "0.1.0"
 dependencies = [

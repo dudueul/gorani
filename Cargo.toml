@@ -13,7 +13,7 @@
 # commit still builds with a plain `cargo check --workspace`.
 [workspace]
 resolver = "2"
-members = ["worker", "crates/formats", "crates/s3", "clients/core", "clients/linux", "clients/windows"]
+members = ["worker", "crates/formats", "crates/s3", "clients/core", "clients/linux", "clients/windows", "clients/macos"]
 
 [workspace.package]
 version = "0.1.0"

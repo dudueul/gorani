@@ -252,14 +252,25 @@ const fn param_size<T>() -> u32 {
 }
 
 /// Hand the platform `data` for the range at `offset` of the file a
-/// FETCH_DATA callback asked for (or `status` to fail the rest of it).
-pub fn transfer(info: &CF_CALLBACK_INFO, offset: u64, data: &[u8], status: NTSTATUS) -> Result<()> {
+/// FETCH_DATA callback asked for.
+pub fn transfer(info: &CF_CALLBACK_INFO, offset: u64, data: &[u8]) -> Result<()> {
+	transfer_op(info, offset, data.as_ptr() as *const c_void, data.len() as u64, STATUS_SUCCESS)
+}
+
+/// Fail the rest of a FETCH_DATA — `length` bytes from `offset`, the range
+/// still owed (found in CI: a failure for 0 bytes is not taken, and the
+/// reader waits out the platform's 60-second timeout instead).
+pub fn fail_transfer(info: &CF_CALLBACK_INFO, offset: u64, length: u64, status: NTSTATUS) -> Result<()> {
+	transfer_op(info, offset, std::ptr::null(), length, status)
+}
+
+fn transfer_op(info: &CF_CALLBACK_INFO, offset: u64, buffer: *const c_void, length: u64, status: NTSTATUS) -> Result<()> {
 	let op = op_info(info, CF_OPERATION_TYPE_TRANSFER_DATA);
 	let mut p = CF_OPERATION_PARAMETERS {
 		ParamSize: param_size::<CF_OPERATION_PARAMETERS_0_0>(),
-		Anonymous: CF_OPERATION_PARAMETERS_0 { TransferData: CF_OPERATION_PARAMETERS_0_0 { Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CompletionStatus: status, Buffer: data.as_ptr() as *const c_void, Offset: offset as i64, Length: data.len() as i64 } },
+		Anonymous: CF_OPERATION_PARAMETERS_0 { TransferData: CF_OPERATION_PARAMETERS_0_0 { Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CompletionStatus: status, Buffer: buffer, Offset: offset as i64, Length: length as i64 } },
 	};
-	// SAFETY: the buffer outlives the call; info is the callback's own.
+	// SAFETY: the buffer (if any) outlives the call; info is the callback's own.
 	unsafe { CfExecute(&op, &mut p) }
 }
 

@@ -224,7 +224,9 @@ async fn origin_stream(env: &Env, key: &str, range: Option<(u64, u64)>, query_pa
 	fetch_signed(&cfg, "GET", key, query_pairs, range, None, None).await
 }
 
-/// Size + etag via HEAD. None on 404.
+/// Size + etag via HEAD. None when the key does not resolve to an object:
+/// 404 — or, on a versioned bucket whose current version is a DELETE
+/// MARKER, 405 (IDrive e2; AWS answers 404 with `x-amz-delete-marker`).
 pub async fn head(env: &Env, key: &str) -> Result<Option<HeadInfo>> {
 	if let Some(bucket) = r2_bucket(env).await? {
 		return Ok(bucket.head(key).await?.map(|o| HeadInfo { size: o.size() }));
@@ -233,7 +235,7 @@ pub async fn head(env: &Env, key: &str) -> Result<Option<HeadInfo>> {
 	let resp = fetch_signed(&cfg, "HEAD", key, &[], None, None, None).await?;
 	match resp.status_code() {
 		200 => Ok(Some(HeadInfo { size: resp.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) })),
-		404 => Ok(None),
+		404 | 405 => Ok(None),
 		s => Err(Error::RustError(format!("S3 head {key}: HTTP {s}"))),
 	}
 }
@@ -258,6 +260,16 @@ pub async fn delete(env: &Env, key: &str) -> Result<()> {
 		// (R2's delete resolves even when the key is absent — the same
 		// contract as the S3 path's 204|404.)
 		bucket.delete(key).await?;
+		return Ok(());
+	}
+	// Only a key that still resolves is deleted. On a versioned bucket (every
+	// Object Lock bucket is one) a DELETE adds a delete marker — and IDrive
+	// e2 answers a SECOND plain DELETE by removing that marker: the object
+	// comes back (found by the live run, 2026-10-15: a share link's copy,
+	// deleted at revoke, deleted again by the nightly purge, was readable
+	// in the bucket afterwards). AWS would add a second marker; checking
+	// first makes "delete" mean the same on both.
+	if head(env, key).await?.is_none() {
 		return Ok(());
 	}
 	let cfg = config(env)?;

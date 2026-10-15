@@ -104,10 +104,15 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 	const wr = ["wrangler", "dev"];
 	if (config) wr.push("--config", config);
 	wr.push("--port", String(port), "--ip", "127.0.0.1", "--persist-to", persistDir, "--test-scheduled");
-	const child = spawn("npx", wr, {
+	// GORANI_DEV_OUTBOUND=node (a real bucket only): the same Worker, its
+	// outbound requests made by Node — through HTTPS_PROXY, for a machine
+	// whose only way out is a proxy (tests/lib/dev-outbound.mjs says why).
+	const viaNode = !!s3 && process.env.GORANI_DEV_OUTBOUND === "node";
+	const [cmd, args] = viaNode ? [process.execPath, [path.join(ROOT, "tests/lib/dev-outbound.mjs"), String(port), persistDir, config ?? "wrangler.jsonc"]] : ["npx", wr];
+	const child = spawn(cmd, args, {
 		cwd: ROOT,
 		detached: true, // own process group: close() kills wrangler AND its workerd children
-		env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "true", PATH: `${process.env.HOME}/.cargo/bin:${process.env.PATH ?? ""}` },
+		env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "true", PATH: `${process.env.HOME}/.cargo/bin:${process.env.PATH ?? ""}`, ...(viaNode ? { NODE_USE_ENV_PROXY: "1" } : {}) },
 		stdio: ["ignore", out, out],
 	});
 	const base = `http://127.0.0.1:${port}`;

@@ -124,8 +124,19 @@ export function startS3Stub({ port = 0, host = "0.0.0.0" } = {}) {
 					res.writeHead(404).end();
 					return;
 				}
-				const n = [...u.parts.keys()].sort((a, b) => a - b);
-				objects.set(u.key, Buffer.concat(n.map((k) => u.parts.get(k))));
+				// As S3 does: the object is the parts the body LISTS, in its order,
+				// each with the ETag its upload answered — an empty or unknown
+				// list is MalformedXML / InvalidPart (the stub used to concatenate
+				// whatever it held, so a Worker that sent no parts passed here and
+				// failed on every real server — the IDrive e2 live run, 2026-10-15).
+				const listed = [...body.toString().matchAll(/<Part>\s*<PartNumber>(\d+)<\/PartNumber>\s*<ETag>([^<]*)<\/ETag>\s*<\/Part>/g)].map((m) => [Number(m[1]), m[2].replace(/&quot;/g, '"')]);
+				const xmlError = (code) => {
+					res.writeHead(400, { "content-type": "application/xml" });
+					res.end(`<?xml version="1.0"?><Error><Code>${code}</Code></Error>`);
+				};
+				if (!listed.length) return xmlError("MalformedXML");
+				if (listed.some(([pn, tag], i) => !u.parts.has(pn) || tag !== `"${u.key}-${pn}"` || (i > 0 && pn <= listed[i - 1][0]))) return xmlError("InvalidPart");
+				objects.set(u.key, Buffer.concat(listed.map(([pn]) => u.parts.get(pn))));
 				uploads.delete(q.get("uploadId"));
 				res.writeHead(200, { "content-type": "application/xml" });
 				res.end(`<?xml version="1.0"?><CompleteMultipartUploadResult><ETag>"done"</ETag></CompleteMultipartUploadResult>`);

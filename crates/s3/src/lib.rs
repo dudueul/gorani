@@ -162,7 +162,13 @@ pub fn sign_request(cfg: &S3Config, method: &str, object_key: &str, query_pairs:
 		"{}\n{}\n{}\nhost:{}\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:{}\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD",
 		method, path, cq, host, amz_date
 	);
-	let string_to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}/s3/aws4_request\n{}", amz_date, date_stamp, sha256_hex(canonical.as_bytes()));
+	// The credential scope — `<date>/<region>/s3/aws4_request` — exactly as
+	// the Authorization header names it. (Until the IDrive e2 live run,
+	// 2026-10-15, this line left the region out: every real S3 server
+	// answered SignatureDoesNotMatch, and the golden vectors below, computed
+	// with the same omission, agreed with the code. Only the S3 stub, which
+	// checks no signature, and the R2 binding, which needs none, worked.)
+	let string_to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}/{}/s3/aws4_request\n{}", amz_date, date_stamp, cfg.region, sha256_hex(canonical.as_bytes()));
 	let k_date = hmac_sha256(format!("AWS4{}", cfg.secret_key).as_bytes(), date_stamp.as_bytes());
 	let k_region = hmac_sha256(&k_date, cfg.region.as_bytes());
 	let k_service = hmac_sha256(&k_region, b"s3");
@@ -336,8 +342,13 @@ mod tests {
 		}
 	}
 
-	/// Golden vectors computed independently (Python hashlib/hmac, the same
-	/// canonicalisation) so a self-consistent signing bug cannot pass.
+	/// Golden vectors from an independent implementation — tests/lib/sigv4.mjs
+	/// (Node's crypto), which a real S3 server (IDrive e2, 2026-10-15) accepts.
+	/// The first vectors here were "independent" too, but were computed with
+	/// the same missing region in the credential scope, and so agreed with
+	/// the bug: a vector is only as independent as the formula it was
+	/// computed from. A real server is the check that cannot share a mistake
+	/// (tests/api/s3-live.test.mjs).
 	const NOW: i64 = 1_791_849_600; // 2026-10-13T00:00:00Z
 
 	#[test]
@@ -352,7 +363,7 @@ mod tests {
 		let r = sign_request(&cfg(), "GET", "files/a/b c.txt", &[], NOW).unwrap();
 		assert_eq!(r.url, "https://minio.example.com/gorani/files/a/b%20c.txt");
 		let auth = &r.headers.iter().find(|(h, _)| h == "Authorization").unwrap().1;
-		assert!(auth.ends_with("Signature=2dab9218f53afc3e75c83524523fe414b3c5e5850229c92fb797491497f48ab2"), "{auth}");
+		assert!(auth.ends_with("Signature=90f30a47480a717f49877d2cfb44df75e2408e13cd782e38265b13d43d227b71"), "{auth}");
 		assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261013/us-east-1/s3/aws4_request, "), "{auth}");
 	}
 
@@ -368,7 +379,7 @@ mod tests {
 		.unwrap();
 		assert!(r.url.ends_with("?partNumber=1&uploadId=abc123"), "{}", r.url);
 		let auth = &r.headers.iter().find(|(h, _)| h == "Authorization").unwrap().1;
-		assert!(auth.ends_with("Signature=5517186698dd98dc2b1220a44aa693d5f9cfd6aa475d5b447532e2e367c90767"), "{auth}");
+		assert!(auth.ends_with("Signature=a708a9aff73e1a6a8ac2a5a742f365195e3e12e0471cc325578f24f43f86b8fa"), "{auth}");
 	}
 
 	#[test]

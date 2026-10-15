@@ -693,3 +693,12 @@ mod tests {
 		assert_eq!(dispatch(&mut m, &json!({ "op": "bogus" }))["code"], "denied");
 	}
 }
+
+/// A shell calls its remote from the platform's own threads (Cloud Files
+/// callbacks; File Provider's queues): both remotes cross threads.
+#[allow(dead_code)]
+fn remotes_are_send() {
+	fn send<T: Send>() {}
+	send::<HttpRemote>();
+	send::<MemRemote>();
+}

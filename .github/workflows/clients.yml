@@ -12,7 +12,8 @@
 # shared crates or this file run it; a newer push cancels an older run of the
 # same branch; Cargo's downloads and build outputs are cached.
 #
-# Supply chain: first-party actions only (actions/checkout, actions/cache),
+# Supply chain: first-party actions only (actions/checkout, actions/cache,
+# actions/upload-artifact),
 # the job token read-only. The toolchains are the runner images' own
 # (rustup + stable Rust, Xcode on macOS) — nothing fetched from a third party.
 
@@ -67,3 +68,19 @@ jobs:
         run: cargo test --locked -p gorani-formats -p gorani-client-core
       - name: Build the CLI
         run: cargo build --locked -p gorani-client-core --bin gorani-sync
+      # ── 39b: the Windows shell, on a real Cloud Files sync root ──
+      - name: The Cloud Files shell's smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p gorani-windows -- --test-threads=1 --nocapture
+      - name: Build the Windows shell
+        if: runner.os == 'Windows'
+        run: cargo build --locked -p gorani-windows --bin gorani-cloud
+      # (What this run built, to try on a PC: debug builds, kept a week.)
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: gorani-windows-debug
+          path: |
+            target/debug/gorani-cloud.exe
+            target/debug/gorani-sync.exe
+          retention-days: 7

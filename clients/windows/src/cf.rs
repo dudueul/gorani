@@ -201,10 +201,12 @@ pub fn info(path: &Path) -> Option<Info> {
 	Some(Info { in_sync: basic.InSyncState == CF_IN_SYNC_STATE_IN_SYNC, identity: buf[at..at + len].to_vec() })
 }
 
-/// Run `f` with a write handle — lifting the read-only attribute for the
-/// moment if the shell set it (found in CI: an exclusive write open of a
-/// read-only placeholder is refused, so evidence could not be dehydrated).
-fn writable<T>(path: &Path, f: impl FnOnce(&Handle) -> Result<T>) -> Result<T> {
+/// Run `f` with the read-only attribute lifted for the moment, if the shell
+/// set it — every write the shell itself makes to such a placeholder needs
+/// it (found in CI: an exclusive write open is refused, so evidence could
+/// not be dehydrated; and the shell's property store answers "access
+/// denied" for a sample's state, 39e).
+pub fn read_only_lifted<T>(path: &Path, f: impl FnOnce() -> T) -> T {
 	let ro = std::fs::metadata(path).map(|m| m.permissions().readonly()).unwrap_or(false);
 	let set = |v: bool| {
 		if let Ok(m) = std::fs::metadata(path) {
@@ -216,11 +218,16 @@ fn writable<T>(path: &Path, f: impl FnOnce(&Handle) -> Result<T>) -> Result<T> {
 	if ro {
 		set(false);
 	}
-	let r = Handle::open(path, true).and_then(|h| f(&h));
+	let r = f();
 	if ro {
 		set(true);
 	}
 	r
+}
+
+/// Run `f` with a write handle (the read-only attribute lifted meanwhile).
+fn writable<T>(path: &Path, f: impl FnOnce(&Handle) -> Result<T>) -> Result<T> {
+	read_only_lifted(path, || Handle::open(path, true).and_then(|h| f(&h)))
 }
 
 /// Point a placeholder at a new identity (a new version), optionally with

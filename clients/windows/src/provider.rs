@@ -387,7 +387,7 @@ impl Provider {
 		if !self.explorer {
 			return;
 		}
-		if let Err(e) = crate::shell::mark_sample(full) {
+		if let Err(e) = cf::read_only_lifted(full, || crate::shell::mark_sample(full)) {
 			self.log(&format!("{}: no sample state shown ({e})", full.display()));
 		}
 		let _ = cf::mark_in_sync(full);

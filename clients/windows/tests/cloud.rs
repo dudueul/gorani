@@ -92,15 +92,16 @@ fn a_cloud_files_folder_over_the_replica() {
 	// 0. Explorer's registration where the shell gives one (39e), said
 	// either way: a Server runner may give only cldapi's.
 	match shell::registered_id(&root) {
-		Some(id) => {
+		Ok(Some(id)) => {
 			eprintln!("Explorer knows the folder as {id}");
 			assert!(id.ends_with("!ana"), "named for the area: {id}");
 		}
-		None => {
+		Ok(None) => {
 			// (Only a Windows without the shell's support may fall back.)
 			assert!(!shell::supported(), "the shell supports sync roots here, yet did not register the folder (the start said why)");
 			eprintln!("this Windows has no shell sync-root support — cldapi's sync root only");
 		}
+		Err(e) => panic!("the shell's list of sync roots: {e}"),
 	}
 
 	// 1. Listed, sized, identified — nothing fetched yet.

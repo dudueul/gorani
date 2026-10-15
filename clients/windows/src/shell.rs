@@ -18,10 +18,10 @@
 
 use std::path::Path;
 
-use windows::core::{HSTRING, PWSTR};
+use windows::core::{Interface, HSTRING, PWSTR};
 use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Storage::Provider::*;
-use windows::Storage::{StorageFile, StorageFolder};
+use windows::Storage::{IStorageItem, StorageFile, StorageFolder};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
@@ -144,17 +144,27 @@ fn register_shell(root: &Path, area: &str, read_only: bool) -> Result<String, St
 	Ok(id)
 }
 
-/// The shell's id for the folder, if the shell registered it (ours).
-pub fn registered_id(root: &Path) -> Option<String> {
-	let folder = StorageFolder::GetFolderFromPathAsync(&plain(root)).and_then(|op| op.get()).ok()?;
-	let id = StorageProviderSyncRootManager::GetSyncRootInformationForFolder(&folder).and_then(|i| i.Id()).ok()?.to_string();
-	id.starts_with("Gorani!").then_some(id)
+/// The shell's id for the folder, if the shell registered it as ours: found
+/// among this user's registered roots by its path. (Asking by folder,
+/// GetSyncRootInformationForFolder, answered nothing for a root registered
+/// a moment before — found in CI.)
+pub fn registered_id(root: &Path) -> Result<Option<String>, String> {
+	let want = plain(root).to_string().trim_end_matches('\\').to_lowercase();
+	let roots = StorageProviderSyncRootManager::GetCurrentSyncRoots().map_err(text)?;
+	for info in roots {
+		let id = info.Id().map_err(text)?.to_string();
+		let path = info.Path().and_then(|f| f.cast::<IStorageItem>()).and_then(|i| i.Path()).map_err(text)?.to_string();
+		if id.starts_with("Gorani!") && path.trim_end_matches('\\').to_lowercase() == want {
+			return Ok(Some(id));
+		}
+	}
+	Ok(None)
 }
 
 /// The folder stops being a Gorani folder — the shell's registration if it
 /// has one, cldapi's otherwise.
 pub fn unregister(root: &Path) -> Result<(), String> {
-	if let Some(id) = registered_id(root) {
+	if let Ok(Some(id)) = registered_id(root) {
 		return StorageProviderSyncRootManager::Unregister(&HSTRING::from(id.as_str())).map_err(text);
 	}
 	crate::cf::unregister(root).map_err(text)

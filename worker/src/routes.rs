@@ -1938,10 +1938,14 @@ async fn share_complete(mut req: Request, env: Env, identity: &Identity, member_
 		Err(resp) => return Ok(resp),
 	};
 	let body: serde_json::Value = req.json().await?;
-	let parts: Vec<(u32, String)> = body
-		.get("parts")
-		.and_then(|p| serde_json::from_value(p.clone()).ok())
-		.unwrap_or_default();
+	// `[{ partNumber, etag }]`, as every client sends it. (This read the list
+	// as `[(number, etag)]` tuples, which an object never is — so it was
+	// always EMPTY, and S3 refused the completion as MalformedXML. The stub
+	// assembled whatever parts it held, so only the IDrive e2 live run,
+	// 2026-10-15, showed that no share link had ever completed on real S3.)
+	let Some(parts) = body.get("parts").and_then(|p| p.as_array()).map(|list| list.iter().filter_map(|p| Some((p.get("partNumber")?.as_u64()? as u32, p.get("etag")?.as_str()?.to_string()))).collect::<Vec<_>>()).filter(|p| !p.is_empty()) else {
+		return json_error(400, "parts: [{ partNumber, etag }] — what each part's upload answered");
+	};
 	s3::multipart_complete(&env, &meta.object_key, &meta.s3_upload_id, &parts).await?;
 	// The same "must add up" rule as file uploads (review, commit 23): the
 	// share was marked ready with whatever size the body claimed, and the

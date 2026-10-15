@@ -73,9 +73,33 @@ console differs from the MinIO steps above.
   `PutObjectRetention` (COMPLIANCE, Content-MD5) answers **204** (AWS: 200
   — the Worker accepts both); the retention reads back as COMPLIANCE; both
   shortening it and deleting the locked version are refused with **400
-  InvalidRequest** (AWS: 403), and the version survives. Not yet run from a
-  deployed Worker: the full `api:s3-live` against e2, which the sandbox
-  this was written in could not route the Worker to.
+  InvalidRequest** (AWS: 403), and the version survives. (Those probes were
+  signed by the TEST's signer, tests/lib/sigv4.mjs — not the Worker's.)
+- **The full `api:s3-live` against e2** (2026-10-15, the Worker itself,
+  without the lock probe) — passes, after three fixes it found:
+  1. **The Worker's SigV4 left the region out of the string-to-sign's
+     credential scope** (crates/s3). Every real S3 server answers that
+     with `SignatureDoesNotMatch`: before this fix NO S3-backed deployment
+     could store a byte — only the R2 binding (which signs nothing) and the
+     S3 stub (which checks nothing) worked. The golden vectors had been
+     computed with the same omission and agreed with the bug; they are now
+     taken from the test's signer, which e2 accepts.
+  2. **A share link's upload never completed on real S3**: its part list
+     was parsed into the wrong shape and sent EMPTY (`MalformedXML`). The
+     stub now refuses an empty or unknown part list the way S3 does.
+  3. **e2 answers a second plain DELETE on a versioned bucket by removing
+     the first one's delete marker** — the object comes back (AWS adds a
+     second marker). A revoked share's copy, deleted at revoke and again by
+     the nightly purge, was readable in the bucket afterwards. The Worker
+     now deletes only a key that still resolves (a HEAD first; e2 answers a
+     delete marker with 405, AWS with 404 — both mean "gone").
+- **Running it from a machine whose only way out is an HTTPS proxy** (a
+  sandbox, a locked-down CI runner): the local runtime (workerd) opens its
+  own sockets and reads no `HTTPS_PROXY`. `GORANI_DEV_OUTBOUND=node
+  NODE_USE_ENV_PROXY=1 GORANI_LIVE_S3=1 node tests/api/s3-live.test.mjs`
+  starts the same Worker through wrangler's API with its outbound requests
+  made by Node (tests/lib/dev-outbound.mjs) — same method, URL, headers and
+  body, so the storage server checks the Worker's own signature.
 - **Cost shape**: e2 bills storage only, with egress included up to a
   multiple of what is stored (check the current terms) — the edge cache
   (below) matters less for the bill here than for latency.
@@ -183,6 +207,37 @@ memory.
      and which a person accepts or rejects.
 
 ## 3. Deploy
+
+### Which Workers plan
+
+**Workers Paid** ($5/month per account) for anything beyond a trial.
+Gorani's interactive requests are light — JSON, a Durable Object call,
+an Access JWT check, SigV4; the crypto runs in the browser — and its
+bundle (≈ 0.6 MiB gzipped), its SQLite-backed Durable Objects and its one
+Cron Trigger all fit the Free plan. What does not is the work that keeps
+evidence evidence. Cloudflare's limits as published (2026-10-15):
+
+| Limit | Free | Paid | Where gorani meets it |
+|---|---|---|---|
+| CPU per request, per Cron Trigger, per Durable Object invocation | 10 ms | 30 s default, up to 5 min (15 min for an hourly-or-slower cron) | **backups** stream and seal EVERY stored byte inside one Durable Object invocation (GB2, AES-GCM in wasm — far past 10 ms for any real store); `audit/verify` re-hashes a whole trail; the nightly pass |
+| Subrequests per invocation | 50 (1,000 to Cloudflare services) | 10,000 | the nightly **lock pass** locks up to 100 evidence objects per store per night, one S3 call each; the cron writes a checkpoint per store |
+| Requests | 100,000/day (Workers), 100,000/day (Durable Objects) | 10 M/month included, 1 M DO requests/month included | every API call is one Worker request and one to three DO requests; a large upload is one request per 8 MiB frame; a video seek is one per frame |
+| DO SQLite rows written | 100,000/day | 50 M/month included | audit lines, read-log rows, the change feed |
+| DO storage | 5 GB per account | unlimited (10 GB per object) | metadata only — the bytes are in S3 |
+
+On Free, going over is not a slowdown: the request fails (Error 1027 or
+1102) until midnight UTC. An evidence store that refuses an upload during
+an incident, or whose backups and locks silently stop, is the failure this
+design exists to prevent. Request body size is the zone's plan, not the
+Workers plan (100 MB on Free and Pro zones — gorani's frames are ≤ 64 MiB).
+
+On Paid, give the Durable Objects room for backups of a growing store
+(`limits.cpu_ms`, up to 300 000). How far 30 seconds goes depends on
+AES-GCM's speed in wasm on Cloudflare's machines, which has not been
+measured here — read a backup run's CPU time in Workers Logs and size the
+limit from that.
+
+### Steps
 
 ```sh
 npm install && npm --prefix web install

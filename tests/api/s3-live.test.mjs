@@ -200,6 +200,12 @@ try {
 	assert.equal(purge.status, 200);
 	assert.ok(purge.json.objectsDeleted >= 2, `the purge deleted the objects: ${JSON.stringify(purge.json)}`);
 	assert.equal((await fetch(`${dev.base}${base}/files/${fileId}`, { headers: { "x-gorani-dev-email": email } })).status, 404, "the purged file is gone");
+	// The bucket's own word, not the Worker's: the revoked link's copy does
+	// not resolve. (It was deleted twice — at revoke, then by the purge — and
+	// IDrive e2 answers a second plain DELETE on a versioned bucket by
+	// REMOVING the first one's delete marker: the copy came back until the
+	// Worker learned to delete only what still resolves, 2026-10-15.)
+	assert.ok([404, 405].includes((await s3fetch(s3, "HEAD", `shares/${shareId}`)).status), "the revoked share's copy is gone from the bucket itself");
 
 	// ── 6. (GORANI_LIVE_S3_LOCK=1) the real server enforces the lock ─────
 	let locked = "";

@@ -108,9 +108,12 @@ jobs:
         run: |
           command -v xcodegen >/dev/null || brew install xcodegen
           xcodegen generate
+          # (ENABLE_DEBUG_DYLIB=NO: Xcode's Debug default puts the code in a
+          # .debug.dylib beside a stub executable — the check below wants the
+          # binary as a release has it.)
           xcodebuild -project Gorani.xcodeproj -scheme Gorani -configuration Debug \
             -destination 'platform=macOS' -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO build
+            CODE_SIGNING_ALLOWED=NO ENABLE_DEBUG_DYLIB=NO build
           # (What came out: the app, the extension inside it, the core inside that.)
           app=build/Build/Products/Debug/Gorani.app
           ls "$app/Contents/PlugIns/GoraniFileProvider.appex/Contents/MacOS/"

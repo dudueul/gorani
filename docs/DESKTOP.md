@@ -397,6 +397,88 @@ gorani-sync replica [--case C]     one JSON request per line on stdin, one answe
   folders, renames, the Trash, polling, an evidence case read-only with a
   swapped record refused.
 
+### 39b as built
+
+```text
+gorani-cloud <folder> [--case C] [--keep-local]    serve the area as a Cloud Files sync root
+gorani-cloud free <file>                           drop one file's local bytes now
+gorani-cloud unregister <folder>                   the folder stops being a sync root
+```
+
+| Part | File | What |
+|---|---|---|
+| the platform | `clients/windows/src/cf.rs` | every `unsafe` call to cldapi: register (PARTIAL hydration — a range read of a 255 GiB image fetches that range), connect (FETCH_DATA, NOTIFY_DELETE, NOTIFY_RENAME), placeholders with an identity `gorani1:<version>:<id>`, update/convert/dehydrate through an oplocked handle |
+| names | `clients/windows/src/names.rs` | a server name as NTFS allows it (look-alikes for `<>:"/\|?*`, reserved device names, trailing dots), unique without case (" (id8)") |
+| the folder's side | `clients/windows/src/watch.rs` | ReadDirectoryChangesW: new files and folders, edits — each event only a path to look at again |
+| the decisions | `clients/windows/src/provider.rs` | the server → the folder (placed, moved, refreshed, removed — never a file the member changed and has not sent); the folder → the server; stop |
+
+- **Deletes and renames are the server's first.** NOTIFY_DELETE and
+  NOTIFY_RENAME are answered only after the server took them; a read-only
+  area answers READ_ONLY_VOLUME and Explorer shows the refusal. A rename
+  out of the folder (the Recycle Bin) is a trash.
+- **A read is of the placeholder's version.** FETCH_DATA asks the replica
+  for that version only, 4 MiB at a time; a refused read (a sample, a
+  changed file, evidence whose hash does not match) fails for the range
+  still owed.
+- **Saves wait for the writer.** A changed file is sent once no handle
+  holds it and nothing touched it for 1.5 s; a stale save becomes a
+  conflict copy beside the other version, on both sides.
+- **Stop drops the plaintext.** Every file in sync is dehydrated — the
+  read-only ones too: the shell lifts the attribute for the moment, and the
+  in-sync policy does not track it.
+
+Found on the runner, each now a comment where it bites and an assertion in
+`clients/windows/tests/cloud.rs`:
+
+- the platform sends no rename/delete notification for the provider's own
+  process (the smoke test renames and deletes through PowerShell);
+- a FETCH_DATA failed for zero bytes is not taken — the reader waits out
+  the platform's 60-second timeout;
+- a rename clears a placeholder's in-sync state, even the provider's own:
+  the shell marks its own moves in sync, and a path the member just renamed
+  whose size and last-write time are unchanged is marked in sync, not sent
+  again as a version;
+- a read-only placeholder refuses the exclusive write open that
+  dehydrating takes.
+
+### 39c as built
+
+```text
+the extension (NSFileProviderReplicatedExtension)   queues, polls every 3 s, translates errors
+        │  ProviderCore (GoraniKit)                  every decision — tested by `swift test`
+        │  GoraniBridge                              the replica's JSON protocol, typed
+        ▼  gorani_open / gorani_call / gorani_free   clients/macos/src/lib.rs (a static library)
+the Rust core                                        keys, sealing, the server — nothing in Swift
+```
+
+- **Identifiers are server ids**; the area's top is the root container.
+  A sample is listed without `allowsReading`; a read-only area's items have
+  no write, rename, move or delete capabilities, and the core refuses them
+  anyway.
+- **Versions.** The content version is the item's version number (new
+  bytes are fetched afresh); the metadata version adds the modified time
+  and the sample flag. A save says which version it follows (the
+  `baseVersion` the system hands over); a stale one is a conflict copy on
+  the server and the item answered is theirs.
+- **Anchors are generations.** ReplicaModel keeps the last 16 listings; a
+  change enumeration answers from them, and an anchor it no longer has is
+  expired — the system then enumerates everything again.
+- **Fetch writes one version whole** into a file the system takes over
+  (the replica's `download` op); a version that moved on meanwhile is
+  fetched once more as the current one.
+- **The profile** is `<app group container>/gorani-sync.json`, the group
+  `$(TeamIdentifierPrefix)io.gorani` — enrolled with `gorani-sync setup
+  --profile …`; the host app adds or removes the domain and shows the path.
+- **The project is generated** (`xcodegen generate`, `project.yml`); the
+  team is `GORANI_TEAM_ID` at build time, never in the repository.
+
+CI on `macos-latest`: the bridge's Rust tests; the static library (and
+the system libraries a program linking it needs); `swift test` over the
+in-memory core — items, fetch, create/modify/delete, a stale save, changes
+since an anchor, an expired anchor, a read-only area, the enumerators; and
+an unsigned `xcodebuild` of the app with the extension inside, the core
+linked into it.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

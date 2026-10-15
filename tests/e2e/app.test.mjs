@@ -514,6 +514,14 @@ try {
 		await page.locator("text=all 2 versions re-hashed and verified").first().waitFor({ timeout: 60_000 });
 		const rv = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/reverify", { email: "mom@family.test" });
 		assert.deepEqual([rv.json.overdue, rv.json.last?.checked, rv.json.last?.failed], [false, 2, 0], "the store recorded it");
+		// The case's inbox key (commit 37b): mom, its manager, makes it here —
+		// signed by her browser, the private half sealed under the case key.
+		await page.locator('[data-test="inbox-ir-e2e"]').filter({ hasText: "no key" }).waitFor({ timeout: 30_000 });
+		await page.locator('[data-test="inbox-key-ir-e2e"]').click();
+		await page.locator('[data-test="inbox-ir-e2e"]').filter({ hasText: "made by" }).waitFor({ timeout: 30_000 });
+		const inboxKeys = (await api(dev.base, "GET", "/api/v1/cases", { email: "mom@family.test" })).json.cases.find((c) => c.id === "ir-e2e").inboxKeys;
+		assert.deepEqual([inboxKeys.length, inboxKeys[0].signedBy, inboxKeys[0].retiredAt], [1, "mom", null], "one current key, signed by mom");
+		assert.match(inboxKeys[0].privateSealed, /^GV04:/, "its private half is placed under the case key");
 		// Collectors (commit 37a): mom registers one through the form — her
 		// browser signs the registration — and a second lead approves it.
 		// The tab then says whether MOM's client counts it: not yet, since

@@ -288,8 +288,9 @@ pub fn build_trust(member: &str, root: &VaultPrivateKey, rec: &IdentityRecord, r
 	Ok(trust_rules(member, &rec.pins, registry))
 }
 
-/// The rules themselves, once the pins are known to be the member's own.
-fn trust_rules(member: &str, pins: &[Pin], registry: &[RegistryIdentity]) -> Trust {
+/// The rules themselves, once the pins are known to be the member's own —
+/// or a collector's (collector.rs: its pins are MAC'd by its device secret).
+pub fn trust_rules(member: &str, pins: &[Pin], registry: &[RegistryIdentity]) -> Trust {
 	let pinned: std::collections::BTreeMap<&str, &str> = pins.iter().map(|p| (p.member.as_str(), p.key_id.as_str())).collect();
 	let mut sound: std::collections::BTreeMap<String, (&RegistryIdentity, VerifyingKey)> = std::collections::BTreeMap::new();
 	for e in registry {

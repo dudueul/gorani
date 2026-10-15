@@ -28,6 +28,7 @@ import { approveRequest, requestApproval, verifyApproval, type Approval, type Ap
 import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
 import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
 import { approveCollector, collectorVerdict, requestCollector, type CollectorRow } from "../vault/collectors.ts";
+import { createInboxKey } from "../vault/inbox.ts";
 import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
@@ -514,9 +515,32 @@ export class GoraniTeam extends LitElement {
 							: nothing}
 					</div>`
 					: nothing}
+				${c.grant ? this.inboxRow(c, manage) : nothing}
 				${this.twoPerson(c, manage)}
 			</section>
 		`;
+	}
+
+	/**
+	 * The case's inbox key (commit 37b, docs/COLLECTORS.md): what collectors
+	 * seal to. A manager makes it here — a fresh pair whose public halves
+	 * they sign and whose private half is sealed under the case key; a new
+	 * one retires the old (items sealed to it still open).
+	 */
+	private inboxRow(c: CaseRow, manage: boolean) {
+		const current = (c.inboxKeys ?? []).find((k) => !k.retiredAt);
+		return html`<div class="mt-2 flex flex-wrap items-center gap-2 text-xs" data-test="inbox-${c.id}">
+			<span class="text-neutral-400">Inbox:</span>
+			${current
+				? html`<span>key <code>${current.keyId.slice(0, 12)}</code> made by ${this.nameOf(current.signedBy)} · ${current.createdAt.slice(0, 10)}${(c.inboxKeys?.length ?? 0) > 1 ? ` · ${c.inboxKeys!.length - 1} retired` : ""}</span>`
+				: html`<span class="text-neutral-500">no key — collectors cannot drop into this case yet</span>`}
+			${manage && !c.closed && !c.rotating
+				? html`<button class=${button} ?disabled=${this.busy} data-test="inbox-key-${c.id}" @click=${() => this.act(`Making ${c.id}'s inbox key`, async () => {
+						await createInboxKey(this.call, await this.caseKey(c), c.id, this.team.signer);
+						return `${c.id} has a new inbox key, signed by you. Collectors that pinned you (or a lead who certified you) seal to it from their next drop.`;
+					})}>${current ? "New inbox key" : "Make the inbox key"}</button>`
+				: nothing}
+		</div>`;
 	}
 
 	/**

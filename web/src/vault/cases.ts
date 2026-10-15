@@ -41,6 +41,7 @@
  */
 
 import { createStoreKey } from "./keys.ts";
+import { resealInboxKeys, type InboxKeyRow } from "./inbox.ts";
 import { checkRecordMatches } from "./records.ts";
 import { places } from "./places.ts";
 import { opensAnything, resealStore, type ApiCall, type RotationReport } from "./rotation.ts";
@@ -81,6 +82,10 @@ export interface CaseRow {
 		prevSignedBy: string | null;
 	} | null;
 	grantees: { member: string; permission: CasePermission; expiresAt: string | null }[];
+	/** The case's inbox keys (commit 37b, inbox.ts): what collectors seal to,
+	 * the private halves sealed under the case key. The current one has no
+	 * `retiredAt`. */
+	inboxKeys?: InboxKeyRow[];
 }
 
 /** A grantee's root public halves (`GET /api/v1/members/<id>/root`). */
@@ -186,8 +191,11 @@ export async function rotateCase(call: ApiCall, root: VaultPrivateKey, c: CaseRo
 		newKey = await importVaultKey(fresh.bundle);
 		const title = await openCaseTitle(oldKey, c);
 		const titleSealed = title === null ? undefined : await sealPlacedText(newKey, places.caseTitle(caseArea(c.id)), title);
+		// The inbox keys (commit 37b) are sealed under the case key: they move
+		// in the SAME commit, or the inbox would open only with a retiring key.
+		const inboxKeys = await resealInboxKeys(oldKey, newKey, c.id, c.inboxKeys ?? []);
 		// Step 1: commit — the new key now lives in the grants, not only here.
-		await call("PUT", `/api/v1/cases/${c.id}/key`, { keyId: fresh.keyId, publicKey: { ec: fresh.publicKey, kem: fresh.pqPublicKey }, grants, titleSealed });
+		await call("PUT", `/api/v1/cases/${c.id}/key`, { keyId: fresh.keyId, publicKey: { ec: fresh.publicKey, kem: fresh.pqPublicKey }, grants, titleSealed, inboxKeys });
 	}
 	const area = caseArea(c.id);
 	const report = await resealStore(call, area, oldKey, newKey);

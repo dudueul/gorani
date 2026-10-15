@@ -127,6 +127,11 @@ impl Place {
 	pub fn case_title(store: &str) -> Self {
 		Self::new("case.title", store, "", None)
 	}
+	/// A case inbox's private key (commit 37b, docs/COLLECTORS.md): sealed
+	/// with the case key, kept in the registry, named by the inbox key's id.
+	pub fn case_inbox(store: &str, key_id: &str) -> Self {
+		Self::new("case.inbox", store, key_id, None)
+	}
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.0
 	}

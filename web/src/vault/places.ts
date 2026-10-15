@@ -31,6 +31,7 @@
  * | `share.name` | member | share id | — | the owner's copy of a link's name |
  * | `store.secrets` | member | — | — | fingerprint + index keys |
  * | `case.title` | `case:<id>` | — | — | a case's title (in the registry) |
+ * | `case.inbox` | `case:<id>` | inbox key id | — | an inbox key's private half (in the registry; inbox.ts) |
  *
  * The `store` column is an AREA (lib/area.ts): a member id, or `case:<id>`
  * for a case (commit 26) — the same kinds, in a different store.
@@ -67,6 +68,8 @@ export const places = {
 	shareName: (store: string, share: string) => place("share.name", store, share),
 	storeSecrets: (store: string) => place("store.secrets", store, ""),
 	caseTitle: (store: string) => place("case.title", store, ""),
+	/** A case inbox's private key (commit 37b): sealed with the case key, named by the inbox key's id. */
+	caseInbox: (store: string, keyId: string) => place("case.inbox", store, keyId),
 };
 
 /** A fresh client-chosen id (file, folder): 128 random bits, base64url — the

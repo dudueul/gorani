@@ -119,7 +119,36 @@ impl GoraniMemberDO {
 				}
 			}
 		}
-		report.pending = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE stamp_imprint IS NOT NULL AND stamp_token IS NULL", None)?.one::<TotalCount>()?.n as u64;
+		// Collected items (commit 37b): stamped at receipt, the same way — the
+		// imprint is SHA-256 of the COLLECTOR's signature.
+		if report.failed == 0 {
+			#[derive(serde::Deserialize)]
+			struct Item {
+				id: String,
+				stamp_imprint: String,
+			}
+			let items: Vec<Item> = self.sql.exec("SELECT id, stamp_imprint FROM inbox_items WHERE stamp_imprint IS NOT NULL AND stamp_token IS NULL ORDER BY received_at LIMIT 20", None)?.to_array()?;
+			for r in items {
+				let mut imprint = [0u8; 32];
+				if hex::decode_to_slice(&r.stamp_imprint, &mut imprint).is_err() {
+					continue;
+				}
+				match crate::tsa::stamp(&self.env, &imprint).await {
+					Ok(Some(s)) => {
+						let token = base64::engine::general_purpose::STANDARD.encode(&s.token);
+						self.sql.exec("UPDATE inbox_items SET stamp_token = ?1, stamped_at = ?2 WHERE id = ?3 AND stamp_token IS NULL", Some(vec![token.into(), s.at.into(), r.id.into()]))?;
+						report.stamped += 1;
+					}
+					Ok(None) => break,
+					Err(e) => {
+						worker::console_error!("gorani: timestamp for inbox item {} failed (retried): {e}", r.id);
+						report.failed += 1;
+						break;
+					}
+				}
+			}
+		}
+		report.pending = self.sql.exec("SELECT (SELECT COUNT(*) FROM file_versions WHERE stamp_imprint IS NOT NULL AND stamp_token IS NULL) + (SELECT COUNT(*) FROM inbox_items WHERE stamp_imprint IS NOT NULL AND stamp_token IS NULL) AS n", None)?.one::<TotalCount>()?.n as u64;
 		Ok(report)
 	}
 

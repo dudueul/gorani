@@ -38,6 +38,7 @@ mod custody;
 mod devices;
 mod family;
 mod files_store;
+mod inbox;
 mod member;
 mod routes;
 mod s3;

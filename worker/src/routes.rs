@@ -347,6 +347,11 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 		("DELETE", [case, "grants", member]) => return forward_family(&env, &identity.email, "DELETE", format!("case-grants/{case}/{member}"), None).await,
 		// Which collectors may drop into the case's inbox (commit 37a).
 		("PUT", [case, "collectors", collector]) => return forward_family(&env, &identity.email, "PUT", format!("collector-grants/{case}/{collector}"), None).await,
+		// The case's inbox key (commit 37b, family/inbox.rs): a manager makes it.
+		("PUT", [case, "inbox-key"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			return forward_family(&env, &identity.email, "PUT", format!("case-inbox-key/{case}"), Some(body)).await;
+		}
 		("DELETE", [case, "collectors", collector]) => return forward_family(&env, &identity.email, "DELETE", format!("collector-grants/{case}/{collector}"), None).await,
 		("PUT", [case, "key"]) => {
 			let body = req.json::<serde_json::Value>().await?;
@@ -423,6 +428,9 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		// Re-verifying is reading every file — and saying so (commit 29h).
 		("GET" | "POST", ["reverify"]) => Some(Need::Read),
 		("GET", ["files", ..] | ["vault-stats"] | ["storage", "pending"] | ["backups", ..]) => Some(Need::Read),
+		// The inbox (commit 37b): anyone on the case may look at what
+		// collectors dropped — it is sealed to a key every grantee opens.
+		("GET", ["inbox"] | ["inbox", _]) => Some(Need::Read),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
 		// Custody (commit 29g) is a record of responsibility, not access:
@@ -786,9 +794,54 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// The download: streamed from S3 with Range passthrough and the
 		// wrapped content key in a header (the client opens it, never us).
 		("GET", ["members", id, "files", file]) => file_download(req, env, &identity, id, file).await,
+		// ── A case's inbox (commit 37b, inbox.rs) — case areas only ──
+		("GET", ["members", id, "inbox"]) if crate::area::case_of(id).is_some() => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "inbox/list", None, actor)).await,
+		("GET", ["members", id, "inbox", item]) if crate::area::case_of(id).is_some() => inbox_download(req, env, &identity, id, item).await,
 
 		_ => json_error(404, "no such route"),
 	}
+}
+
+/// An inbox item's bytes, streamed as a file's are (Range passes through),
+/// with its sealed content key in `x-gorani-ck` and its frame size in
+/// `x-gorani-chunk`. The key is sealed to the INBOX key: the reader opens
+/// that first (inbox.ts), the store opens nothing.
+async fn inbox_download(req: Request, env: Env, identity: &Identity, area: &str, item: &str) -> Result<Response> {
+	let actor = match member_ctx(&env, identity, area).await {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	if !auth::valid_object_id(item) {
+		return json_error(400, "item id: [A-Za-z0-9_-], ≤ 64");
+	}
+	let client = req.headers().get("x-gorani-client")?.unwrap_or_else(|| "unknown".into());
+	let mut found = forward_member(&env, area, "GET", format!("inbox-object/{item}?client={}", urlencode(&client)), None, &actor.email).await?;
+	if found.status_code() != 200 {
+		return Ok(found);
+	}
+	let meta: serde_json::Value = found.json().await?;
+	let object_key = meta.get("objectKey").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+	let range = parse_range(&req.headers().get("Range")?.unwrap_or_default());
+	let mut s3_resp = s3::fetch_stream(&env, "GET", &object_key, range, &[], None).await?;
+	let status = s3_resp.status_code();
+	if status != 200 && status != 206 {
+		return Response::error("Not Found", 404);
+	}
+	let headers = Headers::new();
+	headers.set("Content-Type", "application/octet-stream")?;
+	headers.set("Accept-Ranges", "bytes")?;
+	if let Some(ck) = meta.get("ck").and_then(|x| x.as_str()) {
+		headers.set("x-gorani-ck", ck)?;
+	}
+	if let Some(chunk) = meta.get("chunk").and_then(|x| x.as_u64()).filter(|c| *c > 0) {
+		headers.set("x-gorani-chunk", &chunk.to_string())?;
+	}
+	for h in ["Content-Length", "Content-Range"] {
+		if let Some(v) = s3_resp.headers().get(h)? {
+			headers.set(h, &v)?;
+		}
+	}
+	Ok(Response::from_stream(s3_resp.stream()?)?.with_status(status).with_headers(headers))
 }
 
 /// Complete a recovery ceremony. A case's outcome (a signed grant) is the
@@ -889,7 +942,7 @@ async fn device_call(env: &Env, _identity: &Identity, member_id: &str, device: &
 /// `/api/v1/collect/…` for a collector (commit 37a, docs/COLLECTORS.md).
 /// Every request asks the registry which ACTIVE collector the service token
 /// is — a pending, revoked or unknown one is refused here, before any route.
-async fn route_collector(_req: Request, env: Env, common_name: &str, method: &str, rest: &[&str]) -> Result<Response> {
+async fn route_collector(mut req: Request, env: Env, common_name: &str, method: &str, rest: &[&str]) -> Result<Response> {
 	// (The name becomes part of a registry path: the same shape the registry
 	// accepts at registration, nothing else.)
 	if !(1..=128).contains(&common_name.len()) || !common_name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
@@ -900,12 +953,209 @@ async fn route_collector(_req: Request, env: Env, common_name: &str, method: &st
 		return json_error(403, "this service token is not a registered, active collector");
 	}
 	let collector: serde_json::Value = who.json().await?;
+	let id = collector.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 	match (method, rest) {
 		// Who am I, and where may I drop — a collector's first call, and a
 		// way to check a deployment end to end.
 		("GET", ["whoami"]) => Response::from_json(&collector),
+		// Where to seal (commit 37b): the case's current inbox key, its
+		// manager's signature and the identities to check it with. The
+		// registry refuses a case this collector is not granted, or a closed one.
+		("GET", ["cases", case, "inbox-key"]) => forward_family(&env, "", "GET", format!("collector-inbox/{case}/{id}"), None).await,
+		("POST", ["cases", case, "items"]) => drop_whole(&mut req, &env, &id, case).await,
+		("POST", ["cases", case, "items", "uploads"]) => drop_start(&mut req, &env, &id, case).await,
+		("PUT", ["cases", case, "items", "uploads", upload, part]) => drop_part(&mut req, &env, &id, case, upload, part).await,
+		("POST", ["cases", case, "items", "uploads", upload, "complete"]) => drop_complete(&mut req, &env, &id, case, upload).await,
 		_ => json_error(404, "no such drop route"),
 	}
+}
+
+/// May this collector drop into `case`, sealed to `inbox_key`? Asked on
+/// every drop request, so a revoked grant, a closed case or a rotated inbox
+/// key stops drops at once. Returns the case's area.
+async fn drop_target(env: &Env, collector: &str, case: &str, inbox_key: Option<&str>) -> Result<std::result::Result<String, Response>> {
+	if !crate::area::valid_case_id(case) {
+		return Ok(Err(json_error(400, "case id: 2–40 of a–z, 0–9, dashes")?));
+	}
+	let mut target = forward_family(env, "", "GET", format!("collector-inbox/{case}/{collector}"), None).await?;
+	if target.status_code() != 200 {
+		return Ok(Err(target));
+	}
+	if let Some(key) = inbox_key {
+		let t: serde_json::Value = target.json().await?;
+		if t["key"]["keyId"].as_str() != Some(key) {
+			return Ok(Err(json_error(409, "the item is not sealed to the case's CURRENT inbox key — fetch it again (GET …/inbox-key)")?));
+		}
+	}
+	Ok(Ok(format!("case:{case}")))
+}
+
+/// The inbox item's object key: under the case's prefix,
+/// `inbox/<collector>/<item>`. The collector's own segment means one
+/// collector's ids can never name another's objects — the item id is the
+/// collector's choice, and a choice must not reach someone else's bytes.
+fn inbox_object(area: &str, collector: &str, item: &str) -> String {
+	format!("{}/inbox/{collector}/{item}", crate::area::key_prefix(area))
+}
+
+/// Refuse an item whose object already exists: storage would overwrite it
+/// (and a failed record would then delete the ORIGINAL). Checked before
+/// any byte is written, whole or multipart.
+async fn drop_fresh(env: &Env, object_key: &str) -> Result<Option<Response>> {
+	Ok(match s3::head(env, object_key).await? {
+		Some(_) => Some(json_error(409, "an item with this id was already received — choose a fresh id")?),
+		None => None,
+	})
+}
+
+/// What a drop tells the case's store about the item.
+fn drop_record(item: &str, collector: &str, object_key: &str, size: u64, chunk: Option<u64>, fields: &std::collections::BTreeMap<String, String>) -> serde_json::Value {
+	serde_json::json!({
+		"id": item, "collector": collector, "inboxKeyId": fields.get("inbox_key_id"),
+		"objectKey": object_key, "size": size, "chunk": chunk,
+		"ck": fields.get("ck"), "meta": fields.get("meta"), "stamp": fields.get("stamp"),
+	})
+}
+
+/// A whole drop (≤ what one request carries): GV02 bytes under the item's
+/// content key, the key and the metadata sealed to the inbox public key.
+async fn drop_whole(req: &mut Request, env: &Env, collector: &str, case: &str) -> Result<Response> {
+	let form = form_of(req).await?;
+	let area = match drop_target(env, collector, case, form.fields.get("inbox_key_id").map(String::as_str)).await? {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	if let Err(msg) = check_sealed(&form.file, form.fields.get("size"), &None, &None) {
+		return json_error(400, &msg);
+	}
+	let Some(item) = form.fields.get("item_id").filter(|f| auth::valid_object_id(f)).cloned() else {
+		return json_error(400, "item_id is required: the collector chooses it ([A-Za-z0-9_-], ≤ 64) and signs it");
+	};
+	let size: u64 = form.fields.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
+	let object_key = inbox_object(&area, collector, &item);
+	if let Some(taken) = drop_fresh(env, &object_key).await? {
+		return Ok(taken);
+	}
+	s3::put(env, &object_key, form.file.clone().unwrap_or_default()).await?;
+	let resp = forward_member(env, &area, "POST", "inbox/receive", Some(drop_record(&item, collector, &object_key, size, None, &form.fields)), format!("collector:{collector}")).await?;
+	if resp.status_code() >= 400 {
+		let _ = s3::delete(env, &object_key).await;
+	}
+	Ok(resp)
+}
+
+/// A large drop's plan (D12 limits, as a member's upload): the parts go
+/// straight to storage, one GC01 frame each.
+async fn drop_start(req: &mut Request, env: &Env, collector: &str, case: &str) -> Result<Response> {
+	let area = match drop_target(env, collector, case, None).await? {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	let body: serde_json::Value = req.json().await?;
+	let chunk = body.get("chunk").and_then(|v| v.as_u64()).unwrap_or(0);
+	let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+	const MIN_PART: u64 = 5 * 1024 * 1024;
+	if chunk < MIN_PART || chunk > gorani_formats::chunked::MAX_CHUNK {
+		return json_error(400, "chunk: between the backend's minimum part (5 MiB) and the largest the Worker streams (64 MiB)");
+	}
+	if size > gorani_formats::chunked::MAX_FILE {
+		return json_error(413, "an item is at most 255 GiB (docs/LARGE-FILES.md)");
+	}
+	let parts = size.div_ceil(chunk).max(1);
+	if parts > 10_000 {
+		return json_error(400, "this plan needs more than 10 000 parts — raise the chunk size");
+	}
+	let Some(item) = body.get("itemId").and_then(|v| v.as_str()).filter(|f| auth::valid_object_id(f)) else {
+		return json_error(400, "itemId is required: the collector chooses it and signs it");
+	};
+	let object_key = inbox_object(&area, collector, item);
+	if let Some(taken) = drop_fresh(env, &object_key).await? {
+		return Ok(taken);
+	}
+	let actor = format!("collector:{collector}");
+	let mut started = forward_member(env, &area, "POST", "uploads/start", Some(serde_json::json!({ "objectKey": object_key })), actor.clone()).await?;
+	if started.status_code() >= 400 {
+		return Ok(started);
+	}
+	let started_body: serde_json::Value = started.json().await?;
+	let upload_id = started_body.get("uploadId").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| Error::RustError("no uploadId".into()))?;
+	let s3_upload_id = s3::multipart_init(env, &object_key).await?;
+	forward_member(env, &area, "PUT", format!("uploads/{upload_id}/s3"), Some(serde_json::json!({ "s3UploadId": s3_upload_id })), actor).await?;
+	Response::from_json(&serde_json::json!({ "uploadId": upload_id, "key": object_key, "parts": parts }))
+}
+
+/// The upload's bookkeeping — and it must be an inbox upload of this case
+/// by THIS collector: a collector never writes anywhere else, whatever
+/// upload id it names.
+async fn drop_upload(env: &Env, area: &str, collector: &str, upload: &str) -> std::result::Result<UploadMeta, Response> {
+	let meta = upload_meta(env, area, upload).await?;
+	if !meta.object_key.starts_with(&format!("{}/inbox/{collector}/", crate::area::key_prefix(area))) {
+		return Err(json_error_raw(403, "that upload is not an inbox drop"));
+	}
+	Ok(meta)
+}
+
+async fn drop_part(req: &mut Request, env: &Env, collector: &str, case: &str, upload: &str, part: &str) -> Result<Response> {
+	let area = match drop_target(env, collector, case, None).await? {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	let meta = match drop_upload(env, &area, collector, upload).await {
+		Ok(m) => m,
+		Err(resp) => return Ok(resp),
+	};
+	let Some(n) = part_number(part) else { return json_error(400, "part numbers are 1–10000") };
+	let len = match part_length(req)? {
+		Ok(len) => len,
+		Err(resp) => return Ok(resp),
+	};
+	let etag = s3::multipart_part_stream(env, &meta.object_key, &meta.s3_upload_id, n, req.stream()?, len).await?;
+	Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
+}
+
+async fn drop_complete(req: &mut Request, env: &Env, collector: &str, case: &str, upload: &str) -> Result<Response> {
+	let form = form_of(req).await?;
+	let area = match drop_target(env, collector, case, form.fields.get("inbox_key_id").map(String::as_str)).await? {
+		Ok(a) => a,
+		Err(resp) => return Ok(resp),
+	};
+	let meta = match drop_upload(env, &area, collector, upload).await {
+		Ok(m) => m,
+		Err(resp) => return Ok(resp),
+	};
+	let parts: Vec<(u32, String)> = form
+		.fields
+		.get("parts")
+		.and_then(|p| serde_json::from_str::<Vec<serde_json::Value>>(p).ok())
+		.map(|list| list.into_iter().filter_map(|p| Some((p.get("partNumber")?.as_u64()? as u32, p.get("etag")?.as_str()?.to_string()))).collect())
+		.unwrap_or_default();
+	let size: u64 = form.fields.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
+	let chunk: u64 = form.fields.get("chunk").and_then(|s| s.parse().ok()).unwrap_or(0);
+	if chunk == 0 {
+		return json_error(400, "chunk is required (the GC01 frame size the parts were sealed with)");
+	}
+	let item = meta.object_key.rsplit('/').next().unwrap_or_default().to_string();
+	if form.fields.get("item_id") != Some(&item) {
+		return json_error(400, "item_id must be the item this upload was started for");
+	}
+	// (Checked again here: a whole drop of the same id may have landed while
+	// the parts were travelling.)
+	if let Some(taken) = drop_fresh(env, &meta.object_key).await? {
+		return Ok(taken);
+	}
+	s3::multipart_complete(env, &meta.object_key, &meta.s3_upload_id, &parts).await?;
+	// The object must add up (size + frames × 28) — fail closed, as a member's.
+	if s3::head(env, &meta.object_key).await?.map(|h| h.size) != Some(gorani_formats::chunked::sealed_size(size, chunk)) {
+		let _ = s3::delete(env, &meta.object_key).await;
+		return json_error(400, "the drop does not add up to its declared size");
+	}
+	let actor = format!("collector:{collector}");
+	let resp = forward_member(env, &area, "POST", "inbox/receive", Some(drop_record(&item, collector, &meta.object_key, size, Some(chunk), &form.fields)), actor.clone()).await?;
+	let _ = forward_member(env, &area, "DELETE", format!("uploads/{upload}"), None, actor).await;
+	if resp.status_code() >= 400 {
+		let _ = s3::delete(env, &meta.object_key).await;
+	}
+	Ok(resp)
 }
 
 async fn forward_family(env: &Env, actor: &str, method: &str, path: impl Into<String>, body: Option<serde_json::Value>) -> Result<Response> {
@@ -982,7 +1232,8 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	// `sample`: "1" uploads a malware sample — commit 29e. `intake`: an
 	// evidence file's sealed, signed intake record — commit 29g. `stamp`:
 	// the timestamp imprint, SHA-256 of the hash record's signature — 29j.)
-	const KNOWN: [&str; 16] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake", "stamp"];
+	// (`item_id`, `inbox_key_id`, `meta`: a collector's drop — commit 37b.)
+	const KNOWN: [&str; 19] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake", "stamp", "item_id", "inbox_key_id", "meta"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {

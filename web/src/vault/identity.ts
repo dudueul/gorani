@@ -35,6 +35,9 @@
  * offer     "gorani-custody-offer-v1"  ‖ area ‖ file ‖ seq ‖ from ‖ to ‖ SHA-256(reason)          (custody.ts)
  * accept    "gorani-custody-accept-v1" ‖ area ‖ file ‖ seq ‖ from ‖ to
  * export    "gorani-export-v1"   ‖ case ‖ export id ‖ SHA-256(manifest.json)   (the exporter; export.ts)
+ * collector "gorani-collector-v1" / "gorani-collector-approve-v1" ‖ id ‖ common name ‖ key id ‖ …   (two leads; collectors.ts)
+ * inbox     "gorani-inbox-v1"    ‖ case ‖ inbox key digest                        (a case manager; inbox.ts)
+ * collect   "gorani-collect-v1"  ‖ case ‖ item ‖ collector ‖ SHA-256 ‖ size ‖ name ‖ type ‖ intake…   (a collector; inbox.ts)
  * ```
  *
  * Digests are FULL SHA-256 of the public halves (ec raw ‖ ML-KEM public):

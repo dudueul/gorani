@@ -2,7 +2,8 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > Status: designed (decisions below, 2026-10-15); built in stages 37a–37d —
-> 37a landed (registry, the service-token path, Team › Collectors).
+> 37a landed (registry, the service-token path, Team › Collectors); 37b
+> landed (inbox keys, drops, the collector client).
 
 ## The problem
 
@@ -50,7 +51,8 @@ drop           the collector checks the inbox key's signature against the leads 
                  ck      the content key sealed to the inbox public key (GV03)
                  meta    sealed to the inbox public key: name, type, size, SHA-256, intake,
                          and the collector's signature over
-                         stmt("gorani-collect-v1", case, item, SHA-256, size, intake digest)
+                         stmt("gorani-collect-v1", case, item, collector, SHA-256, size,
+                              name, type, source, method, collected-at, notes)
                  stamp   SHA-256 of that signature — the RFC 3161 imprint (29j), stamped at
                          collection time
                The signature travels sealed: in the clear it would let the server test a
@@ -104,6 +106,69 @@ reject         with a reason, audited; on an evidence case the object stays (wri
 - Team › Collectors: the list with each verdict in words, registration
   (paste what the collector's machine printed), approval (with the key's
   fingerprint to compare), revocation, and granting a managed case.
+
+## 37b as built
+
+- **Inbox keys** (`worker/src/family/inbox.rs`, registry migration v10;
+  `web/src/vault/inbox.ts`): a case manager makes a hybrid pair in the
+  browser, signs `stmt("gorani-inbox-v1", case, key digest)`, and seals the
+  private half under the case key into place `case.inbox(area, key id)`
+  (crates/formats › placed.rs, places.ts). A new key RETIRES the previous
+  one — kept, because items stay sealed to the key they arrived under. A
+  member opens an inbox key only with the case key, and only if it is the
+  key the registry's public halves describe (a real private half paired
+  with public halves of the server's would have collectors seal to the
+  server). A case-key rotation must carry every inbox key re-sealed under
+  the new key, in the same commit as the grants — the registry refuses a
+  set one short or one long (`family.rs › case_rekey`, `cases.ts ›
+  rotateCase`).
+- **The drop routes** (`routes.rs › route_collector`): `GET
+  /api/v1/collect/cases/<case>/inbox-key` (the current key, its signature
+  and the registry's identities), `POST …/items` (whole, GV02), `POST
+  …/items/uploads`, `PUT …/uploads/<u>/<n>`, `POST …/uploads/<u>/complete`
+  (GC01 frames, the size checked against the frames). Every request asks
+  the registry again — grant, open case, and for the record step the
+  CURRENT key — so a revoked grant or a rotated key stops drops at once.
+  The object key is `<case prefix>/inbox/<collector>/<item>`: an item id is
+  the collector's choice, so one collector's ids can never name another's
+  objects, and an id whose object exists is refused BEFORE anything is
+  written (storage would overwrite it; a refused record would then delete
+  the original).
+- **The case store** (`worker/src/inbox.rs`, member migration v16):
+  `inbox_items` holds the sealed key and record, the stamp imprint, and
+  what became of the item. Stamps (stamps.rs) and the evidence lock pass
+  (member.rs › lock_pass) cover inbox objects as they cover versions.
+  Members read the inbox at `GET /api/v1/cases/<case>/inbox` and an item's
+  bytes at `…/inbox/<item>` (Range passes through; the read is logged as
+  `inbox:<item>`, which no file id can spell).
+- **The collector** (`clients/core/src/collector.rs`, `gorani-sync
+  collector …`): `init` makes the identity key and a device secret held by
+  the TPM and/or keyring (devicekey.rs), seals the key and the service
+  token's secret under it, and MACs the profile — pins included — with a
+  second key from the same secret, so an edited profile is refused.
+  `collect` asks `whoami` (the token must be registered with THIS key),
+  checks the inbox key's signature against its pins plus one-hop
+  certificates (identity.rs › trust_rules, the members' own rules), then
+  seals, signs, stamps and sends — and appends a line to its own log.
+  Pins may be fingerprints (128 bits), resolved to full key ids against
+  the registry at use.
+
+- **Team › Cases** shows each case's inbox key (who made it, how many are
+  retired) and gives its managers "Make the inbox key" / "New inbox key".
+
+Limits, as built: a large drop does not resume — a stopped one is sent
+again as a new item (the stray upload is swept like a member's); the
+collector learns the registry's identity list (public keys and
+certificates — what it needs to check a manager's signature); and the
+store can still WITHHOLD an item, which only the collector's own log shows.
+
+What a member's client checks before calling an item verified
+(`inbox.ts › openInboxItem`): the sealed record names this case, this item,
+the collector that dropped it and the size the store counted; the collector
+is one two leads the MEMBER trusts registered (collectors.ts); its
+signature verifies over every field; the stamp imprint is over that
+signature; and, after decryption, the bytes hash to what it signed
+(`checkInboxContent`). Each failure is reported as what failed.
 
 ## Stages
 

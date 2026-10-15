@@ -305,6 +305,30 @@ pub const MIGRATIONS: &[&str] = &[
 	"ALTER TABLE file_versions ADD COLUMN stamp_imprint TEXT",
 	"ALTER TABLE file_versions ADD COLUMN stamp_token TEXT",
 	"ALTER TABLE file_versions ADD COLUMN stamped_at TEXT",
+	// Migration v16 (commit 37b, inbox.rs, docs/COLLECTORS.md): what
+	// collectors dropped into a case's inbox, sealed to its inbox key —
+	// waiting for a person to accept (into a file) or reject it.
+	"CREATE TABLE IF NOT EXISTS inbox_items (
+		id TEXT PRIMARY KEY,
+		collector_id TEXT NOT NULL,
+		inbox_key_id TEXT NOT NULL,
+		object_key TEXT NOT NULL,
+		size INTEGER NOT NULL,
+		chunk_size INTEGER,
+		ck_sealed TEXT NOT NULL,
+		meta_sealed TEXT NOT NULL,
+		stamp_imprint TEXT,
+		stamp_token TEXT,
+		stamped_at TEXT,
+		locked_until TEXT,
+		received_at TEXT NOT NULL,
+		accepted_at TEXT,
+		accepted_by TEXT,
+		accepted_file TEXT,
+		rejected_at TEXT,
+		rejected_by TEXT,
+		reject_reason TEXT
+	)",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -497,7 +521,29 @@ impl GoraniMemberDO {
 				}
 			}
 		}
-		report.pending = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE locked_until IS NULL", None)?.one::<crate::files_store::TotalCount>()?.n as u64;
+		// Collected evidence is write-once from receipt (commit 37b): the
+		// inbox objects of an evidence case are locked the same way.
+		let items: Vec<Unlocked> = self
+			.sql
+			.exec(&format!("SELECT id AS file_id, 0 AS version, object_key, strftime('%Y-%m-%dT%H:%M:%SZ', received_at, '+{days} days') AS until FROM inbox_items WHERE locked_until IS NULL ORDER BY received_at LIMIT 100"), None)?
+			.to_array()?;
+		for r in items {
+			match crate::s3::put_retention(&self.env, &r.object_key, &r.until).await {
+				Ok(lock) => {
+					let mark = match lock {
+						crate::s3::Lock::Locked => r.until.clone(),
+						crate::s3::Lock::BucketRule => "bucket-rule".to_string(),
+					};
+					self.sql.exec("UPDATE inbox_items SET locked_until = ?1 WHERE id = ?2", Some(vec![mark.into(), r.file_id.into()]))?;
+					report.locked += 1;
+				}
+				Err(e) => {
+					worker::console_error!("gorani: lock {} failed: {e}", r.object_key);
+					report.failed += 1;
+				}
+			}
+		}
+		report.pending = self.sql.exec("SELECT (SELECT COUNT(*) FROM file_versions WHERE locked_until IS NULL) + (SELECT COUNT(*) FROM inbox_items WHERE locked_until IS NULL) AS n", None)?.one::<crate::files_store::TotalCount>()?.n as u64;
 		Ok(report)
 	}
 }
@@ -760,6 +806,16 @@ impl GoraniMemberDO {
 				self.file_patch(&actor, &id["files/".len()..], body).await
 			}
 			("DELETE", id) if id.starts_with("files/") => self.file_trash(&actor, &id["files/".len()..]).await,
+			// ── The inbox (commit 37b, inbox.rs) ──
+			("POST", "inbox/receive") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.inbox_receive(&actor, body).await
+			}
+			("GET", "inbox/list") => self.inbox_list().await,
+			("GET", id) if id.starts_with("inbox-object/") => {
+				let q = crate::files_store::urlquery(req.url()?.query().unwrap_or(""));
+				self.inbox_object(&id["inbox-object/".len()..], &actor, q.get("client").map(String::as_str)).await
+			}
 			("POST", "uploads/start") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.upload_start(&actor, body).await

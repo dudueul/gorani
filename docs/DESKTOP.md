@@ -319,6 +319,26 @@ Two options of the TPM part, each a property of the sealed object itself
   loader update, and a part that dies at each one teaches people to turn
   the option off.
 
+### Commit 37b: the same binary as a collector
+
+`gorani-sync collector init|pin|whoami` and `gorani-sync collect` run an
+unattended **collector** (docs/COLLECTORS.md) — a separate profile
+(`~/.gorani-collector.json`), no member, no root, no store key:
+
+```text
+gorani-sync collector init --server https://files.example --id edr-1 \
+    --pins ana:3F2A9C1B…,cy:…  --access-id <service token Client ID>
+        → prints { id, publicKey, keyId, fingerprint } for the leads to register
+gorani-sync collect --case ir-2026-014 --file triage.zip \
+    --source WS-0412 --method "EDR live response" --collected-at 2026-10-15T08:30:00Z
+```
+
+The device-secret machinery is commit 34's, reused: the identity key and the
+service token's secret are sealed under a key from the device secret (TPM
+and/or keyring), the profile — pins included — MAC'd under another. The
+token's secret is read from `GORANI_COLLECTOR_SECRET` or asked for, never a
+flag (argv shows in `ps`).
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

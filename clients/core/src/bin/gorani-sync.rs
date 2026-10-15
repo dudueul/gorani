@@ -13,6 +13,18 @@
 //!       [--source S --collector W         with your signed content hash and the intake record
 //!        --method M --collected-at T      (where it came from, who collected it, how, when)
 //!        --notes X]
+//!
+//! collector init --server S --id I       a COLLECTOR on this machine (commit 37b,
+//!       --pins ana:FP,bo:FP              docs/COLLECTORS.md): its identity key, sealed under
+//!       [--access-id ID]                 the TPM/keyring; prints what the leads register.
+//!                                        The service token's secret: GORANI_COLLECTOR_SECRET,
+//!                                        else asked for
+//! collector pin --pins ana:FP            believe one more lead (the profile is re-MAC'd)
+//! collector whoami                       the registry's word on this collector
+//! collect --case C --file P [--name N]   drop a file into a case's inbox: sealed to its
+//!       [--type T] --source S --method M inbox key (checked against the pins), signed by
+//!       --collected-at T [--notes X]     this collector, stamped
+//!       [--item-id I]
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -93,6 +105,13 @@ fn run(args: &[String]) -> Result<(), Error> {
 	}
 	let flag = |k: &str| flags.get(k).cloned();
 	let req_flag = |k: &str| -> Result<String, Error> { flag(k).ok_or_else(|| Error::Config(format!("--{k} is required"))) };
+
+	// The collector's commands (commit 37b) — its own profile, no member's.
+	match (pos.first().map(String::as_str), pos.get(1).map(String::as_str)) {
+		(Some("collector"), Some(sub)) => return collector_cmd(sub, &flag),
+		(Some("collect"), _) => return collector_cmd("collect", &flag),
+		_ => {}
+	}
 
 	match pos.first().map(String::as_str) {
 		Some("setup") => {
@@ -364,6 +383,65 @@ fn run(args: &[String]) -> Result<(), Error> {
 			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified]");
 			std::process::exit(2);
 		}
+	}
+	Ok(())
+}
+
+fn collector_profile_path(flag: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+	flag("profile").map(PathBuf::from).unwrap_or_else(|| profile_path().with_file_name(".gorani-collector.json"))
+}
+
+/// `collector init|pin|whoami|collect` (clients/core/src/collector.rs).
+fn collector_cmd(sub: &str, flag: &dyn Fn(&str) -> Option<String>) -> Result<(), Error> {
+	use gorani_client_core::collector;
+	let path = collector_profile_path(flag);
+	let need = |k: &str| flag(k).ok_or_else(|| Error::Config(format!("--{k} is required")));
+	match sub {
+		"init" => {
+			if path.exists() {
+				return Err(Error::Config(format!("{} exists — this machine is already a collector (its key is registered; a new one would need registering again). Remove the file to start over.", path.display())));
+			}
+			let access_id = flag("access-id");
+			// The token's secret never on the command line (ps, shell history).
+			let access_secret = match (&access_id, std::env::var("GORANI_COLLECTOR_SECRET").ok()) {
+				(None, _) => None,
+				(Some(_), Some(s)) if !s.trim().is_empty() => Some(zeroize::Zeroizing::new(s.trim().to_string())),
+				(Some(_), _) => Some(zeroize::Zeroizing::new(read_secret("The service token's Client Secret: "))),
+			};
+			let want: devicekey::Want = flag("protect").as_deref().unwrap_or("auto").parse()?;
+			let tpm = tpm_options(flag)?;
+			let server = need("server")?;
+			let id = need("id")?;
+			let (profile, intro) = collector::init(collector::Init { server: &server, id: &id, pins: collector::parse_pins(&need("pins")?)?, access_id, access_secret, dev_collector: flag("dev-collector"), want, tpm: &tpm })?;
+			collector::save(&path, &profile)?;
+			eprintln!("collector {} ready ({}) — give the leads what follows; they compare the fingerprint with this screen before approving", intro.id, devicekey::label(&profile.protectors));
+			println!("{}", serde_json::json!({ "id": intro.id, "publicKey": intro.public_key, "keyId": intro.key_id, "fingerprint": intro.fingerprint }));
+		}
+		"pin" => {
+			let mut o = collector::open(collector::load(&path)?)?;
+			o.add_pins(collector::parse_pins(&need("pins")?)?)?;
+			collector::save(&path, &o.profile)?;
+			println!("pinned: {}", o.profile.pins.iter().map(|p| p.member.as_str()).collect::<Vec<_>>().join(", "));
+		}
+		"whoami" => {
+			let o = collector::open(collector::load(&path)?)?;
+			println!("{}", collector::whoami(&collector::CollectClient::new(&o))?);
+		}
+		"collect" => {
+			let o = collector::open(collector::load(&path)?)?;
+			let file = PathBuf::from(need("file")?);
+			let intake = collector::Intake {
+				name: flag("name").unwrap_or_else(|| file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+				mime: flag("type").unwrap_or_else(|| "application/octet-stream".into()),
+				source: flag("source").unwrap_or_default(),
+				method: flag("method").unwrap_or_default(),
+				collected_at: flag("collected-at").unwrap_or_default(),
+				notes: flag("notes").unwrap_or_default(),
+			};
+			let d = collector::collect(&o, &need("case")?, &file, &intake, flag("item-id"), &collector::log_path(&path))?;
+			println!("{}", serde_json::json!({ "item": d.item, "size": d.size, "sha256": d.sha256, "inboxKeyId": d.inbox_key_id, "parts": d.parts }));
+		}
+		other => return Err(Error::Config(format!("collector {other}: one of init, pin, whoami, collect"))),
 	}
 	Ok(())
 }

@@ -479,6 +479,48 @@ since an anchor, an expired anchor, a read-only area, the enumerators; and
 an unsigned `xcodebuild` of the app with the extension inside, the core
 linked into it.
 
+### 39d as built
+
+The device secret's parts (commit 34) in each system's own stores, under
+the same words — `--protect tpm+keyring` is the machine's hardware and the
+person's login on all three:
+
+| word | Linux | Windows | macOS |
+|---|---|---|---|
+| the hardware: `tpm` (`enclave` on a Mac) | TPM 2.0 through tpm2-tools: the part sealed under the chip's storage key | a 2048-bit RSA key made in the TPM's CNG provider (Platform Crypto Provider), never exportable; the part encrypted to it (OAEP-SHA256) | a P-256 key made in the Secure Enclave (CryptoKit); the part agreed (ECDH, then HKDF) with a peer key whose private half is dropped at once |
+| the login: `keyring` (also `dpapi`, `keychain`) | the Secret Service | DPAPI, user scope, with an entropy only this client passes | a generic password in the login Keychain |
+| a person each unlock: `hello` / `presence` | — (`--tpm-pin`) | Windows Hello: the part is SHA-256 of its signature over a stored challenge — RSA PKCS#1 v1.5 signs alike each time, and setup asks twice to prove it | the enclave key made with user presence (Touch ID or the password) |
+| what the profile keeps | the sealed blobs; an item reference | the key's name and the ciphertext; the DPAPI blob; the Hello key's name and challenge | the key's enclave-encrypted representation and the peer; an item reference |
+
+- **`auto` never prompts**: the hardware and the login where both answer. A
+  shell that starts at sign-in must not wait for a face, so a person's
+  gesture is asked for only when chosen (`--protect tpm+keyring+hello`). A
+  hardware store that answers but will not make a key leaves the login part
+  alone, and says so; the label printed at setup is the truth.
+- **What each does not do.** DPAPI's user keys open with the user's
+  password and the disk, and a domain's backup key opens them on a
+  domain-joined computer — so `auto` pairs DPAPI with the TPM wherever one
+  answers. And as on Linux, code already running as the user can ask
+  every store exactly as this client does; protectors defeat copies (a
+  backup, a stolen disk, the profile), not malware in the session.
+- **The Mac's helper.** CryptoKit is Swift's, so `gorani-keystore`
+  (clients/macos/GoraniKit) does the enclave and Keychain work for the
+  Rust client, which speaks to it as it speaks to tpm2-tools: parts on
+  pipes only. It is found by `GORANI_KEYSTORE`, beside the program, or on
+  PATH; the installer (39f) puts it beside `gorani-sync` and inside the
+  File Provider extension. A debug build can stand a software key in for
+  the enclave (CI's virtual Macs have none); such keys are marked
+  `software:` and the client refuses them outside its own tests.
+- **A profile from another system** says which system holds its part
+  instead of failing obscurely: a profile does not move between computers.
+- **Tests.** Windows' run on the runner with the core's unit tests: DPAPI
+  round trip and a changed blob refused, a CNG key in the software provider
+  (the TPM's same calls) held and deleted with its protector, the TPM's
+  where the runner has one, Hello's "not set up" message, `auto` never
+  asking a person. The Mac's: the helper built, then the client through it
+  — the enclave (or its stand-in) agreeing the same part again and another
+  peer not, the Keychain holding the part until forgotten, `auto`.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

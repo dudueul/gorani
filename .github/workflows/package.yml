@@ -1,17 +1,27 @@
 # Copyright 2026- Seongwoo Hong. All rights reserved.
 #
-# The installers (commit 39f, docs/DESKTOP.md › 39f): an MSIX for Windows
-# and the Mac app (app + File Provider extension + CLI + keystore helper),
-# each installed or run here exactly as a person would get it.
+# The installers (commit 39f–g, docs/DESKTOP.md › 39f–g, docs/INSTALL.md):
+# what a person installs, each installed or run here as they would.
 #
-# Signed only when the signing secrets exist — never asked for, never
-# printed. Without them: the MSIX is signed with a throwaway certificate
-# made and trusted on that runner alone (so the install is tested as a
-# signed one would be), and the Mac app is ad-hoc signed; both are for
-# testing. With them:
+#   Windows  gorani-store.msix              the Store's identity, unsigned — uploaded by hand to
+#                                           Partner Center (a private audience); Microsoft signs it
+#            gorani-windows-x64-unsigned.msix   Windows 11, Add-AppxPackage -AllowUnsigned
+#            gorani-windows-x64.zip         the two programs, no install
+#   macOS    gorani-macos-arm64-cli.tar.gz  gorani-sync and its keystore helper, unsigned
+#            Gorani-macOS-arm64.zip         the app with its Finder integration — only when signed
+#                                           (Developer ID: an extension cannot run unsigned)
 #
-#   Windows  WINDOWS_CERT_PFX (the code-signing .pfx, base64), WINDOWS_CERT_PASSWORD
-#   macOS    GORANI_TEAM_ID (a variable or a secret), APPLE_CERT_P12 (the Developer ID
+# The unsigned files are checked by their users instead: SHA256SUMS lists
+# them all, and on a tag this workflow leaves a DRAFT release holding them;
+# the release manager signs SHA256SUMS on their own machine
+# (tools/release/sign.sh — the key never comes here) and only that
+# publishes it. tools/release/verify.sh / verify.ps1 are what users run;
+# each platform's job runs them against its own files with a throwaway key.
+#
+# Settings, none ever asked for, none printed:
+#   Windows  variables STORE_IDENTITY_NAME, STORE_PUBLISHER, STORE_PUBLISHER_NAME — the
+#            identity Partner Center assigns when the app name is reserved (public values)
+#   macOS    GORANI_TEAM_ID (a variable or a secret), secrets APPLE_CERT_P12 (the Developer ID
 #            Application identity, base64), APPLE_CERT_PASSWORD; to notarize as well,
 #            APPLE_API_KEY (the App Store Connect .p8's text), APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
 #
@@ -19,11 +29,12 @@
 # — not on every push (macOS minutes count ten times).
 #
 # Supply chain: first-party actions only; the platforms' own tools
-# (makeappx, signtool, codesign, notarytool). One tool comes from outside —
-# XcodeGen, from the image's Homebrew — and it runs in a job of its own
-# that holds no secret; the signing job takes only the project it
-# generated, and refuses one with any script phase or build rule (a place
-# a tampered generator could hide a command).
+# (makeappx, signtool, codesign, notarytool, ssh-keygen, gh). One tool comes
+# from outside — XcodeGen, from the image's Homebrew — and it runs in a job
+# of its own that holds no secret; the signing job takes only the project
+# it generated, and refuses one with any script phase or build rule (a
+# place a tampered generator could hide a command). Only the draft-release
+# job may write, and only on a tag.
 
 name: package
 
@@ -31,7 +42,7 @@ on:
   push:
     branches: [main, "claude/**"]
     tags: ["v*"]
-    paths: ["clients/windows/packaging/**", "clients/macos/packaging/**", "clients/macos/project.yml", ".github/workflows/package.yml"]
+    paths: ["clients/windows/packaging/**", "clients/macos/packaging/**", "clients/macos/project.yml", "tools/release/**", ".github/workflows/package.yml"]
   workflow_dispatch:
 
 permissions:
@@ -47,11 +58,13 @@ env:
 
 jobs:
   windows:
-    name: MSIX (Windows)
+    name: Windows (Store package, unsigned MSIX, ZIP)
     runs-on: windows-latest
     timeout-minutes: 45
     env:
-      HAVE_CERT: ${{ secrets.WINDOWS_CERT_PFX != '' }}
+      STORE_NAME: ${{ vars.STORE_IDENTITY_NAME }}
+      STORE_PUBLISHER: ${{ vars.STORE_PUBLISHER }}
+      STORE_PUBLISHER_NAME: ${{ vars.STORE_PUBLISHER_NAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
@@ -65,65 +78,70 @@ jobs:
           restore-keys: cargo-release-${{ runner.os }}-
       - name: Release builds
         run: cargo build --release --locked -p gorani-windows -p gorani-client-core --bin gorani-cloud --bin gorani-sync
-      - name: Package and sign
+      - name: Package
         shell: pwsh
-        env:
-          PFX: ${{ secrets.WINDOWS_CERT_PFX }}
-          PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
-          $dir = Join-Path $env:RUNNER_TEMP 'sign'
-          New-Item -ItemType Directory $dir | Out-Null
-          $pfx = Join-Path $dir 'cert.pfx'
-          try {
-            if ($env:HAVE_CERT -eq 'true') {
-              [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX))
-              $password = $env:PFX_PASSWORD
-              $subject = (Get-PfxData -FilePath $pfx -Password (ConvertTo-SecureString $password -AsPlainText -Force)).EndEntityCertificates[0].Subject
-              $timestamp = @('/tr', 'http://timestamp.digicert.com', '/td', 'SHA256')
-              Write-Output "signing with the release certificate ($subject)"
-            } else {
-              # A throwaway certificate, trusted on this runner only, two days long.
-              $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Gorani Test Build' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(2)
-              $password = [guid]::NewGuid().ToString()
-              Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
-              Export-Certificate -Cert $cert -FilePath (Join-Path $dir 'test.cer') | Out-Null
-              Import-Certificate -FilePath (Join-Path $dir 'test.cer') -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
-              $subject = $cert.Subject
-              $timestamp = @()
-              Write-Output 'no signing secrets: a test package, signed with a throwaway certificate'
-            }
-            # a.b.c.d: the workspace's version and this run's number.
-            $base = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([0-9.]+)"').Matches[0].Groups[1].Value
-            $version = "$base.${{ github.run_number }}"
-            ./clients/windows/packaging/package.ps1 -Version $version -Publisher $subject -Out gorani.msix
-            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
-            & $signtool.FullName sign /fd SHA256 /f $pfx /p $password @timestamp gorani.msix
-            if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
-          } finally {
-            Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+          # The version: a tag's (v1.2.3), else the workspace's. The Store
+          # keeps a package's fourth number for itself (0); elsewhere it is
+          # this run's, so each build installs over the last.
+          $base = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([0-9.]+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v(\d+\.\d+\.\d+)$') { $base = $Matches[1] }
+          New-Item -ItemType Directory dist, store | Out-Null
+          # Unsigned: Windows installs a package without a signature only if
+          # its publisher carries this OID (and never as the signed identity).
+          ./clients/windows/packaging/package.ps1 -Version "$base.${{ github.run_number }}" -Name Gorani.Client `
+            -Publisher 'CN=Gorani Unsigned, OID.2.25.311729368913984317654407730594956997722=1' -Out dist/gorani-windows-x64-unsigned.msix
+          Compress-Archive -Path target/release/gorani-cloud.exe, target/release/gorani-sync.exe -DestinationPath dist/gorani-windows-x64.zip
+          if ($env:STORE_NAME -and $env:STORE_PUBLISHER) {
+            ./clients/windows/packaging/package.ps1 -Version "$base.0" -Name $env:STORE_NAME -Publisher $env:STORE_PUBLISHER `
+              -PublisherDisplayName ($env:STORE_PUBLISHER_NAME ? $env:STORE_PUBLISHER_NAME : 'Gorani') -Out store/gorani-store.msix
+          } else {
+            Write-Output 'no Store identity yet (variables STORE_IDENTITY_NAME, STORE_PUBLISHER): no Store package this run'
           }
-      - name: Install, run, remove — as a person gets it
+      - name: Install and run each, as a person would
         shell: pwsh
         run: |
-          Add-AppxPackage -Path gorani.msix
-          $p = Get-AppxPackage -Name Gorani.Client
-          if (-not $p) { throw 'the package did not install' }
-          Write-Output "installed $($p.PackageFullName)"
-          $apps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+          ./clients/windows/packaging/try-install.ps1 -Path dist/gorani-windows-x64-unsigned.msix -Name Gorani.Client -AllowUnsigned
+          $z = Join-Path $env:RUNNER_TEMP 'zip'
+          Expand-Archive dist/gorani-windows-x64.zip $z
           foreach ($cmd in 'gorani-cloud', 'gorani-sync') {
-            # (Each says how to use it, and exits non-zero: its words are checked.)
-            $said = & (Join-Path $apps "$cmd.exe") 2>&1 | Out-String
-            if ($said -notmatch "usage: $cmd") { throw "the installed $cmd did not answer: $said" }
-            Write-Output "$cmd answers from the package's alias"
+            $said = & (Join-Path $z "$cmd.exe") 2>&1 | Out-String
+            if ($said -notmatch "usage: $cmd") { throw "$cmd from the ZIP did not answer: $said" }
+            Write-Output "$cmd answers from the ZIP"
           }
-          Remove-AppxPackage -Package $p.PackageFullName
-          if (Get-AppxPackage -Name Gorani.Client) { throw 'the package did not uninstall' }
+          # The Store package as Microsoft's signature will make it: signed
+          # here by a throwaway certificate of the same publisher, trusted on
+          # this runner only — the uploaded file stays unsigned.
+          if (Test-Path store/gorani-store.msix) {
+            $dir = Join-Path $env:RUNNER_TEMP 'store-test'
+            New-Item -ItemType Directory $dir | Out-Null
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $env:STORE_PUBLISHER -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(2)
+            $password = [guid]::NewGuid().ToString()
+            Export-PfxCertificate -Cert $cert -FilePath "$dir/test.pfx" -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+            Export-Certificate -Cert $cert -FilePath "$dir/test.cer" | Out-Null
+            Import-Certificate -FilePath "$dir/test.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+            Copy-Item store/gorani-store.msix "$dir/store-test.msix"
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+            & $signtool.FullName sign /fd SHA256 /f "$dir/test.pfx" /p $password "$dir/store-test.msix"
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+            ./clients/windows/packaging/try-install.ps1 -Path "$dir/store-test.msix" -Name $env:STORE_NAME
+          }
           $global:LASTEXITCODE = 0
+      - name: The release check, on Windows (verify.ps1, a throwaway key)
+        shell: pwsh
+        run: ./tools/release/test-verify.ps1 -Files (Get-ChildItem dist -File).FullName
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.HAVE_CERT == 'true' && 'gorani-windows-msix' || 'gorani-windows-msix-test-signed' }}
-          path: gorani.msix
+          name: windows-release
+          path: dist/*
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          # (For Partner Center, by hand — not part of the release.)
+          name: windows-store-upload
+          path: store/gorani-store.msix
+          if-no-files-found: ignore
+          retention-days: 30
 
   macos-project:
     name: Xcode project (generated; no secrets in this job)
@@ -235,9 +253,77 @@ jobs:
           fi
           bin=$(cd clients/macos/GoraniKit && swift build -c release --show-bin-path)
           clients/macos/packaging/package.sh clients/macos/build/Build/Products/Release/Gorani.app \
-            target/release/gorani-sync "$bin/gorani-keystore" "$GITHUB_WORKSPACE/Gorani-macOS.zip"
+            target/release/gorani-sync "$bin/gorani-keystore" "$GITHUB_WORKSPACE/Gorani-macOS-arm64.zip"
+      - name: The unsigned CLI and helper
+        run: |
+          mkdir -p dist cli unpacked
+          bin=$(cd clients/macos/GoraniKit && swift build -c release --show-bin-path)
+          cp target/release/gorani-sync "$bin/gorani-keystore" cli/
+          tar -C cli -czf dist/gorani-macos-arm64-cli.tar.gz gorani-sync gorani-keystore
+          # As a person gets it: unpacked, asked. (gorani-sync finds the
+          # helper beside itself.)
+          tar -C unpacked -xzf dist/gorani-macos-arm64-cli.tar.gz
+          usage=$(unpacked/gorani-sync 2>&1 || true)
+          grep -q "usage: gorani-sync" <<<"$usage" || { echo "the unpacked CLI does not answer: $usage"; exit 1; }
+          unpacked/gorani-keystore probe
+          # The app joins the release only signed: unsigned, its extension
+          # cannot run (it stays a test artifact below).
+          if [ "$HAVE_SIGNING" = "true" ]; then mv Gorani-macOS-arm64.zip dist/; fi
+      - name: The release check, on macOS (verify.sh, a throwaway key)
+        run: tools/release/test-verify.sh dist/*
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.HAVE_SIGNING == 'true' && 'gorani-macos-app' || 'gorani-macos-app-unsigned' }}
-          path: Gorani-macOS.zip
+          name: macos-release
+          path: dist/*
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: env.HAVE_SIGNING != 'true'
+        with:
+          name: macos-app-unsigned-test
+          path: Gorani-macOS-arm64.zip
+          retention-days: 7
+
+  checksums:
+    name: SHA256SUMS (and the check, over the whole release)
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release"
+          merge-multiple: true
+          path: dist
+      - name: SHA256SUMS
+        run: |
+          files=$(ls dist)
+          tools/release/test-verify.sh $(printf 'dist/%s ' $files)
+          (cd dist && sha256sum $files >SHA256SUMS)
+          cat dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+          retention-days: 30
+
+  draft-release:
+    name: A draft release, for the release manager to sign
+    needs: checksums
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: Draft (unsigned until tools/release/sign.sh)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "Gorani $GITHUB_REF_NAME" \
+            --notes "A draft until the release manager signs it: tools/release/sign.sh $GITHUB_REF_NAME. Install nothing from a release without SHA256SUMS.sig — check every download with tools/release/verify.sh or verify.ps1 (docs/INSTALL.md)."

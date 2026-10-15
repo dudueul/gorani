@@ -2,11 +2,14 @@
 <!--
   Copyright 2026- Seongwoo Hong. All rights reserved.
 
-  The Windows package (commit 39f, docs/DESKTOP.md › 39f): gorani-cloud
+  The Windows package (commit 39f, docs/DESKTOP.md › 39f–g): gorani-cloud
   (the Explorer folder) and gorani-sync (the CLI), full trust, each as a
   console command on PATH through an execution alias. package.ps1 fills
-  @VERSION@ (a.b.c.d) and @PUBLISHER@ (the signing certificate's subject —
-  a package's publisher must be exactly the certificate's).
+  in the identity (name, publisher, its display name) and the version
+  (a.b.c.d). Two identities are built (39g): the Store's, exactly as
+  Partner Center assigned it (Microsoft signs that package), and the
+  unsigned one, whose publisher carries the OID Windows requires of a
+  package installed without a signature.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -15,10 +18,10 @@
   xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap uap5 desktop4 rescap">
-  <Identity Name="Gorani.Client" Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="x64" />
+  <Identity Name="@NAME@" Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>Gorani</DisplayName>
-    <PublisherDisplayName>Gorani</PublisherDisplayName>
+    <PublisherDisplayName>@PUBLISHER_NAME@</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   <Dependencies>

@@ -62,6 +62,12 @@ impl From<std::io::Error> for Error {
 	}
 }
 
+/// The team's own deployment (commit 39j): where `gorani-sync setup` and
+/// `collector init` point unless `--server` names another — the Worker's
+/// custom domain in wrangler.jsonc. Only enrolment reads it: an enrolled
+/// computer keeps the server it enrolled with in its profile.
+pub const DEFAULT_SERVER: &str = "https://gorani.at.day";
+
 /// The persisted device profile (the CLI keeps it in a JSON file next to
 /// its state; platform shells put it in their credential stores).
 ///

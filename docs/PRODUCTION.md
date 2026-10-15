@@ -2,6 +2,73 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 
+## 0. The checklist: https://gorani.at.day from nothing
+
+Every step in order, every setting the Worker reads; the sections after
+this one explain each. The Worker is deployed by hand, from a machine
+with `wrangler` signed in to the Cloudflare account — no CI job holds a
+Cloudflare token. (GitHub Actions only builds the desktop programs: their
+settings are in § 3 › The desktop installers.)
+
+1. **The account.** The Cloudflare account that holds the `at.day` zone
+   (the Worker's custom domain must live in the same account), on
+   **Workers Paid** (§ 3 › Which Workers plan), with a Zero Trust team
+   (free up to 50 people) — its team domain is
+   `https://<team>.cloudflareaccess.com`.
+2. **Storage** (§ 1): either an R2 bucket — uncomment `r2_buckets` in
+   `wrangler.jsonc`, nothing else to set — or an S3-compatible bucket and
+   its five secrets below. For evidence, a bucket created with Object Lock.
+3. **Access** (§ 2): a self-hosted application for `gorani.at.day`; an
+   Allow policy for the team; a Bypass for `/s/*`, `/s.html`, `/r.html` and
+   `/api/healthz`; its *Application Audience (AUD) Tag* is `POLICY_AUD`.
+4. **Deploy** (§ 3):
+
+   ```sh
+   npm install && npm --prefix web install
+   npx wrangler login
+   npx wrangler secret put POLICY_AUD          # and every other secret below
+   npm run deploy                              # builds web/ and the Worker; attaches gorani.at.day
+   ```
+
+   (Before the first deploy, `secret put` offers to create the Worker
+   so it can hold the secret — say yes; the deploy then fills it in.)
+5. **Bootstrap** (§ 3 › Steps): `BOOTSTRAP_TOKEN`, then the first member
+   (a parent/lead) through Access with that token; delete the secret after.
+6. **Check**: `curl https://gorani.at.day/api/healthz`; sign in at
+   https://gorani.at.day; enrol a computer (`gorani-sync setup`, docs/INSTALL.md).
+
+**Secrets** — `npx wrangler secret put NAME` (never in `wrangler.jsonc`:
+a name cannot be both a var and a secret, § 1):
+
+| Secret | When | What / where it comes from |
+|---|---|---|
+| `POLICY_AUD` | **always** | the Access application's AUD tag — without it and `TEAM_DOMAIN` every request is refused (auth.rs fails closed) |
+| `TEAM_DOMAIN` | **always** | `https://<team>.cloudflareaccess.com` (the full `…/cdn-cgi/access/certs` URL works too) |
+| `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_KEY` | **unless R2 is bound** | the bucket, `https://` only, and a key scoped to it (§ 1; `S3_SECRET_ACCESS_KEY` is read too) |
+| `BOOTSTRAP_TOKEN` | first run | `openssl rand -base64 32`; needed once to create the first member, meaningless after — delete it |
+| `SIEM_TOKEN` | with `SIEM_URL` | the collector's token (§ 3 › The SIEM feed) |
+| `TSA_AUTHORIZATION` | if the timestamp authority wants one | the `Authorization` header value it gives you (§ 3 › Trusted timestamps) |
+| `MALWAREBAZAAR_AUTH_KEY` | for the hash lookup | an abuse.ch account's Auth-Key; without it the button says the lookup is off (§ 3 › Upload links) |
+| `VAULT_DESTROY_ENABLED` | almost never | any value ARMS crypto-shredding (`DELETE /api/v1/members/<id>/vault?confirm=DESTROY VAULT KEY` erases a vault's key for good). Unset, every such call is refused — leave it unset except for the minutes a deliberate destruction takes |
+
+**Vars** — `wrangler.jsonc › vars` (public values, committed):
+
+| Var | Default | What |
+|---|---|---|
+| `PUBLIC_ORIGIN` | `https://gorani.at.day` | the deployment's address, beside `routes` |
+| `CACHE_MAX_OBJECT_MB`, `CACHE_TTL_DAYS` | `256`, `30` | the Cache API in front of the bucket (§ 1 › Object caching) |
+| `OBJECT_LOCK`, `EVIDENCE_RETAIN_DAYS` | `off`, `2557` | write-once evidence — `on` only for an Object Lock bucket (§ 3) |
+| `SIEM_URL`, `SIEM_FORMAT` | empty, `ndjson` | the SIEM feed; empty is off (§ 3) |
+| `TSA_URL` | empty | an RFC 3161 authority; empty is off (§ 3) |
+| `REVERIFY_DAYS` | `30` (not in the file) | how long an evidence case may go without a client re-hashing it before the nightly pass flags it |
+| `MALWAREBAZAAR_URL` | abuse.ch's API (not in the file) | for pointing the lookup elsewhere (tests point it at a stub) |
+| `GORANI_DEV` | — | **never in production**: `.dev.vars` only; the Worker refuses dev mode whenever `POLICY_AUD` is set |
+
+Already in `wrangler.jsonc`, nothing to do: the custom domain
+(`routes`; `workers_dev` and `preview_urls` off), the static app
+(`assets`), the Durable Objects and their migrations, the two rate
+limiters, the nightly cron (03:17 UTC), observability.
+
 ## 1. Object storage (MinIO — or R2, the priority path)
 
 **Storage priority.** When `wrangler.jsonc` binds an R2 bucket (uncomment
@@ -145,7 +212,9 @@ memory.
 
 ## 2. Cloudflare Access (the perimeter)
 
-1. Enable Access on the Worker (one-click modal or manual app).
+1. Enable Access on the Worker's host, **gorani.at.day** (commit 39j —
+   the custom domain `wrangler.jsonc › routes` attaches; one-click modal
+   or a self-hosted application for that hostname).
 2. `wrangler secret put POLICY_AUD` and `TEAM_DOMAIN` from the modal — the
    Worker verifies every request's JWT (issuer, audience, expiry, signature
    against the team JWKS) and **fails closed** when they are missing.
@@ -159,7 +228,7 @@ memory.
    `/api/healthz`.
 5. Desktop clients sign in as their **member** (commit 33a): install
    `cloudflared` on the computer and set the profile's `accessTokenCmd` to
-   `cloudflared access token -app=https://<your gorani host>` (or export
+   `cloudflared access token -app=https://gorani.at.day` (or export
    `GORANI_ACCESS_TOKEN`). The client sends the member's short-lived token
    as `cf-access-token`; Access validates it and the Worker receives the
    member's JWT — email included. *(Commit 33a also fixed the Worker's
@@ -196,8 +265,9 @@ memory.
      Client Secret is shown once. Give the Access application a policy
      with the action **Service Auth** that includes that token (one token
      per machine; never share one between collectors).
-   - On the machine: `gorani-sync collector init --server https://<host>
-     --id <id> --pins <lead>:<fingerprint>,… --access-id <Client ID>`,
+   - On the machine: `gorani-sync collector init --id <id> --pins
+     <lead>:<fingerprint>,… --access-id <Client ID>` (the server is
+     https://gorani.at.day unless `--server` names another),
      with the Client Secret in `GORANI_COLLECTOR_SECRET` or typed when
      asked (never a flag). Pins are the leads whose fingerprints you
      compared at the machine; it believes a case's inbox key only through
@@ -254,6 +324,20 @@ limit from that.
 npm install && npm --prefix web install
 npm run deploy          # builds web/ + the Rust worker (worker-build)
 ```
+
+**The host** (commit 39j): the deploy attaches **https://gorani.at.day**
+as the Worker's custom domain (`wrangler.jsonc › routes`, `custom_domain`)
+— the `at.day` zone must be in the same Cloudflare account; Cloudflare
+makes the DNS record and the certificate. The `workers.dev` address and
+preview URLs are off (`workers_dev`, `preview_urls`): Access fronts the
+custom domain only, so nothing else should answer. The desktop clients
+enrol against it by default (`gorani-sync setup` without `--server`).
+Another deployment changes the route, `PUBLIC_ORIGIN` and
+`clients/core › DEFAULT_SERVER` together — or keeps the default and passes
+`--server`. Moving an existing deployment to a new host: passkeys are bound
+to the hostname, so each person enrols theirs again (passwords and recovery
+methods are unaffected); a computer's profile keeps the server it enrolled
+with (its `server` field).
 
 First-run bootstrap (commit 25, O18): set a one-time secret first —
 

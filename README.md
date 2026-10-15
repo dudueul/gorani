@@ -27,7 +27,8 @@ build order is the lesson plan — see [docs/COURSE.md](docs/COURSE.md), the
 architecture map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and
 NOTICE lists the Apache-2.0-derived portions.
 
-**Desktop downloads:** the [Releases](https://github.com/dudueul/gorani/releases/latest)
+**The app:** https://gorani.at.day (behind Cloudflare Access). **Desktop
+downloads:** the [Releases](https://github.com/dudueul/gorani/releases/latest)
 page — Latest is always the newest build (Windows, macOS, Linux; unsigned,
 with a signed SHA256SUMS). Check before running anything:
 [docs/INSTALL.md](docs/INSTALL.md).

@@ -4,7 +4,8 @@
 //! commands stay (scriptability, tests, power users).
 //!
 //! ```text
-//! setup                                   enrol this computer (the device's wrapped root copy)
+//! setup [--server S]                     enrol this computer (the device's wrapped root copy);
+//!                                         S: https://gorani.at.day unless named (DEFAULT_SERVER)
 //! cases                                   the cases you are granted: kind, permission, title, state
 //! ls    [--case C]                        the change feed of your area, or of case C
 //! pull  --id F [--case C] [--out O]       a file, decrypted to disk — and, where its uploader
@@ -32,7 +33,7 @@
 //!                                        stdin/stdout, one JSON request per line — what the
 //!                                        Windows and macOS shells call; tests drive it
 //!
-//! collector init --server S --id I       a COLLECTOR on this machine (commit 37b,
+//! collector init [--server S] --id I     a COLLECTOR on this machine (commit 37b,
 //!       --pins ana:FP,bo:FP              docs/COLLECTORS.md): its identity key, sealed under
 //!       [--access-id ID]                 the TPM/keyring; prints what the leads register.
 //!                                        The service token's secret: GORANI_COLLECTOR_SECRET,
@@ -135,7 +136,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 	match pos.first().map(String::as_str) {
 		Some("setup") => {
 			let mut profile = DeviceProfile {
-				server: req_flag("server")?,
+				server: flag("server").unwrap_or_else(|| gorani_client_core::DEFAULT_SERVER.into()),
 				member: req_flag("member")?,
 				device_id: String::new(),
 				token: String::new(),
@@ -567,7 +568,7 @@ fn collector_cmd(sub: &str, flag: &dyn Fn(&str) -> Option<String>) -> Result<(),
 			};
 			let want: devicekey::Want = flag("protect").as_deref().unwrap_or("auto").parse()?;
 			let tpm = tpm_options(flag)?;
-			let server = need("server")?;
+			let server = flag("server").unwrap_or_else(|| gorani_client_core::DEFAULT_SERVER.into());
 			let id = need("id")?;
 			let (profile, intro) = collector::init(collector::Init { server: &server, id: &id, pins: collector::parse_pins(&need("pins")?)?, access_id, access_secret, dev_collector: flag("dev-collector"), want, tpm: &tpm })?;
 			collector::save(&path, &profile)?;

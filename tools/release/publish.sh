@@ -97,6 +97,8 @@ done >"$notes.files"
 	else
 		echo "**Not signed.** No release signing key was set when this was built (the secret \`RELEASE_SIGNING_KEY\`), so there is no \`SHA256SUMS.sig\` and \`verify.sh\` refuses this release. \`SHA256SUMS\` alone shows only that a file arrived intact from this page — not who made it."
 	fi
+	echo
+	echo "Then enrol the computer once against the team's server, https://gorani.at.day (the default): \`gorani-sync setup --member <your member id> --access-token-cmd \"cloudflared access token -app=https://gorani.at.day\"\`."
 } >"$notes"
 
 if [ -n "$dry" ]; then

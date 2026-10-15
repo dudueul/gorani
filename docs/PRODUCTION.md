@@ -394,9 +394,13 @@ tsa.pem` — the imprint is SHA-256 of the version's `hashRecord.signature`
 Upload links need nothing configured: the pages are built with the app,
 the routes are the Worker's, and `/s/r/*` rides the same Access bypass as
 the share pages (§ 2). On a dedicated share hostname (above), route
-`/s/*` there and both kinds of link work from it. The WAF rule above
-should cover `/s/r/*` too — the Worker's own limit is 60 requests a
-minute per caller and link, and a link locks after ten wrong passwords.
+`/s/*` there and both kinds of link work from it. An edge rate-limiting
+rule for `/s/r/*` must leave out the frames of a large upload —
+`PUT /s/r/<id>/uploads/<upload>/<n>`, one request per 8 MiB (a 10 GiB
+file is 1 280 of them) — or limit them far more loosely: the Worker's own
+limit (60 a minute per caller and link) skips them for that reason, and
+the sender's page waits out a 429 on a frame. What the limits protect is
+the password, and a link locks after ten wrong ones whatever the rate.
 
 The opt-in hash lookup ("Ask MalwareBazaar" in the inbox, `gorani-sync
 accept --check-hash`) needs an abuse.ch Auth-Key, as a **secret**:

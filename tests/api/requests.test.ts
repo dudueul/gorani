@@ -40,7 +40,9 @@
  *  10. the opt-in hash lookup sends MalwareBazaar the SHA-256 and the
  *      Auth-Key — nothing else — and the registry's audit records the
  *      lookup without the hash;
- *  11. the upload page is served under the share page's CSP.
+ *  11. the upload page is served under the share page's CSP; a link's
+ *      routes are rate limited — except a large file's frames, one request
+ *      per 8 MiB, which a limit of 60 a minute would stop halfway.
  */
 
 import assert from "node:assert/strict";
@@ -408,6 +410,16 @@ try {
 	assert.match(page.headers.get("content-security-policy") ?? "", /trusted-types 'none'/, "the share page's policy: no Trusted Types policy at all");
 	assert.equal(page.headers.get("referrer-policy"), "no-referrer");
 	assert.equal((await fetch(`${dev.base}/s/r/not-an-id`)).status, 404);
+
+	// The limit (60 a minute per caller and link) — and the frames it leaves out.
+	const linkE = await createRequestLink(call(bo), freshKey, "bo", { ...boKey, retiredAt: null }, { origin: dev.base, label: "limits", note: "", password, days: 1, maxFiles: 1, maxBytes: MiB });
+	const senderE = await openLink(dev.base, linkE.link);
+	const tE = await sendToken(senderE, password);
+	const frames = await Promise.all(Array.from({ length: 70 }, (_, n) => fetch(`${dev.base}/s/r/${linkE.row.id}/uploads/no-such-upload/${n + 1}`, { method: "PUT", headers: { "x-gorani-request-send": tE }, body: new Uint8Array(1) }).then((r) => r.status)));
+	assert.ok(!frames.includes(429), `frames are never rate limited (got ${[...new Set(frames)].join(", ")})`);
+	const metas: number[] = [];
+	for (let n = 0; n < 70 && !metas.includes(429); n++) metas.push((await fetch(`${dev.base}/s/r/${linkE.row.id}/meta`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ view: "x" }) })).status);
+	assert.ok(metas.includes(429), "…the rest of a link's routes are");
 
 	console.log("ok  api:requests — area inbox keys, links with passwords and limits, key substitution refused, lockout, whole + framed uploads, samples by default, case links by managers, rotation, the hash lookup sends the hash only");
 } finally {

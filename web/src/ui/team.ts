@@ -28,7 +28,9 @@ import { approveRequest, requestApproval, verifyApproval, type Approval, type Ap
 import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
 import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
 import { approveCollector, collectorVerdict, requestCollector, type CollectorRow } from "../vault/collectors.ts";
-import { acceptInboxItem, createInboxKey, hashInboxContent, openInboxItem, openInboxKeys, rejectInboxItem, type InboxItem, type OpenedItem } from "../vault/inbox.ts";
+import { acceptInboxItem, createInboxKey, hashInboxContent, linkOf, openInboxItem, openInboxKeys, rejectInboxItem, type InboxItem, type OpenedItem } from "../vault/inbox.ts";
+import { listRequests, openRequestLabel } from "../vault/requests.ts";
+import { caseArea } from "../lib/area.ts";
 import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
@@ -598,8 +600,13 @@ export class GoraniTeam extends LitElement {
 								const r = await fetch(`/api/v1/cases/${c.id}/inbox/${item.id}`, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web-inbox" } });
 								if (!r.ok || !r.body) throw new Error(`download failed: ${r.status}`);
 								const content = await hashInboxContent(opened!, item, r.body);
-								const keys = await openInboxKeys(await this.caseKey(c), c.id, c.inboxKeys ?? []);
-								await acceptInboxItem(this.call, await this.caseKey(c), keys, c.id, item, opened!, content, this.team.signer);
+								const caseKey = await this.caseKey(c);
+								const keys = await openInboxKeys(caseKey, c.id, c.inboxKeys ?? []);
+								// An upload link's item goes into the link's folder, its label in the intake (commit 38).
+								const link = linkOf(item);
+								const row = link ? (await listRequests(this.call, caseArea(c.id))).find((r) => r.id === link) : undefined;
+								const linkLabel = row ? await openRequestLabel(caseKey, caseArea(c.id), row).catch(() => undefined) : undefined;
+								await acceptInboxItem(this.call, caseKey, keys, c.id, item, opened!, content, this.team.signer, { folderId: row?.folderId ?? undefined, linkLabel });
 								await this.loadInbox(c);
 								return opened!.kind === "request"
 									? `${opened!.meta.name} is in ${c.id} as a malware sample: its bytes matched what the sender declared, and you signed them.`

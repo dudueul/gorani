@@ -174,14 +174,26 @@ export async function sendFile(link: OpenLink, token: string, file: Sendable, fr
 	return { item, name: file.name, size: file.size, sha256 };
 }
 
-/** One frame; a dropped connection is tried again (twice), a refusal is not. */
+/**
+ * One frame; a dropped connection is tried again (twice), a refusal is not
+ * — except "too many requests" (429, from an edge rule in front of the
+ * Worker: docs/PRODUCTION.md), which is waited out as the answer says, up
+ * to five times.
+ */
 async function putPart(fetchFn: Fetch, url: string, headers: Record<string, string>, frame: Uint8Array): Promise<{ partNumber: number; etag: string }> {
-	for (let attempt = 0; ; attempt++) {
+	let dropped = 0;
+	let slowed = 0;
+	for (;;) {
 		let r: Response;
 		try {
 			r = await fetchFn(url, { method: "PUT", headers: { ...headers, "content-type": "application/octet-stream" }, body: frame as BodyInit });
 		} catch (e) {
-			if (attempt >= 2) throw e;
+			if (++dropped > 2) throw e;
+			continue;
+		}
+		if (r.status === 429 && ++slowed <= 5) {
+			const wait = Math.min(60, Math.max(1, Number(r.headers.get("retry-after")) || 5));
+			await new Promise((resolve) => setTimeout(resolve, wait * 1000));
 			continue;
 		}
 		if (!r.ok) throw await refusal(r);

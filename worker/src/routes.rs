@@ -964,8 +964,17 @@ async fn request_create(mut req: Request, env: Env, identity: &Identity, area: &
 /// uploader's browser to the area's inbox key; nothing here can open them.
 async fn public_request(mut req: Request, env: Env, segs: &[&str]) -> Result<Response> {
 	let Some(id) = segs.get(1).filter(|i| crate::requests::is_request_id(i)).map(|i| i.to_string()) else { return http_text(404, "no such link").await };
-	if let Some(limited) = rate_limited(&env, "SHARE_LIMITER", format!("request:{}:{id}", client_ip(&req))).await {
-		return Ok(limited);
+	// Rate limited per caller and link — except a large file's frames: one
+	// request per 8 MiB, so a 10 GiB file is 1 280 of them, and a limit of 60
+	// a minute would stop it halfway. Leaving them out costs nothing a limit
+	// was buying: each frame still carries the send token, a wrong one still
+	// counts toward the link's lock, and a frame names an upload that only a
+	// right token could have started.
+	let frame = req.method() == Method::Put && segs.len() == 5 && segs[2] == "uploads";
+	if !frame {
+		if let Some(limited) = rate_limited(&env, "SHARE_LIMITER", format!("request:{}:{id}", client_ip(&req))).await {
+			return Ok(limited);
+		}
 	}
 	let mut found = forward_family(&env, "", "GET", format!("request-area/{id}"), None).await?;
 	let found: serde_json::Value = found.json().await?;

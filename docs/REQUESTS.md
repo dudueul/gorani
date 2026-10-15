@@ -1,7 +1,7 @@
 # Upload links — outsiders send files into a folder or a case
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
-> Status: designed (decisions below, 2026-10-15); built in stages 38a–38d.
+> Status: built (commit 38, stages 38a–38d — decisions below, 2026-10-15).
 
 ## The problem
 
@@ -83,3 +83,73 @@ accept           a member with write access, after looking (and scanning): a new
 | 38b | Upload links: the record and index, the owner's routes, the public routes, the upload page. |
 | 38c | Accepting an outsider's item (as a sample by default), the CLI's `--scan` hook, the MalwareBazaar lookup. |
 | 38d | Tests (API, browser) and the docs. |
+
+## Using it
+
+**In the web app** — the explorer's toolbar has **📥 Inbox**; a folder's
+context menu has **Request files into this folder…**. The dialog's
+**Links** tab makes a link (label, note, password, days, files, size),
+shows it once with its password, and lists the area's links (what each
+took, wrong passwords, open / locked / full / expired / revoked) with
+Revoke. The **Inbox** tab lists what arrived: who the sender says they
+are and what they wrote; **Check hash** decrypts the item in the tab and
+compares its SHA-256 with the declaration; **Ask MalwareBazaar** sends
+that SHA-256 (only that) through the Worker; **Accept** files it — "File
+as a malware sample" is ticked by default; **Reject** seals the reason. A
+member's own area makes its inbox key on the first link; a case's is made
+by a manager (Team › Cases › Make the inbox key), and only a manager
+makes a link into a case. Team › Cases › Inbox shows a case's link items
+beside the collectors'.
+
+**The sender** opens the link, reads the note, types the password, their
+name and a message, chooses files and presses **Seal and send**. Each
+file shows its SHA-256 when it is sent — their receipt.
+
+**From the command line** (`gorani-sync`, docs/DESKTOP.md):
+
+```sh
+gorani-sync inbox                                   # your own inbox (or --case C)
+gorani-sync inbox --item I --check-hash             # decrypt + hash here; ask MalwareBazaar
+gorani-sync accept --item I --scan "clamscan --no-summary"
+gorani-sync accept --item I --as-file --check-hash  # a normal file — unless the hash is known
+gorani-sync reject --item I --reason "not what we asked for"
+```
+
+`--scan` writes the decrypted bytes to a private temporary file (its
+directory 0700, the file 0600, removed afterwards), runs the command on it
+**without a shell** — `{}` in the command is replaced by the path,
+otherwise the path is the last argument — and files nothing when the
+command exits non-zero (ClamAV exits 1 on a find, 2 on an error: both
+refuse). The plaintext touches the disk for the length of the scan: that is
+what a scanner needs, and why the hook is asked for, never on by default.
+
+## Operating it
+
+- **The hash lookup** needs the `MALWAREBAZAAR_AUTH_KEY` secret (or
+  `Bazaar_Abuse_Ch_Key`); without it the lookup answers 503. Each lookup is
+  a `malware.lookup` line on the registry's trail — who asked and whether
+  it was known, never the hash (docs/PRODUCTION.md › Upload links).
+- **Access**: `/s/r/*` is public like `/s/f/*` — the same bypass.
+- **Audit**: `request.create`, `request.revoke`, `request.locked` in the
+  area's trail; `inbox.receive`, `inbox.accept`, `inbox.reject` as for
+  collectors; the uploads themselves as `upload-link:<id>`.
+- **Rotation**: a store-key rotation re-seals the area's inbox key and the
+  links' labels with everything else (rotation.ts) — the links keep
+  working. After a suspected compromise, make a new inbox key and revoke
+  the links: a rotation moves a key, it does not replace it.
+
+## The files
+
+| Where | What |
+|---|---|
+| worker/src/requests.rs | the link record, the owner's routes, the public checks, the reservation |
+| worker/src/routes.rs › request_create, public_request | the registry index, a case link's key check, the page and the upload routes |
+| worker/src/malware.rs | the hash lookup |
+| web/src/vault/requests.ts | making, listing, revoking and parsing links |
+| web/src/vault/request-upload.ts | the sender: open, check the key, seal, send (the page and the suite share it) |
+| web/src/vault/inbox.ts | area inbox keys; opening, accepting and rejecting any area's items |
+| web/r.html, web/src/request-page.ts | the upload page |
+| web/src/ui/files/requests-dialog.ts | the explorer's Upload links & inbox dialog |
+| clients/core/src/inbox.rs, scan.rs | the CLI's inbox and the scanner hook |
+| tests/api/requests.test.ts, tests/e2e/app.test.mjs › 4b | the proofs |
+

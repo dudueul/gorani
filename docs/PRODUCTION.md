@@ -153,8 +153,10 @@ memory.
    IdP). Each member's Access email is registered on their member row
    (`POST /api/v1/family/members` with `emails`).
 4. **Bypass for the public share surface**: the Access application needs an
-   exception for `/s/*` (and `/s.html`) — the share pages authenticate with
-   the link's fragment secret, not Access. Same for `/api/healthz`.
+   exception for `/s/*` (and `/s.html`, `/r.html`) — the share pages and the
+   upload-link pages (`/s/r/*`, commit 38) authenticate with the link's
+   fragment secret, not Access: a sender has no account. Same for
+   `/api/healthz`.
 5. Desktop clients sign in as their **member** (commit 33a): install
    `cloudflared` on the computer and set the profile's `accessTokenCmd` to
    `cloudflared access token -app=https://<your gorani host>` (or export
@@ -387,6 +389,33 @@ an hour). By hand, a token checks with OpenSSL: save it (base64 → DER) and
 tsa.pem` — the imprint is SHA-256 of the version's `hashRecord.signature`
 (base64-decoded) or of the checkpoint's bytes.
 
+### Upload links and the hash lookup (commit 38, docs/REQUESTS.md)
+
+Upload links need nothing configured: the pages are built with the app,
+the routes are the Worker's, and `/s/r/*` rides the same Access bypass as
+the share pages (§ 2). On a dedicated share hostname (above), route
+`/s/*` there and both kinds of link work from it. The WAF rule above
+should cover `/s/r/*` too — the Worker's own limit is 60 requests a
+minute per caller and link, and a link locks after ten wrong passwords.
+
+The opt-in hash lookup ("Ask MalwareBazaar" in the inbox, `gorani-sync
+accept --check-hash`) needs an abuse.ch Auth-Key, as a **secret**:
+
+```sh
+npx wrangler secret put MALWAREBAZAAR_AUTH_KEY
+```
+
+(`Bazaar_Abuse_Ch_Key` is read too — the name this deployment's owner
+chose; set one, not both.) Without it the lookup answers 503 and says
+how to turn it on; nothing else changes. What leaves: the SHA-256 a
+member's client computed from the decrypted bytes, when they press the
+button — never a byte, a name or who sent it. Each lookup is a
+`malware.lookup` line on the registry's trail, without the hash (the
+trail reaches the SIEM). Use is under abuse.ch's fair-use terms; it is a
+button, not a pipeline. The scanner that looks at the BYTES is local:
+`gorani-sync accept --scan "clamscan --no-summary"` on the accepting
+member's machine (docs/REQUESTS.md › Scanning).
+
 ### Upgrading across commit 29 (the audit trails)
 
 `wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration
@@ -445,6 +474,14 @@ Object's SQLite size. Strategy: retention (built), the reserved
 `GoraniFilesDO` split, sharding — see `docs/ARCHITECTURE.md › Growth`.
 
 ## 6. Known gaps
+
+- Upload links (commit 38): an upload does not resume (a dropped one is sent
+  again); the server can withhold an item — the sender's page shows what it
+  sent (the SHA-256 receipt), so a sender can ask; what a sender declares
+  (their name, the file's name and type) is their word, signed by nobody —
+  the accepter's signature is the first on the bytes. A store-key rotation
+  re-seals the area's inbox key, it does not replace it: after a suspected
+  compromise, make a new inbox key and revoke the links.
 
 - Collectors (commit 37): a large drop does not resume (a stopped one is
   sent again as a new item); the store can withhold an inbox item, which

@@ -14,11 +14,19 @@
 //!        --method M --collected-at T      (where it came from, who collected it, how, when)
 //!        --notes X]
 //!
-//! inbox  --case C                        what collectors dropped into case C, each opened
-//!                                        with the inbox key and judged (commit 37c)
-//! accept --case C --item I [--name N]    file a VERIFIED item: its bytes re-read and checked,
-//!                                        your signed hash and intake, the collector's record kept
-//! reject --case C --item I --reason R    turn it away (the reason sealed)
+//! inbox  [--case C]                      what arrived in case C's inbox (collectors, upload
+//!                                        links) or, without --case, your own (upload links):
+//!                                        each opened with the inbox key and judged (37c, 38)
+//!       [--item I --check-hash]          one item's bytes decrypted and hashed here, compared
+//!                                        with its record, and the SHA-256 — only that — asked
+//!                                        of MalwareBazaar through the Worker (38c)
+//! accept [--case C] --item I [--name N]  file an item: its bytes re-read and checked, your signed
+//!       [--as-file | --as-sample]        hash and intake, the sender's record kept. An upload
+//!       [--scan CMD] [--check-hash]      link's item is filed as a malware SAMPLE unless
+//!                                        --as-file; --scan runs CMD (no shell) on the decrypted
+//!                                        bytes in a private temp file and refuses on a non-zero
+//!                                        exit; --check-hash refuses --as-file for a known hash
+//! reject [--case C] --item I --reason R  turn it away (the reason sealed)
 //!
 //! collector init --server S --id I       a COLLECTOR on this machine (commit 37b,
 //!       --pins ana:FP,bo:FP              docs/COLLECTORS.md): its identity key, sealed under
@@ -53,7 +61,7 @@ fn main() {
 const WHOLE_LIMIT: u64 = 48 * 1024 * 1024;
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["accept-unverified", "tpm-pin"];
+const SWITCHES: &[&str] = &["accept-unverified", "tpm-pin", "as-file", "as-sample", "check-hash"];
 
 fn profile_path() -> PathBuf {
 	let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
@@ -308,30 +316,67 @@ fn run(args: &[String]) -> Result<(), Error> {
 				}
 			}
 		}
-		// ── A case's inbox (commit 37c, inbox.rs) ──
+		// ── An area's inbox (commit 37c; a member's own and upload links, 38) ──
 		Some(cmd @ ("inbox" | "accept" | "reject")) => {
 			let (profile, sess) = unlocked(&flag)?;
 			let member = profile.member.clone();
 			let client = api::Client::new(profile);
-			let case = req_flag("case")?;
-			let area = open_area(&client, &sess, &member, Some(&case))?;
+			let case = flag("case");
+			let area = open_area(&client, &sess, &member, case.as_deref())?;
 			let client = client.in_area(&area.name);
-			let keys = inbox::open_inbox_keys(&area)?;
-			let trust = &area.team.as_ref().ok_or(Error::Config("your vault needs its identity".into()))?.1;
-			let collectors: Vec<inbox::CollectorRow> = serde_json::from_value(client.team_get("family/collectors")?["collectors"].clone()).map_err(|e| Error::Config(format!("collectors: {e}")))?;
+			let keys = inbox::open_inbox_keys(&client, &area)?;
+			let trust = area.team.as_ref().map(|(_, t)| t);
+			// Collectors drop into cases only; their registrations decide a verdict.
+			let collectors: Vec<inbox::CollectorRow> = if area.case.is_some() { serde_json::from_value(client.team_get("family/collectors")?["collectors"].clone()).map_err(|e| Error::Config(format!("collectors: {e}")))? } else { Vec::new() };
 			let items: Vec<inbox::InboxItem> = serde_json::from_value(client.inbox()?["items"].clone()).map_err(|e| Error::Config(format!("inbox: {e}")))?;
-			if cmd == "inbox" {
+			// The area's links: a link's label (sealed with the area's key) and its folder.
+			let links: Vec<serde_json::Value> = if items.iter().any(|i| inbox::link_of(i).is_some()) { client.requests()?["requests"].as_array().cloned().unwrap_or_default() } else { Vec::new() };
+			let link_row = |id: &str| links.iter().find(|l| l["id"].as_str() == Some(id));
+			let label_of = |id: &str| link_row(id).and_then(|l| area.open(&Place::request_label(&area.name, id), l["label"].as_str().unwrap_or_default()));
+			let from = |item: &inbox::InboxItem| match inbox::link_of(item) {
+				Some(l) => format!("link “{}”", label_of(l).unwrap_or_else(|| l.to_string())),
+				None => item.collector.clone(),
+			};
+			let lookup = |sha256: &str| -> Result<serde_json::Value, Error> { client.team_post("malware/lookup", serde_json::json!({ "sha256": sha256 })) };
+			let say_lookup = |v: &serde_json::Value| {
+				if v["found"] == true {
+					let tags: Vec<&str> = v["tags"].as_array().map(|t| t.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+					println!("  MalwareBazaar: KNOWN — {}{}{} ({})", v["signature"].as_str().unwrap_or("no signature name"), v["fileType"].as_str().map(|t| format!(", {t}")).unwrap_or_default(), if tags.is_empty() { String::new() } else { format!(", tags {}", tags.join(", ")) }, v["link"].as_str().unwrap_or(""));
+				} else {
+					println!("  MalwareBazaar: not known there (which proves nothing about a file it never saw)");
+				}
+			};
+			if cmd == "inbox" && flag("item").is_none() {
 				for item in &items {
-					let (name, verdict) = match inbox::open_item(&keys, &case, item, trust, &collectors) {
-						Ok(o) => (o.meta.name.clone(), o.problem.map(|p| format!("⚠ unverified: {p}")).unwrap_or_else(|| "✓ signed by its collector".into())),
+					let (name, verdict) = match inbox::open_item(&keys, &area.name, item, trust, &collectors) {
+						Ok(o) => {
+							let v = match (&o.problem, &o.meta) {
+								(Some(p), _) => format!("⚠ unverified: {p}"),
+								(None, inbox::ItemMeta::Request(m)) => format!("an outsider's upload, unsigned — sent by “{}”{}", if m.sender.is_empty() { "unnamed" } else { &m.sender }, if m.message.is_empty() { String::new() } else { format!(": “{}”", m.message) }),
+								(None, inbox::ItemMeta::Collect(_)) => "✓ signed by its collector".into(),
+							};
+							(o.meta.name().to_string(), v)
+						}
 						Err(e) => (item.id.clone(), format!("⚠ does not open: {e}")),
 					};
-					println!("{}	{}	{} bytes	from {}	{}	{verdict}", item.id, name, item.size, item.collector, item.status);
+					println!("{}	{}	{} bytes	from {}	{}	{verdict}", item.id, name, item.size, from(item), item.status);
 				}
 				return Ok(());
 			}
 			let id = req_flag("item")?;
-			let item = items.iter().find(|i| i.id == id).ok_or_else(|| Error::Config(format!("no item {id} in {case}'s inbox")))?;
+			let item = items.iter().find(|i| i.id == id).ok_or_else(|| Error::Config(format!("no item {id} in {}'s inbox", area.name)))?;
+			if cmd == "inbox" {
+				// One item, checked here: decrypted, hashed, compared — and asked about.
+				let opened = inbox::open_item(&keys, &area.name, item, trust, &collectors)?;
+				let key = gorani_formats::formats::import_content_key(&opened.content_key);
+				let (sha256, size) = inbox::hash_item(&client, item, &key, |_| Ok(()))?;
+				let same = sha256 == opened.meta.sha256() && size == opened.meta.size();
+				println!("{id}	{}	SHA-256 {sha256}	{}", opened.meta.name(), if same { "the bytes are what its record says" } else { "⚠ the bytes are NOT what its record says" });
+				if flag("check-hash").is_some() {
+					say_lookup(&lookup(&sha256)?);
+				}
+				return Ok(());
+			}
 			if item.status != "waiting" {
 				return Err(Error::Config(format!("item {id} was already {}", item.status)));
 			}
@@ -340,14 +385,54 @@ fn run(args: &[String]) -> Result<(), Error> {
 				println!("rejected {id}{}", if r["objectKept"] == true { " (an evidence case keeps the object — write-once)" } else { " (its bytes deleted)" });
 				return Ok(());
 			}
-			let opened = inbox::open_item(&keys, &case, item, trust, &collectors)?;
+			let opened = inbox::open_item(&keys, &area.name, item, trust, &collectors)?;
 			if let Some(p) = &opened.problem {
 				return Err(Error::Config(format!("refusing to accept an item that is not verified: {p}")));
 			}
+			let as_sample = match (flag("as-file").is_some(), flag("as-sample").is_some()) {
+				(true, true) => return Err(Error::Config("--as-file or --as-sample, not both".into())),
+				(true, false) => Some(false),
+				(false, true) => Some(true),
+				(false, false) => None,
+			};
 			let key = gorani_formats::formats::import_content_key(&opened.content_key);
-			let (sha256, size) = inbox::hash_item(&client, item, &key, |_| Ok(()))?;
-			let r = inbox::accept(&client, &area, item, &opened, (&sha256, size), flag("name").as_deref())?;
-			println!("accepted {id} as file {} — SHA-256 {sha256}, signed by {} (collected) and {} (accepted)", r["file"]["id"].as_str().unwrap_or("?"), item.collector, member);
+			// --scan: the decrypted bytes in a private file for the scanner
+			// (scan.rs), written as they are hashed — one pass over the item.
+			let (sha256, size) = match flag("scan") {
+				Some(scanner) => {
+					let mut f = gorani_client_core::scan::PrivateFile::create(&id, opened.meta.name())?;
+					let hashed = inbox::hash_item(&client, item, &key, |plain| f.write(plain))?;
+					f.finish()?;
+					let v = gorani_client_core::scan::run(&scanner, &f.path)?;
+					if !v.output.is_empty() {
+						println!("  scanner: {}", v.output.replace('\n', "\n  scanner: "));
+					}
+					if !v.clean {
+						return Err(Error::Config(format!("the scanner refused {id} (exit {}) — nothing was filed; reject it, or accept it deliberately without --scan", v.code.map(|c| c.to_string()).unwrap_or_else(|| "by signal".into()))));
+					}
+					hashed
+				}
+				None => inbox::hash_item(&client, item, &key, |_| Ok(()))?,
+			};
+			if flag("check-hash").is_some() {
+				let v = lookup(&sha256)?;
+				say_lookup(&v);
+				if v["found"] == true && as_sample == Some(false) {
+					return Err(Error::Config("MalwareBazaar knows this file — it is filed as a sample or not at all (drop --as-file)".into()));
+				}
+			}
+			let link = inbox::link_of(item);
+			let label = link.and_then(label_of);
+			let folder = link.and_then(link_row).and_then(|l| l["folderId"].as_str().map(str::to_string));
+			let name = flag("name");
+			let opts = inbox::AcceptOptions { name: name.as_deref(), folder_id: folder.as_deref(), as_sample, link_label: label.as_deref() };
+			let r = inbox::accept(&client, &area, item, &opened, (&sha256, size), &opts)?;
+			let filed = r["file"]["id"].as_str().unwrap_or("?");
+			let sample = r["file"]["sample"] == true;
+			match &opened.meta {
+				inbox::ItemMeta::Collect(_) => println!("accepted {id} as file {filed}{} — SHA-256 {sha256}, signed by {} (collected) and {member} (accepted)", if sample { " (a malware sample)" } else { "" }, item.collector),
+				inbox::ItemMeta::Request(_) => println!("accepted {id} as file {filed}{} — SHA-256 {sha256}: the bytes the sender declared, signed by you ({member})", if sample { ", a malware sample" } else { "" }),
+			}
 		}
 		Some("push") => {
 			let (profile, sess) = unlocked(&flag)?;
@@ -427,7 +512,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified]");
+			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash]");
 			std::process::exit(2);
 		}
 	}

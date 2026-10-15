@@ -31,6 +31,11 @@
  *      key — the registry's, checked; the case's members accept; an export
  *      carries the sender's record, and tools/verify-export.mjs checks it
  *      for what it is — consistent, and unsigned;
+ *  8b. the CLI (gorani-sync) reads a member's own inbox, decrypts and hashes
+ *      an item here, runs a scanner on the decrypted bytes — WITHOUT a shell
+ *      — and files nothing when it objects; files a link's item as a sample
+ *      by default; refuses --as-file for a hash MalwareBazaar knows; and
+ *      what it signs, the browser's code verifies;
  *   9. a store-key rotation re-seals the inbox key and the links' labels;
  *  10. the opt-in hash lookup sends MalwareBazaar the SHA-256 and the
  *      Auth-Key — nothing else — and the registry's audit records the
@@ -39,7 +44,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -59,11 +64,28 @@ import { createStoreKey } from "../../web/src/vault/keys.ts";
 import { hybridDigest } from "../../web/src/vault/identity.ts";
 import { importVaultKey, openPlacedText, sealPlacedText } from "../../web/src/vault/vault-crypto.ts";
 import { resealStore } from "../../web/src/vault/rotation.ts";
+import { deriveRecordKey, macRecord } from "../../web/src/vault/records.ts";
 import type { CaseRow } from "../../web/src/vault/cases.ts";
 import { approveRequest, requestApproval } from "../../web/src/vault/approvals.ts";
 import { buildExport } from "../../web/src/vault/export.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const BIN = path.join(ROOT, "target/debug/gorani-sync");
+
+/** Run the CLI (spawn, not spawnSync: this process runs the S3 stub). */
+function sync(args: string[], profile: string, home: string): Promise<{ status: number; out: string }> {
+	const c = spawn(BIN, [...args, "--profile", profile], { cwd: ROOT, env: { ...process.env, HOME: home } });
+	let out = "";
+	c.stdout.on("data", (d) => (out += d));
+	c.stderr.on("data", (d) => (out += d));
+	return new Promise((resolve) => {
+		const t = setTimeout(() => c.kill("SIGKILL"), 240_000);
+		c.on("exit", (code) => {
+			clearTimeout(t);
+			resolve({ status: code ?? 1, out });
+		});
+	});
+}
 
 const MB_KEY = "suite-auth-key";
 const known = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // SHA-256 of nothing — "known" to the stub
@@ -301,11 +323,62 @@ try {
 	assert.match(verified.stdout, /✔ ioc\.txt: version 1 is the bytes the sender declared/);
 	assert.match(verified.stdout + verified.stderr, /ioc\.txt: sent through an upload link by “Pat” — the sender's word, unsigned; accepted by ana/);
 
+	// ── 8b. The CLI, on bo's own inbox ──
+	if (fs.existsSync(BIN)) {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gorani-requests-cli-"));
+		const profile = path.join(home, "bo.json");
+		const asBo = (args: string[]) => sync([...args, "--secret", bo.recoveryCode, "--dev-email", bo.email], profile, home);
+		// The files store's record authenticated, as the setup screen does (records.ts): the
+		// CLI refuses one without a MAC under the member's root (commit 24, O3).
+		const files = { ...bo.settings.stores.files, mac: await macRecord(await deriveRecordKey(bo.root), "files", bo.settings.stores.files) };
+		assert.equal((await api(dev.base, "PUT", "/api/v1/members/bo/vault", { email: bo.email, body: { settings: { ...bo.settings, stores: { files } } } })).status, 200);
+		assert.equal((await sync(["setup", "--server", dev.base, "--member", "bo", "--name", "bo's workstation", "--secret", bo.recoveryCode, "--device-secret", "e".repeat(64), "--dev-email", bo.email], profile, home)).status, 0);
+		const linkD = await createRequestLink(call(bo), bo.sealer.priv, "bo", boKey, { origin: dev.base, label: "CLI intake", note: "", password, folderId, days: 1, maxFiles: 5, maxBytes: MiB });
+		const senderD = await openLink(dev.base, linkD.link);
+		const tD = await sendToken(senderD, password);
+		const flagged = await sendFile(senderD, tD, fileOf("dropper.exe", enc.encode("MZ… EICAR-STANDARD-ANTIVIRUS-TEST-FILE …")), { sender: "Pat", message: "from the quarantine" });
+		const clean = await sendFile(senderD, tD, fileOf("readme.txt", enc.encode("nothing to see"), "text/plain; charset=utf-8"), { sender: "Pat", message: "" });
+		const knownOne = await sendFile(senderD, tD, fileOf("known.bin", new Uint8Array(0)), { sender: "Pat", message: "" });
+		const listing = await asBo(["inbox"]);
+		assert.equal(listing.status, 0, listing.out);
+		assert.match(listing.out, new RegExp(`${clean.item}\treadme\.txt\t14 bytes\tfrom link “CLI intake”\twaiting\tan outsider's upload, unsigned — sent by “Pat”`));
+		const checked = await asBo(["inbox", "--item", clean.item, "--check-hash"]);
+		assert.match(checked.out, new RegExp(`SHA-256 ${clean.sha256}\tthe bytes are what its record says`));
+		assert.match(checked.out, /MalwareBazaar: not known there/);
+		// The scanner: a stand-in that objects to the EICAR marker. Run without a shell — the
+		// `sh -c` here is the SCANNER, chosen by the person; the item's name never reaches it.
+		const scanner = `sh -c '! grep -q EICAR-STANDARD "$0"'`;
+		const refused = await asBo(["accept", "--item", flagged.item, "--scan", scanner]);
+		assert.notEqual(refused.status, 0);
+		assert.match(refused.out, /the scanner refused .* \(exit 1\) — nothing was filed/);
+		assert.equal((await call(bo)<{ items: InboxItem[] }>("GET", "/api/v1/members/bo/inbox")).items.find((i) => i.id === flagged.item)!.status, "waiting", "…and nothing was");
+		assert.equal(fs.readdirSync(os.tmpdir()).filter((d) => d.startsWith("gorani-scan-")).length, 0, "the decrypted copy is gone");
+		const ok = await asBo(["accept", "--item", clean.item, "--scan", scanner]);
+		assert.equal(ok.status, 0, ok.out);
+		assert.match(ok.out, /accepted .* as file [A-Za-z0-9_-]+, a malware sample — SHA-256 [0-9a-f]{64}: the bytes the sender declared, signed by you \(bo\)/);
+		assert.match((await asBo(["accept", "--item", knownOne.item, "--as-file", "--check-hash"])).out, /MalwareBazaar: KNOWN — SuiteRAT[\s\S]*filed as a sample or not at all/, "a known hash is not filed as a normal file");
+		assert.equal((await asBo(["accept", "--item", knownOne.item, "--check-hash"])).status, 0, "…as a sample, it is");
+		// What the CLI signed (Rust), the browser's code verifies (TS).
+		const cliFile = (await call(bo)<{ items: InboxItem[] }>("GET", "/api/v1/members/bo/inbox")).items.find((i) => i.id === clean.item)!.accepted!.file;
+		const kc = (await call(bo)<{ keys: Record<string, { type: string; sample: boolean; intake: string; collection: string }> }>("POST", "/api/v1/members/bo/files/keys", { ids: [cliFile] })).keys[cliFile];
+		assert.ok(kc.sample && isSampleType(await openPlacedText(bo.sealer.priv, places.fileType("bo", cliFile, 1), kc.type)), "a sample by both marks");
+		assert.equal(originalType(await openPlacedText(bo.sealer.priv, places.fileType("bo", cliFile, 1), kc.type)), "text/plain; charset=utf-8", "the original type kept, encoded as the browser encodes it");
+		const ci2 = await checkIntake(bo.sealer.priv, boTrust, "bo", cliFile, kc.intake);
+		assert.equal(ci2.status, "verified");
+		if (ci2.status === "verified") assert.equal(ci2.record.source, "Pat, through upload link CLI intake");
+		assert.deepEqual([(await checkItemCollection(bo.sealer.priv, "bo", cliFile, kc.collection, boTrust, [], { sha256: clean.sha256, size: 14 })).problem], [null]);
+		assert.equal((await call(bo)<{ files: { id: string }[] }>("GET", `/api/v1/members/bo/files/list?folder=${folderId}`)).files.some((f) => f.id === cliFile), true, "into the link's folder");
+		fs.rmSync(home, { recursive: true, force: true });
+	} else {
+		console.log("skip  api:requests › the CLI part — build it first: cargo build -p gorani-client-core");
+	}
+
 	// ── 9. A rotation of bo's files key re-seals the inbox key and the labels ──
 	const fresh = await createStoreKey();
 	const freshKey = await importVaultKey(fresh.bundle.slice());
 	const report = await resealStore(call(bo) as never, "bo", bo.sealer.priv, freshKey);
-	assert.deepEqual([report.resealed.inboxkey, report.resealed.requestlabel, report.resealed.collection, report.resealed.reject], [1, 2, 2, 1], "inbox key, two labels, two records, a reason");
+	const cli = fs.existsSync(BIN);
+	assert.deepEqual([report.resealed.inboxkey, report.resealed.requestlabel, report.resealed.collection, report.resealed.reject], [1, cli ? 3 : 2, cli ? 4 : 2, 1], "the inbox key, every label, every record, the reason");
 	const rotated = await areaInboxKeys(call(bo), "bo");
 	assert.equal((await openAreaInboxKeys(freshKey, "bo", rotated)).size, 1, "the inbox key opens with the new files key — links keep working");
 	await assert.rejects(openAreaInboxKeys(bo.sealer.priv, "bo", rotated), "…and not with the old one");
@@ -317,14 +390,15 @@ try {
 	assert.deepEqual(await call(bo)("POST", "/api/v1/malware/lookup", { sha256: s1.sha256 }), { found: false });
 	assert.equal((await api(dev.base, "POST", "/api/v1/malware/lookup", { email: bo.email, body: { sha256: "not a hash", name: "headers.eml" } })).status, 400);
 	assert.equal((await api(dev.base, "POST", "/api/v1/malware/lookup", { email: "stranger@else.test", body: { sha256: known } })).status, 403, "members only");
-	assert.equal(mb.requests.length, 2, "one request per lookup — no retries, no extras");
+	// (Two lookups here, and three by the CLI in 8b.)
+	assert.equal(mb.requests.length, cli ? 5 : 2, "one request per lookup — no retries, no extras");
 	for (const r of mb.requests) {
 		assert.equal(r.headers["auth-key"], MB_KEY, "the Auth-Key goes from the Worker");
 		assert.match(r.body, /^query=get_info&hash=[0-9a-f]{64}$/, "…with the hash, and nothing else");
 		assert.equal(r.headers["x-gorani-dev-email"], undefined, "no caller identity forwarded");
 	}
 	const registry = (await call(ana)<{ audit: { action: string; target: string; details: string | null }[] }>("GET", "/api/v1/family")).audit.filter((l) => l.action === "malware.lookup");
-	assert.equal(registry.length, 2, "each lookup is on the registry's trail");
+	assert.equal(registry.length, cli ? 5 : 2, "each lookup is on the registry's trail");
 	assert.ok(registry.every((l) => l.target === "bo" && !JSON.stringify(l).includes(known) && !JSON.stringify(l).includes(s1.sha256)), "…without the hash");
 
 	// ── 11. The page ──

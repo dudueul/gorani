@@ -8,6 +8,9 @@
  *   │          │                    │ lock (button, auto-lock, visibility)
  *   │          └──▶ setup ──────────┘
  *   └──▶ first (nobody registered yet: the first lead, once — commit 39k)
+ *
+ * Which account opens is not a choice: the one whose emails hold the
+ * signed-in Access email (GET /api/v1/me, commit 39l).
  * ```
  *
  * The state machine is a small store (src/lib/store.ts); components read it
@@ -19,7 +22,7 @@
 import { LitElement, html, nothing } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { store } from "./lib/store.ts";
-import { api, type FamilyState, type Member } from "./lib/api.ts";
+import { api, type Member } from "./lib/api.ts";
 import type { VaultSettings } from "./vault/methods.ts";
 import type { VaultSession } from "./vault/session.ts";
 import "./ui/unlock.ts";
@@ -30,7 +33,6 @@ type Screen =
 	| { at: "loading" }
 	| { at: "error"; message: string }
 	| { at: "first" }
-	| { at: "choose"; family: FamilyState }
 	| { at: "locked"; member: Member; settings: VaultSettings }
 	| { at: "setup"; member: Member }
 	| { at: "unlocked"; member: Member; session: VaultSession; stay: boolean };
@@ -66,16 +68,23 @@ export class GoraniApp extends LitElement {
 
 	private async boot(): Promise<void> {
 		try {
-			const family = await api.get<FamilyState>("/api/v1/family");
-			const active = family.members.filter((m) => m.active);
-			if (!active.length) {
+			// The ONE account tied to the signed-in Access email (commit 39l).
+			// Until then this listed every member ("Who's opening?") for
+			// anyone signed in — the Worker refused the wrong pick, but the
+			// list itself told a signed-in stranger who was on the team.
+			const me = await api.get<{ email: string; member: Member | null; empty: boolean }>("/api/v1/me");
+			if (me.empty) {
 				// A fresh deployment (commit 39k): until then this said "the
 				// first member is created by the admin" and offered no way to,
 				// short of a hand-made API call carrying the bootstrap token.
 				screen.set({ at: "first" });
 				return;
 			}
-			screen.set({ at: "choose", family });
+			if (!me.member) {
+				screen.set({ at: "error", message: `You are signed in as ${me.email || "an identity without an email"}, and no account in this team uses that address. Ask a lead to add it (Team › People), then reload this page.` });
+				return;
+			}
+			await this.bootMember(me.member);
 		} catch (e) {
 			screen.set({ at: "error", message: e instanceof Error ? e.message : String(e) });
 		}
@@ -90,8 +99,6 @@ export class GoraniApp extends LitElement {
 				return html`<div class="flex h-full items-center justify-center px-6"><p class="max-w-md text-center text-red-400">${s.message}</p></div>`;
 			case "first":
 				return this.renderFirst();
-			case "choose":
-				return this.renderChoose(s.family);
 			case "locked":
 				return html`<gorani-unlock .memberId=${s.member.id} .memberName=${s.member.name} .settings=${s.settings} @unlocked=${(e: CustomEvent) => this.onUnlocked(s.member, e.detail)}></gorani-unlock>`;
 			case "setup":
@@ -161,26 +168,6 @@ export class GoraniApp extends LitElement {
 					${this.firstBusy ? "Creating…" : "Create"}
 				</button>
 			</form>
-		`;
-	}
-
-	private renderChoose(family: FamilyState) {
-		const active = family.members.filter((m) => m.active);
-		return html`
-			<section class="w-full max-w-sm rounded-2xl border border-neutral-800 bg-neutral-900 p-6 shadow-xl">
-				<h2 class="text-lg font-medium">Who's opening?</h2>
-				<ul class="mt-3 space-y-2">
-					${active.map(
-						(m) => html`
-							<li>
-								<button class="w-full rounded-xl border border-neutral-700 px-3 py-2.5 text-left text-sm hover:border-accent" @click=${() => void this.bootMember(m)}>
-									${m.name} <span class="text-neutral-500">· ${m.role}</span>
-								</button>
-							</li>
-						`,
-					)}
-				</ul>
-			</section>
 		`;
 	}
 

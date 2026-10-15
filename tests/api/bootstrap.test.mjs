@@ -30,6 +30,11 @@ const create = (email, body, token) =>
 const mom = { id: "mom", name: "Mom", role: "lead", emails: ["mom@family.test"] };
 
 try {
+	// Who am I (commit 39l), on an empty team: nobody, and the team is empty
+	// — the app shows the first-lead screen.
+	const before = await api(dev.base, "GET", "/api/v1/me", { email: "mom@family.test" });
+	assert.deepEqual(before.json, { email: "mom@family.test", member: null, empty: true });
+
 	// The race the token closes: the first caller through Access, no token.
 	const raced = await create("stranger@elsewhere.test", { id: "eve", name: "Eve", role: "lead", emails: ["stranger@elsewhere.test"] });
 	assert.equal(raced.status, 403, "without the token, nobody becomes the first parent");
@@ -52,8 +57,15 @@ try {
 	assert.equal(kid.status, 200);
 	const fam = await api(dev.base, "GET", "/api/v1/family", { email: "mom@family.test" });
 	assert.deepEqual(fam.json.members.map((m) => m.id).sort(), ["jinu", "mom"]);
+	// Who am I, now: exactly the caller's own account (by email, any case),
+	// and a stranger is nobody — told nothing about who is on the team.
+	const me = await api(dev.base, "GET", "/api/v1/me", { email: "Jinu@Family.test" });
+	assert.equal(me.json.member?.id, "jinu");
+	assert.equal(me.json.empty, false);
+	const nobody = await api(dev.base, "GET", "/api/v1/me", { email: "stranger@elsewhere.test" });
+	assert.deepEqual(nobody.json, { email: "stranger@elsewhere.test", member: null, empty: false });
 
-	console.log("ok  api:bootstrap — the first parent needs the operator's token, once; forged verdicts and odd bodies refused");
+	console.log("ok  api:bootstrap — the first parent needs the operator's token, once; forged verdicts and odd bodies refused; /me names the caller's own account, and a stranger none");
 } finally {
 	await dev.close();
 }

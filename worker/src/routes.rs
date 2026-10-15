@@ -501,6 +501,8 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 	match (method, segments) {
 		// ── The family registry (GoraniFamilyDO) ────────────────────────
 		("GET", ["family"]) => forward_family(&env, &identity.email, "GET", "state", None).await,
+		// The signed-in person's own account (commit 39l): what the app opens.
+		("GET", ["me"]) => forward_family(&env, &identity.email, "GET", "me", None).await,
 		("POST", ["family", "members"]) => {
 			// The bootstrap proof (O18) — decided here, where the secret is;
 			// the registry applies it only while it has no members.

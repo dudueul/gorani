@@ -15,3 +15,4 @@
 # Whoever installs compares the fingerprint verify prints with the one the
 # release manager gave them in person — a key read from the same place as
 # the download proves nothing on its own.
+release@gorani namespaces="gorani-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINTd/A4PIMMSdFUBz2m5HKiuISi2b/RYjVxarnAQUs1M gorani release key (CI), made 2026-10-15

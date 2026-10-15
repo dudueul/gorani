@@ -91,17 +91,18 @@ fn a_cloud_files_folder_over_the_replica() {
 
 	// 0. Explorer's registration where the shell gives one (39e), said
 	// either way: a Server runner may give only cldapi's.
-	match shell::registered_id(&root) {
-		Ok(Some(id)) => {
-			eprintln!("Explorer knows the folder as {id}");
-			assert!(id.ends_with("!ana"), "named for the area: {id}");
+	let id = shell::sync_root_id("ana").expect("this user's SID");
+	match shell::registered_path(&id) {
+		Ok(Some(path)) => {
+			eprintln!("Explorer knows the folder as {id} ({path})");
+			assert!(shell::same_folder(&path, &root), "the shell's root {path} is this folder");
 		}
 		Ok(None) => {
 			// (Only a Windows without the shell's support may fall back.)
-			assert!(!shell::supported(), "the shell supports sync roots here, yet does not list {} among its Gorani roots: {:?}", root.display(), shell::roots());
+			assert!(!shell::supported(), "the shell supports sync roots here, yet holds nothing under {id} — by folder: {:?}, among its roots: {:?}", shell::registered_id(&root), shell::roots());
 			eprintln!("this Windows has no shell sync-root support — cldapi's sync root only");
 		}
-		Err(e) => panic!("the shell's list of sync roots: {e}"),
+		Err(e) => panic!("the shell, asked for {id}: {e} — by folder: {:?}, among its roots: {:?}", shell::registered_id(&root), shell::roots()),
 	}
 
 	// 1. Listed, sized, identified — nothing fetched yet.

@@ -144,13 +144,34 @@ fn register_shell(root: &Path, area: &str, read_only: bool) -> Result<String, St
 	Ok(id)
 }
 
-/// The shell's id for the folder, if the shell registered it as ours: found
-/// among this user's registered roots by its path. (Asking by folder,
-/// GetSyncRootInformationForFolder, answered nothing for a root registered
-/// a moment before — found in CI.)
+/// The folder the shell holds under `id`, if it holds one (an unknown id
+/// is "none", not an error).
+pub fn registered_path(id: &str) -> Result<Option<String>, String> {
+	match StorageProviderSyncRootManager::GetSyncRootInformationForId(&HSTRING::from(id)) {
+		Ok(info) => Ok(Some(info.Path().and_then(|f| f.cast::<IStorageItem>()).and_then(|i| i.Path()).map_err(text)?.to_string())),
+		Err(e) if e.code() == windows::Win32::Foundation::ERROR_NOT_FOUND.to_hresult() || e.code() == windows::Win32::Foundation::E_INVALIDARG => Ok(None),
+		Err(e) => Err(text(e)),
+	}
+}
+
+/// Whether `path` is the folder `root` (canonical, folded).
+pub fn same_folder(path: &str, root: &Path) -> bool {
+	same_form(Path::new(path)) == same_form(root)
+}
+
+/// The shell's id for the folder, if the shell registered it as ours —
+/// asked by folder, then looked for among the user's roots. (Found in CI:
+/// on a Server runner both can answer nothing for a root the shell has just
+/// registered and answers for by id — see `registered_path`.)
 pub fn registered_id(root: &Path) -> Result<Option<String>, String> {
-	let want = same_form(root);
-	Ok(roots()?.into_iter().find(|(_, path)| same_form(Path::new(path)) == want).map(|(id, _)| id))
+	if let Ok(folder) = StorageFolder::GetFolderFromPathAsync(&plain(root)).and_then(|op| op.get()) {
+		if let Ok(id) = StorageProviderSyncRootManager::GetSyncRootInformationForFolder(&folder).and_then(|i| i.Id()) {
+			if id.to_string().starts_with("Gorani!") {
+				return Ok(Some(id.to_string()));
+			}
+		}
+	}
+	Ok(roots()?.into_iter().find(|(_, path)| same_folder(path, root)).map(|(id, _)| id))
 }
 
 /// A path in one form for comparing: canonical where it exists (long

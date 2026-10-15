@@ -95,8 +95,8 @@
 		// evidence version, and every audit checkpoint, then gets a COMPLIANCE
 		// retention nobody can shorten. Off, nothing is locked — and evidence
 		// opened meanwhile is locked the moment it is turned on.
-		"OBJECT_LOCK": "off",
-		"EVIDENCE_RETAIN_DAYS": "2557",
+		"OBJECT_LOCK": "on",
+		"EVIDENCE_RETAIN_DAYS": "14",
 
 		// ── The SIEM feed (docs/CUSTODY.md › Stage 7, 29i) ─────────────────
 		// Empty: no feed. Set, every chained audit line is POSTed there by
@@ -116,7 +116,7 @@
 		// (Team › People › Timestamp authority). An account's credential, if
 		// it wants one, is a secret: `wrangler secret put TSA_AUTHORIZATION`
 		// (sent verbatim as the Authorization header, e.g. "Basic …").
-		"TSA_URL": ""
+		"TSA_URL": "http://time.certum.pl"
 	},
 
 	// ── Storage priority: Cloudflare R2 ──────────────────────────────────

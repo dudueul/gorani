@@ -543,7 +543,7 @@ mod tests {
 	use super::*;
 
 	fn fresh(pins: &str) -> (CollectorProfile, Introduction) {
-		init(Init { server: "http://x", id: "edr-1", pins: parse_pins(pins).unwrap(), access_id: Some("abc.access".into()), access_secret: Some(Zeroizing::new("s3cret".into())), dev_collector: None, want: devicekey::Want::File, tpm: &devicekey::TpmOptions::default() }).unwrap()
+		init(Init { server: "http://x", id: "edr-1", pins: parse_pins(pins).unwrap(), access_id: Some("abc.access".into()), access_secret: Some(Zeroizing::new("s3cret".into())), dev_collector: None, want: devicekey::Want::FILE, tpm: &devicekey::TpmOptions::default() }).unwrap()
 	}
 
 	#[test]

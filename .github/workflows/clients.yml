@@ -1,0 +1,134 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+#
+# The native clients on the machines they run on (commit 39, docs/DESKTOP.md):
+# the core and its CLI built and unit-tested on Windows and macOS, and —
+# as they land — each platform's shell and its smoke test (39b Windows
+# Cloud Files, 39c macOS File Provider). The Linux side, the worker and the
+# browser are proven by `node tests/run.mjs` against `wrangler dev`; this
+# workflow is for what that machine cannot build.
+#
+# Cost (a private repository): Windows minutes count twice, macOS ten times
+# against the plan. Hence: only pushes and PRs that touch the clients, the
+# shared crates or this file run it; a newer push cancels an older run of the
+# same branch; Cargo's downloads and build outputs are cached.
+#
+# Supply chain: first-party actions only (actions/checkout, actions/cache,
+# actions/upload-artifact), the job token read-only, no secrets in this
+# workflow. The toolchains are the runner images' own (rustup + stable Rust,
+# Xcode on macOS). One tool comes from outside: XcodeGen, from the image's
+# own Homebrew (a checksummed bottle), to generate the Xcode project the
+# unsigned macOS build needs — a build that holds nothing worth stealing.
+
+name: clients
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths: ["clients/**", "crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/clients.yml"]
+  pull_request:
+    paths: ["clients/**", "crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/clients.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clients-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  core:
+    name: core (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup default stable
+          rustc --version && cargo --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      # (On Windows these include the device-key protectors — DPAPI, a CNG
+      # key in the software provider and the TPM's where the runner has one,
+      # Hello's "not set up" — 39d.)
+      - name: Unit tests (formats, client core)
+        run: cargo test --locked -p gorani-formats -p gorani-client-core -- --nocapture
+      - name: Build the CLI
+        run: cargo build --locked -p gorani-client-core --bin gorani-sync
+      # ── 39b: the Windows shell, on a real Cloud Files sync root ──
+      - name: The Cloud Files shell's smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p gorani-windows -- --test-threads=1 --nocapture
+      - name: Build the Windows shell
+        if: runner.os == 'Windows'
+        run: cargo build --locked -p gorani-windows --bin gorani-cloud
+      # (What this run built, to try on a PC: debug builds, kept a week.)
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: gorani-windows-debug
+          path: |
+            target/debug/gorani-cloud.exe
+            target/debug/gorani-sync.exe
+          retention-days: 7
+      # ── 39c: the macOS shell — the Rust bridge, the Swift logic, the app ──
+      - name: The C bridge's unit tests (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p gorani-macos
+      # (Built as the static library GoraniKit links; the note printed is what
+      # else a program linking it needs — Package.swift and project.yml say so.)
+      - name: Build the bridge library (macOS)
+        if: runner.os == 'macOS'
+        run: cargo rustc --locked -p gorani-macos --lib -- --print native-static-libs
+      - name: The File Provider logic's tests (macOS)
+        if: runner.os == 'macOS'
+        working-directory: clients/macos/GoraniKit
+        run: swift test
+      # ── 39d: the Mac's stores for a device-secret part, through the helper ──
+      # (The real Secure Enclave where the runner has one — a virtual Mac
+      # usually has not: then the debug helper's software stand-in, which the
+      # client accepts only in its tests. The login Keychain is the runner's.)
+      - name: The Secure Enclave and Keychain helper, with the client (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          (cd clients/macos/GoraniKit && swift build --product gorani-keystore)
+          export GORANI_KEYSTORE="$(cd clients/macos/GoraniKit && swift build --show-bin-path)/gorani-keystore"
+          echo "this runner: $("$GORANI_KEYSTORE" probe)"
+          GORANI_KEYSTORE_SOFTWARE=1 cargo test --locked -p gorani-client-core devicekey -- --ignored --nocapture --test-threads=1
+      - name: Build the app and its File Provider extension, unsigned (macOS)
+        if: runner.os == 'macOS'
+        working-directory: clients/macos
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate
+          # (ENABLE_DEBUG_DYLIB=NO: Xcode's Debug default puts the code in a
+          # .debug.dylib beside a stub executable — the check below wants the
+          # binary as a release has it.)
+          xcodebuild -project Gorani.xcodeproj -scheme Gorani -configuration Debug \
+            -destination 'platform=macOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO ENABLE_DEBUG_DYLIB=NO build
+          # (What came out: the app, the extension inside it, the core inside that.)
+          app=build/Build/Products/Debug/Gorani.app
+          ls "$app/Contents/PlugIns/GoraniFileProvider.appex/Contents/MacOS/"
+          nm -gU "$app/Contents/PlugIns/GoraniFileProvider.appex/Contents/MacOS/GoraniFileProvider" | grep -c gorani_call

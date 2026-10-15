@@ -1,0 +1,243 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+#
+# The installers (commit 39f, docs/DESKTOP.md › 39f): an MSIX for Windows
+# and the Mac app (app + File Provider extension + CLI + keystore helper),
+# each installed or run here exactly as a person would get it.
+#
+# Signed only when the signing secrets exist — never asked for, never
+# printed. Without them: the MSIX is signed with a throwaway certificate
+# made and trusted on that runner alone (so the install is tested as a
+# signed one would be), and the Mac app is ad-hoc signed; both are for
+# testing. With them:
+#
+#   Windows  WINDOWS_CERT_PFX (the code-signing .pfx, base64), WINDOWS_CERT_PASSWORD
+#   macOS    GORANI_TEAM_ID (a variable or a secret), APPLE_CERT_P12 (the Developer ID
+#            Application identity, base64), APPLE_CERT_PASSWORD; to notarize as well,
+#            APPLE_API_KEY (the App Store Connect .p8's text), APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
+#
+# When: release tags (v*), by hand, and when the packaging itself changes
+# — not on every push (macOS minutes count ten times).
+#
+# Supply chain: first-party actions only; the platforms' own tools
+# (makeappx, signtool, codesign, notarytool). One tool comes from outside —
+# XcodeGen, from the image's Homebrew — and it runs in a job of its own
+# that holds no secret; the signing job takes only the project it
+# generated, and refuses one with any script phase or build rule (a place
+# a tampered generator could hide a command).
+
+name: package
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+    paths: ["clients/windows/packaging/**", "clients/macos/packaging/**", "clients/macos/project.yml", ".github/workflows/package.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: MSIX (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      HAVE_CERT: ${{ secrets.WINDOWS_CERT_PFX != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+      - name: Release builds
+        run: cargo build --release --locked -p gorani-windows -p gorani-client-core --bin gorani-cloud --bin gorani-sync
+      - name: Package and sign
+        shell: pwsh
+        env:
+          PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'sign'
+          New-Item -ItemType Directory $dir | Out-Null
+          $pfx = Join-Path $dir 'cert.pfx'
+          try {
+            if ($env:HAVE_CERT -eq 'true') {
+              [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX))
+              $password = $env:PFX_PASSWORD
+              $subject = (Get-PfxData -FilePath $pfx -Password (ConvertTo-SecureString $password -AsPlainText -Force)).EndEntityCertificates[0].Subject
+              $timestamp = @('/tr', 'http://timestamp.digicert.com', '/td', 'SHA256')
+              Write-Output "signing with the release certificate ($subject)"
+            } else {
+              # A throwaway certificate, trusted on this runner only, two days long.
+              $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Gorani Test Build' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(2)
+              $password = [guid]::NewGuid().ToString()
+              Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+              Export-Certificate -Cert $cert -FilePath (Join-Path $dir 'test.cer') | Out-Null
+              Import-Certificate -FilePath (Join-Path $dir 'test.cer') -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+              $subject = $cert.Subject
+              $timestamp = @()
+              Write-Output 'no signing secrets: a test package, signed with a throwaway certificate'
+            }
+            # a.b.c.d: the workspace's version and this run's number.
+            $base = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([0-9.]+)"').Matches[0].Groups[1].Value
+            $version = "$base.${{ github.run_number }}"
+            ./clients/windows/packaging/package.ps1 -Version $version -Publisher $subject -Out gorani.msix
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+            & $signtool.FullName sign /fd SHA256 /f $pfx /p $password @timestamp gorani.msix
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+          } finally {
+            Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+          }
+      - name: Install, run, remove — as a person gets it
+        shell: pwsh
+        run: |
+          Add-AppxPackage -Path gorani.msix
+          $p = Get-AppxPackage -Name Gorani.Client
+          if (-not $p) { throw 'the package did not install' }
+          Write-Output "installed $($p.PackageFullName)"
+          $apps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+          foreach ($cmd in 'gorani-cloud', 'gorani-sync') {
+            # (Each says how to use it, and exits non-zero: its words are checked.)
+            $said = & (Join-Path $apps "$cmd.exe") 2>&1 | Out-String
+            if ($said -notmatch "usage: $cmd") { throw "the installed $cmd did not answer: $said" }
+            Write-Output "$cmd answers from the package's alias"
+          }
+          Remove-AppxPackage -Package $p.PackageFullName
+          if (Get-AppxPackage -Name Gorani.Client) { throw 'the package did not uninstall' }
+          $global:LASTEXITCODE = 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.HAVE_CERT == 'true' && 'gorani-windows-msix' || 'gorani-windows-msix-test-signed' }}
+          path: gorani.msix
+          retention-days: 14
+
+  macos-project:
+    name: Xcode project (generated; no secrets in this job)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate
+        working-directory: clients/macos
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcode-project
+          path: |
+            clients/macos/Gorani.xcodeproj
+            clients/macos/App/Info.plist
+            clients/macos/App/Gorani.entitlements
+            clients/macos/Extension/Info.plist
+            clients/macos/Extension/GoraniFileProvider.entitlements
+          retention-days: 1
+
+  macos:
+    name: The app (macOS)
+    needs: macos-project
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      TEAM_ID: ${{ vars.GORANI_TEAM_ID || secrets.GORANI_TEAM_ID }}
+      HAVE_SIGNING: ${{ secrets.APPLE_CERT_P12 != '' && (vars.GORANI_TEAM_ID != '' || secrets.GORANI_TEAM_ID != '') }}
+      HAVE_NOTARY: ${{ secrets.APPLE_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xcode-project
+          path: clients/macos
+      - name: The generated project runs nothing of its own
+        run: |
+          if grep -nE 'PBXShellScriptBuildPhase|PBXBuildRule|shellScript' clients/macos/Gorani.xcodeproj/project.pbxproj; then
+            echo "::error::the generated project holds a script phase or build rule — refusing to build it here"
+            exit 1
+          fi
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+      - name: Release builds (the core library, the CLI, the keystore helper)
+        run: |
+          cargo build --release --locked -p gorani-macos --lib
+          cargo build --release --locked -p gorani-client-core --bin gorani-sync
+          (cd clients/macos/GoraniKit && swift build -c release --product gorani-keystore)
+      - name: Build the app and its extension
+        working-directory: clients/macos
+        env:
+          # (Package.swift links the core from here — the release build.)
+          GORANI_LIB_DIR: ${{ github.workspace }}/target/release
+        run: |
+          prefix=""
+          [ -n "$TEAM_ID" ] && prefix="$TEAM_ID."
+          # (arm64 only: the core is built for it — Release would otherwise
+          # build x86_64 too, and find no core to link there.)
+          xcodebuild -project Gorani.xcodeproj -scheme Gorani -configuration Release \
+            -destination 'platform=macOS,arch=arm64' -derivedDataPath build \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO "TeamIdentifierPrefix=$prefix" "GORANI_TEAM_ID=$TEAM_ID" build
+      - name: Assemble, sign, notarize
+        env:
+          P12: ${{ secrets.APPLE_CERT_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          work="$RUNNER_TEMP/sign"
+          mkdir -m 0700 "$work"
+          keychain="$work/build.keychain-db"
+          cleanup() {
+            [ -f "$keychain" ] && security delete-keychain "$keychain" || true
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          if [ "$HAVE_SIGNING" = "true" ]; then
+            kc_password=$(uuidgen)
+            security create-keychain -p "$kc_password" "$keychain"
+            security set-keychain-settings -lut 3600 "$keychain"
+            security unlock-keychain -p "$kc_password" "$keychain"
+            base64 --decode <<<"$P12" >"$work/cert.p12"
+            security import "$work/cert.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+            rm -f "$work/cert.p12"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_password" "$keychain" >/dev/null
+            security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+            SIGN_IDENTITY=$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ { print $2; exit }')
+            [ -n "$SIGN_IDENTITY" ] || { echo "::error::no Developer ID Application identity in APPLE_CERT_P12"; exit 1; }
+            export SIGN_IDENTITY
+            if [ "$HAVE_NOTARY" = "true" ]; then
+              printf '%s' "$API_KEY" >"$work/notary.p8"
+              export NOTARY_KEY="$work/notary.p8" NOTARY_KEY_ID NOTARY_ISSUER
+            fi
+          fi
+          bin=$(cd clients/macos/GoraniKit && swift build -c release --show-bin-path)
+          clients/macos/packaging/package.sh clients/macos/build/Build/Products/Release/Gorani.app \
+            target/release/gorani-sync "$bin/gorani-keystore" "$GITHUB_WORKSPACE/Gorani-macOS.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.HAVE_SIGNING == 'true' && 'gorani-macos-app' || 'gorani-macos-app-unsigned' }}
+          path: Gorani-macOS.zip
+          retention-days: 14

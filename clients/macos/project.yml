@@ -1,0 +1,90 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+#
+# The macOS shell's Xcode project (commit 39c), generated — `xcodegen
+# generate` — rather than committed: a .pbxproj does not review. The
+# Rust library is built first (`cargo build -p gorani-macos`); GoraniKit
+# (Package.swift) links it.
+#
+# Signing: DEVELOPMENT_TEAM is GORANI_TEAM_ID, given at build time
+# (xcodebuild … GORANI_TEAM_ID=<your team>), never written here. The app
+# group the extension reads the profile from is "<team prefix>io.gorani".
+
+name: Gorani
+options:
+  bundleIdPrefix: io.gorani
+  deploymentTarget:
+    macOS: "13.0"
+packages:
+  GoraniKit:
+    path: GoraniKit
+settings:
+  base:
+    DEVELOPMENT_TEAM: $(GORANI_TEAM_ID)
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Gorani:
+    type: application
+    platform: macOS
+    sources: [App]
+    scheme: {}
+    # (The app only adds and removes the domain: it does not link the core.)
+    dependencies:
+      - target: GoraniFileProvider
+        embed: true
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Gorani
+        GoraniAppGroup: $(TeamIdentifierPrefix)io.gorani
+        LSApplicationCategoryType: public.app-category.productivity
+    entitlements:
+      path: App/Gorani.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups: [$(TeamIdentifierPrefix)io.gorani]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.gorani.app
+  GoraniFileProvider:
+    type: app-extension
+    platform: macOS
+    sources: [Extension]
+    dependencies:
+      - package: GoraniKit
+    info:
+      path: Extension/Info.plist
+      properties:
+        CFBundleDisplayName: Gorani
+        GoraniAppGroup: $(TeamIdentifierPrefix)io.gorani
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+          NSExtensionFileProviderDocumentGroup: $(TeamIdentifierPrefix)io.gorani
+          NSExtensionFileProviderSupportsEnumeration: true
+          # Finder's badges (39e): named under the extension's bundle id,
+          # matched by GoraniFileProviderItem.decorations.
+          NSFileProviderDecorations:
+            - Identifier: $(PRODUCT_BUNDLE_IDENTIFIER).sample
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.warning
+              Label: Malware sample — never opened raw
+            - Identifier: $(PRODUCT_BUNDLE_IDENTIFIER).readOnly
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.locked
+              Label: Read-only (an evidence case or a read grant)
+            - Identifier: $(PRODUCT_BUNDLE_IDENTIFIER).unverifiedName
+              Category: Badge
+              BadgeImageType: com.apple.icon-decoration.badge.warning
+              Label: Name not verified — not what it claims to be
+    entitlements:
+      path: Extension/GoraniFileProvider.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.application-groups: [$(TeamIdentifierPrefix)io.gorani]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.gorani.app.fileprovider

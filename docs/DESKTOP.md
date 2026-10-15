@@ -346,6 +346,244 @@ and/or keyring), the profile — pins included — MAC'd under another. The
 token's secret is read from `GORANI_COLLECTOR_SECRET` or asked for, never a
 flag (argv shows in `ps`).
 
+## Commit 39: Windows and macOS
+
+Asked 2026-10-15: built and tested on **GitHub Actions** (hosted
+`windows-latest` and `macos-latest` runners — `.github/workflows/clients.yml`;
+this repository's own machine cannot build either), **File Provider** on
+macOS (D16's choice), a paid Apple Developer team (its Team ID is a setting,
+never in the repository), and all four parts in this phase:
+
+| Stage | What |
+|---|---|
+| 39a | **The replica** (`clients/core/src/replica.rs`): what a shell that keeps real files on disk needs — items by server id, reads of one version, new files and versions from paths (whole or GC01 frames), conflicts kept, a diff to apply — over the server (`HttpRemote`) or in memory (`MemRemote`, what each platform's smoke test drives). One JSON protocol over either: `gorani-sync replica` speaks it on stdin/stdout, the macOS bridge across its C interface. CI builds and unit-tests the core on Windows and macOS. |
+| 39b | **Windows**: a Cloud Files sync root (`clients/windows`) — placeholders, hydration on read, local saves uploaded, renames and deletes, server changes applied, plaintext dropped when the shell stops. |
+| 39c | **macOS**: a File Provider extension and its host app (`clients/macos`) over the Rust core through a C bridge. |
+| 39d | **The hardware device key**: Windows Hello (a TPM-backed key, its deterministic RSA signature) and the Secure Enclave (CryptoKit key agreement) as protectors. |
+| 39e | **Explorer and Finder**: the navigation-pane entry and sync states (StorageProviderSyncRootManager), Finder decorations. |
+| 39f | **Installers**: an MSIX and a signed, notarized app — signed in CI only when the signing secrets exist. |
+
+### 39a as built
+
+```text
+gorani-sync replica [--case C]     one JSON request per line on stdin, one answer per line:
+  {"op":"items"}                   the tree by id ("" is the top), names opened in their places
+  {"op":"read","id","version","offset","len"}     bytes of THAT version only
+  {"op":"create","parent","name","path"}          a new file from a local path
+  {"op":"save","id","base","path"}                the version after `base` — or a conflict copy
+  {"op":"mkdir"|"rename"|"trash"|"poll", …}
+```
+
+- **Reads of one version.** A placeholder made for version N has N's size
+  and N's signed hash; filling it with N+1's bytes would corrupt it. The
+  engine's `read_at` refuses ("changed on the server") and the shell's
+  next poll updates the placeholder. The same rules as the mount: a sample
+  is never readable, evidence is checked against its uploader's signed hash
+  before a byte is served.
+- **Uploads from paths**, because these shells keep real files: up to
+  48 MiB read once and hashed and sealed from the same buffer; above, GC01
+  frames — now also as a new VERSION through the multipart path (the core
+  only sent new files that way) — re-hashed as they are sealed, so a file
+  that changed after it was hashed is never completed under a signature
+  for other bytes (`push_frames`' `expect`; the CLI's `push` checks it too).
+- **One protocol, two remotes.** `HttpRemote` is the engine — the same
+  naming, sample and evidence decisions as the Linux mount; `MemRemote`
+  keeps the rules a shell depends on (versions, conflicts, samples,
+  read-only areas, empty-folder trashing) and none of the crypto, so a
+  Windows or macOS runner proves its placeholder layer without a server.
+- `api:replica` drives it against `wrangler dev`: the tree by id, a range
+  across GC01 frames, a stale version refused, new files and versions
+  whole and framed (49 MiB), a conflict copy beside the browser's save,
+  folders, renames, the Trash, polling, an evidence case read-only with a
+  swapped record refused.
+
+### 39b as built
+
+```text
+gorani-cloud <folder> [--case C] [--keep-local]    serve the area as a Cloud Files sync root
+gorani-cloud free <file>                           drop one file's local bytes now
+gorani-cloud unregister <folder>                   the folder stops being a sync root
+```
+
+| Part | File | What |
+|---|---|---|
+| the platform | `clients/windows/src/cf.rs` | every `unsafe` call to cldapi: register (PARTIAL hydration — a range read of a 255 GiB image fetches that range), connect (FETCH_DATA, NOTIFY_DELETE, NOTIFY_RENAME), placeholders with an identity `gorani1:<version>:<id>`, update/convert/dehydrate through an oplocked handle |
+| names | `clients/windows/src/names.rs` | a server name as NTFS allows it (look-alikes for `<>:"/\|?*`, reserved device names, trailing dots), unique without case (" (id8)") |
+| the folder's side | `clients/windows/src/watch.rs` | ReadDirectoryChangesW: new files and folders, edits — each event only a path to look at again |
+| the decisions | `clients/windows/src/provider.rs` | the server → the folder (placed, moved, refreshed, removed — never a file the member changed and has not sent); the folder → the server; stop |
+
+- **Deletes and renames are the server's first.** NOTIFY_DELETE and
+  NOTIFY_RENAME are answered only after the server took them; a read-only
+  area answers READ_ONLY_VOLUME and Explorer shows the refusal. A rename
+  out of the folder (the Recycle Bin) is a trash.
+- **A read is of the placeholder's version.** FETCH_DATA asks the replica
+  for that version only, 4 MiB at a time; a refused read (a sample, a
+  changed file, evidence whose hash does not match) fails for the range
+  still owed.
+- **Saves wait for the writer.** A changed file is sent once no handle
+  holds it and nothing touched it for 1.5 s; a stale save becomes a
+  conflict copy beside the other version, on both sides.
+- **Stop drops the plaintext.** Every file in sync is dehydrated — the
+  read-only ones too: the shell lifts the attribute for the moment, and the
+  in-sync policy does not track it.
+
+Found on the runner, each now a comment where it bites and an assertion in
+`clients/windows/tests/cloud.rs`:
+
+- the platform sends no rename/delete notification for the provider's own
+  process (the smoke test renames and deletes through PowerShell);
+- a FETCH_DATA failed for zero bytes is not taken — the reader waits out
+  the platform's 60-second timeout;
+- a rename clears a placeholder's in-sync state, even the provider's own:
+  the shell marks its own moves in sync, and a path the member just renamed
+  whose size and last-write time are unchanged is marked in sync, not sent
+  again as a version;
+- a read-only placeholder refuses the exclusive write open that
+  dehydrating takes.
+
+### 39c as built
+
+```text
+the extension (NSFileProviderReplicatedExtension)   queues, polls every 3 s, translates errors
+        │  ProviderCore (GoraniKit)                  every decision — tested by `swift test`
+        │  GoraniBridge                              the replica's JSON protocol, typed
+        ▼  gorani_open / gorani_call / gorani_free   clients/macos/src/lib.rs (a static library)
+the Rust core                                        keys, sealing, the server — nothing in Swift
+```
+
+- **Identifiers are server ids**; the area's top is the root container.
+  A sample is listed without `allowsReading`; a read-only area's items have
+  no write, rename, move or delete capabilities, and the core refuses them
+  anyway.
+- **Versions.** The content version is the item's version number (new
+  bytes are fetched afresh); the metadata version adds the modified time
+  and the sample flag. A save says which version it follows (the
+  `baseVersion` the system hands over); a stale one is a conflict copy on
+  the server and the item answered is theirs.
+- **Anchors are generations.** ReplicaModel keeps the last 16 listings; a
+  change enumeration answers from them, and an anchor it no longer has is
+  expired — the system then enumerates everything again.
+- **Fetch writes one version whole** into a file the system takes over
+  (the replica's `download` op); a version that moved on meanwhile is
+  fetched once more as the current one.
+- **The profile** is `<app group container>/gorani-sync.json`, the group
+  `$(TeamIdentifierPrefix)io.gorani` — enrolled with `gorani-sync setup
+  --profile …`; the host app adds or removes the domain and shows the path.
+- **The project is generated** (`xcodegen generate`, `project.yml`); the
+  team is `GORANI_TEAM_ID` at build time, never in the repository.
+
+CI on `macos-latest`: the bridge's Rust tests; the static library (and
+the system libraries a program linking it needs); `swift test` over the
+in-memory core — items, fetch, create/modify/delete, a stale save, changes
+since an anchor, an expired anchor, a read-only area, the enumerators; and
+an unsigned `xcodebuild` of the app with the extension inside, the core
+linked into it.
+
+### 39d as built
+
+The device secret's parts (commit 34) in each system's own stores, under
+the same words — `--protect tpm+keyring` is the machine's hardware and the
+person's login on all three:
+
+| word | Linux | Windows | macOS |
+|---|---|---|---|
+| the hardware: `tpm` (`enclave` on a Mac) | TPM 2.0 through tpm2-tools: the part sealed under the chip's storage key | a 2048-bit RSA key made in the TPM's CNG provider (Platform Crypto Provider), never exportable; the part encrypted to it (OAEP-SHA256) | a P-256 key made in the Secure Enclave (CryptoKit); the part agreed (ECDH, then HKDF) with a peer key whose private half is dropped at once |
+| the login: `keyring` (also `dpapi`, `keychain`) | the Secret Service | DPAPI, user scope, with an entropy only this client passes | a generic password in the login Keychain |
+| a person each unlock: `hello` / `presence` | — (`--tpm-pin`) | Windows Hello: the part is SHA-256 of its signature over a stored challenge — RSA PKCS#1 v1.5 signs alike each time, and setup asks twice to prove it | the enclave key made with user presence (Touch ID or the password) |
+| what the profile keeps | the sealed blobs; an item reference | the key's name and the ciphertext; the DPAPI blob; the Hello key's name and challenge | the key's enclave-encrypted representation and the peer; an item reference |
+
+- **`auto` never prompts**: the hardware and the login where both answer. A
+  shell that starts at sign-in must not wait for a face, so a person's
+  gesture is asked for only when chosen (`--protect tpm+keyring+hello`). A
+  hardware store that answers but will not make a key leaves the login part
+  alone, and says so; the label printed at setup is the truth.
+- **What each does not do.** DPAPI's user keys open with the user's
+  password and the disk, and a domain's backup key opens them on a
+  domain-joined computer — so `auto` pairs DPAPI with the TPM wherever one
+  answers. And as on Linux, code already running as the user can ask
+  every store exactly as this client does; protectors defeat copies (a
+  backup, a stolen disk, the profile), not malware in the session.
+- **The Mac's helper.** CryptoKit is Swift's, so `gorani-keystore`
+  (clients/macos/GoraniKit) does the enclave and Keychain work for the
+  Rust client, which speaks to it as it speaks to tpm2-tools: parts on
+  pipes only. It is found by `GORANI_KEYSTORE`, beside the program, or on
+  PATH; the installer (39f) puts it beside `gorani-sync` and inside the
+  File Provider extension. A debug build can stand a software key in for
+  the enclave (CI's virtual Macs have none); such keys are marked
+  `software:` and the client refuses them outside its own tests.
+- **A profile from another system** says which system holds its part
+  instead of failing obscurely: a profile does not move between computers.
+- **Tests.** Windows' run on the runner with the core's unit tests: DPAPI
+  round trip and a changed blob refused, a CNG key in the software provider
+  (the TPM's same calls) held and deleted with its protector, the TPM's
+  where the runner has one, Hello's "not set up" message, `auto` never
+  asking a person. The Mac's: the helper built, then the client through it
+  — the enclave (or its stand-in) agreeing the same part again and another
+  peer not, the Keychain holding the part until forgotten, `auto`.
+
+### 39e as built
+
+What Explorer and Finder show of a Gorani folder:
+
+- **Explorer** (`clients/windows/src/shell.rs`): the folder is registered
+  through the shell's StorageProviderSyncRootManager as
+  `Gorani!<the user's SID>!<area>` — its own entry in the navigation pane
+  ("Gorani — <area>", "(read-only)" for an evidence case), the Status
+  column's cloud and tick, "Always keep on this device" and "Free up
+  space"; a malware sample carries a custom state ("Malware sample — never
+  opened raw", a warning sign) and is marked in sync again after, so the
+  shell's write is not taken for an edit. The policies are cldapi's own
+  (cf.rs). Where the shell will not register it (a Server SKU, a
+  policy), cldapi's registration alone still makes it a working folder —
+  said once at start, with the reason; `gorani-cloud unregister` undoes
+  whichever it got.
+- **Finder** (`GoraniFileProviderItem.decorations`, the extension's
+  `NSFileProviderDecorations`): a badge on a sample (warning), on every
+  item of a read-only area (locked), and on a name that did not open in
+  its place (warning) — named under the extension's bundle id.
+- **Found on the runner** (Windows Server, a non-interactive session):
+  `StorageFolder` refuses a `\\?\` path (the form `canonicalize` gives); a
+  sample's state is refused while the placeholder is read-only (lifted for
+  the write, as for every write the shell makes — cf.rs ›
+  read_only_lifted); and the shell's queries — by id, by folder, the list —
+  answer nothing for a root `Register` has just taken. The registration is
+  real: the shell writes it down at `HKLM\…\Explorer\SyncRootManager\<id>\
+  UserSyncRoots` (the user's SID naming the folder), so lookups — and
+  `unregister`, which must remove that entry or leave a stale one in the
+  navigation pane — fall back to reading it.
+- **Tests**: the Windows smoke test finds the folder under its id and
+  checks the shell's folder is this one (failing, where the shell supports
+  sync roots, instead of only saying so), sees the sample stay in sync with
+  its state shown, and proves `unregister` leaves nothing under the id.
+  `swift test` checks each badge and that an ordinary file has none.
+
+### 39f as built
+
+`.github/workflows/package.yml` makes what a person installs, and installs
+or runs it there, as they would:
+
+| | Windows | macOS |
+|---|---|---|
+| what | an MSIX (`clients/windows/packaging`): gorani-cloud and gorani-sync, full trust, each a console command on PATH through an execution alias; logos drawn by `logos.py` (no image committed) | Gorani.app (`clients/macos/packaging/package.sh`): the app, its File Provider extension, the CLI (`Contents/MacOS/gorani-sync`) and two copies of the keystore helper — the CLI's, and the extension's signed to inherit its sandbox |
+| signed with secrets | `WINDOWS_CERT_PFX`, `WINDOWS_CERT_PASSWORD`; the package's publisher is the certificate's subject; timestamped | `GORANI_TEAM_ID` (variable or secret), `APPLE_CERT_P12`, `APPLE_CERT_PASSWORD`: Developer ID, inside-out, hardened runtime, the app group `<team>.io.gorani`; notarized and stapled with `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` |
+| without them | signed with a throwaway certificate made and trusted on that runner only — so installing is tested as a signed package's would be | ad-hoc signed, for testing (Gatekeeper will not open it from a download) |
+| checked | installed with Add-AppxPackage, both aliases answer, removed again | the bundled CLI answers, the helper probes, the extension's binary holds the core |
+
+- **When**: release tags (`v*`), by hand, and when the packaging changes —
+  not on every push.
+- **The one outside tool.** XcodeGen (Homebrew) runs in a job that holds
+  no secret; the signing job takes only the project it generated, and
+  refuses one holding a script phase or a build rule — where a tampered
+  generator could hide a command next to the signing identity.
+- **The secrets** are read only in the steps that sign, never printed;
+  the macOS identity lives in a throwaway keychain deleted when the step
+  ends. They are never asked for: set them in the repository's settings
+  when the certificates exist, and the next tag ships signed packages.
+- **The Mac's helpers and the Keychain.** Both keystore copies are signed
+  with one identifier, so the login Keychain's rule for the CLI's items
+  admits the extension's helper too. Apple silicon only for now (the core
+  is built for arm64).
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

@@ -1,0 +1,20 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# The macOS shell's Rust half (commit 39c, docs/DESKTOP.md): the client
+# core's replica behind a C interface (include in Sources/CGorani/gorani.h),
+# linked as a static library into the File Provider extension and its host
+# app (project.yml) and into the Swift tests (Package.swift).
+
+[package]
+name = "gorani-macos"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+gorani-client-core = { path = "../core" }
+serde_json = "1"
+base64 = "0.22"

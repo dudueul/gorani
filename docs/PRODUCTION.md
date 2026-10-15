@@ -420,6 +420,30 @@ button, not a pipeline. The scanner that looks at the BYTES is local:
 `gorani-sync accept --scan "clamscan --no-summary"` on the accepting
 member's machine (docs/REQUESTS.md › Scanning).
 
+### The desktop installers (commit 39f, docs/DESKTOP.md › 39f)
+
+`.github/workflows/package.yml` builds the Windows MSIX and the Mac app on
+release tags (`v*`), by hand, and when the packaging changes. Signing
+needs these in the repository's settings (Actions secrets — the team id may
+be a variable); none is ever asked for, and each is read only by the step
+that signs:
+
+| name | what |
+|---|---|
+| `WINDOWS_CERT_PFX` | a code-signing certificate with its key, as base64 of the .pfx |
+| `WINDOWS_CERT_PASSWORD` | its password |
+| `GORANI_TEAM_ID` | the Apple Developer team (variable or secret) — the app group is `<team>.io.gorani` |
+| `APPLE_CERT_P12` | the Developer ID Application identity, as base64 of the .p12 |
+| `APPLE_CERT_PASSWORD` | its password |
+| `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | an App Store Connect API key (the .p8's text, its id, the issuer) — to notarize |
+
+Without them the workflow still builds and tests both: the MSIX signed
+with a throwaway certificate trusted only on its runner, the Mac app
+ad-hoc signed — artifacts for testing, not for people. Each computer then
+enrols as before (`gorani-sync setup`; the default protectors are the TPM
+and DPAPI on Windows, the Secure Enclave and the login Keychain on a Mac —
+docs/DESKTOP.md › 39d).
+
 ### Upgrading across commit 29 (the audit trails)
 
 `wrangler.jsonc` gains the `AUDIT` Durable Object binding and migration

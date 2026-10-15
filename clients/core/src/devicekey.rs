@@ -21,6 +21,17 @@
 //! | `keyring` | in the user's login keyring (Secret Service — GNOME Keyring, KWallet), encrypted under their login | a random item reference | holds nothing |
 //! | `file`    | as hex in the profile — dev and CI only, chosen explicitly | the part itself | is the part |
 //!
+//! Windows and macOS (commit 39d — `devicekey/windows.rs`, `devicekey/macos.rs`)
+//! hold parts in their own stores, under the same three words, so
+//! `--protect tpm+keyring` means the same on every computer: the machine's
+//! hardware, and the person's login.
+//!
+//! | word | Linux | Windows | macOS |
+//! |---|---|---|---|
+//! | the hardware (`tpm`; `enclave` on a Mac) | TPM 2.0, tpm2-tools | the TPM, as a non-exportable CNG key (Platform Crypto Provider) | the Secure Enclave (a CryptoKit key) |
+//! | the login (`keyring`) | Secret Service | DPAPI (the user's logon secret) | the login Keychain |
+//! | a person, each unlock (`hello`; `presence` on a Mac) | — (a TPM PIN, `--tpm-pin`) | Windows Hello (a PIN, a face, a finger) | the Secure Enclave with user presence (Touch ID or the password) |
+//!
 //! ```text
 //! device secret = HKDF-SHA256(salt "gorani-device-parts-v1", ikm = part₁ ‖ part₂ …, info = kinds)
 //! ```
@@ -80,6 +91,27 @@ pub enum Protector {
 	Keyring { item: String },
 	/// The part itself, in the clear (dev and CI only).
 	File { part: String },
+	/// Windows (commit 39d): the part as DPAPI protected it for this user
+	/// (base64) — only their logon opens it, on this computer.
+	Dpapi { blob: String },
+	/// Windows: the part encrypted (RSA-OAEP, base64) to a key that never
+	/// leaves its store — `provider` "tpm" (the Platform Crypto Provider:
+	/// the TPM) or "software" (tests) — found by `key`, its name.
+	Cng { provider: String, key: String, wrapped: String },
+	/// Windows Hello: the part is a hash of the Hello key's signature over
+	/// `challenge` (base64) — a gesture each time it is asked for.
+	Hello { key: String, challenge: String },
+	/// macOS: an item in the login Keychain, found by this reference.
+	Keychain { item: String },
+	/// macOS: a Secure Enclave key (its encrypted representation, base64 —
+	/// only this Mac's enclave can use it) and the peer public key the part
+	/// is agreed with; `presence`: each use asks for Touch ID or the password.
+	Enclave {
+		key: String,
+		peer: String,
+		#[serde(default)]
+		presence: bool,
+	},
 }
 
 impl Protector {
@@ -88,34 +120,69 @@ impl Protector {
 			Protector::Tpm { .. } => "tpm",
 			Protector::Keyring { .. } => "keyring",
 			Protector::File { .. } => "file",
+			Protector::Dpapi { .. } => "dpapi",
+			Protector::Cng { .. } => "cng",
+			Protector::Hello { .. } => "hello",
+			Protector::Keychain { .. } => "keychain",
+			Protector::Enclave { .. } => "enclave",
 		}
 	}
 }
 
-/// What a person asks for at setup (`--protect`).
+/// What a person asks for at setup (`--protect`): `auto`, or words joined
+/// with `+` — each the same idea on every system (the table above), made
+/// by that system's own store.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Want {
-	/// Everything this machine has: the TPM and the keyring where both
-	/// answer, either alone otherwise — and an error, not a silent file,
-	/// where neither does.
+	/// Everything this machine has without asking anyone: the hardware and
+	/// the login where both answer, either alone otherwise — and an error,
+	/// not a silent file, where neither does.
 	Auto,
-	Tpm,
-	Keyring,
-	TpmKeyring,
-	File,
+	/// These (`HARDWARE | LOGIN | PRESENCE | FILE`).
+	Set(u8),
+}
+
+impl Want {
+	/// The machine's hardware: a TPM, the Secure Enclave.
+	pub const HARDWARE: u8 = 1;
+	/// The person's login: the keyring, DPAPI, the login Keychain.
+	pub const LOGIN: u8 = 2;
+	/// A person at each unlock: Windows Hello, the enclave with presence.
+	pub const PRESENCE: u8 = 4;
+	pub const FILE_PART: u8 = 8;
+	pub const FILE: Want = Want::Set(Self::FILE_PART);
+	pub const TPM_KEYRING: Want = Want::Set(Self::HARDWARE | Self::LOGIN);
+}
+
+/// The words `--protect` takes here, with what each is.
+fn words() -> &'static [(&'static str, u8)] {
+	if cfg!(target_os = "macos") {
+		&[("enclave", Want::HARDWARE), ("keychain", Want::LOGIN), ("keyring", Want::LOGIN), ("presence", Want::PRESENCE), ("file", Want::FILE_PART)]
+	} else if cfg!(windows) {
+		&[("tpm", Want::HARDWARE), ("dpapi", Want::LOGIN), ("keyring", Want::LOGIN), ("hello", Want::PRESENCE), ("presence", Want::PRESENCE), ("file", Want::FILE_PART)]
+	} else {
+		&[("tpm", Want::HARDWARE), ("keyring", Want::LOGIN), ("file", Want::FILE_PART)]
+	}
 }
 
 impl std::str::FromStr for Want {
 	type Err = Error;
 	fn from_str(s: &str) -> Result<Self, Error> {
-		Ok(match s {
-			"auto" => Want::Auto,
-			"tpm" => Want::Tpm,
-			"keyring" => Want::Keyring,
-			"tpm+keyring" | "keyring+tpm" => Want::TpmKeyring,
-			"file" => Want::File,
-			other => return Err(Error::Config(format!("--protect {other}: one of auto, tpm, keyring, tpm+keyring, file"))),
-		})
+		if s == "auto" {
+			return Ok(Want::Auto);
+		}
+		let mut set = 0u8;
+		for w in s.split('+') {
+			let Some((_, bit)) = words().iter().find(|(name, _)| *name == w) else {
+				let names: Vec<&str> = words().iter().map(|(n, _)| *n).collect();
+				return Err(Error::Config(format!("--protect {s}: auto, or one or more of {} joined with + (on this system)", names.join(", "))));
+			};
+			set |= bit;
+		}
+		if set & Want::FILE_PART != 0 && set != Want::FILE_PART {
+			return Err(Error::Config("--protect file stands alone: a part in the profile beside a protected one only looks stronger".into()));
+		}
+		Ok(Want::Set(set))
 	}
 }
 
@@ -150,6 +217,10 @@ pub fn label(protectors: &[Protector]) -> String {
 	protectors
 		.iter()
 		.map(|p| match p {
+			// (The words a person reads — "tpm" is the TPM on either system.)
+			Protector::Cng { provider, .. } if provider == "tpm" => "tpm".to_string(),
+			Protector::Cng { provider, .. } => format!("cng[{provider}]"),
+			Protector::Enclave { presence: true, .. } => "enclave[presence]".to_string(),
 			Protector::Tpm { pin, pcrs, .. } if *pin || !pcrs.is_empty() => {
 				let mut opts: Vec<String> = Vec::new();
 				if *pin {
@@ -205,43 +276,65 @@ fn combine(parts: &[(&'static str, Zeroizing<[u8; 32]>)]) -> Zeroizing<[u8; 32]>
 	out
 }
 
-/// Make the protectors `want` names (each with a fresh random part) and
-/// the device secret they give. Nothing is written but into the TPM blobs
-/// returned and the keyring.
+/// Make the protectors `want` names (each with a fresh part — random and
+/// sealed, or, for Hello and the enclave, derived from what the hardware
+/// answers) and the device secret they give. Nothing is written but into
+/// the blobs returned and the platform's own stores.
 pub fn create(want: Want, label_text: &str, tpm_options: &TpmOptions) -> Result<(Vec<Protector>, Zeroizing<[u8; 32]>), Error> {
-	let kinds: Vec<&'static str> = match want {
-		Want::Tpm => vec!["tpm"],
-		Want::Keyring => vec!["keyring"],
-		Want::TpmKeyring => vec!["tpm", "keyring"],
-		Want::File => vec!["file"],
-		Want::Auto => {
-			let (tpm, keyring) = (tpm::available(), keyring::available());
-			match (tpm, keyring) {
-				(true, true) => vec!["tpm", "keyring"],
-				(true, false) => vec!["tpm"],
-				(false, true) => vec!["keyring"],
-				(false, false) => {
-					return Err(Error::Config(
-						"this machine offers neither a TPM (tpm2-tools and /dev/tpmrm0 — the user must be in the `tss` group) nor a login keyring (secret-tool and a Secret Service such as GNOME Keyring). Install one, or pass --protect file to keep the secret in the profile — then anyone who copies the profile, with the member's sign-in, can open this computer's copy".into(),
-					))
-				}
-			}
-		}
+	if cfg!(any(windows, target_os = "macos")) && (tpm_options.pin.is_some() || !tpm_options.pcrs.is_empty()) {
+		return Err(Error::Config("--tpm-pin and --tpm-pcrs are for Linux's TPM (tpm2-tools); here a person is asked with --protect …+hello (Windows) or …+presence (macOS)".into()));
+	}
+	let (set, auto) = match want {
+		Want::Set(s) => (s, false),
+		Want::Auto => (platform::auto()?, true),
 	};
 	let mut protectors = Vec::new();
 	let mut parts = Vec::new();
-	for kind in kinds {
-		let mut part = Zeroizing::new([0u8; 32]);
-		rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut part[..]);
-		let p = match kind {
-			"tpm" => tpm::seal(&part, tpm_options)?,
-			"keyring" => keyring::store(&part, label_text)?,
-			_ => Protector::File { part: crate::transfer::hex(&part[..]) },
+	for bit in [Want::HARDWARE, Want::PRESENCE, Want::LOGIN, Want::FILE_PART] {
+		if set & bit == 0 {
+			continue;
+		}
+		let made = match bit {
+			Want::HARDWARE => platform::hardware(tpm_options),
+			Want::PRESENCE => platform::presence(label_text),
+			Want::LOGIN => platform::login(label_text),
+			_ => {
+				let part = random_part();
+				Ok((Protector::File { part: crate::transfer::hex(&part[..]) }, part))
+			}
 		};
-		protectors.push(p);
-		parts.push((kind, part));
+		match made {
+			Ok((p, part)) => {
+				parts.push((p.kind(), part));
+				protectors.push(p);
+			}
+			// `auto` found the hardware there but could not use it (a TPM
+			// that answers and will not make keys): the login alone, said
+			// aloud — the label printed at setup says it too.
+			Err(e) if auto && bit == Want::HARDWARE && set & Want::LOGIN != 0 => eprintln!("warning: this machine's hardware key store did not take a part ({e}) — the login protects it alone"),
+			Err(e) => {
+				forget(&protectors);
+				return Err(e);
+			}
+		}
 	}
 	Ok((protectors, combine(&parts)))
+}
+
+fn random_part() -> Zeroizing<[u8; 32]> {
+	let mut part = Zeroizing::new([0u8; 32]);
+	rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut part[..]);
+	part
+}
+
+/// A part another system holds (a profile copied between computers).
+fn elsewhere(p: &Protector) -> Error {
+	let whose = match p {
+		Protector::Dpapi { .. } | Protector::Cng { .. } | Protector::Hello { .. } => "Windows",
+		Protector::Keychain { .. } | Protector::Enclave { .. } => "macOS",
+		_ => "Linux",
+	};
+	Error::Config(format!("this profile's {} part is held by {whose} on the computer that enrolled it — a profile does not move between computers: enrol this one", p.kind()))
 }
 
 /// The device secret, from its protectors — each asked for its part.
@@ -252,12 +345,8 @@ pub fn open(protectors: &[Protector]) -> Result<Zeroizing<[u8; 32]>, Error> {
 	let mut parts = Vec::new();
 	for p in protectors {
 		let part = match p {
-			Protector::Tpm { public, private, srk, pin, pcrs } => {
-				let pin = if *pin { Some(ask_pin("TPM PIN for this computer: ")?) } else { None };
-				tpm::unseal(public, private, *srk, pin.as_deref().map(String::as_str), pcrs)?
-			}
-			Protector::Keyring { item } => keyring::lookup(item)?,
 			Protector::File { part } => hex32(part).ok_or(Error::Format("a file protector's part is not 32 bytes of hex"))?,
+			other => platform::open(other)?,
 		};
 		parts.push((p.kind(), part));
 	}
@@ -268,11 +357,70 @@ pub fn open(protectors: &[Protector]) -> Result<Zeroizing<[u8; 32]>, Error> {
 /// TPM blob is only data — dropping it from the profile is enough).
 pub fn forget(protectors: &[Protector]) {
 	for p in protectors {
+		platform::forget(p);
+	}
+}
+
+/// Each system's stores, behind the same five calls. (Linux's, and any
+/// other Unix with tpm2-tools and a Secret Service.)
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+	use super::*;
+
+	pub fn auto() -> Result<u8, Error> {
+		match (tpm::available(), keyring::available()) {
+			(true, true) => Ok(Want::HARDWARE | Want::LOGIN),
+			(true, false) => Ok(Want::HARDWARE),
+			(false, true) => Ok(Want::LOGIN),
+			(false, false) => Err(Error::Config(
+				"this machine offers neither a TPM (tpm2-tools and /dev/tpmrm0 — the user must be in the `tss` group) nor a login keyring (secret-tool and a Secret Service such as GNOME Keyring). Install one, or pass --protect file to keep the secret in the profile — then anyone who copies the profile, with the member's sign-in, can open this computer's copy".into(),
+			)),
+		}
+	}
+
+	pub fn hardware(o: &TpmOptions) -> Result<(Protector, Zeroizing<[u8; 32]>), Error> {
+		let part = random_part();
+		Ok((tpm::seal(&part, o)?, part))
+	}
+
+	pub fn presence(_: &str) -> Result<(Protector, Zeroizing<[u8; 32]>), Error> {
+		Err(Error::Config("on Linux a person is asked through the TPM: --protect tpm --tpm-pin".into()))
+	}
+
+	pub fn login(label_text: &str) -> Result<(Protector, Zeroizing<[u8; 32]>), Error> {
+		let part = random_part();
+		Ok((keyring::store(&part, label_text)?, part))
+	}
+
+	pub fn open(p: &Protector) -> Result<Zeroizing<[u8; 32]>, Error> {
+		match p {
+			Protector::Tpm { public, private, srk, pin, pcrs } => {
+				let pin = if *pin { Some(ask_pin("TPM PIN for this computer: ")?) } else { None };
+				tpm::unseal(public, private, *srk, pin.as_deref().map(String::as_str), pcrs)
+			}
+			Protector::Keyring { item } => keyring::lookup(item),
+			other => Err(elsewhere(other)),
+		}
+	}
+
+	pub fn forget(p: &Protector) {
 		if let Protector::Keyring { item } = p {
 			keyring::clear(item);
 		}
 	}
 }
+
+#[cfg(windows)]
+#[path = "devicekey/windows.rs"]
+pub mod win;
+#[cfg(windows)]
+use self::win as platform;
+
+#[cfg(target_os = "macos")]
+#[path = "devicekey/macos.rs"]
+pub mod mac;
+#[cfg(target_os = "macos")]
+use self::mac as platform;
 
 fn hex32(s: &str) -> Option<Zeroizing<[u8; 32]>> {
 	let s = s.trim();
@@ -366,6 +514,7 @@ pub mod tpm {
 		fn new() -> Result<Self, Error> {
 			let base = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
 			let dir = base.join(format!("gorani-tpm-{}", crate::new_item_id()));
+			#[cfg_attr(not(unix), allow(unused_mut))]
 			let mut b = std::fs::DirBuilder::new();
 			#[cfg(unix)]
 			{
@@ -570,7 +719,7 @@ mod tests {
 
 	#[test]
 	fn a_file_protector_round_trips_and_labels_say_what_protects() {
-		let (ps, secret) = create(Want::File, "test", &TpmOptions::default()).unwrap();
+		let (ps, secret) = create(Want::FILE, "test", &TpmOptions::default()).unwrap();
 		assert_eq!(label(&ps), "file");
 		assert_eq!(*open(&ps).unwrap(), *secret);
 		let json = serde_json::to_string(&ps).unwrap();
@@ -580,8 +729,30 @@ mod tests {
 		assert_eq!(label(&[tpm(true, vec![0, 7])]), "tpm[pin,pcr:0,pcr:7]");
 		assert_eq!(TpmOptions::parse_pcrs("7, 0,7").unwrap(), vec![0, 7]);
 		assert!(TpmOptions::parse_pcrs("24").is_err());
-		assert!("tpm+keyring".parse::<Want>().is_ok() && "usb".parse::<Want>().is_err());
+		assert!("keyring".parse::<Want>().is_ok() && "usb".parse::<Want>().is_err());
+		assert!("file+keyring".parse::<Want>().is_err(), "a file part beside a protected one is refused");
 		assert!(open(&[]).is_err(), "no protectors, no secret");
+		let cng = |provider: &str| Protector::Cng { provider: provider.into(), key: "k".into(), wrapped: String::new() };
+		assert_eq!(label(&[cng("tpm"), Protector::Dpapi { blob: String::new() }]), "tpm+dpapi", "the TPM is \"tpm\" on Windows too");
+		assert_eq!(label(&[cng("software")]), "cng[software]");
+		assert_eq!(label(&[Protector::Enclave { key: String::new(), peer: String::new(), presence: true }, Protector::Keychain { item: "x".into() }]), "enclave[presence]+keychain");
+	}
+
+	#[test]
+	fn the_same_words_mean_the_same_on_every_system() {
+		let hw = if cfg!(target_os = "macos") { "enclave" } else { "tpm" };
+		assert_eq!(format!("{hw}+keyring").parse::<Want>().unwrap(), Want::TPM_KEYRING);
+		assert_eq!("file".parse::<Want>().unwrap(), Want::FILE);
+		if cfg!(not(any(windows, target_os = "macos"))) {
+			assert!("hello".parse::<Want>().is_err() && "dpapi".parse::<Want>().is_err(), "Windows' words are not Linux's");
+		}
+	}
+
+	#[test]
+	fn a_part_from_another_system_says_so() {
+		let foreign = if cfg!(windows) { Protector::Keychain { item: "x".into() } } else { Protector::Dpapi { blob: "AA==".into() } };
+		let e = open(&[foreign]).map(|_| ()).expect_err("not openable here").to_string();
+		assert!(e.contains("does not move between computers"), "{e}");
 	}
 
 	#[test]

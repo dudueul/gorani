@@ -91,7 +91,7 @@ jobs:
           # its publisher carries this OID (and never as the signed identity).
           ./clients/windows/packaging/package.ps1 -Version "$base.${{ github.run_number }}" -Name Gorani.Client `
             -Publisher 'CN=Gorani Unsigned, OID.2.25.311729368913984317654407730594956997722=1' -Out dist/gorani-windows-x64-unsigned.msix
-          Compress-Archive -Path target/release/gorani-cloud.exe, target/release/gorani-sync.exe -DestinationPath dist/gorani-windows-x64.zip
+          Compress-Archive -Path target/release/gorani-cloud.exe, target/release/gorani-sync.exe, clients/windows/packaging/gorani.ico -DestinationPath dist/gorani-windows-x64.zip
           if ($env:STORE_NAME -and $env:STORE_PUBLISHER) {
             ./clients/windows/packaging/package.ps1 -Version "$base.0" -Name $env:STORE_NAME -Publisher $env:STORE_PUBLISHER `
               -PublisherDisplayName ($env:STORE_PUBLISHER_NAME ? $env:STORE_PUBLISHER_NAME : 'Gorani') -Out store/gorani-store.msix

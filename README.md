@@ -2,6 +2,8 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 
+<p align="center"><img src="docs/assets/gorani.svg" width="180" alt="Gorani: a cute water deer (고라니), round ears, dark eyes and two little tusks"></p>
+
 A zero-trust, end-to-end encrypted file store for a security-operations
 team (it began as a family NAS — docs/FAMILY.md is that history). Files are
 sealed in the browser (Lit + WebCrypto) or the native Rust clients before

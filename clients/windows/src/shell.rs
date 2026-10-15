@@ -29,9 +29,20 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// The custom state a malware sample shows (Explorer's Status column).
 const SAMPLE_STATE: i32 = 1;
-/// The folder's icon in the navigation pane (shell32's closed folder) —
-/// until the installer gives the program one of its own (39f).
+/// The folder's icon in the navigation pane where the program has none of
+/// its own beside it (shell32's closed folder).
 const FOLDER_ICON: &str = "%SystemRoot%\\System32\\shell32.dll,-4";
+
+/// The water deer (39h): gorani.ico beside the program — the package and
+/// the ZIP both put it there — else the system's folder.
+fn icon() -> String {
+	std::env::current_exe()
+		.ok()
+		.and_then(|exe| exe.parent().map(|d| d.join("gorani.ico")))
+		.filter(|p| p.is_file())
+		.map(|p| format!("{},0", plain(&p)))
+		.unwrap_or_else(|| FOLDER_ICON.to_string())
+}
 /// A sample's state icon (user32's standard warning sign).
 const WARNING_ICON: &str = "%SystemRoot%\\System32\\user32.dll,-101";
 /// What the in-sync state tracks, in the shell's documented bits: times and
@@ -125,7 +136,7 @@ fn register_shell(root: &Path, area: &str, read_only: bool) -> Result<String, St
 		info.SetId(&HSTRING::from(id.as_str()))?;
 		info.SetPath(&folder)?;
 		info.SetDisplayNameResource(&HSTRING::from(name.as_str()))?;
-		info.SetIconResource(&HSTRING::from(FOLDER_ICON))?;
+		info.SetIconResource(&HSTRING::from(icon()))?;
 		// The same policies cf.rs › register gives cldapi.
 		info.SetHydrationPolicy(StorageProviderHydrationPolicy::Partial)?;
 		info.SetHydrationPolicyModifier(StorageProviderHydrationPolicyModifier::None)?;

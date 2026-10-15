@@ -243,12 +243,24 @@ pub async fn authenticate(env: &Env, req: &Request) -> Result<Identity> {
 	if !iss.starts_with(&team_origin) {
 		return Err(Error::RustError(format!("token issuer {iss} is not the team")));
 	}
-	if t.claims.get("aud").and_then(|v| v.as_str()) != Some(aud.as_str()) {
+	// Access sends `aud` as an ARRAY holding the application's tag (RFC
+	// 7519 allows either form; until commit 39k only a string was read, so
+	// a real token would have failed here next).
+	let audience_ok = match t.claims.get("aud") {
+		Some(serde_json::Value::String(a)) => *a == aud,
+		Some(serde_json::Value::Array(all)) => all.iter().any(|a| a.as_str() == Some(aud.as_str())),
+		_ => false,
+	};
+	if !audience_ok {
 		return Err(Error::RustError("token audience does not match POLICY_AUD".into()));
 	}
 	let exp = t.claims.get("exp").and_then(|v| v.as_u64()).unwrap_or(0);
 	if exp < now {
 		return Err(Error::RustError("token expired".into()));
+	}
+	// Not before (Access sets it to the issue time); a minute of clock skew.
+	if t.claims.get("nbf").and_then(|v| v.as_u64()).is_some_and(|nbf| nbf > now + 60) {
+		return Err(Error::RustError("token is not valid yet".into()));
 	}
 	// A member's token names their email. A SERVICE token's names a
 	// `common_name` and no email (commit 37a): that is a collector — or no

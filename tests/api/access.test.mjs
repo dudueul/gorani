@@ -81,9 +81,12 @@ function jwt(claims, { key = privateKey, kid = KID, alg = "RS256" } = {}) {
 	return `${head}.${body}.${b64u(sig)}`;
 }
 const now = () => Math.floor(Date.now() / 1000);
-const member = (email, extra = {}) => jwt({ iss: TEAM, aud: AUD, email, sub: `user-${email}`, iat: now(), exp: now() + 600, type: "app", ...extra });
+// The claims as Access writes them: `aud` an ARRAY holding the application's
+// tag (a string is read too — RFC 7519 allows both), `nbf` the issue time,
+// an `identity_nonce`.
+const member = (email, extra = {}) => jwt({ aud: [AUD], email, exp: now() + 600, iat: now(), nbf: now(), iss: TEAM, type: "app", identity_nonce: "n0nce", sub: `user-${email}`, country: "US", ...extra });
 // A service token's JWT: Access's machine identity — a common_name, no email.
-const service = () => jwt({ iss: TEAM, aud: AUD, common_name: "8d7e2a0b.access", sub: "", iat: now(), exp: now() + 600, type: "app" });
+const service = () => jwt({ aud: [AUD], common_name: "8d7e2a0b.access", exp: now() + 600, iat: now(), nbf: now(), iss: TEAM, sub: "", type: "app" });
 
 const dev = await startDev({ persist: "access", vars: { GORANI_DEV: "0", POLICY_AUD: AUD, TEAM_DOMAIN: CERTS, BOOTSTRAP_TOKEN: BOOT } });
 const call = (method, path, token, body, extra = {}) =>
@@ -118,7 +121,10 @@ try {
 		return r.text;
 	};
 	assert.match(await refused(null, "no token"), /missing Access token/);
-	assert.match(await refused(member("ana@team.test", { aud: "someone-elses-app" }), "another application's token"), /audience/);
+	assert.match(await refused(member("ana@team.test", { aud: ["someone-elses-app"] }), "another application's token"), /audience/);
+	assert.match(await refused(member("ana@team.test", { aud: [] }), "a token for no application"), /audience/);
+	assert.equal((await call("GET", "/api/v1/family", member("ana@team.test", { aud: AUD }))).status, 200, "aud as a plain string is the same audience");
+	assert.match(await refused(member("ana@team.test", { nbf: now() + 3600 }), "a token not valid for another hour"), /not valid yet/);
 	assert.match(await refused(member("ana@team.test", { exp: now() - 60 }), "an expired token"), /expired/);
 	assert.match(await refused(member("ana@team.test", { iss: "https://evil.cloudflareaccess.com" }), "another team's issuer"), /issuer/);
 	assert.match(await refused(jwt({ iss: TEAM, aud: AUD, email: "ana@team.test", exp: now() + 600 }, { key: other.privateKey }), "signed by a key the team does not hold"), /bad signature/);
@@ -131,7 +137,7 @@ try {
 	const [h, , s] = member("ana@team.test").split(".");
 	assert.match(await refused(`${h}.${b64u(JSON.stringify({ iss: TEAM, aud: AUD, email: "mallory@team.test", exp: now() + 600 }))}.${s}`, "claims edited after signing"), /bad signature/);
 
-	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused on member routes and, unregistered, on the drop routes; missing, foreign-audience, expired, foreign-issuer, forged, unknown-key, non-RS256 (HS256, ES256) and wrong-key-type tokens each refused by name — against a JWKS in Access's own shape");
+	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused on member routes and, unregistered, on the drop routes; missing, foreign-audience, expired, foreign-issuer, forged, not-yet-valid, unknown-key, non-RS256 (HS256, ES256) and wrong-key-type tokens each refused by name — Access's own token and JWKS shapes (aud an array)");
 } finally {
 	await dev.close();
 	await new Promise((r) => jwks.close(r));

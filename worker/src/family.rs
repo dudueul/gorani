@@ -651,7 +651,7 @@ impl GoraniFamilyDO {
 		})?)
 	}
 
-	async fn create_member(&self, actor: &str, body: NewMember) -> Result<Response> {
+	async fn create_member(&self, actor: &str, mut body: NewMember) -> Result<Response> {
 		if !auth::valid_member_id(&body.id) {
 			return json_error(400, "member id: 2–32 chars of a–z, 0–9, dashes");
 		}
@@ -679,6 +679,12 @@ impl GoraniFamilyDO {
 			}
 			if role != "lead" {
 				return json_error(400, "the first member must be a lead");
+			}
+			// The bootstrap screen (commit 39k) sends no emails: the first lead
+			// is the person signed in — their verified Access email, never one
+			// typed (a typo would lock the only lead out of their own team).
+			if body.emails.is_empty() && !actor.is_empty() {
+				body.emails = vec![actor.to_string()];
 			}
 		}
 		if let Some(e) = self.email_taken(&body.emails, None)? {

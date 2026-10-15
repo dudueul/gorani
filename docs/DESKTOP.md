@@ -180,10 +180,16 @@ before starting (commit 33, after D11/D12) found:
   private-key use), binds the key type to the algorithm (an ES256 token,
   HS256, or an RS256 header over a non-RSA key is refused), refuses keys
   under 2048 bits, and re-reads the JWKS when a token names a key it has
-  not seen (Access rotates keys; at most once a minute). The stub now
+  not seen (Access rotates keys; at most once a minute). And the next
+  wall, found reading Access's documentation instead of waiting for it:
+  Access's `aud` is an **array** holding the application's tag — the
+  Worker read only a string, so a correctly signed token would have
+  failed as "audience does not match". Both forms are read now, and `nbf`
+  is checked. The stub now
   serves RSA keys in Access's own response shape (`keys` beside
-  `public_cert` / `public_certs`) — a stub is a claim about the real
-  thing, and this one had never been checked against it.
+  `public_cert` / `public_certs`) and mints Access's own claims (`aud` an
+  array, `nbf`, `identity_nonce`) — a stub is a claim about the real thing,
+  and this one had never been checked against it.
 
 ### 33b as built
 

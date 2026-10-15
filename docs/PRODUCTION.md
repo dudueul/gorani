@@ -47,8 +47,9 @@ settings are in § 3 › The desktop installers.)
 
    (Before the first deploy, `secret put` offers to create the Worker
    so it can hold the secret — say yes; the deploy then fills it in.)
-5. **Bootstrap** (§ 3 › Steps): `BOOTSTRAP_TOKEN`, then the first member
-   (a parent/lead) through Access with that token; delete the secret after.
+5. **Bootstrap** (§ 3 › Steps): `BOOTSTRAP_TOKEN` (keep the value a
+   minute), then https://gorani.at.day › *Create the first lead* with it;
+   delete the secret after.
 6. **Check**: `curl https://gorani.at.day/api/healthz`; sign in at
    https://gorani.at.day; enrol a computer (`gorani-sync setup`, docs/INSTALL.md).
 
@@ -387,20 +388,32 @@ to the hostname, so each person enrols theirs again (passwords and recovery
 methods are unaffected); a computer's profile keeps the server it enrolled
 with (its `server` field).
 
-First-run bootstrap (commit 25, O18): set a one-time secret first —
+First-run bootstrap (commit 25, O18; the screen, commit 39k): set a
+one-time secret, keeping its value for the next minute —
 
 ```sh
-openssl rand -base64 32 | npx wrangler secret put BOOTSTRAP_TOKEN
+BOOT=$(openssl rand -base64 32); echo "$BOOT"
+printf %s "$BOOT" | npx wrangler secret put BOOTSTRAP_TOKEN
 ```
 
-— then sign in through Access and `POST /api/v1/family/members` with your
-parent member and the header `x-gorani-bootstrap: <that token>`. Without the
-secret a production deployment refuses to bootstrap at all; without the
-header nobody becomes the first member (the race the token closes: whoever
-got through Access first used to become a parent). The first member must
-be a parent; after it exists the token is meaningless (delete the secret
-if you like). Then `PUT /api/v1/family/master` with the generated master
-public half, and create each vault from the UI (commit ⑨'s setup screen).
+— then open https://gorani.at.day and sign in through Access. With nobody
+registered yet the app shows **Create the first lead**: your member id
+(lowercase, e.g. `seongwoo`), your name, and that token. You become the
+first lead under the email you signed in with (the registry takes it from
+Access, not from a field). Without the secret a production deployment
+refuses to bootstrap at all; without the token nobody becomes the first
+member (the race it closes: whoever got through Access first used to become
+the admin). After the first member exists the token is meaningless —
+`npx wrangler secret delete BOOTSTRAP_TOKEN`. (Until commit 39k this step
+piped the token straight into wrangler — so nobody ever saw it — and asked
+for a hand-made API call the browser could not make.)
+
+Then, in the app: your own vault (the setup screen — a password, and the
+recovery code it shows once), the other members (Team › People; each sets
+up their own vault at first sign-in), and — once there are two or more
+leads — the **team recovery key** (Team › Recovery: k of n leads must
+approve any recovery, docs/CASES.md). Until it exists, a member who loses
+every unlock method loses their area.
 
 **Rate limits** (O13) are in `wrangler.jsonc › ratelimits` (60/min per
 caller + share link, 30/min per caller + device). They are per Cloudflare

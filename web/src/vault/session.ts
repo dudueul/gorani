@@ -1,6 +1,6 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// The device-hold design follows Mailflare's vault session (Apache 2.0, ©
-// Cloudflare, Inc.); see NOTICE.
+// The device-hold design follows Mailflare's vault session (Seongwoo Hong's modified version; Apache 2.0,
+// original © Cloudflare, Inc.); see NOTICE.
 
 /**
  * The unlocked session (docs/VAULT.md › In the browser). What "unlocked"

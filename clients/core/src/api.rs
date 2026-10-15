@@ -1,5 +1,5 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
-// Portions derived from Mailflare's desktop core (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
+// Portions derived from Mailflare's desktop core (Seongwoo Hong's modified version; Apache 2.0, original © Cloudflare, Inc.); see NOTICE.
 
 //! The HTTP layer: every endpoint of docs/DESKTOP.md, one method each. In
 //! production the member signs in through Access — their token rides every

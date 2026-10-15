@@ -1,6 +1,6 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 // The change-feed and tombstone design follows Mailflare's files store
-// (Apache 2.0, © Cloudflare, Inc.); see NOTICE.
+// (Seongwoo Hong's modified version; Apache 2.0, original © Cloudflare, Inc.); see NOTICE.
 
 //! `GoraniMemberDO` — one family member's database (instance `member:<id>`).
 //!

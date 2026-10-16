@@ -401,6 +401,17 @@ export class FilesModel {
 		this.set({ selection: next });
 	}
 
+	/** Exactly these (the marquee: until 39m it added each hit with a
+	 * toggling select on every pointer move, so items flickered in and out). */
+	selectOnly(items: Selection[]): void {
+		this.set({ selection: items });
+	}
+
+	/** The sort's direction, set rather than flipped (the Sort by menu). */
+	sortDirection(dir: SortState["dir"]): void {
+		this.set({ sort: { ...this.state.get().sort, dir } });
+	}
+
 	selectAll(): void {
 		const s = this.state.get();
 		const source = s.trashMode ? { folders: s.trashFolders, files: s.trashFiles } : { folders: s.folders, files: s.files };
@@ -439,21 +450,45 @@ export class FilesModel {
 	}
 
 	async move(kind: "file" | "folder", ids: string[], folderId: string | null): Promise<void> {
-		for (const id of ids) {
-			const path = kind === "file" ? `${areaPath(this.memberId)}/files/${id}` : `${areaPath(this.memberId)}/files/folders/${id}`;
-			await this.bridge.apiSend("PATCH", path, kind === "file" ? { folderId } : { parentId: folderId });
+		await this.moveItems(ids.map((id) => ({ kind, id })), folderId);
+	}
+
+	/** Move a selection — files and folders together — into a folder (null:
+	 * the top). Until commit 39m every caller passed ONE kind for the lot,
+	 * the first item's, so a folder dragged or moved along with files went
+	 * to the files route and failed. Each item goes on its own; one the
+	 * server refuses (a folder into its own subfolder) is reported, and the
+	 * rest still move. */
+	async moveItems(items: Selection[], folderId: string | null): Promise<void> {
+		const failed: string[] = [];
+		let moved = 0;
+		for (const it of items) {
+			if (it.kind === "folder" && it.id === folderId) continue; // a folder onto itself: nothing to do
+			const path = it.kind === "file" ? `${areaPath(this.memberId)}/files/${it.id}` : `${areaPath(this.memberId)}/files/folders/${it.id}`;
+			try {
+				await this.bridge.apiSend("PATCH", path, it.kind === "file" ? { folderId } : { parentId: folderId });
+				moved++;
+			} catch (e) {
+				failed.push(`“${this.names.get(it.id) ?? it.id}”: ${e instanceof Error ? e.message : String(e)}`);
+			}
 		}
 		await this.refresh();
-		this.bridge.toast(`Moved ${ids.length} item${ids.length > 1 ? "s" : ""}`);
+		this.bridge.toast([moved ? `Moved ${moved} item${moved > 1 ? "s" : ""}` : "", failed.length ? `not moved — ${failed.join("; ")}` : ""].filter(Boolean).join(" · ") || "Nothing to move");
 	}
 
 	async trash(kind: "file" | "folder", ids: string[]): Promise<void> {
-		for (const id of ids) {
-			const path = kind === "file" ? `${areaPath(this.memberId)}/files/${id}` : `${areaPath(this.memberId)}/files/folders/${id}`;
+		await this.trashItems(ids.map((id) => ({ kind, id })));
+	}
+
+	/** To the Trash, files and folders together (see moveItems: until 39m a
+	 * mixed selection was deleted as the first item's kind). */
+	async trashItems(items: Selection[]): Promise<void> {
+		for (const it of items) {
+			const path = it.kind === "file" ? `${areaPath(this.memberId)}/files/${it.id}` : `${areaPath(this.memberId)}/files/folders/${it.id}`;
 			await this.bridge.apiSend("DELETE", path);
 		}
 		await this.refresh();
-		this.bridge.toast(`Moved ${ids.length} item${ids.length > 1 ? "s" : ""} to the Trash`);
+		this.bridge.toast(`Moved ${items.length} item${items.length > 1 ? "s" : ""} to the Trash`);
 	}
 
 	async restore(files: string[], folders: string[]): Promise<void> {
@@ -1047,10 +1082,18 @@ export class FilesModel {
 		if (this.clipboard.files.length + this.clipboard.folders.length) this.bridge.toast("Cut");
 	}
 
-	async paste(): Promise<void> {
+	/** Whether Paste has anything to paste (the menus grey it out otherwise —
+	 * until 39m they asked whether something was SELECTED instead). */
+	get canPaste(): boolean {
+		return !!this.clipboard && this.clipboard.files.length + this.clipboard.folders.length > 0;
+	}
+
+	/** Paste into `into` (a folder right-clicked, a tree row), or into the
+	 * open folder. */
+	async paste(into?: string | null): Promise<void> {
 		const clip = this.clipboard;
 		if (!clip) return;
-		const folderId = this.state.get().folderId;
+		const folderId = into === undefined ? this.state.get().folderId : into;
 		if (clip.mode === "cut") {
 			for (const id of clip.files) await this.bridge.apiSend("PATCH", `${areaPath(this.memberId)}/files/${id}`, { folderId });
 			for (const id of clip.folders) await this.bridge.apiSend("PATCH", `${areaPath(this.memberId)}/files/folders/${id}`, { parentId: folderId });
@@ -1061,6 +1104,12 @@ export class FilesModel {
 		}
 		// Copy = duplicate: open the bytes, seal them fresh (a copy is a new
 		// file with a new content key — the original's history is untouched).
+		// Folders are not copied (a deep copy re-seals every file inside):
+		// said, not silently skipped.
+		if (clip.folders.length && !clip.files.length) {
+			this.bridge.toast("Folders are not copied — Cut and Paste moves them");
+			return;
+		}
 		for (const id of clip.files) {
 			const plainParts: Uint8Array[] = [];
 			const served = await this.openBytes(id, undefined, async (plain) => {

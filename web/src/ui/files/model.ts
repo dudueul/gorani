@@ -70,6 +70,11 @@ export interface FileRow {
 	version: number;
 	createdAt: string;
 	updatedAt: string;
+	/** The original file's modified date (39y), opened from its sealed
+	 * place — ISO 8601, or null when the uploader's client did not know it
+	 * (or uploaded before 39y). Shown and sorted by in place of updatedAt
+	 * (`shownModified`), as a file manager shows the file's own date. */
+	modified: string | null;
 	trashedWith?: string | null;
 	/** A malware sample (commit 29e): the server's flag. The model also
 	 * honours the sealed type's mark (isSample) — either one counts. */
@@ -415,7 +420,8 @@ export class FilesModel {
 			rows.map(async (f) => {
 				const name = await this.openName(priv, places.fileName(this.memberId, f.id), f.id, f.name);
 				const sample = f.sample === true;
-				return { id: f.id, folder: f.folder, nameSealed: f.name, name, kind: sample ? "sample" : kindOf(name), size: Number(f.size), version: f.version, createdAt: f.createdAt, updatedAt: f.updatedAt, trashedWith: f.trashedWith ?? null, sample };
+				const modified = f.modified ? await openModified(priv, this.memberId, f.id, f.version, f.modified) : null;
+				return { id: f.id, folder: f.folder, nameSealed: f.name, name, kind: sample ? "sample" : kindOf(name), size: Number(f.size), version: f.version, createdAt: f.createdAt, updatedAt: f.updatedAt, modified, trashedWith: f.trashedWith ?? null, sample };
 			}),
 		);
 	}
@@ -431,7 +437,7 @@ export class FilesModel {
 				case "name":
 					return cmp(a.name, b.name) * dir;
 				case "modified":
-					return a.updatedAt.localeCompare(b.updatedAt) * dir;
+					return shownModified(a).localeCompare(shownModified(b)) * dir;
 				case "size":
 					return (a.size - b.size) * dir;
 				case "type":
@@ -877,7 +883,13 @@ export class FilesModel {
 		// …and, in an evidence case, its intake record, sealed into this
 		// file's place and signed the same way (commit 29g, intake.ts).
 		const intake = me && intakeFields ? await signIntake(me.signer, priv, this.memberId, id, intakeFields) : undefined;
-		const extra = { ...(mmeta ? { mmeta } : {}), ...(signed ? { hash: signed.sealed, stamp: signed.stamp } : {}), ...(intake ? { intake } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}) };
+		// The original's modified date (39y): when this copy was last changed
+		// on the uploader's disk — sealed into version 1's place, so the
+		// server keeps its own times and never learns (or alters) this one.
+		// (A browser that does not know it says 0, or now: either is sent as
+		// it is, since there is no better date to keep.)
+		const modified = file.lastModified > 0 ? await sealPlacedText(priv, places.fileModified(this.memberId, id, 1), new Date(file.lastModified).toISOString()) : undefined;
+		const extra = { ...(mmeta ? { mmeta } : {}), ...(signed ? { hash: signed.sealed, stamp: signed.stamp } : {}), ...(intake ? { intake } : {}), ...(sample ? { sample: "1" } : {}), ...(folderId ? { folder_id: folderId } : {}), ...(modified ? { modified } : {}) };
 		try {
 			if (file.size > WHOLE_LIMIT) {
 				// GC01 frames, each read and sealed only when the bridge is ready
@@ -1747,7 +1759,10 @@ export class FilesModel {
 			// exactly what it is — this case's own copy, checked first.
 			const me = this.bridge.identity?.() ?? null;
 			const intake: IntakeFields | null = this.bridge.areaKind?.() === "evidence" ? { source: `a copy of “${name}” (${id}) in this case`, collector: me?.signer.member ?? "", method: "duplicated in gorani from the case's own copy, after its signature was checked", collectedAt: new Date().toISOString(), notes: "" } : null;
-			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original }), await this.fingerprint(digest), folderId, hexOf(digest), sample, intake);
+			// The copy keeps its original's date, as a file manager's copy does (39y).
+			const source = this.rowOf(id);
+			const lastModified = source ? Date.parse(shownModified(source)) : Date.now();
+			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original, lastModified }), await this.fingerprint(digest), folderId, hexOf(digest), sample, intake);
 		}
 		await this.refresh();
 		this.bridge.toast(`Duplicated ${clip.files.length} file${clip.files.length > 1 ? "s" : ""}`);
@@ -1804,7 +1819,7 @@ export class FilesModel {
 	/** Info for the Get Info / details pane: everything readable, opened. */
 	/** `mime` is what may be rendered: null unless `policy` is "normal" (commit
 	 * 29e). `shownType` is for display only — a sample's original type. */
-	async info(id: string): Promise<{ name: string; kind: FileKind; size: number; version: number; createdAt: string; updatedAt: string; mime: string | null; policy: "normal" | "sample" | "unverified"; shownType: string | null } | null> {
+	async info(id: string): Promise<{ name: string; kind: FileKind; size: number; version: number; createdAt: string; updatedAt: string; modified: string | null; mime: string | null; policy: "normal" | "sample" | "unverified"; shownType: string | null } | null> {
 		const keys = await this.keysFor<{ keys: Record<string, { key: string; version: number; type: string | null; size: number; sample?: boolean }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
@@ -1812,7 +1827,7 @@ export class FilesModel {
 		const policy = await this.policyOf(meta, id, opened);
 		const row = this.rowOf(id);
 		const shownType = opened.mime && isSampleType(opened.mime) ? originalType(opened.mime) : opened.mime;
-		return row ? { name: row.name, kind: row.kind, size: row.size, version: meta.version, createdAt: row.createdAt, updatedAt: row.updatedAt, mime: policy === "normal" ? opened.mime : null, policy, shownType } : null;
+		return row ? { name: row.name, kind: row.kind, size: row.size, version: meta.version, createdAt: row.createdAt, updatedAt: row.updatedAt, modified: row.modified, mime: policy === "normal" ? opened.mime : null, policy, shownType } : null;
 	}
 
 	async refresh(): Promise<void> {
@@ -1863,6 +1878,23 @@ export function toWebVtt(text: string): string {
 	return `WEBVTT\n\n${t.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}`;
 }
 
+/** The date a file manager shows for a file (39y): its own modified date
+ * when the uploader's client kept it, else when it reached gorani. */
+export function shownModified(f: { modified?: string | null; updatedAt: string }): string {
+	return f.modified ?? f.updatedAt;
+}
+
+/** A version's original modified date, opened from its place — or null:
+ * one that does not open there, or is not a date, is not shown. */
+async function openModified(priv: VaultPrivateKey, area: string, id: string, version: number, sealed: string): Promise<string | null> {
+	try {
+		const text = await openPlacedText(priv, places.fileModified(area, id, version), sealed);
+		return /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(text) && Number.isFinite(Date.parse(text)) ? text : null;
+	} catch {
+		return null;
+	}
+}
+
 /** The body of `files/purge`: the items by kind, or Empty Trash. */
 function purgeBody(what: Selection[] | "trash"): { files?: string[]; folders?: string[]; trash?: true } {
 	if (what === "trash") return { trash: true };
@@ -1887,6 +1919,8 @@ interface FileRowJson {
 	version: number;
 	createdAt: string;
 	updatedAt: string;
+	/** The current version's sealed original modified date (39y). */
+	modified?: string | null;
 	trashedWith?: string | null;
 	sample?: boolean;
 }

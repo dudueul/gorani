@@ -40,6 +40,8 @@ export interface ShareTarget {
 	name: string;
 	size: number;
 	version: number;
+	/** The original's modified date (39y): it rides in the link's sealed meta. */
+	modified?: string | null;
 }
 
 /**
@@ -185,7 +187,7 @@ export class GoraniShare extends LitElement {
 			if (this.viewOnly && this.copyVersion !== null) {
 				// View-only (40c): no copy for the link — only its sealed name,
 				// and the hash of the claim proof its page will derive.
-				const metaSealed = await sealShareMeta(keys.meta, id, { name: this.target.name, type: null, size: this.target.size, modified: null });
+				const metaSealed = await sealShareMeta(keys.meta, id, { name: this.target.name, type: null, size: this.target.size, modified: this.target.modified ?? null });
 				await this.model.api.apiSend("POST", `${areaPath(this.model.memberId)}/files/shares`, {
 					id,
 					fileId: this.target.id,
@@ -208,7 +210,7 @@ export class GoraniShare extends LitElement {
 			await this.model.openBytes(this.target.id, this.target.version, (p) => { plainParts.push(p); });
 			const plain = concatParts(plainParts);
 			const copy = await sealChunked(keys.data, plain, DEFAULT_CHUNK);
-			const metaSealed = await sealShareMeta(keys.meta, id, { name: this.target.name, type: null, size: plain.length, modified: null });
+			const metaSealed = await sealShareMeta(keys.meta, id, { name: this.target.name, type: null, size: plain.length, modified: this.target.modified ?? null });
 			// The owner's list keeps the link's name sealed into the share's place.
 			const nameSealed = await this.model.sealShareName(id, this.target.name);
 

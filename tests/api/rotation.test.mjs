@@ -66,7 +66,7 @@ try {
 	assert.equal(up.status, 200, JSON.stringify(up.json));
 	// (Version 2 carries a content-hash record: the walk re-seals it like any
 	// other value — its signature, inside, names no key and does not change.)
-	const v2 = await upload(`/files/${fileId}/versions`, { ck: await a.fileKey(fileId, 2, ck2), type: await a.fileType(fileId, 2, "text/plain"), size: String(v2plain.length), base_version: "1", hash: await a.fileHash(fileId, 2, { v: 1, stand: "in" }) }, await sealWith(await importContentKey(ck2), v2plain));
+	const v2 = await upload(`/files/${fileId}/versions`, { ck: await a.fileKey(fileId, 2, ck2), type: await a.fileType(fileId, 2, "text/plain"), size: String(v2plain.length), base_version: "1", hash: await a.fileHash(fileId, 2, { v: 1, stand: "in" }), modified: await a.fileModified(fileId, 2, "2019-05-04T03:02:01.000Z") }, await sealWith(await importContentKey(ck2), v2plain));
 	assert.equal(v2.status, 200, JSON.stringify(v2.json));
 	await call("PUT", "/api/v1/members/jinu/files/secrets", { sealed: await a.secrets(JSON.stringify({ fp: "fingerprint key", idx: "index key" })) });
 	const shareId = newShareId();
@@ -84,19 +84,19 @@ try {
 
 	const privA = a.priv;
 	const before = await opensAnything(call, "jinu", privA);
-	// 2 versions × (key + type) + file name + folder name + music + video sidecar + poster + position + share name + secrets + hash
-	assert.equal(before, 13, "the old store key opens every sealed value before the rotation");
+	// 2 versions × (key + type) + file name + folder name + music + video sidecar + poster + position + share name + secrets + hash + modified date (39y)
+	assert.equal(before, 14, "the old store key opens every sealed value before the rotation");
 
 	// ── 1. The rotation walk ────────────────────────────────────────────
 	const storeB = await createStoreKey();
 	const b = await storeSealer(storeB.bundle, "jinu");
 	const privB = b.priv;
 	const report = await resealStore(call, "jinu", privA, privB);
-	assert.deepEqual(report.resealed, { version: 2, file: 1, folder: 1, music: 1, video: 1, position: 1, share: 1, secrets: 1, hash: 1, intake: 0, custody: 0, collection: 0, reject: 0, inboxkey: 0, requestlabel: 0 }, "every kind, every row — older versions included (intake and custody live in evidence cases: api:custody walks them; collection records and rejections in case inboxes: api:collect)");
+	assert.deepEqual(report.resealed, { version: 2, file: 1, folder: 1, music: 1, video: 1, position: 1, share: 1, secrets: 1, hash: 1, modified: 1, intake: 0, custody: 0, collection: 0, reject: 0, inboxkey: 0, requestlabel: 0 }, "every kind, every row — older versions included (intake and custody live in evidence cases: api:custody walks them; collection records and rejections in case inboxes: api:collect)");
 
 	// ── 2. The proof: the old key opens NOTHING; the new key everything ─
 	assert.equal(await opensAnything(call, "jinu", privA), 0, "the departed member's old store key opens nothing in the store");
-	assert.equal(await opensAnything(call, "jinu", privB), 13, "the new key opens all of it");
+	assert.equal(await opensAnything(call, "jinu", privB), 14, "the new key opens all of it");
 
 	// The OLD version still decrypts to its original bytes under the new key
 	// (via ?version=1 — which, before commit 24, silently served version 2).
@@ -109,7 +109,7 @@ try {
 
 	// ── 3. Idempotent, and the old form is gone ─────────────────────────
 	const again = await resealStore(call, "jinu", privA, privB);
-	assert.deepEqual(again.resealed, { version: 0, file: 0, folder: 0, music: 0, video: 0, position: 0, share: 0, secrets: 0, hash: 0, intake: 0, custody: 0, collection: 0, reject: 0, inboxkey: 0, requestlabel: 0 }, "a second walk re-seals nothing");
+	assert.deepEqual(again.resealed, { version: 0, file: 0, folder: 0, music: 0, video: 0, position: 0, share: 0, secrets: 0, hash: 0, modified: 0, intake: 0, custody: 0, collection: 0, reject: 0, inboxkey: 0, requestlabel: 0 }, "a second walk re-seals nothing");
 	assert.equal(again.alreadyNew.version, 2);
 	const oldForm = await api(dev.base, "PUT", "/api/v1/members/jinu/files/reseal", { email, body: { keys: { [fileId]: { ck: "GV03:x" } } } });
 	assert.equal(oldForm.status, 400, "the living-version-only reseal form is refused (clean break)");

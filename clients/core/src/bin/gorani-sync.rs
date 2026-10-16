@@ -521,6 +521,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 						let ck = gorani_formats::formats::new_content_key();
 						let key = gorani_formats::formats::import_content_key(&ck);
 						let mut fields = area.new_file_fields(&file_id, &name, &ck, size, &sha256, intake.as_ref())?;
+						fields.extend(area.modified_field(&file_id, 1, mtime_of(Path::new(&path)))?);
 						fields.push(("chunk".into(), chunk.to_string()));
 						transfer::push_frames(&client, &journal, &jkey, Path::new(&path), &key, &member, &file_id, chunk, size, fields, None, Some(&sha256), progress)?
 					}
@@ -539,7 +540,9 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let ck = gorani_formats::formats::new_content_key();
 			let key = gorani_formats::formats::import_content_key(&ck);
 			let sealed = gorani_formats::formats::seal_with(&key, &bytes);
-			let fields = api::UploadFields { form: area.new_file_fields(&file_id, &name, &ck, bytes.len() as u64, &sha256, intake.as_ref())? };
+			let mut form = area.new_file_fields(&file_id, &name, &ck, bytes.len() as u64, &sha256, intake.as_ref())?;
+			form.extend(area.modified_field(&file_id, 1, mtime_of(Path::new(&path)))?);
+			let fields = api::UploadFields { form };
 			let row = client.upload_whole(&fields, &sealed)?;
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
@@ -723,3 +726,9 @@ fn unlocked(flag: &dyn Fn(&str) -> Option<String>) -> Result<(DeviceProfile, Ses
 
 /// What a name that does not open in its place prints as (O6).
 const UNVERIFIED: &str = "⚠ unverified — not sealed here";
+
+/// A local file's modified time, seconds since the epoch — 0 when the file
+/// system has none (39y: pushed with the file, sealed).
+fn mtime_of(path: &Path) -> u64 {
+	std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
+}

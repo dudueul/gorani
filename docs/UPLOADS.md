@@ -56,6 +56,26 @@ there is one duplicate prompt and one progress line. The status bar shows
 "Uploading 12 of 340 · IMG_0012.jpg" and **Stop**: the file being sent
 finishes, the rest are not sent, and the toast says how many went.
 
+**A file keeps its own date (39y).** The "Date modified" column shows
+the file's own modified date, as a file manager does, not the moment it
+reached gorani.
+- **Where it comes from.** In the browser it is `File.lastModified`; the
+  desktop clients send the local file's mtime. It is sealed into version
+  n's place (`file.modified`, docs/ENCRYPTION.md), like the name, so the
+  server keeps only its own times and cannot change this one unseen.
+- **Where it goes.** It sorts the column and shows in the preview pane and
+  Get Info, beside "Uploaded". It also rides in backups, the rotation walk
+  (kind `modified`), share links' sealed meta and the desktop mounts.
+- **Copies.** A copy keeps its original's date, as a file manager's does.
+- **Older files.** A file uploaded before 39y, or by a client that did not
+  know the date, shows when it arrived.
+
+Two limits:
+- **The Linux mount** sends the time a file was last written there. A date
+  set after the file is closed (`touch -d`, `cp -p`) isn't sent.
+- **Downloads.** A browser can't set a downloaded file's date. The desktop
+  mounts show the stored date.
+
 **A big file shows its parts (39x).** A file past the whole-upload limit
 (48 MiB) is sealed and sent in parts (docs/LARGE-FILES.md). While one is
 going, the bar adds "37 of 1,200 parts" beside its name. A part counts

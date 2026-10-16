@@ -65,7 +65,15 @@ struct FileSqlRow {
 	/// not ask for it.
 	#[serde(default)]
 	sample: i64,
+	/// The current version's sealed original modified date (39y) — null for
+	/// a file uploaded before it, or by a client that did not know it.
+	#[serde(default)]
+	modified_sealed: Option<String>,
 }
+
+/// The current version's sealed modified date, as a column of a `files`
+/// SELECT (39y): one lookup by primary key per row.
+const MODIFIED_COL: &str = "(SELECT v.modified_sealed FROM file_versions v WHERE v.file_id = files.id AND v.version = files.version) AS modified_sealed";
 
 #[derive(Clone, serde::Deserialize)]
 struct FolderSqlRow {
@@ -191,6 +199,10 @@ impl GoraniMemberDO {
 		if get("mmeta").is_some_and(|b| !gorani_formats::placed::is_placed_text(&b)) {
 			return json_error(400, "music metadata must arrive sealed into its place (GV04)");
 		}
+		// The original's modified date (39y): sealed, or not at all.
+		if get("modified").is_some_and(|m| !gorani_formats::placed::is_placed_text(&m)) {
+			return json_error(400, "the modified date must arrive sealed into its place (GV04)");
+		}
 		if let Some(refused) = self.hash_refusal(get("hash").as_deref()).await? {
 			return Ok(refused);
 		}
@@ -235,7 +247,7 @@ impl GoraniMemberDO {
 		self.contributor_add(&file_id, actor).await?;
 		self.sql
 			.exec(
-				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, stamp_imprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, stamp_imprint, modified_sealed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
 				Some(vec![
 					file_id.clone().into(),
 					version.into(),
@@ -248,6 +260,7 @@ impl GoraniMemberDO {
 					bind(get("tag")),
 					bind(get("hash")),
 					bind(get("stamp")),
+					bind(get("modified")),
 				]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("version insert: {e}")))?;
@@ -304,6 +317,10 @@ impl GoraniMemberDO {
 		if get("mmeta").is_some_and(|b| !gorani_formats::placed::is_placed_text(&b)) {
 			return json_error(400, "music metadata must arrive sealed into its place (GV04)");
 		}
+		// The original's modified date (39y): sealed, or not at all.
+		if get("modified").is_some_and(|m| !gorani_formats::placed::is_placed_text(&m)) {
+			return json_error(400, "the modified date must arrive sealed into its place (GV04)");
+		}
 		if let Some(refused) = self.hash_refusal(get("hash").as_deref()).await? {
 			return Ok(refused);
 		}
@@ -313,7 +330,7 @@ impl GoraniMemberDO {
 		}
 		self.sql
 			.exec(
-				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, stamp_imprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+				"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, tag, hash_sealed, stamp_imprint, modified_sealed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
 				Some(vec![
 					file_id.clone().into(),
 					next.into(),
@@ -326,6 +343,7 @@ impl GoraniMemberDO {
 					bind(get("tag")),
 					bind(get("hash")),
 					bind(get("stamp")),
+					bind(get("modified")),
 				]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("version insert: {e}")))?;
@@ -549,14 +567,14 @@ impl GoraniMemberDO {
 		let offset = q.get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
 		let limit = q.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(500).clamp(1, 1000);
 		let (rows, total): (Vec<FileSqlRow>, TotalCount) = if folder == "all" {
-			let rows = self.sql.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample FROM files WHERE deleted_at IS NULL ORDER BY created_at, id LIMIT ?1 OFFSET ?2", Some(vec![limit.into(), offset.into()]))?.to_array()?;
+			let rows = self.sql.exec(&format!("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample, {MODIFIED_COL} FROM files WHERE deleted_at IS NULL ORDER BY created_at, id LIMIT ?1 OFFSET ?2"), Some(vec![limit.into(), offset.into()]))?.to_array()?;
 			let total = self.sql.exec("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NULL", None)?.one::<TotalCount>()?;
 			(rows, total)
 		} else {
 			let parent = if folder == "root" { None } else { Some(folder.clone()) };
 			let rows = self
 				.sql
-				.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample FROM files WHERE deleted_at IS NULL AND folder_id IS ?1 ORDER BY created_at, id LIMIT ?2 OFFSET ?3", Some(vec![bind(parent.clone()), limit.into(), offset.into()]))?
+				.exec(&format!("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample, {MODIFIED_COL} FROM files WHERE deleted_at IS NULL AND folder_id IS ?1 ORDER BY created_at, id LIMIT ?2 OFFSET ?3"), Some(vec![bind(parent.clone()), limit.into(), offset.into()]))?
 				.to_array()?;
 			let total = self.sql.exec("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NULL AND folder_id IS ?1", Some(vec![bind(parent)]))?.one::<TotalCount>()?;
 			(rows, total)
@@ -566,7 +584,7 @@ impl GoraniMemberDO {
 			"total": total.n,
 			"files": rows.into_iter().map(|f| serde_json::json!({
 				"id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size,
-				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner, "sample": f.sample != 0,
+				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner, "sample": f.sample != 0, "modified": f.modified_sealed,
 			})).collect::<Vec<_>>(),
 			"folders": folders.into_iter().map(|f| serde_json::json!({
 				"id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at,
@@ -1385,7 +1403,7 @@ impl GoraniMemberDO {
 	pub(crate) async fn trash_list(&self) -> Result<Response> {
 		let files: Vec<FileSqlRow> = self
 			.sql
-			.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, sample FROM files WHERE deleted_at IS NOT NULL ORDER BY updated_at DESC", None)?
+			.exec(&format!("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, sample, {MODIFIED_COL} FROM files WHERE deleted_at IS NOT NULL ORDER BY updated_at DESC"), None)?
 			.to_array()?;
 		let folders: Vec<FolderSqlRow> = self
 			.sql
@@ -1395,7 +1413,7 @@ impl GoraniMemberDO {
 		Ok(Response::from_json(&serde_json::json!({
 			"files": files.into_iter().map(|f| serde_json::json!({
 				"id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size,
-				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "sample": f.sample != 0,
+				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "sample": f.sample != 0, "modified": f.modified_sealed,
 			})).collect::<Vec<_>>(),
 			"folders": folders.into_iter().map(|f| serde_json::json!({
 				"id": f.id, "parent": f.parent_id, "name": f.name_sealed, "createdAt": f.created_at, "updatedAt": f.updated_at,
@@ -1650,6 +1668,7 @@ impl GoraniMemberDO {
 	/// | `share` | shares | the owner's copy of the name |
 	/// | `secrets` | files_secrets | fingerprint + index keys |
 	/// | `hash` | file_versions | the uploader's signed content hash (29d) |
+	/// | `modified` | file_versions | the original file's modified date (39y) |
 	/// | `intake` | files | an evidence file's signed intake record (29g) |
 	/// | `custody` | custody | each custody link's sealed reason (29g) |
 	/// | `collection` | files | an accepted inbox item's collection record (37c) |
@@ -1679,13 +1698,15 @@ impl GoraniMemberDO {
 			// (Its own kind, not a third value of `version`: most versions
 			// carry no hash, and a walk's items stay one or two values.)
 			"hash" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, hash_sealed AS v1, NULL AS v2 FROM file_versions WHERE rowid > ?1 AND hash_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
+			// (The original's modified date, 39y: its own kind for the same reason.)
+			"modified" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, modified_sealed AS v1, NULL AS v2 FROM file_versions WHERE rowid > ?1 AND modified_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"intake" => "SELECT rowid AS row, id AS a, NULL AS b, intake_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 AND intake_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"custody" => "SELECT rowid AS row, file_id AS a, CAST(seq AS TEXT) AS b, reason_sealed AS v1, NULL AS v2 FROM custody WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"collection" => "SELECT rowid AS row, id AS a, NULL AS b, collection_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 AND collection_sealed IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"reject" => "SELECT rowid AS row, id AS a, NULL AS b, reject_reason AS v1, NULL AS v2 FROM inbox_items WHERE rowid > ?1 AND reject_reason IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"inboxkey" => "SELECT rowid AS row, key_id AS a, NULL AS b, private_sealed AS v1, NULL AS v2 FROM area_inbox_keys WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"requestlabel" => "SELECT rowid AS row, id AS a, NULL AS b, label_sealed AS v1, NULL AS v2 FROM upload_requests WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
-			_ => return json_error(400, "kind: version | file | folder | music | video | position | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
+			_ => return json_error(400, "kind: version | file | folder | music | video | position | share | secrets | hash | modified | intake | custody | collection | reject | inboxkey | requestlabel"),
 		};
 		// `&file=<id>` narrows `version` to one file's versions (commit 29e:
 		// marking a sample re-seals each of ITS versions' types — a walk of
@@ -1745,13 +1766,14 @@ impl GoraniMemberDO {
 				"secrets" => "UPDATE files_secrets SET v = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				// (Only a row that HAS a hash: a reseal never adds a claim.)
 				"hash" => "UPDATE file_versions SET hash_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND hash_sealed IS NOT NULL",
+				"modified" => "UPDATE file_versions SET modified_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND modified_sealed IS NOT NULL",
 				"intake" => "UPDATE files SET intake_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND intake_sealed IS NOT NULL",
 				"custody" => "UPDATE custody SET reason_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"collection" => "UPDATE files SET collection_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND collection_sealed IS NOT NULL",
 				"reject" => "UPDATE inbox_items SET reject_reason = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND reject_reason IS NOT NULL",
 				"inboxkey" => "UPDATE area_inbox_keys SET private_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"requestlabel" => "UPDATE upload_requests SET label_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
-				_ => return json_error(400, "kind: version | file | folder | music | video | position | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
+				_ => return json_error(400, "kind: version | file | folder | music | video | position | share | secrets | hash | modified | intake | custody | collection | reject | inboxkey | requestlabel"),
 			};
 			plan.push((sql, row, v1, v2));
 		}
@@ -1782,7 +1804,7 @@ impl GoraniMemberDO {
 		match self.file_sql_row(id).await? {
 			Some(f) => Ok(Response::from_json(&serde_json::json!({
 				"id": f.id, "folder": f.folder_id, "name": f.name_sealed, "size": f.size,
-				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner, "sample": f.sample != 0,
+				"version": f.version, "createdAt": f.created_at, "updatedAt": f.updated_at, "owner": f.owner, "sample": f.sample != 0, "modified": f.modified_sealed,
 			}))?),
 			None => json_error(404, "no such file"),
 		}
@@ -1791,7 +1813,7 @@ impl GoraniMemberDO {
 	async fn file_sql_row(&self, id: &str) -> Result<Option<FileSqlRow>> {
 		let rows: Vec<FileSqlRow> = self
 			.sql
-			.exec("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample FROM files WHERE id = ?1", Some(vec![id.into()]))?
+			.exec(&format!("SELECT id, folder_id, name_sealed, size, version, created_at, updated_at, owner, sample, {MODIFIED_COL} FROM files WHERE id = ?1"), Some(vec![id.into()]))?
 			.to_array()?;
 		Ok(rows.into_iter().next())
 	}

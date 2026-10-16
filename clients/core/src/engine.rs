@@ -366,7 +366,10 @@ impl Engine {
 			let name = self.area.open(&Place::file_name(&self.area.name, id), f["name"].as_str().unwrap_or_default());
 			let version = f["version"].as_i64().unwrap_or(1);
 			let size = f["size"].as_u64().or_else(|| f["size"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
-			nodes.insert(ino, Node { ino, parent, name: shown(name, id), kind: Kind::File, id: Some(id.into()), size, version, modified: iso_seconds(f["updatedAt"].as_str().unwrap_or_default()), sample: f["sample"].as_bool() == Some(true), local: false });
+			// The file's own modified date where its uploader kept it (39y), else
+			// when it reached the server.
+			let modified = f["modified"].as_str().and_then(|m| self.area.open_modified(id, version, m)).unwrap_or_else(|| iso_seconds(f["updatedAt"].as_str().unwrap_or_default()));
+			nodes.insert(ino, Node { ino, parent, name: shown(name, id), kind: Kind::File, id: Some(id.into()), size, version, modified, sample: f["sample"].as_bool() == Some(true), local: false });
 		}
 		for n in local {
 			if !nodes.contains_key(&n.ino) && nodes.contains_key(&n.parent) {
@@ -701,6 +704,8 @@ impl Engine {
 				if let Some(f) = &folder {
 					form.push(("folder_id".into(), f.clone()));
 				}
+				// (When it was last written here — the mount's own mtime, 39y.)
+				form.extend(self.area.modified_field(&id, 1, node.modified)?);
 				self.client.upload_whole(&UploadFields { form }, &sealed)?;
 				if let Some(n) = self.nodes.get_mut(&ino) {
 					n.local = false;
@@ -711,7 +716,8 @@ impl Engine {
 				}
 			}
 			Some(base) => {
-				let form = self.area.version_fields(&id, base, &ck, plain.len() as u64, &sha256)?;
+				let mut form = self.area.version_fields(&id, base, &ck, plain.len() as u64, &sha256)?;
+				form.extend(self.area.modified_field(&id, base + 1, node.modified)?);
 				match self.client.upload_version(&id, &UploadFields { form }, &sealed) {
 					Ok(_) => {
 						if let Some(n) = self.nodes.get_mut(&ino) {
@@ -733,6 +739,7 @@ impl Engine {
 						if let Some(f) = &folder {
 							form.push(("folder_id".into(), f.clone()));
 						}
+						form.extend(self.area.modified_field(&copy_id, 1, node.modified)?);
 						self.client.upload_whole(&UploadFields { form }, &sealed2)?;
 						eprintln!("gorani-mount: {} changed elsewhere while it was open — your bytes were saved as “{copy_name}”", node.name);
 						if let Some(h) = self.handles.get_mut(&fh) {
@@ -875,12 +882,22 @@ fn now_secs() -> u64 {
 }
 
 /// Seconds since the epoch of `YYYY-MM-DDTHH:MM:SS…` (UTC); 0 if unreadable.
-fn iso_seconds(s: &str) -> u64 {
+pub(crate) fn iso_seconds(s: &str) -> u64 {
 	let n = |a: usize, b: usize| s.get(a..b).and_then(|x| x.parse::<i64>().ok());
 	let (Some(y), Some(m), Some(d)) = (n(0, 4), n(5, 7), n(8, 10)) else { return 0 };
 	let (h, mi, se) = (n(11, 13).unwrap_or(0), n(14, 16).unwrap_or(0), n(17, 19).unwrap_or(0));
 	let days = days_from_civil(y, m, d);
 	(days * 86_400 + h * 3600 + mi * 60 + se).max(0) as u64
+}
+
+/// Seconds since the epoch as ISO 8601 UTC — what the browser's
+/// `Date.toISOString` writes, so a date sealed here reads the same there
+/// (39y: a file's original modified date).
+pub(crate) fn iso_of(secs: u64) -> String {
+	let days = (secs / 86_400) as i64;
+	let rest = secs % 86_400;
+	let (y, m, d) = civil_from_days(days);
+	format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z", rest / 3600, rest % 3600 / 60, rest % 60)
 }
 
 // Howard Hinnant's civil-calendar algorithms (proleptic Gregorian).
@@ -926,5 +943,17 @@ mod tests {
 		assert_eq!(iso_seconds("1970-01-01T00:00:00Z"), 0);
 		assert_eq!(iso_seconds("2000-03-01T00:00:00Z"), 951_868_800);
 		assert_eq!(iso_seconds("garbage"), 0);
+	}
+
+	#[test]
+	fn a_modified_date_is_written_as_the_browser_writes_it_and_reads_back() {
+		// (39y: a desktop seals its mtime in the format Date.toISOString
+		// writes, so either side opens what the other sealed.)
+		assert_eq!(iso_of(0), "1970-01-01T00:00:00.000Z");
+		assert_eq!(iso_of(951_868_800), "2000-03-01T00:00:00.000Z");
+		assert_eq!(iso_of(1_760_000_000), "2025-10-09T08:53:20.000Z");
+		for secs in [1, 59, 86_399, 86_400, 951_868_799, 1_760_000_000, 4_102_444_800] {
+			assert_eq!(iso_seconds(&iso_of(secs)), secs, "{secs} round-trips");
+		}
 	}
 }

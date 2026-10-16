@@ -291,7 +291,8 @@ try {
 		assert.equal(r.status, 200, `16 MiB part ${p}: ${r.status}`);
 		tags20.push({ partNumber: p, etag: (await r.json()).etag });
 	}
-	const done20 = await upload(dev.base, "jinu@family.test", "jinu", `/files/uploads/${st20.json.uploadId}/complete`, { key: st20.json.key, size: String(p20.length), chunk: String(c16), ck: f20.fields.ck, name: f20.fields.name, type: f20.fields.type, parts: JSON.stringify(tags20) }, null);
+	// (With the original's modified date, 39y — the completion carries it.)
+	const done20 = await upload(dev.base, "jinu@family.test", "jinu", `/files/uploads/${st20.json.uploadId}/complete`, { key: st20.json.key, size: String(p20.length), chunk: String(c16), ck: f20.fields.ck, name: f20.fields.name, type: f20.fields.type, parts: JSON.stringify(tags20), modified: await store.fileModified(f20.id, 1, "2011-12-13T14:15:16.000Z") }, null);
 	assert.equal(done20.status, 200, JSON.stringify(done20.json));
 	const got20 = await fetch(`${dev.base}/api/v1/members/jinu/files/${f20.id}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
 	assert.equal(got20.headers.get("x-gorani-chunk"), String(c16));
@@ -394,7 +395,40 @@ try {
 	const bad = await upload(dev.base, "jinu@family.test", "jinu", "/files", { file_id: store.newId(), ck: ckSealed, name, type: typeSealed, size: String(plain.length) }, enc.encode("plaintext bytes!!"));
 	assert.equal(bad.status, 400);
 
-	console.log("ok  api:files — upload/list/keys/download/folders/changes/versions/chunked+range/trash/duplicates/video sidecars/secrets/refusals/family");
+	// ── The original's modified date (39y) ─────────────────────────────
+	// Sealed into each version's place by the uploader's client; the
+	// listing carries the CURRENT version's, still sealed; one that is not
+	// sealed text is refused, and a file uploaded without one lists null.
+	{
+		const listed = async (id) => (await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" })).json.files.find((f) => f.id === id);
+		const ckD = newContentKey();
+		const plainD = enc.encode("a file with a past");
+		const fD = await store.newFile("dated.txt", "text/plain", ckD);
+		const when1 = "2003-04-05T06:07:08.000Z";
+		const upD = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...fD.fields, size: String(plainD.length), modified: await store.fileModified(fD.id, 1, when1) }, await sealWith(await importContentKey(ckD), plainD));
+		assert.equal(upD.status, 200, JSON.stringify(upD.json));
+		const rowD = await listed(fD.id);
+		assert.match(rowD.modified ?? "", /^GV04:/, "the listing carries it sealed — the server never sees the date");
+		assert.equal(await store.openFileModified(fD.id, 1, rowD.modified), when1, "…and it opens, in version 1's place");
+		await assert.rejects(store.openFileModified(fD.id, 2, rowD.modified), "…and nowhere else");
+		const ckD2 = newContentKey();
+		const when2 = "2004-05-06T07:08:09.000Z";
+		const v2D = await upload(dev.base, "jinu@family.test", "jinu", `/files/${fD.id}/versions`, { ck: await store.fileKey(fD.id, 2, ckD2), type: await store.fileType(fD.id, 2, "text/plain"), size: String(plainD.length), base_version: "1", modified: await store.fileModified(fD.id, 2, when2) }, await sealWith(await importContentKey(ckD2), plainD));
+		assert.equal(v2D.status, 200, JSON.stringify(v2D.json));
+		assert.equal(await store.openFileModified(fD.id, 2, (await listed(fD.id)).modified), when2, "a new version carries its own, and the listing follows the current version");
+		assert.equal(await store.openFileModified(f20.id, 1, (await listed(f20.id)).modified), "2011-12-13T14:15:16.000Z", "a chunked upload's completion carries it too");
+		const fNone = await store.newFile("undated.txt", "text/plain", ckD);
+		assert.equal((await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...fNone.fields, size: String(plainD.length) }, await sealWith(await importContentKey(ckD), plainD))).status, 200);
+		assert.equal((await listed(fNone.id)).modified, null, "a file uploaded without one lists none (the explorer shows its upload time)");
+		const fBad = await store.newFile("bad-date.txt", "text/plain", ckD);
+		const badDate = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...fBad.fields, size: String(plainD.length), modified: when1 }, await sealWith(await importContentKey(ckD), plainD));
+		assert.equal(badDate.status, 400, "a date in the clear is refused — the store would hold what the uploader's client did not seal");
+		assert.match(badDate.json.error, /modified date must arrive sealed/);
+		const walk = (await api(dev.base, "GET", "/api/v1/members/jinu/files/sealed?kind=modified&after=0&limit=100", { email: "jinu@family.test" })).json;
+		assert.ok(walk.items.some((i) => i.a === fD.id && i.b === "1") && walk.items.some((i) => i.a === fD.id && i.b === "2"), "the rotation walk reaches every version's date (kind modified)");
+	}
+
+	console.log("ok  api:files — upload/list/keys/download/folders/changes/versions/chunked+range/trash/duplicates/video sidecars/secrets/refusals/family/the original's modified date (sealed, per version, walked)");
 } finally {
 	await dev.close();
 }

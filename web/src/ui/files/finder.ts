@@ -26,6 +26,7 @@
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, Selection, SortState } from "./model.ts";
+import { shownModified } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, deleteForever, emptyTrash, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
 import { fromRelativePaths } from "./dropped.ts";
@@ -58,7 +59,7 @@ export class GoraniFinder extends LitElement {
 	private typeTimer: ReturnType<typeof setTimeout> | undefined;
 	@state() private quickLook: { id: string; name: string; url?: string; text?: string; kind: FileKind; meta?: { size: number; version: number; updatedAt: string } } | null = null;
 	@state() private info: Awaited<ReturnType<FilesModel["info"]>> = null;
-	@state() private shareTarget: { id: string; name: string; size: number; version: number } | null = null;
+	@state() private shareTarget: { id: string; name: string; size: number; version: number; modified: string | null } | null = null;
 	/** The upload-links dialog (commit 38): its tab, and the folder a new link files into. */
 	@state() private requests: { tab: "inbox" | "links"; folderId: string | null; folderName: string } | null = null;
 
@@ -69,7 +70,7 @@ export class GoraniFinder extends LitElement {
 	private openShare(id: string): void {
 		const row = this.s().files.find((f) => f.id === id);
 		if (!row) return;
-		this.shareTarget = { id, name: row.name, size: row.size, version: row.version };
+		this.shareTarget = { id, name: row.name, size: row.size, version: row.version, modified: row.modified };
 	}
 
 	protected override createRenderRoot(): HTMLElement {
@@ -159,7 +160,7 @@ export class GoraniFinder extends LitElement {
 			if (p && this.quickLook?.id === id) {
 				if (row.kind === "image") this.quickLook.url = blobURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
 				else if (row.kind === "text" || row.kind === "code" || row.kind === "pdf") this.quickLook.text = new TextDecoder().decode(p.bytes.subarray(0, 16384));
-				this.quickLook.meta = { size: row.size, version: row.version, updatedAt: row.updatedAt };
+				this.quickLook.meta = { size: row.size, version: row.version, updatedAt: shownModified(row) };
 			}
 		} catch {
 			// best-effort
@@ -819,7 +820,7 @@ export class GoraniFinder extends LitElement {
 				<span data-rename="${id}" class="flex min-w-0 items-center gap-2.5">${icon(k)}<span class="truncate">${name}</span></span>
 				<span class="text-right text-neutral-400">${size === null ? "--" : fmtSize(size)}</span>
 				<span class="text-neutral-400">${kind === "folder" ? "Folder" : kindLabel(k)}</span>
-				<span class="text-right text-neutral-400">${fmtDate((kind === "folder" ? this.s().folders : this.s().files).find((x) => x.id === id)?.updatedAt ?? "")}</span>
+				<span class="text-right text-neutral-400">${fmtDate(kind === "folder" ? (this.s().folders.find((x) => x.id === id)?.updatedAt ?? "") : shownModified(this.s().files.find((x) => x.id === id) ?? { updatedAt: "" }))}</span>
 			</div>
 		`;
 		return html`
@@ -1002,7 +1003,7 @@ export class GoraniFinder extends LitElement {
 						<p class="truncate text-base font-medium text-neutral-100">${i.name}</p>
 					</div>
 					<dl class="mt-4 space-y-1.5 text-xs">
-						${[["Kind", kindLabel(i.kind)], ["Size", fmtSize(i.size)], ["Version", `v${i.version}`], ["MIME", i.mime ?? "—"], ["Created", new Date(i.createdAt).toLocaleString()], ["Modified", new Date(i.updatedAt).toLocaleString()]].map(([k, v]) => html`<div class="flex justify-between gap-4 border-b border-neutral-800 pb-1.5"><dt class="text-neutral-500">${k}</dt><dd class="truncate text-neutral-300">${v}</dd></div>`)}
+						${[["Kind", kindLabel(i.kind)], ["Size", fmtSize(i.size)], ["Version", `v${i.version}`], ["MIME", i.mime ?? "—"], ["Modified", new Date(shownModified(i)).toLocaleString()], ["Uploaded", new Date(i.createdAt).toLocaleString()]].map(([k, v]) => html`<div class="flex justify-between gap-4 border-b border-neutral-800 pb-1.5"><dt class="text-neutral-500">${k}</dt><dd class="truncate text-neutral-300">${v}</dd></div>`)}
 					</dl>
 					<p class="mt-3 text-xs text-neutral-500">Sealed end to end — the server stored none of these values, they were opened here.</p>
 				</div>

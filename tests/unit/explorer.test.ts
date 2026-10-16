@@ -22,7 +22,7 @@
 import assert from "node:assert/strict";
 import { generateHybridKey, importVaultKey, openWith, unwrapPlacedKey, isPlacedText } from "../../web/src/vault/vault-crypto.ts";
 import { openChunk, chunkFor, frameCount, sealedSize } from "../../web/src/vault/chunked-file.ts";
-import { FilesModel, UNVERIFIED, WHOLE_LIMIT, toWebVtt, type FilesBridge } from "../../web/src/ui/files/model.ts";
+import { FilesModel, UNVERIFIED, WHOLE_LIMIT, toWebVtt, shownModified, type FilesBridge } from "../../web/src/ui/files/model.ts";
 import { walkEntries, fromRelativePaths, plainFiles, isLitter, MAX_DROPPED_FILES, type EntryLike, type FileEntryLike, type DirEntryLike } from "../../web/src/ui/files/dropped.ts";
 import { memoryJournal } from "../../web/src/lib/upload-journal.ts";
 import { places } from "../../web/src/vault/places.ts";
@@ -39,7 +39,7 @@ import { join } from "node:path";
 const store = await generateHybridKey();
 const storePrivate = await importVaultKey(store.bundle);
 const objects = new Map<string, Uint8Array>();
-const rows = new Map<string, { id: string; folder: string | null; name: string; size: number; version: number; createdAt: string; updatedAt: string; trashedWith?: string | null; sample?: boolean }>();
+const rows = new Map<string, { id: string; folder: string | null; name: string; size: number; version: number; createdAt: string; updatedAt: string; trashedWith?: string | null; sample?: boolean; modified?: string | null }>();
 const folders = new Map<string, { id: string; parent: string | null; name: string; createdAt: string; updatedAt: string; deletedAt?: string | null }>();
 const versions = new Map<string, { ck: string; object: string; type: string | null; chunk: number | null; hash: string | null }>();
 let feedCursor = 0;
@@ -62,7 +62,7 @@ const server = {
 		if (p.endsWith("/files/list")) {
 			const folder = url.searchParams.get("folder") ?? "root";
 			return {
-				files: [...rows.values()].filter((r) => !r.trashedWith && (folder === "all" || (folder === "root" ? r.folder === null : r.folder === folder))).map((r) => ({ id: r.id, folder: r.folder, name: r.name, size: r.size, version: r.version, createdAt: r.createdAt, updatedAt: r.updatedAt, sample: r.sample === true })),
+				files: [...rows.values()].filter((r) => !r.trashedWith && (folder === "all" || (folder === "root" ? r.folder === null : r.folder === folder))).map((r) => ({ id: r.id, folder: r.folder, name: r.name, size: r.size, version: r.version, createdAt: r.createdAt, updatedAt: r.updatedAt, sample: r.sample === true, modified: r.modified ?? null })),
 				// Every live folder, whichever folder is listed — the real
 				// contract (files_store.rs › files_list: "folders come along
 				// whole"); the model takes the folder's children from them.
@@ -220,7 +220,7 @@ const bridge: FilesBridge = {
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
 		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk: null, hash: fields.hash ?? null });
-		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now(), sample: fields.sample === "1" });
+		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now(), sample: fields.sample === "1", modified: fields.modified ?? null });
 		tags.set(id, fields.tag);
 		feedCursor++;
 		feed.push({ seq: feedCursor, kind: "file.put", data: { id } });
@@ -257,7 +257,7 @@ const bridge: FilesBridge = {
 		const object = `obj/${id}`;
 		objects.set(object, sealed);
 		versions.set(id, { ck: fields.ck, object, type: fields.type, chunk, hash: fields.hash ?? null });
-		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now() });
+		rows.set(id, { id, folder: (fields.folder_id as string | null) ?? null, name: fields.name, size: Number(fields.size), version: 1, createdAt: now(), updatedAt: now(), modified: fields.modified ?? null });
 		tags.set(id, fields.tag);
 		feedCursor++;
 		feed.push({ seq: feedCursor, kind: "file.put", data: { id } });
@@ -393,6 +393,37 @@ assert.equal((await model.verify(row.id)).status, "verified");
 	assert.ok(toasts.some((t) => /gone from the server — starting over/.test(t)));
 	assert.deepEqual(partsSent, [1, 2, 3, 4, 5, 6, 7], "every part again, under a fresh upload");
 	assert.equal((await model.verify(model.state.get().files.find((f) => f.name === "capture.pcap")!.id)).status, "verified");
+}
+
+// 5d. The original's modified date (39y): sealed at upload into version
+// 1's place, shown and sorted by in the listing; a file the uploader's
+// client gave none shows its upload time; a copy keeps its original's.
+{
+	const old = new File(["written long ago"], "old-letter.txt", { type: "text/plain", lastModified: Date.parse("1999-12-31T23:59:58.000Z") });
+	const fresh = new File(["written just now"], "new-letter.txt", { type: "text/plain", lastModified: Date.parse("2030-01-02T03:04:05.000Z") });
+	await model.upload([old, fresh]);
+	const byName = (n: string) => model.state.get().files.find((f) => f.name === n)!;
+	const stored = rows.get(byName("old-letter.txt").id)!;
+	assert.match(stored.modified ?? "", /^GV04:/, "the server holds it sealed");
+	assert.ok(!(stored.modified ?? "").includes("1999"), "…never in the clear");
+	assert.equal(byName("old-letter.txt").modified, "1999-12-31T23:59:58.000Z", "the listing opens the file's own date");
+	assert.equal(shownModified(byName("old-letter.txt")), "1999-12-31T23:59:58.000Z", "…and shows it in place of the upload time");
+	model.sortBy("modified");
+	if (model.state.get().sort.dir !== "asc") model.sortDirection("asc");
+	const order = model.sorted().files.map((f) => f.name);
+	assert.ok(order.indexOf("old-letter.txt") < order.indexOf("new-letter.txt") && order.indexOf("new-letter.txt") === order.length - 1, `sorted by the files' own dates (${order.join(", ")})`);
+	model.sortBy("name");
+	model.select({ kind: "file", id: byName("old-letter.txt").id });
+	model.copy();
+	await model.paste();
+	const copy = model.state.get().files.find((f) => f.name !== "old-letter.txt" && f.name.startsWith("old-letter"))!;
+	assert.equal(copy.modified, "1999-12-31T23:59:58.000Z", "a copy keeps its original's date, as a file manager's does");
+	// (Tampering: a value moved to another file's row opens nowhere there,
+	// so the listing shows that file's upload time rather than a planted date.)
+	rows.get(byName("new-letter.txt").id)!.modified = stored.modified;
+	await model.refresh();
+	assert.equal(byName("new-letter.txt").modified, null, "a date sealed for another file is not shown");
+	assert.equal(shownModified(byName("new-letter.txt")), byName("new-letter.txt").updatedAt, "…the file shows when it reached the server, as one without a date does");
 }
 
 // 6. Rename re-seals; the server's stored name changes shape but stays sealed.

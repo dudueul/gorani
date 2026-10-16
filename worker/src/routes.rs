@@ -1652,6 +1652,57 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 	Ok(resp)
 }
 
+/// A file version whose bytes the storage did not have (commit 39t). Before
+/// anything changes, the Worker makes sure — twice over:
+///
+/// 1. it asks again (a read right after a write can miss on a store that
+///    is only eventually consistent);
+/// 2. it asks about up to three OTHER files of this area: a storage that
+///    has none of them is not this deployment's bucket (a wrong S3_BUCKET
+///    or endpoint would make EVERY file look lost — and trashing them all
+///    is exactly the wrong answer), so nothing is changed and a lead is
+///    pointed at Check storage.
+///
+/// Only then does the store act (files_store.rs › file_lost): a working
+/// file goes to the Trash with the reason on its trail; evidence, a held
+/// case and older versions are only recorded. The reader hears 410 Gone,
+/// with what happened.
+async fn lost_object(env: &Env, member_id: &str, file_id: &str, meta: &serde_json::Value, object_key: &str, actor: &str) -> Result<Response> {
+	if s3::head(env, object_key).await?.is_some() {
+		return json_error(503, "the storage did not find this file a moment ago, but has it now — try again");
+	}
+	let mut canary = forward_member(env, member_id, "GET", format!("files/canary?not={file_id}"), None, actor.to_string()).await?;
+	let others: Vec<String> = canary.json::<serde_json::Value>().await?.get("objectKeys").and_then(|k| k.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+	if others.is_empty() {
+		return json_error(502, "the storage has no bytes for this file, and this area holds no other file to tell a lost file from a wrong bucket — nothing was changed; a lead can run Team › People › Check storage");
+	}
+	let mut answering = false;
+	for key in &others {
+		if s3::head(env, key).await?.is_some() {
+			answering = true;
+			break;
+		}
+	}
+	if !answering {
+		return json_error(502, "the storage has neither this file nor the other files of this area it was asked about — it is probably not this deployment's bucket (S3_BUCKET, S3_ENDPOINT); nothing was changed — a lead can run Team › People › Check storage");
+	}
+	let version = meta.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+	let mut done = forward_member(env, member_id, "POST", format!("files-lost/{file_id}"), Some(serde_json::json!({ "version": version, "objectKey": object_key })), actor.to_string()).await?;
+	if done.status_code() != 200 {
+		return Ok(done);
+	}
+	let v: serde_json::Value = done.json().await?;
+	let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+	let message = if flag("trashed") {
+		"this file's bytes are gone from the storage (asked twice, while it answered for this area's other files) — the file was moved to the Trash"
+	} else if flag("evidence") || flag("held") {
+		"this file's bytes are gone from the storage (asked twice, while it answered for this area's other files) — it is evidence or under a hold, so it stays where it is; the loss is on its audit trail: tell a lead"
+	} else {
+		"this version's bytes are gone from the storage (asked twice, while it answered for this area's other files) — the loss is on the file's audit trail"
+	};
+	json_error(410, message)
+}
+
 async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, member_id: &str, file_id: &str) -> Result<Response> {
 	let actor = match member_ctx(&env, identity, member_id).await {
 		Ok(a) => a,
@@ -1740,16 +1791,25 @@ async fn upload_start(mut req: Request, env: Env, identity: &Identity, member_id
 	let mut started = started;
 	let started_body: serde_json::Value = started.json().await?;
 	let upload_id: String = started_body.get("uploadId").and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| Error::RustError("no uploadId".into()))?;
-	let s3_upload_id = s3::multipart_init(&env, &object_key).await?;
+	let s3_upload_id = match s3::multipart_init(&env, &object_key).await {
+		Ok(id) => id,
+		Err(e) => {
+			// The storage refused to start it (39t): the bookkeeping row would
+			// point at nothing — it goes now, not two days later with the
+			// housekeeping. (The refusal itself reaches the caller as 502.)
+			let _ = forward_member(&env, member_id, "DELETE", format!("uploads/{upload_id}"), None, &actor.email).await;
+			return Err(e);
+		}
+	};
 	forward_member(&env, member_id, "PUT", format!("uploads/{upload_id}/s3"), Some(serde_json::json!({ "s3UploadId": s3_upload_id })), &actor.email).await?;
 	Ok(Response::from_json(&serde_json::json!({ "uploadId": upload_id, "key": object_key, "parts": parts }))?)
 }
 
 async fn upload_part(mut req: Request, env: Env, identity: &Identity, member_id: &str, upload_id: &str, part: &str) -> Result<Response> {
-	match member_ctx(&env, identity, member_id).await {
-		Ok(_) => {}
+	let actor = match member_ctx(&env, identity, member_id).await {
+		Ok(a) => a,
 		Err(resp) => return Ok(resp),
-	}
+	};
 	let meta = match upload_meta(&env, member_id, upload_id).await {
 		Ok(m) => m,
 		Err(resp) => return Ok(resp),
@@ -1759,7 +1819,18 @@ async fn upload_part(mut req: Request, env: Env, identity: &Identity, member_id:
 		Ok(len) => len,
 		Err(resp) => return Ok(resp),
 	};
-	let etag = s3::multipart_part_stream(&env, &meta.object_key, &meta.s3_upload_id, n, req.stream()?, len).await?;
+	let etag = match s3::multipart_part_stream(&env, &meta.object_key, &meta.s3_upload_id, n, req.stream()?, len).await {
+		Ok(etag) => etag,
+		// The storage no longer knows this multipart upload (aborted, expired
+		// by a lifecycle rule, or never started — 39t): its bookkeeping goes,
+		// and the client hears "no such upload", forgets its resume record
+		// and starts the file over (model.ts › uploadOne).
+		Err(e) if s3::is_missing(&e) => {
+			let _ = forward_member(&env, member_id, "DELETE", format!("uploads/{upload_id}"), None, &actor.email).await;
+			return json_error(404, "no such upload: the storage no longer has it — start this file over");
+		}
+		Err(e) => return Err(e),
+	};
 	Response::from_json(&serde_json::json!({ "partNumber": n, "etag": etag }))
 }
 
@@ -1933,8 +2004,18 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 		});
 	let mut s3_resp = s3::fetch_stream(&env, "GET", &object_key, range, &[], cache_span).await?;
 	let status = s3_resp.status_code();
-	if status != 200 && status != 206 {
-		return Response::error("Not Found", 404);
+	match status {
+		200 | 206 => {}
+		// The bytes are not there: make sure, then say so (commit 39t).
+		404 => return lost_object(&env, member_id, file_id, &meta, &object_key, &actor.email).await,
+		416 => return Response::error("Range Not Satisfiable", 416),
+		// A REFUSAL, not a missing file (39t). Until now every other status
+		// answered "Not Found" — so with the storage refusing reads (the
+		// production 403 of 39s), every file looked lost.
+		_ => {
+			let reason = s3::public_reason(&s3::refused(&format!("read {object_key}"), s3_resp).await.to_string()).unwrap_or_else(|| format!("HTTP {status}"));
+			return json_error(502, &format!("the storage refused this read ({reason}) — a lead can run Team › People › Check storage"));
+		}
 	}
 	let headers = Headers::new();
 	headers.set("Content-Type", "application/octet-stream")?;

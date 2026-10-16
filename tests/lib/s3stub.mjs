@@ -151,7 +151,8 @@ export function startS3Stub({ port = 0, host = "0.0.0.0" } = {}) {
 			if (req.method === "PUT" && q.has("uploadId")) {
 				const u = uploads.get(q.get("uploadId"));
 				if (!u) {
-					res.writeHead(404).end();
+					// What S3 says for an upload it does not know (39t).
+					res.writeHead(404, { "Content-Type": "application/xml" }).end('<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist.</Message></Error>');
 					return;
 				}
 				u.parts.set(Number(q.get("partNumber")), body);

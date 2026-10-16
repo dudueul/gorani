@@ -102,6 +102,75 @@ impl GoraniMemberDO {
 	/// into places that name the file, so the id must exist before the
 	/// sealing does); the Worker checked its shape and built the object key;
 	/// the DO owns the rows — and refuses an id already taken (409).
+	// ── Bytes the storage no longer has (commit 39t, routes.rs › lost_object) ──
+
+	/// Up to three OTHER living files' current objects: what the Worker asks
+	/// the storage about before it believes a file is lost. A storage that
+	/// has none of them is not this deployment's (a wrong bucket, a wrong
+	/// endpoint) — and then nothing is lost, everything is unreachable.
+	pub(crate) async fn canary(&self, req: Request) -> Result<Response> {
+		let not = urlquery(req.url()?.query().unwrap_or("")).get("not").cloned().unwrap_or_default();
+		#[derive(serde::Deserialize)]
+		struct Key {
+			object_key: String,
+		}
+		let rows: Vec<Key> = self
+			.sql
+			.exec("SELECT v.object_key AS object_key FROM files f JOIN file_versions v ON v.file_id = f.id AND v.version = f.version WHERE f.deleted_at IS NULL AND f.id != ?1 ORDER BY f.created_at DESC LIMIT 3", Some(vec![not.into()]))?
+			.to_array()?;
+		Response::from_json(&serde_json::json!({ "objectKeys": rows.into_iter().map(|r| r.object_key).collect::<Vec<_>>() }))
+	}
+
+	/// `POST files-lost/<file> { version, objectKey }`: the Worker found no
+	/// bytes for this version — twice — while the storage answered for this
+	/// area's other files. A WORKING file whose living version is gone goes
+	/// to the Trash (restorable for 30 days, should the bytes come back),
+	/// with the reason on its trail. Evidence, a case on legal hold, or an
+	/// older version is never moved: the loss is recorded, and a lead
+	/// decides (for evidence it is an incident, not housekeeping).
+	pub(crate) async fn file_lost(&self, actor: &str, file: &str, body: serde_json::Value) -> Result<Response> {
+		let version = body.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+		let object_key = body.get("objectKey").and_then(|v| v.as_str()).unwrap_or_default();
+		#[derive(serde::Deserialize)]
+		struct Row {
+			object_key: String,
+			current: i64,
+		}
+		let rows: Vec<Row> = self
+			.sql
+			.exec("SELECT v.object_key AS object_key, f.version AS current FROM file_versions v JOIN files f ON f.id = v.file_id WHERE v.file_id = ?1 AND v.version = ?2 AND f.deleted_at IS NULL", Some(vec![file.into(), version.into()]))?
+			.to_array()?;
+		let Some(row) = rows.into_iter().next() else { return json_error(404, "no such live file version") };
+		// (The Worker names the object this store gave it; another is refused.)
+		if row.object_key != object_key {
+			return json_error(409, "that is not this version's object");
+		}
+		let detail = format!("v{version}: the storage has no bytes for it (asked twice, while it answered for this area's other files)");
+		let kept = self.evidence_refusal().await?.is_some() || row.current != version;
+		if kept {
+			self.audit(actor, "file.lost", file, None, Some(&detail)).await?;
+			return Response::from_json(&serde_json::json!({ "trashed": false, "evidence": self.is_evidence().await?, "held": self.is_held().await? }));
+		}
+		self.sql.exec("UPDATE files SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1 AND deleted_at IS NULL", Some(vec![file.into()]))?;
+		self.audit(actor, "file.lost", file, None, Some(&format!("{detail} — moved to the Trash"))).await?;
+		Response::from_json(&serde_json::json!({ "trashed": true, "evidence": false, "held": false }))
+	}
+
+	/// Where a file may go (commit 39t): the top folder, or a folder that
+	/// exists and is not in the Trash. Until 39t a file sent into a folder
+	/// deleted meanwhile (on another device, or while a big upload ran) was
+	/// stored there — and no listing ever showed it again: the explorer
+	/// lists a folder's files only inside that folder. (Folders themselves
+	/// were already checked: folder_put and folder_patch refuse a gone parent.)
+	async fn folder_refusal(&self, folder: Option<&str>) -> Result<Option<Response>> {
+		let Some(folder) = folder else { return Ok(None) };
+		let live: Option<ExistsRow> = self.sql.exec("SELECT 1 AS one FROM file_folders WHERE id = ?1 AND deleted_at IS NULL", Some(vec![folder.into()]))?.to_array::<ExistsRow>().ok().and_then(|mut r| r.pop());
+		Ok(match live {
+			Some(_) => None,
+			None => Some(json_error_raw(404, "no such folder: it was deleted or moved to the Trash (on another device?) — refresh, and choose another")),
+		})
+	}
+
 	pub(crate) async fn file_put(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
 		if let Some(msg) = self.vault_gate().await? {
 			return json_error(400, &msg);
@@ -143,6 +212,9 @@ impl GoraniMemberDO {
 		let taken: Option<ExistsRow> = self.sql.exec("SELECT 1 AS one FROM files WHERE id = ?1", Some(vec![file_id.clone().into()]))?.to_array::<ExistsRow>().ok().and_then(|mut r| r.pop());
 		if taken.is_some() {
 			return json_error(409, "a file with this id exists — choose a fresh id (a new version goes to files/<id>/versions)");
+		}
+		if let Some(refused) = self.folder_refusal(get("folderId").as_deref()).await? {
+			return Ok(refused);
 		}
 		let version = 1i64;
 		let object_key = get("objectKey").ok_or_else(|| worker::Error::RustError("missing objectKey".into()))?;
@@ -576,6 +648,9 @@ impl GoraniMemberDO {
 		if body.get("folderId").is_some() {
 			match body.get("folderId").and_then(|v| v.as_str()).map(str::to_string) {
 				Some(f) => {
+					if let Some(refused) = self.folder_refusal(Some(&f)).await? {
+						return Ok(refused);
+					}
 					sets.push("folder_id = ?");
 					params.push(f.into());
 				}
@@ -708,7 +783,7 @@ impl GoraniMemberDO {
 		if let Some(p) = &parent {
 			let exists: Option<ExistsRow> = self.sql.exec("SELECT 1 AS one FROM file_folders WHERE id = ?1 AND deleted_at IS NULL", Some(vec![p.clone().into()]))?.to_array::<ExistsRow>().ok().and_then(|mut r| r.pop());
 			if exists.is_none() {
-				return json_error(400, "parent folder does not exist");
+				return json_error(404, "no such folder: the parent was deleted or moved to the Trash (on another device?) — refresh, and choose another");
 			}
 		}
 		let id = body.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(uuid);
@@ -750,7 +825,7 @@ impl GoraniMemberDO {
 			}
 			let exists: Option<ExistsRow> = self.sql.exec("SELECT 1 AS one FROM file_folders WHERE id = ?1 AND deleted_at IS NULL", Some(vec![p.clone().into()]))?.to_array::<ExistsRow>().ok().and_then(|mut r| r.pop());
 			if exists.is_none() {
-				return json_error(400, "parent folder does not exist");
+				return json_error(404, "no such folder: the parent was deleted or moved to the Trash (on another device?) — refresh, and choose another");
 			}
 		}
 		let mut sets: Vec<&str> = vec![];
@@ -1175,7 +1250,10 @@ impl GoraniMemberDO {
 		// folder together with its (separately trashed) parent keeps it inside.
 		for id in &folders {
 			self.sql.exec(
-				"UPDATE file_folders SET parent_id = NULL WHERE id = ?1 AND EXISTS (SELECT 1 FROM file_folders p WHERE p.id = file_folders.parent_id AND p.deleted_at IS NOT NULL)",
+				// (Not LIVE — in the Trash, or purged altogether: 39t. Only the
+				// Trash was checked, so a folder whose parent had been purged
+				// came back inside a folder that no longer existed.)
+				"UPDATE file_folders SET parent_id = NULL WHERE id = ?1 AND parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM file_folders p WHERE p.id = file_folders.parent_id AND p.deleted_at IS NULL)",
 				Some(vec![id.as_str().into()]),
 			)?;
 		}
@@ -1184,7 +1262,7 @@ impl GoraniMemberDO {
 			n_files += self.sql.exec(&format!("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NOT NULL AND id IN ({qs})"), Some(params.clone()))?.one::<TotalCount>()?.n;
 			self.sql
 				.exec(
-					&format!("UPDATE files SET deleted_at = NULL, trashed_with = NULL, folder_id = CASE WHEN EXISTS (SELECT 1 FROM file_folders f2 WHERE f2.id = files.folder_id AND f2.deleted_at IS NOT NULL) THEN NULL ELSE folder_id END WHERE id IN ({qs})"),
+					&format!("UPDATE files SET deleted_at = NULL, trashed_with = NULL, folder_id = CASE WHEN folder_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM file_folders f2 WHERE f2.id = files.folder_id AND f2.deleted_at IS NULL) THEN NULL ELSE folder_id END WHERE id IN ({qs})"),
 					Some(params),
 				)?;
 		}

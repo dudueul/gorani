@@ -311,8 +311,71 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
 	out
 }
 
+// ── Why a storage server said no (commit 39s) ───────────────────────
+
+/// A storage refusal in words an operator can act on: the status, S3's own
+/// error code when the answer carried one, and what usually causes it.
+///
+/// Until 39s the Worker said only "S3 put <key>: HTTP 403" — and a 403
+/// has five common causes with five different fixes (a wrong secret, a
+/// wrong region, an unknown key, a key without write rights, something in
+/// front of the endpoint that is not S3 at all). S3 names its reason in
+/// the error body's `<Code>`; this reads it. The `Server` header tells the
+/// last case apart: an answer with no code from `cloudflare` was refused
+/// by Cloudflare in front of the endpoint (Access, WAF, bot rules), never
+/// by the storage server behind it.
+///
+/// Nothing here repeats the error body's `<Message>` or other elements:
+/// a SignatureDoesNotMatch body carries the string-to-sign and the access
+/// key id, and none of that belongs in a log line or a browser.
+///
+/// `bodied`: whether the answer could carry a reason at all — a HEAD
+/// answer never has a body, so a missing code there says nothing about
+/// who answered.
+pub fn refusal_reason(status: u16, code: Option<&str>, server: &str, bodied: bool) -> String {
+	let hint = match code {
+		Some("SignatureDoesNotMatch") => "the endpoint rejects the signature: S3_SECRET_KEY is not this key's secret, or S3_REGION is not the region S3_ENDPOINT's host names",
+		Some("AuthorizationHeaderMalformed") => "S3_REGION is not the region this endpoint expects",
+		Some("InvalidAccessKeyId") => "the endpoint does not know S3_ACCESS_KEY_ID: a deleted or mistyped key, or one made for another provider or region",
+		Some("AccessDenied") => "the key is valid but not allowed to do this: give it object read, write and delete (and multipart and list) on S3_BUCKET",
+		Some("AllAccessDisabled") | Some("AccountProblem") => "the provider has disabled this account or bucket (billing, or a hold on the account)",
+		Some("NoSuchBucket") => "S3_BUCKET does not exist at S3_ENDPOINT (a bucket in another region needs that region's host)",
+		Some("PermanentRedirect") | Some("TemporaryRedirect") => "the bucket lives at another endpoint: use the host of the region it was created in",
+		Some("RequestTimeTooSkewed") => "the request's clock and the server's disagree by more than 15 minutes",
+		Some("InvalidRequest") => "the server refused the request's form (on an Object Lock bucket: is a default retention set? gorani needs none)",
+		Some(other) => return format!("HTTP {status} {other}"),
+		None if !bodied && !server.to_ascii_lowercase().contains("cloudflare") => return format!("HTTP {status} (a HEAD answer carries no reason — Team › People › Check storage shows the write's)"),
+		None if server.to_ascii_lowercase().contains("cloudflare") => "not an S3 answer: Cloudflare in front of S3_ENDPOINT refused the request (Access, WAF or bot rules on that host) — let the Worker's requests through, or use the storage's own host",
+		None if (300..400).contains(&status) => "not an S3 answer: a redirect — S3_ENDPOINT is not the storage's S3 API host (some providers answer unknown requests with a redirect to their homepage)",
+		None => "not an S3 answer (no error code): something in front of S3_ENDPOINT refused it — a reverse proxy, a login page, or the provider's web console instead of its S3 API host",
+	};
+	match code {
+		Some(code) => format!("HTTP {status} {code} — {hint}"),
+		None => format!("HTTP {status} — {hint}"),
+	}
+}
+
 #[cfg(test)]
 mod tests {
+
+	/// 39s: each refusal says what S3 said and what to change; an answer
+	/// that is not S3's is named as such, and Cloudflare's apart.
+	#[test]
+	fn refusals_are_explained() {
+		let r = super::refusal_reason(403, Some("SignatureDoesNotMatch"), "", true);
+		assert!(r.starts_with("HTTP 403 SignatureDoesNotMatch — ") && r.contains("S3_SECRET_KEY") && r.contains("S3_REGION"), "{r}");
+		assert!(super::refusal_reason(403, Some("AccessDenied"), "MinIO", true).contains("write"));
+		assert!(super::refusal_reason(403, Some("InvalidAccessKeyId"), "", true).contains("S3_ACCESS_KEY_ID"));
+		assert_eq!(super::refusal_reason(409, Some("OperationAborted"), "", true), "HTTP 409 OperationAborted");
+		let cf = super::refusal_reason(403, None, "cloudflare", true);
+		assert!(cf.contains("not an S3 answer") && cf.contains("Cloudflare"), "{cf}");
+		assert!(super::refusal_reason(302, None, "nginx", true).contains("redirect"));
+		assert!(super::refusal_reason(403, None, "nginx", true).contains("not an S3 answer"));
+		// A HEAD answer has no body: no code is not evidence of a proxy.
+		let head = super::refusal_reason(403, None, "MinIO", false);
+		assert!(head.starts_with("HTTP 403 (") && !head.contains("not an S3 answer"), "{head}");
+		assert!(super::refusal_reason(403, None, "cloudflare", false).contains("Cloudflare"), "Cloudflare's own refusal is named on a HEAD too");
+	}
 
 	/// O16: a `{:?}` of the config never prints a key.
 	#[test]

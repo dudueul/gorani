@@ -24,10 +24,13 @@
  * And one test-only control route (commit 25), for the suites that must see
  * the Worker meet a FAILING storage backend (docs/SECURITY-REVIEW.md › O10):
  *
- *   POST   /__fault  { method, prefix, status, count, query? }
+ *   POST   /__fault  { method, prefix, status, count, query?, code?, server? }
  *          the next `count` requests with that method on keys under
  *          `prefix` (and, with `query`, whose query string contains it)
- *          answer `status` instead (count 0 clears the rule)
+ *          answer `status` instead (count 0 clears the rule) — with S3's
+ *          error body `<Error><Code>code</Code>…` when `code` is given, and
+ *          a `Server` header when `server` is (commit 39s: the Worker reads
+ *          both to say why a storage refused)
  *
  * Authorization headers are accepted and ignored here on purpose.
  */
@@ -65,7 +68,9 @@ export function startS3Stub({ port = 0, host = "0.0.0.0" } = {}) {
 			const fault = faults.find((f) => f.method === req.method && key.startsWith(f.prefix) && (f.query === undefined || url.search.includes(f.query)) && f.count > 0);
 			if (fault) {
 				fault.count--;
-				res.writeHead(fault.status).end();
+				const headers = fault.server ? { Server: fault.server } : {};
+				if (fault.code) res.writeHead(fault.status, { ...headers, "Content-Type": "application/xml" }).end(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>${fault.code}</Code><Message>stub refusal</Message></Error>`);
+				else res.writeHead(fault.status, headers).end();
 				return;
 			}
 			// Object Lock retention (COMPLIANCE).

@@ -16,7 +16,7 @@
 //! sidecars, backup segments); the bucket is private and its keys are
 //! Worker secrets. Nothing here inspects content beyond sizes and statuses.
 
-use gorani_s3::{complete_multipart_body, md5, retention_xml, sign_request, xml_val, xml_vals, S3Config, SignedRequest};
+use gorani_s3::{complete_multipart_body, md5, refusal_reason, retention_xml, sign_request, xml_val, xml_vals, S3Config, SignedRequest};
 use worker::*;
 
 use crate::cache;
@@ -46,11 +46,17 @@ async fn r2_bucket(env: &Env) -> Result<Option<Bucket>> {
 /// Resolve the configuration: vars for endpoint/region/bucket, secrets (or
 /// plain vars, in `wrangler dev`) for the credentials.
 pub fn config(env: &Env) -> Result<S3Config> {
+	// Every value trimmed (commit 39s): a secret pasted with its line's end
+	// (`echo … | wrangler secret put`, a copied console field) carries a
+	// newline or a space that no key, region or bucket name ever contains —
+	// signed in, it fails every request as a bad signature, with nothing in
+	// the dashboard to show it. Team › People › Check storage says when a
+	// value had any (`settings_shape`).
 	let var = |name: &str| -> Result<String> {
-		env.var(name).map(|v| v.to_string()).map_err(|_| Error::RustError(format!("missing {name} for the S3 backend")))
+		env.var(name).map(|v| v.to_string().trim().to_string()).map_err(|_| Error::RustError(format!("missing {name} for the S3 backend")))
 	};
 	let secret = |name: &str| -> Result<String> {
-		env.secret(name).map(|v| v.to_string()).or_else(|_| var(name))
+		env.secret(name).map(|v| v.to_string().trim().to_string()).or_else(|_| var(name))
 	};
 	let raw = var("S3_ENDPOINT")?.trim_end_matches('/').to_string();
 	// A bare host (`s3.eu-central-1.idrivee2.com`, as provider consoles show
@@ -119,6 +125,31 @@ async fn fetch_signed_js(cfg: &S3Config, method: &str, object_key: &str, query_p
 	}
 	let req = Request::new_with_init(&url, &RequestInit { method: method_of(method)?, headers: wh, body, ..Default::default() })?;
 	Fetch::Request(req).send().await
+}
+
+/// A storage refusal, explained (commit 39s): S3's own error code from the
+/// answer's body and the `Server` header, read into words by
+/// `gorani_s3::refusal_reason` — "HTTP 403" alone has five causes and five
+/// different fixes. `what` names the operation and key for the operator's
+/// log; the browser is told only the reason (lib.rs › `public_reason`).
+async fn refused(what: &str, mut resp: Response) -> Error {
+	let status = resp.status_code();
+	let server = resp.headers().get("Server").ok().flatten().unwrap_or_default();
+	let bodied = !what.starts_with("head ");
+	let body = if bodied { resp.text().await.unwrap_or_default() } else { String::new() };
+	Error::RustError(format!("S3 {what}: {}", refusal_reason(status, xml_val(&body, "Code").as_deref(), &server, bodied)))
+}
+
+/// What a caller may be told of a storage error: "HTTP 403 AccessDenied"
+/// — the status and S3's code, never the object key or the endpoint the
+/// operator's log line carries (lib.rs answers unhandled errors with this
+/// when there is one, and "internal error" otherwise).
+pub fn public_reason(message: &str) -> Option<String> {
+	let rest = message.strip_prefix("S3 ")?;
+	let at = rest.find(": HTTP ")?;
+	let reason = &rest[at + 2..];
+	let short = reason.split(" — ").next().unwrap_or(reason).split(" (").next().unwrap_or(reason);
+	Some(short.trim().to_string())
 }
 
 // ── Object operations ───────────────────────────────────────────────
@@ -236,7 +267,7 @@ pub async fn head(env: &Env, key: &str) -> Result<Option<HeadInfo>> {
 	match resp.status_code() {
 		200 => Ok(Some(HeadInfo { size: resp.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) })),
 		404 | 405 => Ok(None),
-		s => Err(Error::RustError(format!("S3 head {key}: HTTP {s}"))),
+		_ => Err(refused(&format!("head {key}"), resp).await),
 	}
 }
 
@@ -249,7 +280,7 @@ pub async fn put(env: &Env, key: &str, bytes: Vec<u8>) -> Result<()> {
 	let cfg = config(env)?;
 	let resp = fetch_signed(&cfg, "PUT", key, &[], None, Some(bytes), Some("application/octet-stream")).await?;
 	if resp.status_code() != 200 {
-		return Err(Error::RustError(format!("S3 put {key}: HTTP {}", resp.status_code())));
+		return Err(refused(&format!("put {key}"), resp).await);
 	}
 	Ok(())
 }
@@ -276,7 +307,7 @@ pub async fn delete(env: &Env, key: &str) -> Result<()> {
 	let resp = fetch_signed(&cfg, "DELETE", key, &[], None, None, None).await?;
 	match resp.status_code() {
 		204 | 404 => Ok(()),
-		s => Err(Error::RustError(format!("S3 delete {key}: HTTP {s}"))),
+		_ => Err(refused(&format!("delete {key}"), resp).await),
 	}
 }
 
@@ -315,7 +346,7 @@ pub async fn list(env: &Env, prefix: &str, max: usize) -> Result<Vec<String>> {
 		}
 		let mut resp = fetch_signed(&cfg, "GET", "", &q, None, None, None).await?;
 		if resp.status_code() != 200 {
-			return Err(Error::RustError(format!("S3 list {prefix}: HTTP {}", resp.status_code())));
+			return Err(refused(&format!("list {prefix}"), resp).await);
 		}
 		let xml = resp.text().await?;
 		out.extend(xml_vals(&xml, "Key"));
@@ -356,10 +387,10 @@ pub async fn put_retention(env: &Env, key: &str, until: &str) -> Result<Lock> {
 	wh.set("Content-MD5", &base64::engine::general_purpose::STANDARD.encode(md5(&body)))?;
 	wh.set("Content-Type", "application/xml")?;
 	let req = Request::new_with_init(&url, &RequestInit { method: Method::Put, headers: wh, body: Some(body.into()), ..Default::default() })?;
-	let mut resp = Fetch::Request(req).send().await?;
+	let resp = Fetch::Request(req).send().await?;
 	match resp.status_code() {
 		200 | 204 => Ok(Lock::Locked),
-		s => Err(Error::RustError(format!("S3 retention {key}: HTTP {s} {}", resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()))),
+		_ => Err(refused(&format!("retention {key}"), resp).await),
 	}
 }
 
@@ -373,11 +404,13 @@ pub async fn multipart_init(env: &Env, key: &str) -> Result<String> {
 	}
 	let cfg = config(env)?;
 	let mut resp = fetch_signed(&cfg, "POST", key, &[("uploads".to_string(), String::new())], None, None, None).await?;
-	let status = resp.status_code();
-	let body = resp.text().await?;
-	if status != 200 {
-		return Err(Error::RustError(format!("S3 multipart init: HTTP {status} {body}")));
+	// (Until 39s this error echoed the WHOLE body — and a
+	// SignatureDoesNotMatch body carries the string-to-sign and the access
+	// key id into the log.)
+	if resp.status_code() != 200 {
+		return Err(refused(&format!("multipart init {key}"), resp).await);
 	}
+	let body = resp.text().await?;
 	xml_val(&body, "UploadId").ok_or_else(|| Error::RustError("S3 multipart init: no UploadId".into()))
 }
 
@@ -394,10 +427,9 @@ pub async fn multipart_part(env: &Env, key: &str, upload_id: &str, part: u32, by
 	let cfg = config(env)?;
 	let q = [("partNumber".to_string(), part.to_string()), ("uploadId".to_string(), upload_id.to_string())];
 	let resp = fetch_signed(&cfg, "PUT", key, &q, None, Some(bytes), Some("application/octet-stream")).await?;
-	let status = resp.status_code();
 	let etag = resp.headers().get("ETag")?;
-	if status != 200 {
-		return Err(Error::RustError(format!("S3 part {part}: HTTP {status}")));
+	if resp.status_code() != 200 {
+		return Err(refused(&format!("part {part} of {key}"), resp).await);
 	}
 	etag.ok_or_else(|| Error::RustError("S3 part: missing ETag".into()))
 }
@@ -419,10 +451,9 @@ pub async fn multipart_part_stream(env: &Env, key: &str, upload_id: &str, part: 
 	let cfg = config(env)?;
 	let q = [("partNumber".to_string(), part.to_string()), ("uploadId".to_string(), upload_id.to_string())];
 	let resp = fetch_signed_js(&cfg, "PUT", key, &q, None, Some(Data::from(stream).into()), Some("application/octet-stream")).await?;
-	let status = resp.status_code();
 	let etag = resp.headers().get("ETag")?;
-	if status != 200 {
-		return Err(Error::RustError(format!("S3 part {part}: HTTP {status}")));
+	if resp.status_code() != 200 {
+		return Err(refused(&format!("part {part} of {key}"), resp).await);
 	}
 	etag.ok_or_else(|| Error::RustError("S3 part: missing ETag".into()))
 }
@@ -445,7 +476,8 @@ pub async fn multipart_complete(env: &Env, key: &str, upload_id: &str, parts: &[
 	// `<Error>` body** (the status is sent before the server finishes
 	// assembling). A 200 alone is not success.
 	if status != 200 || xml_val(&text, "Code").is_some() {
-		return Err(Error::RustError(format!("S3 multipart complete: HTTP {status} {}", xml_val(&text, "Code").unwrap_or_default())));
+		let server = resp.headers().get("Server").ok().flatten().unwrap_or_default();
+		return Err(Error::RustError(format!("S3 multipart complete {key}: {}", refusal_reason(status, xml_val(&text, "Code").as_deref(), &server, true))));
 	}
 	Ok(())
 }
@@ -462,6 +494,181 @@ pub async fn multipart_abort(env: &Env, key: &str, upload_id: &str) -> Result<()
 	let resp = fetch_signed(&cfg, "DELETE", key, &q, None, None, None).await?;
 	match resp.status_code() {
 		204 | 404 => Ok(()),
-		s => Err(Error::RustError(format!("S3 multipart abort: HTTP {s}"))),
+		_ => Err(refused(&format!("multipart abort {key}"), resp).await),
+	}
+}
+
+// ── Team › People › Check storage (commit 39s) ────────────────────
+
+/// One probe step's outcome.
+fn step(name: &str, ok: bool, status: u16, reason: Option<String>, server: &str) -> serde_json::Value {
+	serde_json::json!({ "step": name, "ok": ok, "status": status, "reason": reason, "server": server })
+}
+
+/// The five settings as the deployment holds them — never their values
+/// beyond what an operator needs to recognise them: the endpoint, region
+/// and bucket (configuration, not credentials), the access key id's last
+/// four characters (enough to tell WHICH key, as provider consoles list
+/// them) and the secret's length only. `padded`: the stored value had
+/// spaces or a line end around it (config() trims them now; the stored
+/// secret still should be set again cleanly).
+fn settings_shape(env: &Env) -> serde_json::Value {
+	let raw = |name: &str| env.secret(name).map(|v| v.to_string()).ok().or_else(|| env.var(name).map(|v| v.to_string()).ok());
+	let entry = |name: &str, show: &dyn Fn(&str) -> String| match raw(name) {
+		Some(v) => serde_json::json!({ "name": name, "set": true, "padded": v != v.trim(), "shown": show(v.trim()) }),
+		None => serde_json::json!({ "name": name, "set": false }),
+	};
+	let plain = |v: &str| v.to_string();
+	let tail = |v: &str| format!("…{}", v.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>());
+	let length = |v: &str| format!("{} characters", v.chars().count());
+	let secret_name = if raw("S3_SECRET_KEY").is_some() { "S3_SECRET_KEY" } else { "S3_SECRET_ACCESS_KEY" };
+	serde_json::json!([
+		entry("S3_ENDPOINT", &plain),
+		entry("S3_REGION", &plain),
+		entry("S3_BUCKET", &plain),
+		entry("S3_ACCESS_KEY_ID", &tail),
+		entry(secret_name, &length),
+	])
+}
+
+/// Mistakes the settings show by themselves, before a request is sent.
+fn settings_warnings(cfg: &S3Config) -> Vec<String> {
+	let mut out = Vec::new();
+	let host = cfg.endpoint.split("//").nth(1).unwrap_or_default().split('/').next().unwrap_or_default().to_ascii_lowercase();
+	// The bucket in the host: consoles show a "bucket endpoint" for
+	// virtual-hosted addressing; gorani addresses by path, so the request
+	// would name the bucket twice.
+	if !cfg.bucket.is_empty() && host.starts_with(&format!("{}.", cfg.bucket.to_ascii_lowercase())) {
+		out.push(format!("S3_ENDPOINT's host begins with the bucket's name — gorani puts the bucket in the path; use the host without \"{}.\"", cfg.bucket));
+	}
+	// A region named in the host (s3.eu-central-1.idrivee2.com) that is not
+	// S3_REGION: signed into every request's scope, refused as a bad signature.
+	let named = host.split('.').find(|label| {
+		let parts: Vec<&str> = label.split('-').collect();
+		parts.len() >= 3 && parts[0].len() == 2 && parts[0].chars().all(|c| c.is_ascii_lowercase()) && parts.last().is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+	});
+	if let Some(region) = named {
+		if region != cfg.region {
+			out.push(format!("S3_ENDPOINT's host names the region {region}, but S3_REGION is \"{}\" — the request is signed for S3_REGION", cfg.region));
+		}
+	}
+	out
+}
+
+/// A real round trip — write, read the size back, read the bytes back,
+/// delete — on a probe object of 16 random bytes under `probe/`, each
+/// step's answer explained. It stops at the first refusal (the later steps
+/// would only repeat it). A lead runs it from Team › People; routes.rs ›
+/// storage_probe checks the role.
+///
+/// On a versioned bucket (every Object Lock bucket is one) the delete
+/// leaves a 16-byte noncurrent version and a delete marker, which the
+/// bucket's noncurrent-version lifecycle rule removes (docs/PRODUCTION.md).
+pub async fn probe(env: &Env) -> Result<serde_json::Value> {
+	let mut id = [0u8; 8];
+	getrandom::getrandom(&mut id).map_err(|e| Error::RustError(format!("no randomness: {e}")))?;
+	let key = format!("probe/{}", hex::encode(id));
+	let mut bytes = [0u8; 16];
+	getrandom::getrandom(&mut bytes).map_err(|e| Error::RustError(format!("no randomness: {e}")))?;
+	let mut steps = Vec::new();
+
+	if let Some(bucket) = r2_bucket(env).await? {
+		// The binding signs nothing and has no statuses: each step either
+		// works or names the binding's error.
+		let r2 = |name: &str, r: std::result::Result<bool, String>| match r {
+			Ok(true) => step(name, true, 200, None, "r2"),
+			Ok(false) => step(name, false, 0, Some("the binding answered, but not with the probe's bytes".into()), "r2"),
+			Err(e) => step(name, false, 0, Some(e), "r2"),
+		};
+		let put = bucket.put(&key, bytes.to_vec()).execute().await.map(|_| true).map_err(|e| e.to_string());
+		let ok = put.is_ok();
+		steps.push(r2("write", put));
+		if ok {
+			let got = match bucket.get(&key).execute().await {
+				Ok(Some(o)) => match o.body() {
+					Some(b) => b.bytes().await.map(|v| v == bytes).map_err(|e| e.to_string()),
+					None => Ok(false),
+				},
+				Ok(None) => Ok(false),
+				Err(e) => Err(e.to_string()),
+			};
+			steps.push(r2("read", got));
+			steps.push(r2("delete", bucket.delete(&key).await.map(|_| true).map_err(|e| e.to_string())));
+		}
+		let ok = steps.iter().all(|s| s["ok"].as_bool() == Some(true));
+		return Ok(serde_json::json!({ "backend": "r2", "ok": ok, "steps": steps }));
+	}
+
+	let settings = settings_shape(env);
+	let cfg = match config(env) {
+		Ok(cfg) => cfg,
+		Err(e) => return Ok(serde_json::json!({ "backend": "s3", "ok": false, "settings": settings, "warnings": [e.to_string()], "steps": [] })),
+	};
+	let warnings = settings_warnings(&cfg);
+	let server_of = |r: &Response| r.headers().get("Server").ok().flatten().unwrap_or_default();
+
+	// 1. write
+	let mut resp = fetch_signed(&cfg, "PUT", &key, &[], None, Some(bytes.to_vec()), Some("application/octet-stream")).await?;
+	let (status, server) = (resp.status_code(), server_of(&resp));
+	if status != 200 {
+		let body = resp.text().await.unwrap_or_default();
+		steps.push(step("write", false, status, Some(refusal_reason(status, xml_val(&body, "Code").as_deref(), &server, true)), &server));
+	} else {
+		steps.push(step("write", true, status, None, &server));
+		// 2. size
+		let resp = fetch_signed(&cfg, "HEAD", &key, &[], None, None, None).await?;
+		let (status, server) = (resp.status_code(), server_of(&resp));
+		let size = resp.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok());
+		let size_ok = status == 200 && size == Some(16);
+		steps.push(step("size", size_ok, status, (!size_ok).then(|| if status == 200 { format!("the size read back is {size:?}, not 16") } else { refusal_reason(status, None, &server, false) }), &server));
+		// 3. read
+		let mut resp = fetch_signed(&cfg, "GET", &key, &[], None, None, None).await?;
+		let (status, server) = (resp.status_code(), server_of(&resp));
+		if status == 200 {
+			let same = resp.bytes().await? == bytes;
+			steps.push(step("read", same, status, (!same).then(|| "the bytes read back are not the ones written".to_string()), &server));
+		} else {
+			let body = resp.text().await.unwrap_or_default();
+			steps.push(step("read", false, status, Some(refusal_reason(status, xml_val(&body, "Code").as_deref(), &server, true)), &server));
+		}
+		// 4. delete (tried even after a failed read: the probe cleans up)
+		let mut resp = fetch_signed(&cfg, "DELETE", &key, &[], None, None, None).await?;
+		let (status, server) = (resp.status_code(), server_of(&resp));
+		let ok = status == 204 || status == 200;
+		let reason = if ok { None } else { Some(refusal_reason(status, xml_val(&resp.text().await.unwrap_or_default(), "Code").as_deref(), &server, true)) };
+		steps.push(step("delete", ok, status, reason, &server));
+	}
+	let ok = steps.iter().all(|s| s["ok"].as_bool() == Some(true));
+	Ok(serde_json::json!({ "backend": "s3", "ok": ok, "settings": settings, "warnings": warnings, "steps": steps }))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn cfg(endpoint: &str, region: &str, bucket: &str) -> S3Config {
+		S3Config { endpoint: endpoint.into(), region: region.into(), bucket: bucket.into(), access_key: "k".into(), secret_key: "s".into() }
+	}
+
+	/// 39s: the settings' own mistakes, found before a request is sent.
+	#[test]
+	fn settings_warnings_name_the_mismatch() {
+		assert!(settings_warnings(&cfg("https://s3.eu-central-1.idrivee2.com", "eu-central-1", "gorani")).is_empty());
+		let w = settings_warnings(&cfg("https://s3.eu-central-1.idrivee2.com", "us-east-1", "gorani"));
+		assert!(w.len() == 1 && w[0].contains("eu-central-1") && w[0].contains("us-east-1"), "{w:?}");
+		let w = settings_warnings(&cfg("https://gorani.s3.eu-central-1.idrivee2.com", "eu-central-1", "gorani"));
+		assert!(w.iter().any(|m| m.contains("bucket's name")), "{w:?}");
+		// R2's host names no region ("auto"); MinIO's neither.
+		assert!(settings_warnings(&cfg("https://abc123.r2.cloudflarestorage.com", "auto", "gorani")).is_empty());
+		assert!(settings_warnings(&cfg("https://minio.example.com", "us-east-1", "gorani")).is_empty());
+	}
+
+	/// The caller hears the status and S3's code; the key stays in the log.
+	#[test]
+	fn public_reason_drops_the_key() {
+		let m = format!("S3 put files/me/abc/v-1: {}", refusal_reason(403, Some("AccessDenied"), "", true));
+		assert_eq!(public_reason(&m).as_deref(), Some("HTTP 403 AccessDenied"));
+		assert_eq!(public_reason(&format!("S3 head files/x: {}", refusal_reason(403, None, "", false))).as_deref(), Some("HTTP 403"));
+		assert_eq!(public_reason("no such member"), None);
 	}
 }

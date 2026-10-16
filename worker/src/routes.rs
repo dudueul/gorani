@@ -236,6 +236,22 @@ async fn tsa_probe(env: &Env, email: &str) -> Result<Response> {
 	}
 }
 
+/// `POST /family/storage/probe` (commit 39s): a lead's check of the
+/// deployment's object storage — a real write, size, read and delete of a
+/// 16-byte probe object, each answer explained (s3.rs › probe), and the
+/// five settings as the deployment holds them (never the secret, and only
+/// the access key id's last four characters). Until 39s a misconfigured
+/// bucket showed up as the first upload failing with "internal error",
+/// and the log said "HTTP 403" and nothing else.
+async fn storage_probe(env: &Env, email: &str) -> Result<Response> {
+	match actor_of(env, email, None).await? {
+		Some(a) if a.role == "lead" => {}
+		Some(_) => return json_error(403, "only a lead checks the deployment's storage"),
+		None => return json_error(403, "not a team member"),
+	}
+	Response::from_json(&crate::s3::probe(env).await?)
+}
+
 async fn actor_of(env: &Env, email: &str, target: Option<&str>) -> Result<Option<Actor>> {
 	let namespace = env.durable_object("FAMILY")?;
 	let stub = namespace.id_from_name("family")?.get_stub()?;
@@ -555,6 +571,7 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// A lead's client needs the TSA's certificate to show its fingerprint
 		// before certifying it: a token over a random imprint carries it.
 		("POST", ["family", "tsa", "probe"]) => tsa_probe(&env, &identity.email).await,
+		("POST", ["family", "storage", "probe"]) => storage_probe(&env, &identity.email).await,
 		// The opt-in hash lookup (commit 38c, malware.rs): any active member,
 		// rate limited per member — a button, not a pipeline.
 		("POST", ["malware", "lookup"]) => {

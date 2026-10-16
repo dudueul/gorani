@@ -897,6 +897,13 @@ try {
 		const fp = (await page.locator('[data-test="my-fingerprint"]').textContent())?.trim() ?? "";
 		assert.match(fp, /^([0-9A-F]{4} ){7}[0-9A-F]{4}$/, "the fingerprint people read to each other");
 		assert.equal(fp.replace(/ /g, ""), ids.find((e) => e.member === "mom").keyId.slice(0, 32).toUpperCase(), "…is the registered identity's");
+		// Team › People › Check storage (39s): a lead's round trip through
+		// the deployment's storage, each step shown (api:storage covers the
+		// refusals; here, that the button reaches the Worker and renders).
+		await page.locator('[data-test="storage-check"]').click();
+		await page.locator('[data-test="storage-verdict"]', { hasText: "working" }).waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator('[data-test="storage-step"][data-ok="true"]').count(), 4, "write, size, read and delete");
+		assert.match(await page.locator('[data-test="storage-settings"]').innerText(), /S3_SECRET_KEY\s+\d+ characters/, "the secret by its length only");
 		// Team › People › Members (39l): a lead adds an account, changes it
 		// and deactivates it from the web app — the registry's rules, its
 		// refusals shown in its own words. (Until 39l only an API call could.)

@@ -196,6 +196,44 @@ console differs from the MinIO steps above.
   multiple of what is stored (check the current terms) — the edge cache
   (below) matters less for the bill here than for latency.
 
+### When the storage refuses (commit 39s)
+
+Found at the first production upload: the browser said "internal error"
+and the Worker's log said `S3 put files/…: HTTP 403` and nothing else.
+Since 39s, the log, the member and a lead each see more:
+
+- **Team › People › Check storage** (leads only). The Worker writes a
+  16-byte probe object under `probe/`, then reads its size, reads it back
+  and deletes it. Each step shows the status, the `Server` that answered,
+  and S3's own error code with what it usually means. Below that are the
+  five settings as the Worker holds them: endpoint, region, bucket, the
+  access key id's last four characters, and the secret's **length** (never
+  its value). A value stored with spaces or a line end around it is
+  flagged. `config()` trims such values now, but set the secret again
+  cleanly anyway. Two mistakes are named before any request is sent: a
+  region in the endpoint's host that is not `S3_REGION`, and an endpoint
+  whose host starts with the bucket's name (gorani addresses buckets by
+  path).
+- **The member** whose upload was refused gets a 502 with the status and
+  the code: "the storage refused this (HTTP 403 AccessDenied)". The object
+  key and the endpoint stay in the log. The public share pages still say
+  "internal error".
+- **The log line** carries the explanation (`gorani_s3::refusal_reason`),
+  never the error body's other elements. A SignatureDoesNotMatch body
+  holds the string-to-sign and the access key id. (Until 39s,
+  `multipart init` wrote the whole body to the log.)
+
+What a 403 means, by its code:
+
+| S3 says | Usually | Fix |
+|---|---|---|
+| `SignatureDoesNotMatch` | the secret is not this key's, or `S3_REGION` is not the region the endpoint's host names | set `S3_SECRET_KEY` again (no line end); use the host's region |
+| `InvalidAccessKeyId` | the endpoint does not know the key: deleted, mistyped, or made for another provider or region | create or copy the key for this endpoint |
+| `AccessDenied` | the key is valid but may not write here | give it object read, write and delete, multipart and list on the bucket |
+| `NoSuchBucket`, `PermanentRedirect` | wrong bucket name, or a bucket from another region | the bucket's own region host |
+| no code, `Server: cloudflare` | not the storage: Cloudflare in front of the endpoint (Access, WAF or bot rules on a tunnel's host) refused the Worker | let the Worker through, or use the storage's own host |
+| no code, a redirect | not the S3 API host (some providers answer unknown requests with a redirect to their homepage) | the provider's S3 endpoint, not its console |
+
 Part-size rule (both backends): a multipart upload's parts are GC01
 frames, and every part but the last must be ≥ 5 MiB. The chunk the client
 picks is the part size; the init route refuses smaller plans with an

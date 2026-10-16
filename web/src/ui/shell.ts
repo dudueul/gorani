@@ -24,6 +24,7 @@ import { FilesModel } from "./files/model.ts";
 import { sessionBridge } from "./files/bridge.ts";
 import { askIntake } from "./files/intake-dialog.ts";
 import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
+import { readPlace } from "./files/place.ts";
 import { LocalIndex } from "../vault/index.ts";
 import "./viewer/viewer.ts";
 import type { ViewerTarget } from "./viewer/viewer.ts";
@@ -59,6 +60,32 @@ export class GoraniShell extends LitElement {
 	private stopAutoLock: (() => void) | null = null;
 	private stopOnLock: (() => void) | null = null;
 
+	/** The browser's Back/Forward (commit 39l): the address holds the area
+	 * and folder (files/shared.ts › readPlace) — follow it. */
+	private onPopState = (): void => {
+		const place = readPlace();
+		if (!this.model) return;
+		if (place.area && place.area !== this.area) {
+			if (place.area === this.member.id && this.member.role !== "external") {
+				this.view = "files";
+				this.openArea(place.area, this.member.name, place.folder);
+				return;
+			}
+			const c = this.grantedCases.find((x) => `case:${x.id}` === place.area);
+			if (c) {
+				this.view = "files";
+				this.openArea(place.area, c.id, place.folder);
+			}
+			return;
+		}
+		void this.model.follow(place.folder);
+	};
+
+	override connectedCallback(): void {
+		super.connectedCallback();
+		addEventListener("popstate", this.onPopState);
+	}
+
 	/**
 	 * Unmount = lock, and lock = unmount (docs/SECURITY-REVIEW.md › O2).
 	 * Everything that held plaintext or keys for this session ends here:
@@ -73,6 +100,7 @@ export class GoraniShell extends LitElement {
 	 */
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
+		removeEventListener("popstate", this.onPopState);
 		this.stopAutoLock?.();
 		this.stopOnLock?.();
 		this.stopAutoLock = this.stopOnLock = null;
@@ -128,7 +156,11 @@ export class GoraniShell extends LitElement {
 			if (this.session.locked) return;
 			// An external member has no own area: they start in a case, once
 			// the team (and so their trust) is open.
-			if (this.member.role !== "external") this.openArea(this.member.id, this.member.name);
+			// Where the address says (a reload, or the unlock after a lock,
+			// opens the folder that was open): the own area here; a case's
+			// once the cases are known (openTeamContext).
+			const place = readPlace();
+			if (this.member.role !== "external" && (!place.area || place.area === this.member.id)) this.openArea(this.member.id, this.member.name, place.folder);
 			void this.openTeamContext();
 		}
 	}
@@ -143,9 +175,16 @@ export class GoraniShell extends LitElement {
 			if (copy === "sealed") this.toast("Your area's recovery copy is up to date");
 			if (copy === "untrusted") this.toast("The team's recovery key is not verified yet — compare a lead's fingerprint (Team › People)");
 			await this.loadCases();
-			if (!this.area && this.grantedCases[0]) this.openArea(`case:${this.grantedCases[0].id}`, this.grantedCases[0].id);
+			const place = readPlace();
+			const named = this.grantedCases.find((c) => `case:${c.id}` === place.area);
+			if (named && !this.area) this.openArea(`case:${named.id}`, named.id, place.folder);
+			else if (!this.area && this.member.role !== "external" && place.area) this.openArea(this.member.id, this.member.name);
+			else if (!this.area && this.grantedCases[0]) this.openArea(`case:${this.grantedCases[0].id}`, this.grantedCases[0].id);
 		} catch (e) {
 			this.toast(`Team: ${e instanceof Error ? e.message : String(e)}`);
+			// The address named a case, but the team did not open: the own
+			// files, rather than nothing.
+			if (!this.area && !this.session.locked && this.member.role !== "external") this.openArea(this.member.id, this.member.name);
 		}
 	}
 
@@ -159,7 +198,7 @@ export class GoraniShell extends LitElement {
 
 	/** Point the explorer at an area. A case's key comes from the member's
 	 * grant, opened only after its signature verifies (cases.ts). */
-	private openArea(area: string, title: string): void {
+	private openArea(area: string, title: string, folder: string | null = null): void {
 		this.model?.dispose();
 		const own = area === this.member.id;
 		const caseId = own ? null : area.slice("case:".length);
@@ -190,7 +229,7 @@ export class GoraniShell extends LitElement {
 		this.areaTitle = title;
 		window.__goraniMember = area;
 		void this.model
-			.open()
+			.open(folder)
 			.then(() => (own ? this.persistPinned() : undefined))
 			.catch((e) => this.toast(e instanceof Error ? e.message : String(e)));
 		void this.requestUpdate();

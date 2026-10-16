@@ -27,6 +27,7 @@ import type { UploadJournal, UploadRecord } from "../../lib/upload-journal.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { areaPath } from "../../lib/area.ts";
+import { writePlace } from "./place.ts";
 import { kindOf, type FileKind } from "./icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
@@ -80,7 +81,12 @@ export interface SortState {
 
 export interface FilesState {
 	folderId: string | null;
+	/** The current folder's child folders — what the view lists. */
 	folders: FolderRow[];
+	/** Every folder of the area: the tree, breadcrumbs, "Move to…". (The
+	 * server sends them whole with each listing; until commit 39l they were
+	 * all shown as `folders` — every folder appeared inside every folder.) */
+	tree: FolderRow[];
 	files: FileRow[];
 	selection: Selection[];
 	sort: SortState;
@@ -149,6 +155,14 @@ export class FilesModel {
 	private secrets: { fp: Uint8Array; idx: Uint8Array } | null = null;
 	private history: (string | null)[] = [null];
 	private historyAt = 0;
+	/** Where the explorer is going: the last listing asked for. The state
+	 * moves only when a listing lands (list), so for a moment the screen is
+	 * still where it was — a refresh, or the same folder opened twice, must
+	 * go by where it is headed instead. */
+	private target: { folderId: string | null; trash: boolean } = { folderId: null, trash: false };
+	/** Each listing's number: one that lands after a newer one was asked for
+	 * is dropped (two quick double-clicks; a change-feed refresh mid-walk). */
+	private listSeq = 0;
 	private clipboard: { mode: "copy" | "cut"; files: string[]; folders: string[] } | null = null;
 	private pollTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly listeners = new Set<() => void>();
@@ -163,7 +177,7 @@ export class FilesModel {
 		this.bridge = bridge;
 		this.memberId = memberId;
 		this.index = index;
-		this.state = store<FilesState>({ folderId: null, folders: [], files: [], selection: [], sort: { by: "name", dir: "asc" }, loading: false, error: null, trashMode: false, trashFiles: [], trashFolders: [] });
+		this.state = store<FilesState>({ folderId: null, folders: [], tree: [], files: [], selection: [], sort: { by: "name", dir: "asc" }, loading: false, error: null, trashMode: false, trashFiles: [], trashFolders: [] });
 	}
 
 	subscribe(listener: () => void): () => void {
@@ -200,8 +214,13 @@ export class FilesModel {
 
 	// ── navigation ──────────────────────────────────────────────────────
 
-	async open(): Promise<void> {
-		await this.list(null);
+	/** Open the area, in `folder` when the address named one that exists. */
+	async open(folder: string | null = null): Promise<void> {
+		await this.list(folder);
+		if (folder && !this.state.get().tree.some((f) => f.id === folder)) await this.list(null);
+		this.history = [this.state.get().folderId];
+		this.historyAt = 0;
+		writePlace(this.memberId, this.state.get().folderId, "replace");
 		void this.watchChanges();
 		// Uploads that stopped part-way here (D12, 31b): say so once, and how
 		// to continue — the parts already sent are not sent again.
@@ -214,7 +233,23 @@ export class FilesModel {
 			.catch(() => undefined);
 	}
 
+	/** Go to a folder (null: the area's top). Leaves the Trash too — until
+	 * commit 39l a folder opened from the Trash listed into the Trash view,
+	 * and Home re-listed the folder you were in rather than the top. */
 	async setFolder(id: string | null): Promise<void> {
+		// The open folder, opened again (a double-click is two clicks first;
+		// a tree row clicked twice): no new history entry, nothing to load.
+		if (!this.target.trash && this.target.folderId === id && this.history[this.historyAt] === id) return;
+		this.history = [...this.history.slice(0, this.historyAt + 1), id];
+		this.historyAt++;
+		writePlace(this.memberId, id, "push");
+		await this.list(id);
+	}
+
+	/** The browser's Back/Forward brought the address here: follow it,
+	 * without writing it again. */
+	async follow(id: string | null): Promise<void> {
+		if (!this.target.trash && this.target.folderId === id) return;
 		this.history = [...this.history.slice(0, this.historyAt + 1), id];
 		this.historyAt++;
 		await this.list(id);
@@ -224,6 +259,7 @@ export class FilesModel {
 		if (this.historyAt > 0) {
 			this.historyAt--;
 			const id = this.history[this.historyAt] ?? null;
+			writePlace(this.memberId, id, "replace");
 			await this.list(id);
 		}
 	}
@@ -232,6 +268,7 @@ export class FilesModel {
 		if (this.historyAt < this.history.length - 1) {
 			this.historyAt++;
 			const id = this.history[this.historyAt] ?? null;
+			writePlace(this.memberId, id, "replace");
 			await this.list(id);
 		}
 	}
@@ -244,44 +281,52 @@ export class FilesModel {
 		return this.historyAt < this.history.length - 1;
 	}
 
+	/** List a folder (or the Trash) and show it — all at once: the folder,
+	 * its contents and the mode change together when the listing lands.
+	 * Until commit 39l the folder id changed first and the old contents
+	 * stayed up under the new path until the new ones decrypted (Finder's
+	 * next column showed the parent's files; a click there acted on them). */
 	private async list(folderId: string | null, opts: { trash?: boolean } = {}): Promise<void> {
-		this.set({ loading: true, error: null, folderId });
+		const trash = Boolean(opts.trash);
+		const seq = ++this.listSeq;
+		this.target = { folderId, trash };
+		this.set({ loading: true, error: null });
 		try {
-			if (opts.trash) {
+			if (trash) {
 				const t = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[]; trashedWith: { id: string; with: string }[] }>(`${areaPath(this.memberId)}/files/trash`);
 				const withMap = new Map(t.trashedWith.map((x) => [x.id, x.with]));
-				this.set({
-					trashFiles: await this.decryptFiles(t.files.map((f) => ({ ...f, trashedWith: withMap.get(f.id) ?? null }))),
-					trashFolders: await this.decryptFolders(t.folders.map((f) => ({ ...f, trashedWith: withMap.get(f.id) ?? null }))),
-					loading: false,
-				});
+				const trashFiles = await this.decryptFiles(t.files.map((f) => ({ ...f, trashedWith: withMap.get(f.id) ?? null })));
+				const trashFolders = await this.decryptFolders(t.folders.map((f) => ({ ...f, trashedWith: withMap.get(f.id) ?? null })));
+				if (seq !== this.listSeq) return;
+				this.set({ folderId, trashMode: true, trashFiles, trashFolders, selection: [], loading: false });
 				return;
 			}
 			const l = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[] }>(`${areaPath(this.memberId)}/files/list?folder=${folderId ?? "root"}&limit=1000`);
-			const folders = await this.decryptFolders(l.folders);
+			const tree = await this.decryptFolders(l.folders);
+			const folders = tree.filter((f) => (f.parent ?? null) === folderId);
 			const files = await this.decryptFiles(l.files);
-			this.set({ folders, files, selection: [], loading: false });
+			if (seq !== this.listSeq) return;
+			this.set({ folderId, trashMode: false, folders, tree, files, selection: [], loading: false });
 			// The local index learns every listing (names decrypted here, in
 			// this browser only). Until commit 39l nothing fed it: search found
 			// nothing and Recents stayed empty, whatever the vault held.
 			const when = (iso: string) => Date.parse(iso) || Date.now();
 			this.index?.upsert([
-				...folders.map((f) => ({ id: f.id, kind: "folder" as const, folderId: f.parent ?? null, name: f.name, updatedAt: when(f.updatedAt || f.createdAt) })),
+				...tree.map((f) => ({ id: f.id, kind: "folder" as const, folderId: f.parent ?? null, name: f.name, updatedAt: when(f.updatedAt || f.createdAt) })),
 				...files.map((f) => ({ id: f.id, kind: "file" as const, folderId: f.folder ?? null, name: f.name, updatedAt: when(f.updatedAt || f.createdAt), size: f.size })),
 			]);
 		} catch (e) {
-			this.set({ loading: false, error: e instanceof Error ? e.message : String(e) });
+			if (seq !== this.listSeq) return;
+			this.set({ folderId, trashMode: trash, loading: false, error: e instanceof Error ? e.message : String(e) });
 		}
 	}
 
 	async openTrash(): Promise<void> {
-		this.set({ trashMode: true });
-		await this.list(this.state.get().folderId, { trash: true });
+		await this.list(this.target.folderId, { trash: true });
 	}
 
 	async closeTrash(): Promise<void> {
-		this.set({ trashMode: false });
-		await this.list(this.state.get().folderId);
+		await this.list(this.target.folderId);
 	}
 
 	// ── decryption of listings ──────────────────────────────────────────
@@ -1108,8 +1153,7 @@ export class FilesModel {
 	}
 
 	async refresh(): Promise<void> {
-		const s = this.state.get();
-		await this.list(s.folderId, { trash: s.trashMode });
+		await this.list(this.target.folderId, { trash: this.target.trash });
 	}
 
 	dispose(): void {

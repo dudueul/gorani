@@ -84,6 +84,13 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 			`S3_SECRET_KEY=${s3?.secretKey ?? "test"}`,
 			"CACHE_MAX_OBJECT_MB=6",
 			"VAULT_DESTROY_ENABLED=1",
+			// No timestamp authority unless the suite brings its own (api:timestamps
+			// hands its stub's URL in): wrangler.jsonc names a public TSA for a
+			// deployment, and a suite must not depend on reaching it — where it
+			// could not be resolved, every nightly pass (which stamps the audit
+			// checkpoints) failed with a 500 and took api:approvals and api:audit
+			// with it. An empty TSA_URL is "none configured" (tsa.rs › configured).
+			...("TSA_URL" in vars ? [] : ["TSA_URL="]),
 			// Extra vars a suite needs on its own server (api:bootstrap's
 			// BOOTSTRAP_TOKEN) — never secrets of a real deployment.
 			...Object.entries(vars).map(([k, v]) => `${k}=${v}`),

@@ -65,8 +65,6 @@ export class GoraniFinder extends LitElement {
 		if (!row) return;
 		this.shareTarget = { id, name: row.name, size: row.size, version: row.version };
 	}
-	/** Column view: the walked path of folders + the deepest selection. */
-	@state() private columnPath: string[] = [];
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -121,16 +119,22 @@ export class GoraniFinder extends LitElement {
 		return this.s().selection;
 	}
 
+	/** Every navigation goes here: it leaves Search, Recents and the Trash,
+	 * and the model puts the folder in the address (commit 39l). */
+	private go(id: string | null): Promise<void> {
+		this.recentsMode = false;
+		this.searchHits = null;
+		this.query = "";
+		return this.model.setFolder(id);
+	}
+
 	private async openEntry(kind: "file" | "folder", id: string): Promise<void> {
 		if (this.s().trashMode) return;
 		if (kind === "folder") {
-			if (this.view === "column") {
-				this.columnPath = [...this.columnPath, id];
-				this.model.clearSelection();
-				// Column view keeps the model's folder at the walked path's end.
-				return;
-			}
-			await this.model.setFolder(id);
+			// Column view too: the open folder IS the walked path's end (the
+			// columns are drawn from it — columnView). Until commit 39l a folder
+			// opened here was pushed onto a list nothing drew.
+			await this.go(id);
 			return;
 		}
 		const row = this.s().files.find((f) => f.id === id) ?? this.s().trashFiles.find((f) => f.id === id);
@@ -232,8 +236,7 @@ export class GoraniFinder extends LitElement {
 		this.searchHits = null;
 		this.query = "";
 		this.recentsMode = false;
-		if (this.view === "column") this.columnPath = [];
-		await this.model.setFolder(hit.kind === "folder" ? hit.id : hit.folderId);
+		await this.go(hit.kind === "folder" ? hit.id : hit.folderId);
 		if (hit.kind === "file") this.model.select({ kind: "file", id: hit.id });
 	}
 
@@ -262,12 +265,19 @@ export class GoraniFinder extends LitElement {
 		};
 		const cmd = e[modKey()];
 		switch (e.key) {
-			case "ArrowDown":
-				move(1);
+			// ⌘↑ goes to the enclosing folder and ⌘↓ opens the selection, as
+			// in Finder (⌃ off a Mac); the bare arrows move the selection.
+			case "ArrowDown": {
+				const cur = order[at];
+				if (cmd) {
+					if (at >= 0 && cur) void this.openEntry(cur.kind, cur.id);
+				} else move(1);
 				e.preventDefault();
 				return;
+			}
 			case "ArrowUp":
-				move(-1);
+				if (cmd) void this.go(this.s().tree.find((f) => f.id === this.s().folderId)?.parent ?? null);
+				else move(-1);
 				e.preventDefault();
 				return;
 			// Finder: Enter renames; ⌘O (and ⌘↓) open.
@@ -292,7 +302,7 @@ export class GoraniFinder extends LitElement {
 				return;
 			case "Backspace":
 				if (cmd) void this.deleteSelection();
-				else void this.model.setFolder(this.s().folders.find((f) => f.id === this.s().folderId)?.parent ?? null);
+				else void this.go(this.s().tree.find((f) => f.id === this.s().folderId)?.parent ?? null);
 				e.preventDefault();
 				return;
 			case "Escape":
@@ -385,7 +395,7 @@ export class GoraniFinder extends LitElement {
 		const s = this.s();
 		const { folders, files } = this.view === "column" ? this.columnVisible() : this.visible();
 		return html`
-			<div class="flex h-full flex-col bg-neutral-900/95 text-neutral-200" @keydown=${(e: KeyboardEvent) => this.onKeydown(e)}>
+			<div class="flex h-full flex-col bg-neutral-900/95 text-neutral-200 outline-none" tabindex="-1" @keydown=${(e: KeyboardEvent) => this.onKeydown(e)}>
 				${this.toolbar()}
 				<div class="flex min-h-0 flex-1">
 					${this.sidebar()}
@@ -410,8 +420,8 @@ export class GoraniFinder extends LitElement {
 			html`<button class="rounded-lg px-2.5 py-1.5 text-sm ${this.view === mode ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title=${title} @click=${() => (this.view = mode)}>${glyph}</button>`;
 		return html`
 			<div class="flex items-center gap-1.5 border-b border-neutral-800 px-3 py-2">
-				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canBack} @click=${() => void this.model.back()}>‹</button>
-				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canForward} @click=${() => void this.model.forward()}>›</button>
+				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canBack} @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.back(); }}>‹</button>
+				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canForward} @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.forward(); }}>›</button>
 				<div class="mx-1 h-5 border-l border-neutral-800"></div>
 				${view("icon", "⊞", "Icons")} ${view("list", "☰", "List")} ${view("column", "❙❙❙", "Columns")}
 				<div class="mx-1 h-5 border-l border-neutral-800"></div>
@@ -447,12 +457,12 @@ export class GoraniFinder extends LitElement {
 		return html`
 			<aside class="w-52 shrink-0 overflow-y-auto border-r border-neutral-800/70 bg-neutral-900/60 px-2 py-3 text-sm" @drop=${(e: DragEvent) => this.onDropIntoFolder(e, null)} @dragover=${(e: DragEvent) => e.preventDefault()}>
 				<p class="px-2 pb-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Favorites</p>
-				${fav("Home", "🏠", s.folderId === null && !s.trashMode, () => void this.model.closeTrash())}
-				${s.folders.filter((f) => !f.parent).map((f) => fav(f.name, "📁", s.folderId === f.id && !s.trashMode, () => void this.model.setFolder(f.id)))}
+				${fav("Home", "🏠", s.folderId === null && !s.trashMode, () => void this.go(null))}
+				${s.tree.filter((f) => !f.parent).map((f) => fav(f.name, "📁", s.folderId === f.id && !s.trashMode, () => void this.go(f.id)))}
 				<p class="px-2 pt-3 pb-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Recents</p>
 				${fav("Recent files", "⏱", this.recentsMode, () => void this.showRecents())}
 				<p class="px-2 pt-3 pb-1 text-xs font-semibold uppercase tracking-wide text-neutral-500">Locations</p>
-				${fav("Trash", "🗑", s.trashMode, () => void this.model.openTrash())}
+				${fav("Trash", "🗑", s.trashMode, () => { this.recentsMode = false; this.searchHits = null; void this.model.openTrash(); })}
 			</aside>
 		`;
 	}
@@ -530,36 +540,54 @@ export class GoraniFinder extends LitElement {
 		return this.visible();
 	}
 
+	/**
+	 * Column view, as macOS draws it: one column per level from the area's
+	 * top down to the open folder, the open folder's own contents last, and
+	 * a preview of the selected file beside them. A folder clicked in any
+	 * column opens it (the columns to its right redraw from there). The
+	 * ancestor columns list folders — the tree arrives whole with every
+	 * listing; files come for the open folder only.
+	 */
 	private columnView(): TemplateResult {
 		const s = this.s();
-		const levels: { id: string | null; folders: typeof s.folders; files: typeof s.files }[] = [];
-		// Level 0: the model's current listing. Levels 1..n-1: the folders
-		// walked on the way here, re-listed from the model's knowledge of the
-		// tree (children of walked folders come from the listing cache).
-		levels.push({ id: s.folderId, folders: s.folders, files: s.files });
-		void this.columnPath; // (walked-path refinement lands with the index feed)
-		const col = (level: (typeof levels)[number], last: boolean) => html`
-			<div class="min-w-56 flex-1 overflow-y-auto border-r border-neutral-800/70 p-1.5 text-sm ${last ? "border-r-0" : ""}">
-				${level.folders.map((f) => this.columnCell("folder", f.id, f.name, "folder"))}
-				${level.files.map((f) => this.columnCell("file", f.id, f.name, f.kind))}
-				${!level.folders.length && !level.files.length ? html`<p class="px-3 py-6 text-xs text-neutral-600">Empty</p>` : nothing}
-			</div>
-		`;
+		const chain: (string | null)[] = [];
+		for (let cur: string | null = s.folderId; cur; cur = s.tree.find((f) => f.id === cur)?.parent ?? null) chain.unshift(cur);
+		chain.unshift(null);
+		const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name);
+		const col = (level: number) => {
+			const parent = chain[level] ?? null;
+			const last = level === chain.length - 1;
+			const folders = last ? this.visible().folders : s.tree.filter((f) => (f.parent ?? null) === parent).sort(byName);
+			const files = last ? this.visible().files : [];
+			const open = chain[level + 1];
+			return html`
+				<div class="min-w-56 max-w-72 flex-1 overflow-y-auto border-r border-neutral-800/70 p-1.5 text-sm" data-column=${level}>
+					${folders.map((f) => this.columnCell("folder", f.id, f.name, "folder", f.id === open))}
+					${files.map((f) => this.columnCell("file", f.id, f.name, f.kind))}
+					${!folders.length && !files.length ? html`<p class="px-3 py-6 text-xs text-neutral-600">Empty</p>` : nothing}
+				</div>
+			`;
+		};
 		const selected = this.selection()[0];
 		return html`
-			<div class="flex h-full">
-				${levels.map((l, i) => col(l, i === levels.length - 1 && !selected))}
+			<div class="flex h-full overflow-x-auto">
+				${chain.map((_, i) => col(i))}
 				${selected && selected.kind === "file" ? this.columnPreview(selected.id) : nothing}
 			</div>
 		`;
 	}
 
-	private columnCell(kind: "file" | "folder", id: string, name: string, k: FileKind): TemplateResult {
+	private columnCell(kind: "file" | "folder", id: string, name: string, k: FileKind, walked = false): TemplateResult {
 		return html`
 			<div
 				data-item="${kind}:${id}"
-				class="flex cursor-default items-center gap-2 rounded-md px-2.5 py-1.5 ${this.isSelected(kind, id) ? "bg-accent/20" : "hover:bg-neutral-800/60"}"
-				@click=${(e: MouseEvent) => this.model.select({ kind, id }, { add: e[modKey()], range: e.shiftKey })}
+				class="flex cursor-default items-center gap-2 rounded-md px-2.5 py-1.5 ${this.isSelected(kind, id) ? "bg-accent/20" : walked ? "bg-neutral-800" : "hover:bg-neutral-800/60"}"
+				@click=${(e: MouseEvent) => {
+					// A plain click on a folder opens it into the next column;
+					// with a modifier it selects, to act on several.
+					if (kind === "folder" && !e[modKey()] && !e.shiftKey) void this.go(id).then(() => this.model.select({ kind, id }));
+					else this.model.select({ kind, id }, { add: e[modKey()], range: e.shiftKey });
+				}}
 				@dblclick=${() => void this.openEntry(kind, id)}
 				@contextmenu=${(e: MouseEvent) => this.contextMenu(e, kind, id, name)}
 				draggable="true"
@@ -616,12 +644,12 @@ export class GoraniFinder extends LitElement {
 		while (cursor && !seen.has(cursor)) {
 			seen.add(cursor);
 			crumbs.push({ id: cursor, name: this.model.names.get(cursor) ?? "…" });
-			cursor = s.folders.find((f) => f.id === cursor)?.parent ?? null;
+			cursor = s.tree.find((f) => f.id === cursor)?.parent ?? null;
 		}
 		if (s.trashMode) crumbs.push({ id: null, name: "Trash" });
 		return html`
 			<footer class="flex items-center gap-1 border-t border-neutral-800/70 px-3 py-1.5 text-xs text-neutral-400" @drop=${(e: DragEvent) => this.onDropIntoFolder(e, null)} @dragover=${(e: DragEvent) => e.preventDefault()}>
-				${crumbs.map((c, i) => html`${i > 0 ? html`<span class="text-neutral-600">/</span>` : nothing}<button class="rounded px-1 py-0.5 hover:bg-neutral-800 ${i === crumbs.length - 1 ? "text-neutral-200" : ""}" @click=${() => c.id !== null && void this.model.setFolder(c.id)}>${c.name}</button>`)}
+				${crumbs.map((c, i) => html`${i > 0 ? html`<span class="text-neutral-600">/</span>` : nothing}<button class="rounded px-1 py-0.5 hover:bg-neutral-800 ${i === crumbs.length - 1 ? "text-neutral-200" : ""}" @click=${() => void this.go(c.id)}>${c.name}</button>`)}
 			</footer>
 		`;
 	}

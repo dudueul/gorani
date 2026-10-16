@@ -92,19 +92,23 @@ export class GoraniApp extends LitElement {
 
 	protected override render() {
 		const s = screen.get();
+		// Every screen before the explorer is a card, centred in the window.
+		// (Until commit 39l they had no container at all: the cards sat in the
+		// top-left corner of an element with no size.)
+		const centred = (card: unknown) => html`<div class="flex min-h-full w-full items-center justify-center p-4" data-screen=${s.at}>${card}</div>`;
 		switch (s.at) {
 			case "loading":
-				return html`<div class="flex h-full items-center justify-center text-neutral-500">Loading…</div>`;
+				return centred(html`<p class="text-neutral-500">Loading…</p>`);
 			case "error":
-				return html`<div class="flex h-full items-center justify-center px-6"><p class="max-w-md text-center text-red-400">${s.message}</p></div>`;
+				return centred(html`<p class="max-w-md text-center text-red-400">${s.message}</p>`);
 			case "first":
-				return this.renderFirst();
+				return centred(this.renderFirst());
 			case "locked":
-				return html`<gorani-unlock .memberId=${s.member.id} .memberName=${s.member.name} .settings=${s.settings} @unlocked=${(e: CustomEvent) => this.onUnlocked(s.member, e.detail)}></gorani-unlock>`;
+				return centred(html`<gorani-unlock class="block w-full max-w-sm" .memberId=${s.member.id} .memberName=${s.member.name} .settings=${s.settings} @unlocked=${(e: CustomEvent) => this.onUnlocked(s.member, e.detail)}></gorani-unlock>`);
 			case "setup":
-				return html`<gorani-setup .memberId=${s.member.id} .memberName=${s.member.name} @settings=${(e: CustomEvent) => screen.set({ at: "locked", member: s.member, settings: e.detail.settings })} @setup-done=${() => void this.bootMember(s.member)}></gorani-setup>`;
+				return centred(html`<gorani-setup class="block w-full max-w-sm" .memberId=${s.member.id} .memberName=${s.member.name} @settings=${(e: CustomEvent) => screen.set({ at: "locked", member: s.member, settings: e.detail.settings })} @setup-done=${() => void this.bootMember(s.member)}></gorani-setup>`);
 			case "unlocked":
-				return html`<gorani-shell .member=${s.member} .session=${s.session} .stay=${s.stay} @locked=${() => void this.bootMember(s.member)}></gorani-shell>`;
+				return html`<gorani-shell class="block h-full" .member=${s.member} .session=${s.session} .stay=${s.stay} @locked=${() => void this.bootMember(s.member)}></gorani-shell>`;
 		}
 	}
 

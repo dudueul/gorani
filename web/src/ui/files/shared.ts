@@ -123,6 +123,14 @@ export class GoraniMenu extends LitElement {
 	@property({ type: Array }) items: MenuItem[] = [];
 	@property({ type: Number }) x = 0;
 	@property({ type: Number }) y = 0;
+	/** Where the focus was: it goes back there when the menu closes, so the
+	 * explorer keeps its keyboard (commit 39l). */
+	returnFocus: HTMLElement | null = null;
+
+	override disconnectedCallback(): void {
+		super.disconnectedCallback();
+		if (this.returnFocus?.isConnected) this.returnFocus.focus({ preventScroll: true });
+	}
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -189,6 +197,8 @@ export class GoraniMenu extends LitElement {
 export function showMenu(items: MenuItem[], x: number, y: number): void {
 	document.querySelectorAll("gorani-menu").forEach((m) => m.remove());
 	const menu = document.createElement("gorani-menu") as GoraniMenu;
+	const before = document.activeElement;
+	menu.returnFocus = before instanceof HTMLElement && before !== document.body ? before : null;
 	menu.items = items;
 	menu.x = x;
 	menu.y = y;

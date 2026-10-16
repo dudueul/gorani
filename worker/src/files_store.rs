@@ -757,23 +757,22 @@ impl GoraniMemberDO {
 		if let Some(refused) = self.evidence_refusal().await? {
 			return Ok(refused);
 		}
-		let n = self
-			.sql
-			.exec(
-				"WITH RECURSIVE d(id) AS (SELECT id FROM file_folders WHERE id = ?1 AND deleted_at IS NULL UNION ALL SELECT f.id FROM file_folders f JOIN d ON f.parent_id = d.id) UPDATE file_folders SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), trashed_with = ?1 WHERE id IN (SELECT id FROM d)",
-				Some(vec![id.into()]),
-			)?
-			.rows_written();
+		// Count first, then update — as trash_restore does: rows_written
+		// also counts the change-feed trigger's writes, so it overstated the
+		// report (and a folder's trip through the Trash read 6 + 3 for 2 + 1).
+		const TREE: &str = "WITH RECURSIVE d(id) AS (SELECT id FROM file_folders WHERE id = ?1 AND deleted_at IS NULL UNION ALL SELECT f.id FROM file_folders f JOIN d ON f.parent_id = d.id WHERE f.deleted_at IS NULL)";
+		let p = Some(vec![id.into()]);
+		let n = self.sql.exec(&format!("{TREE} SELECT COUNT(*) AS n FROM d"), p.clone())?.one::<TotalCount>()?.n;
 		if n == 0 {
 			return json_error(404, "no such folder");
 		}
-		let files = self
-			.sql
-			.exec(
-				"WITH RECURSIVE d(id) AS (SELECT id FROM file_folders WHERE id = ?1 UNION ALL SELECT f.id FROM file_folders f JOIN d ON f.parent_id = d.id) UPDATE files SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), trashed_with = ?1 WHERE folder_id IN (SELECT id FROM d) AND deleted_at IS NULL",
-				Some(vec![id.into()]),
-			)?
-			.rows_written();
+		let files = self.sql.exec(&format!("{TREE} SELECT COUNT(*) AS n FROM files WHERE folder_id IN (SELECT id FROM d) AND deleted_at IS NULL"), p.clone())?.one::<TotalCount>()?.n;
+		// Files first, while the tree still reads as living; then the folders.
+		self.sql.exec(
+			&format!("{TREE} UPDATE files SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), trashed_with = ?1 WHERE folder_id IN (SELECT id FROM d) AND deleted_at IS NULL"),
+			p.clone(),
+		)?;
+		self.sql.exec(&format!("{TREE} UPDATE file_folders SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), trashed_with = ?1 WHERE id IN (SELECT id FROM d)"), p)?;
 		self.audit(actor, "folder.trash", id, None, None).await?;
 		Ok(Response::from_json(&serde_json::json!({ "folders": n, "files": files }))?)
 	}
@@ -1113,9 +1112,13 @@ impl GoraniMemberDO {
 		}))?)
 	}
 
-	/// Restore files and folders from the Trash. A folder whose parent is
-	/// still in the Trash comes back at the top level; a file whose folder is
-	/// still there likewise (the tree must never dangle).
+	/// Restore files and folders from the Trash. A folder comes back with
+	/// everything its deletion took along — the subfolders and files that
+	/// share its `trashed_with` mark (folder_trash) — and nothing else: a file
+	/// someone trashed on its own before the folder went stays in the Trash.
+	/// A folder whose parent is still in the Trash comes back at the top
+	/// level; a file whose folder is still there likewise (the tree must
+	/// never dangle).
 	pub(crate) async fn trash_restore(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
 		let files: Vec<String> = body.get("files").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
 		let folders: Vec<String> = body.get("folders").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
@@ -1123,18 +1126,33 @@ impl GoraniMemberDO {
 		// trigger's writes (journal + counter), so it cannot be the report.
 		let mut n_files = 0;
 		let mut n_folders = 0;
-		if !folders.is_empty() {
-			let (qs, params) = in_clause(&folders);
-			n_folders = self.sql.exec(&format!("SELECT COUNT(*) AS n FROM file_folders WHERE deleted_at IS NOT NULL AND id IN ({qs})"), Some(params.clone()))?.one::<TotalCount>()?.n;
-			self.sql
-				.exec(
-					&format!("UPDATE file_folders SET deleted_at = NULL, trashed_with = NULL, parent_id = CASE WHEN EXISTS (SELECT 1 FROM file_folders p WHERE p.id = file_folders.parent_id AND p.deleted_at IS NOT NULL) THEN NULL ELSE parent_id END WHERE id IN ({qs})"),
-					Some(params),
-				)?;
+		// The subtree one deletion took: the folder, then each trashed child
+		// carrying the same mark. `=` rather than `IS`, so a folder trashed
+		// before the mark existed (NULL) restores alone instead of sweeping
+		// up every unmarked thing beneath it. One folder per statement (a
+		// recursive CTE, not an id list): a big tree must not run into the
+		// bound-parameter ceiling.
+		const SUBTREE: &str = "WITH RECURSIVE d(id) AS (SELECT id FROM file_folders WHERE id = ?1 AND deleted_at IS NOT NULL UNION ALL SELECT f.id FROM file_folders f JOIN d ON f.parent_id = d.id WHERE f.deleted_at IS NOT NULL AND f.trashed_with = (SELECT trashed_with FROM file_folders WHERE id = ?1))";
+		const SWEPT_FILES: &str = "FROM files WHERE deleted_at IS NOT NULL AND folder_id IN (SELECT id FROM d) AND trashed_with = (SELECT trashed_with FROM file_folders WHERE id = ?1)";
+		for id in &folders {
+			let p = Some(vec![id.as_str().into()]);
+			n_folders += self.sql.exec(&format!("{SUBTREE} SELECT COUNT(*) AS n FROM d"), p.clone())?.one::<TotalCount>()?.n;
+			n_files += self.sql.exec(&format!("{SUBTREE} SELECT COUNT(*) AS n {SWEPT_FILES}"), p.clone())?.one::<TotalCount>()?.n;
+			// Files before folders: the files' test reads the folders' marks.
+			self.sql.exec(&format!("{SUBTREE} UPDATE files SET deleted_at = NULL, trashed_with = NULL WHERE id IN (SELECT id {SWEPT_FILES})"), p.clone())?;
+			self.sql.exec(&format!("{SUBTREE} UPDATE file_folders SET deleted_at = NULL, trashed_with = NULL WHERE id IN (SELECT id FROM d)"), p)?;
+		}
+		// Re-parent only once every requested folder is back, so restoring a
+		// folder together with its (separately trashed) parent keeps it inside.
+		for id in &folders {
+			self.sql.exec(
+				"UPDATE file_folders SET parent_id = NULL WHERE id = ?1 AND EXISTS (SELECT 1 FROM file_folders p WHERE p.id = file_folders.parent_id AND p.deleted_at IS NOT NULL)",
+				Some(vec![id.as_str().into()]),
+			)?;
 		}
 		if !files.is_empty() {
 			let (qs, params) = in_clause(&files);
-			n_files = self.sql.exec(&format!("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NOT NULL AND id IN ({qs})"), Some(params.clone()))?.one::<TotalCount>()?.n;
+			n_files += self.sql.exec(&format!("SELECT COUNT(*) AS n FROM files WHERE deleted_at IS NOT NULL AND id IN ({qs})"), Some(params.clone()))?.one::<TotalCount>()?.n;
 			self.sql
 				.exec(
 					&format!("UPDATE files SET deleted_at = NULL, trashed_with = NULL, folder_id = CASE WHEN EXISTS (SELECT 1 FROM file_folders f2 WHERE f2.id = files.folder_id AND f2.deleted_at IS NOT NULL) THEN NULL ELSE folder_id END WHERE id IN ({qs})"),

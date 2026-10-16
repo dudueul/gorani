@@ -90,10 +90,10 @@ export class GoraniWin11 extends LitElement {
 		const crumbs: { id: string | null; name: string }[] = [];
 		let cursor = s.trashMode ? null : s.folderId;
 		while (cursor) {
-			const f = s.folders.find((x) => x.id === cursor) ?? this.model.names.get(cursor)?.[0] ?? null;
+			const f = s.tree.find((x) => x.id === cursor) ?? null;
 			const name = this.model.names.get(cursor) ?? "…";
 			crumbs.unshift({ id: cursor, name });
-			cursor = f ? (s.folders.find((x) => x.id === cursor)?.parent ?? null) : null;
+			cursor = f ? (f.parent ?? null) : null;
 		}
 		crumbs.unshift({ id: null, name: this.memberName });
 		if (s.trashMode) crumbs.push({ id: null, name: "Trash" });
@@ -110,10 +110,19 @@ export class GoraniWin11 extends LitElement {
 		return this.s().selection;
 	}
 
+	/** Every navigation goes here: it leaves Search, Recents and the Trash,
+	 * and the model puts the folder in the address (commit 39l). */
+	private go(id: string | null): Promise<void> {
+		this.recentsMode = false;
+		this.searchHits = null;
+		this.query = "";
+		return this.model.setFolder(id);
+	}
+
 	private async openEntry(kind: "file" | "folder", id: string, name: string): Promise<void> {
 		if (this.s().trashMode) return; // trashed items are read-only until restored
 		if (kind === "folder") {
-			await this.model.setFolder(id);
+			await this.go(id);
 			return;
 		}
 		const row = this.s().files.find((f) => f.id === id);
@@ -190,7 +199,7 @@ export class GoraniWin11 extends LitElement {
 		const s = this.s();
 		const items: MenuItem[] = [
 			{ label: "Home", run: () => { const f = this.firstSel(); if (!f) return; void this.model.move(f.kind, this.selection().map((x) => x.id), null); } },
-			...(s.folders
+			...(s.tree
 				.filter((f) => !this.selection().some((x) => x.id === f.id))
 				.map((f) => ({ label: f.name, run: () => { const it = this.firstSel(); if (!it) return; void this.model.move(it.kind, this.selection().map((x) => x.id), f.id); } }))),
 			{ separator: true, label: "" },
@@ -260,7 +269,7 @@ export class GoraniWin11 extends LitElement {
 		this.searchHits = null;
 		this.query = "";
 		this.recentsMode = false;
-		await this.model.setFolder(hit.kind === "folder" ? hit.id : hit.folderId);
+		await this.go(hit.kind === "folder" ? hit.id : hit.folderId);
 		if (hit.kind === "file") this.model.select({ kind: "file", id: hit.id });
 	}
 
@@ -317,8 +326,8 @@ export class GoraniWin11 extends LitElement {
 				return;
 			case "Backspace":
 				if (!s.trashMode) {
-					const parent = s.folders.find((f) => f.id === s.folderId)?.parent ?? null;
-					void this.model.setFolder(parent);
+					const parent = s.tree.find((f) => f.id === s.folderId)?.parent ?? null;
+					void this.go(parent);
 				}
 				e.preventDefault();
 				return;
@@ -438,7 +447,7 @@ export class GoraniWin11 extends LitElement {
 		const s = this.s();
 		const { folders, files } = this.visible();
 		return html`
-			<div class="flex h-full flex-col bg-neutral-900 text-neutral-200" @keydown=${(e: KeyboardEvent) => this.onKeydown(e)}>
+			<div class="flex h-full flex-col bg-neutral-900 text-neutral-200 outline-none" tabindex="-1" @keydown=${(e: KeyboardEvent) => this.onKeydown(e)}>
 				${this.commandBar()}
 				${this.addressBar()}
 				<div class="flex min-h-0 flex-1">
@@ -515,13 +524,13 @@ export class GoraniWin11 extends LitElement {
 		const crumbs = this.path();
 		return html`
 			<div class="flex items-center gap-1 border-b border-neutral-800 px-2 py-1.5">
-				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canBack} @click=${() => void this.model.back()}>←</button>
-				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canForward} @click=${() => void this.model.forward()}>→</button>
-				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800" title="Up one folder" @click=${() => void this.model.setFolder(this.s().folders.find((f) => f.id === this.s().folderId)?.parent ?? null)}>↑</button>
+				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canBack} @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.back(); }}>←</button>
+				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canForward} @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.forward(); }}>→</button>
+				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800" title="Up one folder" @click=${() => void this.go(this.s().tree.find((f) => f.id === this.s().folderId)?.parent ?? null)}>↑</button>
 				<nav class="mx-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto rounded-lg bg-neutral-950 px-2.5 py-1.5 text-sm" @drop=${(e: DragEvent) => this.onDropIntoFolder(e, null)} @dragover=${(e: DragEvent) => e.preventDefault()}>
 					${crumbs.map((c, i) =>
 						html`${i > 0 ? html`<span class="text-neutral-600">›</span>` : nothing}
-						<button class="whitespace-nowrap rounded px-1.5 py-0.5 hover:bg-neutral-800 ${i === crumbs.length - 1 ? "text-neutral-100" : "text-neutral-400"}" @click=${() => c.id !== null && void this.model.setFolder(c.id)}>${c.name}</button>`,
+						<button class="whitespace-nowrap rounded px-1.5 py-0.5 hover:bg-neutral-800 ${i === crumbs.length - 1 ? "text-neutral-100" : "text-neutral-400"}" @click=${() => void this.go(c.id)}>${c.name}</button>`,
 					)}
 				</nav>
 				<div class="relative">
@@ -550,7 +559,7 @@ export class GoraniWin11 extends LitElement {
 		return html`
 			<aside class="w-60 shrink-0 overflow-y-auto border-r border-neutral-800 px-2 py-3 text-sm">
 				<p class="px-2 pb-1 text-xs uppercase tracking-wide text-neutral-500">Quick access</p>
-				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.folderId === null && !s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.model.closeTrash()}>
+				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.folderId === null && !s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.go(null)}>
 					${icon("folder")} Home
 				</button>
 				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${this.recentsMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.showRecents()}>
@@ -559,7 +568,7 @@ export class GoraniWin11 extends LitElement {
 				<p class="px-2 pt-3 pb-1 text-xs uppercase tracking-wide text-neutral-500">${this.memberName}'s folders</p>
 				${this.treeRows(null, 0)}
 				<p class="px-2 pt-3 pb-1 text-xs uppercase tracking-wide text-neutral-500"></p>
-				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.model.openTrash()}>
+				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.openTrash(); }}>
 					🗑 Trash
 				</button>
 			</aside>
@@ -568,7 +577,7 @@ export class GoraniWin11 extends LitElement {
 
 	private treeRows(parent: string | null, depth: number): TemplateResult[] {
 		const s = this.s();
-		return s.folders
+		return s.tree
 			.filter((f) => (f.parent ?? null) === parent)
 			.map(
 				(f) => html`
@@ -576,7 +585,7 @@ export class GoraniWin11 extends LitElement {
 						<button
 							class="flex w-full items-center gap-1.5 rounded-lg py-1.5 pr-2.5 hover:bg-neutral-800 ${s.folderId === f.id && !s.trashMode ? "bg-neutral-800" : ""}"
 							${cssom({ "padding-left": `${8 + depth * 14}px` })}
-							@click=${() => void this.model.setFolder(f.id)}
+							@click=${() => void this.go(f.id)}
 							@drop=${(e: DragEvent) => this.onDropIntoFolder(e, f.id)}
 							@dragover=${(e: DragEvent) => e.preventDefault()}
 						>

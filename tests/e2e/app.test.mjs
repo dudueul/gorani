@@ -138,6 +138,11 @@ try {
 		page.on("response", (r) => { if (r.url().includes("/api/") && r.status() >= 400) console.error(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(dev.base, "")}`); });
 		await page.goto(dev.base);
 		// (The signed-in email opens its own account — no chooser since 39l.)
+		{
+			const card = await page.locator("gorani-setup section").first().boundingBox();
+			const vp = page.viewportSize();
+			assert.ok(card && Math.abs(card.x + card.width / 2 - vp.width / 2) < 4 && Math.abs(card.y + card.height / 2 - vp.height / 2) < vp.height * 0.2, `the setup card is centred, not in a corner (${JSON.stringify(card)})`);
+		}
 		await page.getByPlaceholder("Password (12+ chars)").fill("sora's very long password!");
 		await page.getByPlaceholder("Repeat it").fill("sora's very long password!");
 		await page.getByRole("button", { name: "Create the vault" }).click();
@@ -278,6 +283,128 @@ try {
 			await page.getByRole("button", { name: "Windows", exact: true }).click();
 			await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached" });
 			await assertNoViolations(page, "the context menus, both explorers");
+		}
+
+		// ── Navigation, both explorers (commit 39l) ──────────────────────
+		// Reported as "completely broken: double-click and nothing moves".
+		// Every folder was listed inside every folder (the listing carries the
+		// whole tree, and all of it was shown), so a folder seemed to open into
+		// itself; Home re-listed the folder you were in; the top breadcrumb was
+		// ignored; the explorer could never hold the keyboard focus; Finder's
+		// column view drew one column whatever was opened. And the place is now
+		// in the address (#a=<area>&f=<folder>): the browser's Back/Forward
+		// move between folders, a reload opens where you were.
+		{
+			const W = "gorani-win11";
+			const F = "gorani-finder";
+			const folderRow = (host, name) => page.locator(`${host} [data-item^="folder:"]`, { hasText: name }).first();
+			const fileRow = (host, name) => page.locator(`${host} [data-item^="file:"]`, { hasText: name }).first();
+			const crumbs = async () => (await page.locator(`${W} nav`).first().innerText()).replace(/\s+/g, " ").trim();
+			const listed = async (host) => page.locator(`${host} [data-item]`).evaluateAll((els) => els.map((e) => e.textContent.replace(/\s+/g, " ").trim().split(" ")[0]));
+			const newFolder = async (name) => {
+				await page.locator(`${W} button`, { hasText: "New" }).first().click();
+				await page.locator("gorani-menu").getByRole("menuitem", { name: /folder/i }).first().click();
+				const input = page.locator("div.fixed input").last();
+				await input.fill(name);
+				await input.press("Enter");
+				await folderRow(W, name).waitFor({ timeout: 15_000 });
+			};
+			// The address moves first, the screen when the listing lands — so
+			// a test step waits on what the screen shows.
+			const until = async (check, what) => {
+				for (let i = 0; i < 100 && !(await check()); i++) await page.waitForTimeout(100);
+				assert.ok(await check(), what);
+			};
+			const atTop = async () => {
+				await page.locator(`${W} nav button`).first().click();
+				await page.waitForFunction(() => !new URLSearchParams(location.hash.slice(1)).get("f"), null, { timeout: 10_000 });
+				await until(async () => !/NavA/.test(await crumbs()), "the top crumb goes to the top");
+			};
+
+			await newFolder("NavA");
+			await folderRow(W, "NavA").dblclick();
+			await page.waitForFunction(() => new URLSearchParams(location.hash.slice(1)).has("f"), null, { timeout: 10_000 });
+			await until(async () => /NavA/.test(await crumbs()), "double-click opens the folder");
+			assert.deepEqual(await listed(W), [], "a new folder is empty — it does not list itself, or its siblings");
+			const navA = await page.evaluate(() => new URLSearchParams(location.hash.slice(1)).get("f"));
+			await newFolder("NavB");
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "inside.txt", mimeType: "text/plain", buffer: Buffer.from("in NavA") });
+			await fileRow(W, "inside.txt").waitFor({ timeout: 30_000 });
+
+			// Up, Back, Forward, the browser's own Back/Forward, the tree, the top crumb.
+			await page.locator(`${W} button[title="Up one folder"]`).click();
+			await folderRow(W, "NavA").waitFor();
+			assert.equal(await folderRow(W, "NavB").count(), 0, "a subfolder is not listed at the top");
+			await page.locator(`${W} button`, { hasText: "←" }).first().click();
+			await folderRow(W, "NavB").waitFor({ timeout: 10_000 });
+			await page.locator(`${W} button`, { hasText: "→" }).first().click();
+			await folderRow(W, "NavA").waitFor({ timeout: 10_000 });
+			await page.goBack();
+			await fileRow(W, "inside.txt").waitFor({ timeout: 10_000 });
+			await page.goForward();
+			await folderRow(W, "NavA").waitFor({ timeout: 10_000 });
+			await page.locator(`${W} aside button`, { hasText: "NavA" }).first().click();
+			await fileRow(W, "inside.txt").waitFor({ timeout: 10_000 });
+			await atTop();
+			await folderRow(W, "NavA").waitFor();
+
+			// The keyboard reaches the explorer: Enter opens, Backspace goes up.
+			await folderRow(W, "NavA").click();
+			await page.keyboard.press("Enter");
+			await fileRow(W, "inside.txt").waitFor({ timeout: 10_000 });
+			await fileRow(W, "inside.txt").click();
+			await page.keyboard.press("Backspace");
+			await folderRow(W, "NavA").waitFor({ timeout: 10_000 });
+
+			// Move by drag and drop; delete a folder with what is in it; the
+			// Trash; Restore; Home leaves the Trash for the top.
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "dragged.txt", mimeType: "text/plain", buffer: Buffer.from("dragged") });
+			await fileRow(W, "dragged.txt").waitFor({ timeout: 30_000 });
+			await fileRow(W, "dragged.txt").dragTo(folderRow(W, "NavA"));
+			await fileRow(W, "dragged.txt").waitFor({ state: "detached", timeout: 10_000 });
+			await folderRow(W, "NavA").click();
+			await page.locator(`${W} button`, { hasText: "Delete" }).first().click();
+			await folderRow(W, "NavA").waitFor({ state: "detached", timeout: 10_000 });
+			await page.locator(`${W} aside button`, { hasText: "Trash" }).first().click();
+			await folderRow(W, "NavA").waitFor({ timeout: 10_000 });
+			await folderRow(W, "NavA").click({ button: "right" });
+			await page.locator("gorani-menu").getByRole("menuitem", { name: "Restore", exact: true }).click();
+			await page.locator(`${W} aside button`, { hasText: /^\s*Home\s*$/ }).first().click();
+			await folderRow(W, "NavA").waitFor({ timeout: 10_000 });
+			await folderRow(W, "NavA").dblclick();
+			await fileRow(W, "dragged.txt").waitFor({ timeout: 10_000 });
+
+			// A reload opens where you were (unlocking again if it asks).
+			await page.reload();
+			const pw = page.getByPlaceholder(/Recovery code/);
+			await Promise.race([fileRow(W, "dragged.txt").waitFor({ timeout: 30_000 }), pw.waitFor({ timeout: 30_000 })]);
+			if (await pw.count()) {
+				await pw.fill(jinu.recoveryCode);
+				await page.getByRole("button", { name: "Unlock" }).click();
+			}
+			await fileRow(W, "dragged.txt").waitFor({ timeout: 30_000 });
+			assert.equal(await page.evaluate(() => new URLSearchParams(location.hash.slice(1)).get("f")), navA, "the address still names the folder");
+
+			// Finder: columns open with a click, one per level; list view's
+			// double-click and ⌃↑.
+			await atTop();
+			await page.getByRole("button", { name: "Finder", exact: true }).click();
+			await page.locator(`${F} button[title="Columns"]`).click();
+			await folderRow(F, "NavA").click();
+			await page.locator(`${F} [data-column="1"]`).waitFor({ timeout: 10_000 });
+			assert.match(await page.locator(`${F} [data-column="1"]`).innerText(), /NavB/, "the opened folder's contents are the next column — the column appears with them, never with the parent's");
+			await page.locator(`${F} button`, { hasText: "‹" }).first().click();
+			await page.locator(`${F} [data-column="1"]`).waitFor({ state: "detached", timeout: 10_000 });
+			await page.locator(`${F} button[title="List"]`).click();
+			await folderRow(F, "NavA").dblclick();
+			await fileRow(F, "inside.txt").waitFor({ timeout: 10_000 });
+			await fileRow(F, "inside.txt").click();
+			await page.keyboard.press("Control+ArrowUp");
+			await folderRow(F, "NavA").waitFor({ timeout: 10_000 });
+			await page.locator(`${F} button[title="Columns"]`).click();
+			await page.getByRole("button", { name: "Windows", exact: true }).click();
+			await page.locator(`${W} [data-upload]`).first().waitFor({ state: "attached" });
+			await assertNoViolations(page, "navigation, both explorers");
 		}
 
 		// ── Streaming media through the service worker (O11) ───────────

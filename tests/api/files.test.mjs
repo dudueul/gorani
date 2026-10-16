@@ -296,6 +296,21 @@ try {
 	const afterTrash = await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" });
 	assert.ok(!afterTrash.json.files.some((f) => f.id === fileId), "trashed files leave the lists");
 
+	// ── 8b. A folder goes to the Trash with its contents, and comes back
+	// with them — exactly them: the letter, trashed on its own above, was
+	// not the folder's to take, so it is not the folder's to bring back.
+	const subId = store.newId();
+	assert.equal((await api(dev.base, "POST", "/api/v1/members/jinu/files/folders", { email: "jinu@family.test", body: { id: subId, parentId: folderId, name: await store.folderName(subId, "2026") } })).status, 200);
+	assert.equal((await api(dev.base, "PATCH", `/api/v1/members/jinu/files/${bigFile.id}`, { email: "jinu@family.test", body: { folderId: subId } })).status, 200);
+	const gone = await api(dev.base, "DELETE", `/api/v1/members/jinu/files/folders/${folderId}`, { email: "jinu@family.test" });
+	assert.deepEqual(gone.json, { folders: 2, files: 1 }, "Photos, 2026 and photo.dat");
+	const back = await api(dev.base, "POST", "/api/v1/members/jinu/files/trash/restore", { email: "jinu@family.test", body: { files: [], folders: [folderId] } });
+	assert.deepEqual(back.json, { folders: 2, files: 1 }, "restoring the folder brings back what its deletion took");
+	assert.ok((await api(dev.base, "GET", `/api/v1/members/jinu/files/list?folder=${subId}`, { email: "jinu@family.test" })).json.files.some((f) => f.id === bigFile.id), "the file is back where it was, two levels down");
+	const stillTrashed = await api(dev.base, "GET", "/api/v1/members/jinu/files/trash", { email: "jinu@family.test" });
+	assert.ok(stillTrashed.json.files.some((f) => f.id === fileId), "the letter trashed on its own stays in the Trash");
+	assert.ok(!stillTrashed.json.folders.length, "no folder is left behind in the Trash");
+
 	// ── 9. Secrets, stored sealed ──────────────────────────────────────
 	const secrets = await store.secrets(JSON.stringify({ fp: "x".repeat(43), idx: "y".repeat(43) }));
 	const putS = await api(dev.base, "PUT", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test", body: { sealed: secrets } });

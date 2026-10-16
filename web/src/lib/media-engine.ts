@@ -9,8 +9,10 @@
  * filesystem, no clock, no network, no JavaScript callbacks. It is handed
  * bytes and hands bytes back — a `moov` becomes an index, and the index
  * plus a segment's sample bytes become fMP4 for Media Source Extensions.
- * It never sees a key: the page decrypts (frame-reader.ts) and passes
- * plaintext in.
+ * It never sees a file's key: the page decrypts (frame-reader.ts) and
+ * passes plaintext in. The one key it does see is a protected copy's
+ * (commit 40a, docs/DRM.md): the Worker hands it to a lead's browser to
+ * package that copy, and `protect()` passes it in for exactly that.
  *
  * The boundary (no wasm-bindgen, so no generated glue to audit):
  *
@@ -47,9 +49,13 @@ interface Exports {
 	gm_init(handle: number): number;
 	gm_plan(handle: number, n: number): number;
 	gm_segment(handle: number, n: number, ptr: number, len: number): number;
+	gm_protect(handle: number, ptr: number, len: number): number;
+	gm_protect_init(packager: number): number;
+	gm_protect_segment(packager: number, n: number, ptr: number, len: number): number;
+	gm_protect_drop(packager: number): void;
 }
 
-const EXPORTS = ["memory", "gm_alloc", "gm_free", "gm_out_ptr", "gm_out_len", "gm_out_free", "gm_index_moov", "gm_drop", "gm_init", "gm_plan", "gm_segment"] as const;
+const EXPORTS = ["memory", "gm_alloc", "gm_free", "gm_out_ptr", "gm_out_len", "gm_out_free", "gm_index_moov", "gm_drop", "gm_init", "gm_plan", "gm_segment", "gm_protect", "gm_protect_init", "gm_protect_segment", "gm_protect_drop"] as const;
 
 export class MediaEngine {
 	private broken = false;
@@ -113,6 +119,41 @@ export class MediaEngine {
 	/** @internal */
 	drop(h: number): void {
 		if (!this.broken) this.x.gm_drop(h);
+	}
+
+	/** @internal — the key material is copied in, then its buffer zeroed. */
+	protectOf(h: number, material: Uint8Array): number {
+		const p = this.put(material);
+		try {
+			return this.call(() => this.x.gm_protect(h, p, material.length));
+		} finally {
+			if (!this.broken) {
+				new Uint8Array(this.x.memory.buffer, p, material.length).fill(0);
+				this.x.gm_free(p, material.length);
+			}
+		}
+	}
+
+	/** @internal */
+	protectInitOf(ph: number): Uint8Array {
+		this.call(() => this.x.gm_protect_init(ph));
+		return this.bytes();
+	}
+
+	/** @internal */
+	protectSegmentOf(ph: number, n: number, joined: Uint8Array): Uint8Array {
+		const p = this.put(joined);
+		try {
+			this.call(() => this.x.gm_protect_segment(ph, n, p, joined.length));
+		} finally {
+			if (!this.broken) this.x.gm_free(p, joined.length);
+		}
+		return this.bytes();
+	}
+
+	/** @internal */
+	protectDrop(ph: number): void {
+		if (!this.broken) this.x.gm_protect_drop(ph);
 	}
 
 	/** Copy bytes into the instance. */
@@ -195,6 +236,15 @@ export class MediaIndex {
 		return this.engine.segmentOf(this.live(), n, joined);
 	}
 
+	/**
+	 * A packager for this video's protected copy (commit 40a): `material` is
+	 * the 48 bytes the Worker handed out — key, key id, constant IV. Throws,
+	 * with the reason, for a video FairPlay cannot play.
+	 */
+	protect(material: Uint8Array): Protector {
+		return new Protector(this.engine, this.engine.protectOf(this.live(), material), this);
+	}
+
 	drop(): void {
 		if (this.dropped) return;
 		this.dropped = true;
@@ -203,6 +253,47 @@ export class MediaIndex {
 
 	private live(): number {
 		if (this.dropped) throw new Error("this video's index was already let go");
+		return this.handle;
+	}
+}
+
+/**
+ * Packages one protected copy: `init()`, then `segment(n, …)` for every
+ * segment IN ORDER (parameter sets a stream sends in band carry over),
+ * each from the same planned blocks as MediaIndex.segment.
+ */
+export class Protector {
+	private dropped = false;
+	private readonly engine: MediaEngine;
+	private readonly handle: number;
+	private readonly index: MediaIndex;
+	constructor(engine: MediaEngine, handle: number, index: MediaIndex) {
+		this.engine = engine;
+		this.handle = handle;
+		this.index = index;
+	}
+
+	init(): Uint8Array {
+		return this.engine.protectInitOf(this.live());
+	}
+
+	segment(n: number, joined: Uint8Array): Uint8Array {
+		return this.engine.protectSegmentOf(this.live(), n, joined);
+	}
+
+	/** The plan is the index's: the same plaintext blocks. */
+	plan(n: number): [number, number][] {
+		return this.index.plan(n);
+	}
+
+	drop(): void {
+		if (this.dropped) return;
+		this.dropped = true;
+		this.engine.protectDrop(this.handle);
+	}
+
+	private live(): number {
+		if (this.dropped) throw new Error("this protected copy's packager was already let go");
 		return this.handle;
 	}
 }

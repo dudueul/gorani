@@ -10,11 +10,17 @@
 //! DASH and the token signer — there the SERVER assembled segments from
 //! plaintext it could read; here the server never reads a byte, so this
 //! runs in the browser (crates/media-wasm) and in the native clients, over
-//! frames they decrypted themselves. Key handling never enters this crate:
-//! it parses boxes and builds segments, nothing else.
+//! frames they decrypted themselves.
+//!
+//! One exception since commit 40a (docs/DRM.md): `cbcs` encrypts a lead's
+//! protected copy with a key the Worker handed to that lead's browser for
+//! the purpose (src/cbcs.rs, with src/nal.rs finding each slice header).
+//! The engine encrypts what it is given with the key it is given; who may
+//! watch is the Worker's license server, not this crate.
 
 pub mod boxes;
 pub mod bytes;
+pub mod cbcs;
 pub mod compat;
 pub mod error;
 pub mod index_builder;
@@ -22,6 +28,7 @@ pub mod indexer;
 pub mod moof_builder;
 pub mod moov;
 pub mod moov_builder;
+pub mod nal;
 pub mod parse_frag;
 pub mod playlist;
 pub mod readplan;

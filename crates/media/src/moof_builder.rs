@@ -28,6 +28,11 @@ pub struct TrackRun {
     pub base_dts: i64,
     pub samples: Vec<Sample2>,
     pub payload: Vec<u8>,
+    /// `cbcs` subsample maps (commit 40a, crate::cbcs): per sample, its
+    /// (clear bytes, protected bytes) pairs. `Some` writes them into the
+    /// traf as `senc` + `saiz` + `saio`; `None` (clear tracks, and
+    /// protected audio, which needs no map) writes nothing extra.
+    pub subsamples: Option<Vec<Vec<(u16, u32)>>>,
 }
 
 impl TrackRun {
@@ -126,6 +131,7 @@ pub fn expand_track_run(idx: &MediaIndex, st: &SegmentTrack, base_dts: i64) -> R
         base_dts,
         samples,
         payload: Vec::new(),
+        subsamples: None,
     })
 }
 
@@ -290,6 +296,9 @@ pub fn build_segment(runs: &[TrackRun], sequence: u32) -> Result<Vec<u8>> {
             }
         }
         w.close_box(tr)?;
+        if let Some(maps) = &run.subsamples {
+            write_sample_encryption(&mut w, maps, run.samples.len())?;
+        }
         w.close_box(traf)?;
         emitted.push((ri, doff_pos));
     }
@@ -308,6 +317,54 @@ pub fn build_segment(runs: &[TrackRun], sequence: u32) -> Result<Vec<u8>> {
     }
     w.close_box(mdat)?;
     Ok(w.into_vec())
+}
+
+/// The sample auxiliary information of a protected track (ISO/IEC 23001-7
+/// §7.2, ISO/IEC 14496-12 §8.7.8–9): `senc` holds each sample's subsample
+/// map — no per-sample IV, since `cbcs` uses the constant IV from `tenc` —
+/// and `saiz`/`saio` say how big each entry is and where the first one
+/// starts, as an offset from the moof (default-base-is-moof). Players read
+/// one or the other pair; writing both is what every packager does.
+fn write_sample_encryption(w: &mut ByteWriter, maps: &[Vec<(u16, u32)>], samples: usize) -> Result<()> {
+    if maps.len() != samples {
+        return Err(CoreError::Parse(format!("{} subsample maps for {samples} samples", maps.len())));
+    }
+    let senc = w.open_box(b"senc");
+    w.u32(0x0000_0002); // version 0, flags: subsample maps present
+    w.u32(samples as u32);
+    let first_entry = w.len();
+    let mut sizes = Vec::with_capacity(samples);
+    for map in maps {
+        if map.len() > u16::MAX as usize {
+            return Err(CoreError::Parse("a sample with more than 65535 subsamples".into()));
+        }
+        w.u16(map.len() as u16);
+        for (clear, protected) in map {
+            w.u16(*clear);
+            w.u32(*protected);
+        }
+        let size = 2 + 6 * map.len();
+        if size > u8::MAX as usize {
+            return Err(CoreError::Parse("a sample with more than 42 subsamples".into()));
+        }
+        sizes.push(size as u8);
+    }
+    w.close_box(senc)?;
+    let uniform = sizes.first().filter(|s| sizes.iter().all(|x| x == *s)).copied();
+    let saiz = w.open_box(b"saiz");
+    w.u32(0);
+    w.u8(uniform.unwrap_or(0)); // default_sample_info_size, 0 = listed below
+    w.u32(samples as u32);
+    if uniform.is_none() {
+        w.bytes(&sizes);
+    }
+    w.close_box(saiz)?;
+    let saio = w.open_box(b"saio");
+    w.u32(0);
+    w.u32(1); // one run of entries: the senc above
+    w.u32(first_entry as u32); // the moof starts at offset 0 of this buffer
+    w.close_box(saio)?;
+    Ok(())
 }
 
 /// Build segment `n` of `idx` from per-track payloads supplied in the same

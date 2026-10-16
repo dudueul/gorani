@@ -23,6 +23,7 @@ import assert from "node:assert/strict";
 import { generateHybridKey, importVaultKey, openWith, unwrapPlacedKey, isPlacedText } from "../../web/src/vault/vault-crypto.ts";
 import { openChunk, chunkFor, frameCount, sealedSize } from "../../web/src/vault/chunked-file.ts";
 import { FilesModel, UNVERIFIED, WHOLE_LIMIT, type FilesBridge } from "../../web/src/ui/files/model.ts";
+import { walkEntries, fromRelativePaths, plainFiles, isLitter, MAX_DROPPED_FILES, type EntryLike, type FileEntryLike, type DirEntryLike } from "../../web/src/ui/files/dropped.ts";
 import { memoryJournal } from "../../web/src/lib/upload-journal.ts";
 import { places } from "../../web/src/vault/places.ts";
 import { createCodeVault } from "../../web/src/vault/keys.ts";
@@ -62,7 +63,12 @@ const server = {
 			const folder = url.searchParams.get("folder") ?? "root";
 			return {
 				files: [...rows.values()].filter((r) => !r.trashedWith && (folder === "all" || (folder === "root" ? r.folder === null : r.folder === folder))).map((r) => ({ id: r.id, folder: r.folder, name: r.name, size: r.size, version: r.version, createdAt: r.createdAt, updatedAt: r.updatedAt, sample: r.sample === true })),
-				folders: [...folders.values()].filter((f) => !f.deletedAt && (folder === "root" ? f.parent === null : f.parent === folder)).map((f) => ({ id: f.id, parent: f.parent, name: f.name, createdAt: f.createdAt, updatedAt: f.updatedAt })),
+				// Every live folder, whichever folder is listed — the real
+				// contract (files_store.rs › files_list: "folders come along
+				// whole"); the model takes the folder's children from them.
+				// (Until 39r this fake sent only the children, so a test could
+				// not see a folder made two levels down.)
+				folders: [...folders.values()].filter((f) => !f.deletedAt).map((f) => ({ id: f.id, parent: f.parent, name: f.name, createdAt: f.createdAt, updatedAt: f.updatedAt })),
 			};
 		}
 		if (p.endsWith("/files/trash")) {
@@ -491,9 +497,88 @@ await model.markSample(plainRow.id);
 assert.equal(model.state.get().files.find((f) => f.id === plainRow.id)?.sample, true);
 assert.equal(await model.preview(plainRow.id), null);
 
+// ── Folder uploads (commit 39r, dropped.ts) ──────────────────────────
+{
+	// The walk: readEntries answers in batches (Chrome: 100) and must be
+	// asked again until it answers empty — 250 files all arrive; the
+	// systems' litter is left out; an empty folder keeps its place.
+	const fileEntry = (name: string, body: string = name): FileEntryLike => ({ name, isFile: true, isDirectory: false, file: (ok) => ok(new File([body], name, { type: "text/plain" })) });
+	const dirEntry = (name: string, children: EntryLike[]): DirEntryLike => ({
+		name,
+		isFile: false,
+		isDirectory: true,
+		createReader: () => {
+			let at = 0;
+			return {
+				readEntries: (ok) => {
+					const batch = children.slice(at, at + 100);
+					at += batch.length;
+					ok(batch);
+				},
+			};
+		},
+	});
+	const many = Array.from({ length: 250 }, (_, i) => fileEntry(`p${String(i).padStart(3, "0")}.txt`, `photo ${i}`));
+	const walked = await walkEntries([dirEntry("Holiday", [dirEntry("day 1", many), dirEntry("empty", []), fileEntry(".DS_Store"), fileEntry("._IMG_0001.jpg"), fileEntry("notes.txt", "holiday notes")])]);
+	assert.equal(walked.files.length, 251, "every file, past readEntries' first batch of 100");
+	assert.deepEqual(walked.dirs.map((d) => d.join("/")), ["Holiday", "Holiday/day 1", "Holiday/empty"], "parents before children, the empty one too");
+	assert.deepEqual(walked.skipped.sort(), ["Holiday/.DS_Store", "Holiday/._IMG_0001.jpg"], "Finder's and macOS's litter left out");
+	assert.equal(isLitter("Thumbs.db") && isLitter("desktop.ini") && !isLitter("photo.jpg"), true);
+	assert.deepEqual(walked.files.find((f) => f.file.name === "notes.txt")?.dir, ["Holiday"]);
+
+	// The folder picker: each file's webkitRelativePath.
+	const rel = (path: string, body: string) => Object.defineProperty(new File([body], path.split("/").pop()!), "webkitRelativePath", { value: path });
+	const picked = fromRelativePaths([rel("Trip/a.txt", "trip a"), rel("Trip/sub/b.txt", "trip b"), rel("Trip/sub/.DS_Store", "x")]);
+	assert.deepEqual(picked.dirs.map((d) => d.join("/")), ["Trip", "Trip/sub"]);
+	assert.deepEqual(picked.files.map((f) => f.dir.join("/")), ["Trip", "Trip/sub"]);
+	assert.equal(picked.skipped.length, 1);
+	assert.throws(() => fromRelativePaths(Array.from({ length: MAX_DROPPED_FILES + 1 }, (_, i) => rel(`Big/${i}.txt`, ""))), /at most 10,000 files/, "an oversized folder is refused whole, not uploaded part-way");
+
+	// Upload a tree: its folders made under the target, each file in its own.
+	await model.open(null);
+	const small = await walkEntries([dirEntry("Holiday", [dirEntry("day 1", [fileEntry("a.txt", "beach a"), fileEntry("b.txt", "beach b")]), dirEntry("empty", []), fileEntry("notes.txt", "holiday notes 39r")])]);
+	await model.uploadTree(small, null);
+	const tree1 = model.state.get().tree;
+	const holiday = tree1.filter((f) => f.name === "Holiday" && f.parent === null);
+	assert.equal(holiday.length, 1, "one Holiday at the top");
+	const day1 = tree1.find((f) => f.name === "day 1" && f.parent === holiday[0]!.id);
+	assert.ok(day1 && tree1.some((f) => f.name === "empty" && f.parent === holiday[0]!.id), "its subfolders inside it, the empty one too");
+	const rowsIn = (folderId: string) => [...rows.values()].filter((r) => r.folder === folderId).length;
+	assert.equal(rowsIn(day1!.id), 2, "day 1's files went into day 1");
+	assert.equal(rowsIn(holiday[0]!.id), 1, "notes.txt into Holiday");
+	assert.match(toasts.at(-1)!, /Uploaded “Holiday”: 3 of 3 files, 3 new folders/);
+	assert.equal(model.state.get().upload, null, "no progress left behind");
+
+	// The same folder dropped again, with a new day: Holiday is found, not doubled.
+	await model.uploadTree(await walkEntries([dirEntry("Holiday", [dirEntry("day 2", [fileEntry("c.txt", "mountain c")])])]), null);
+	const tree2 = model.state.get().tree;
+	assert.equal(tree2.filter((f) => f.name === "Holiday" && f.parent === null).length, 1, "a second drop adds to the folder that is there");
+	assert.ok(tree2.some((f) => f.name === "day 2" && f.parent === holiday[0]!.id));
+	assert.match(toasts.at(-1)!, /1 of 1 file, 1 new folder$/);
+
+	// Files dropped ON a folder go into it, whatever folder is on screen.
+	await model.upload([new File(["into day 1 (39r)"], "dropped.txt")], { into: day1!.id });
+	assert.equal(rowsIn(day1!.id), 3, "a drop onto a folder lands in it");
+
+	// Stop: the file being sent finishes, the rest are not sent.
+	const five = await walkEntries([dirEntry("Many", Array.from({ length: 5 }, (_, i) => fileEntry(`m${i}.txt`, `stop test ${i}`)))]);
+	const unsubscribe = model.state.subscribe((st) => {
+		if (st.upload && st.upload.done === 1 && !st.upload.stopping) model.stopUpload();
+	});
+	await model.uploadTree(five, null);
+	unsubscribe();
+	const manyId = model.state.get().tree.find((f) => f.name === "Many")!.id;
+	assert.equal(rowsIn(manyId), 2, "the first file, and the one being sent when Stop came");
+	assert.ok(toasts.some((t) => t === "Upload stopped — 2 of 5 sent"), toasts.slice(-3).join(" | "));
+
+	// Nothing but litter: nothing uploaded, and said so.
+	await model.uploadTree(plainFiles([new File(["x"], ".DS_Store")]), null);
+	assert.match(toasts.at(-1)!, /^Nothing to upload — left out 1 system file/);
+}
+
 model.dispose(); // stops the change-feed poll so the test process can exit
 
-console.log("ok  explorer model: sealed listings, uploads+duplicates, downloads, trash, copies, feed");
+console.log("ok  explorer model: sealed listings, uploads+duplicates, downloads, trash, copies, feed, folder uploads (the walk past 100, litter, merge, into a folder, Stop)");
 
 function concatAll(parts: Uint8Array[]): Uint8Array {
 	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));

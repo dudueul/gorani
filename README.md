@@ -25,7 +25,8 @@ clients (live-tested), the family hierarchy, ownership, the R2-priority
 storage path, the nightly cron, the music library, and a browser e2e. The
 build order is the lesson plan — see [docs/COURSE.md](docs/COURSE.md), the
 architecture map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (duplicate
-detection: [docs/DUPLICATES.md](docs/DUPLICATES.md)), and
+detection: [docs/DUPLICATES.md](docs/DUPLICATES.md); uploads, folders and
+where a drop goes: [docs/UPLOADS.md](docs/UPLOADS.md)), and
 NOTICE lists the Apache-2.0-derived portions.
 
 **The app:** https://gorani.at.day (behind Cloudflare Access). **Desktop

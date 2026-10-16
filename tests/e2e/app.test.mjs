@@ -197,7 +197,7 @@ try {
 		// A sealed upload through the file picker; the listing decrypts the
 		// name in-browser — the whole round trip with no test-side crypto.
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "hello.txt", mimeType: "text/plain", buffer: Buffer.from("uploaded from the real browser") });
-		await page.locator("text=hello.txt").first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "hello.txt" }).first().waitFor({ timeout: 60_000 });
 		// Jinu's record was seeded by this test WITHOUT a MAC (as a record
 		// sealed to a member by someone else arrives): the first open pinned
 		// it, and the shell saved the pin (trust on first use, O3).
@@ -206,7 +206,7 @@ try {
 		// …and OPEN it: the viewer fetches the content key (POST files/keys —
 		// the app used to send a GET there, so no file could ever be opened)
 		// and decrypts in the page.
-		await page.locator("text=hello.txt").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "hello.txt" }).first().dblclick();
 		await page.locator("text=uploaded from the real browser").first().waitFor({ timeout: 30_000 });
 		await page.keyboard.press("Escape");
 		await assertNoViolations(page, "unlock → upload → open");
@@ -223,7 +223,7 @@ try {
 		// watcher (assertNoViolations) sees each.
 		{
 			await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "menu-a.txt", mimeType: "text/plain", buffer: Buffer.from("a file for the menus") });
-			await page.locator("text=menu-a.txt").first().waitFor({ timeout: 60_000 });
+			await page.locator('[data-body] [data-item^="file:"]', { hasText: "menu-a.txt" }).first().waitFor({ timeout: 60_000 });
 			const row = (host, name) => page.locator(`${host} [data-item^="file:"]`, { hasText: name }).first();
 			const openMenu = async (host, name) => {
 				await row(host, name).click({ button: "right" });
@@ -554,6 +554,73 @@ try {
 			await assertNoViolations(page, "duplicates");
 		}
 
+		// ── Folder uploads (39r): a whole folder picked, files dropped ON a
+		// folder, files dropped on the list, and a stray drop. Until 39r a
+		// dropped folder arrived as one empty "file", a drop onto a folder
+		// went to the folder on screen, and the list itself took no drop. ──
+		{
+			const W = "gorani-win11";
+			const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+			const { join } = await import("node:path");
+			const { tmpdir } = await import("node:os");
+			const fileRow = (name) => page.locator(`${W} [data-body] [data-item^="file:"]`, { hasText: name }).first();
+			const folderRow = (name) => page.locator(`${W} [data-body] [data-item^="folder:"]`, { hasText: name }).first();
+			const top = async () => {
+				await page.locator(`${W} nav button`).first().click();
+				await folderRow("Trip").waitFor({ timeout: 15_000 }).catch(() => {});
+			};
+			const dir = mkdtempSync(join(tmpdir(), "gorani-e2e-folder-"));
+			try {
+				mkdirSync(join(dir, "Trip", "day 1"), { recursive: true });
+				writeFileSync(join(dir, "Trip", "day 1", "beach.txt"), "beach, 39r");
+				writeFileSync(join(dir, "Trip", "notes.txt"), "trip notes, 39r");
+				writeFileSync(join(dir, "Trip", ".DS_Store"), "Finder's litter");
+				// The folder picker (webkitdirectory): the folder, its subfolder, its files.
+				await page.locator(`${W} [data-upload-folder]`).setInputFiles(join(dir, "Trip"));
+				await page.getByText(/Uploaded “Trip”: 2 of 2 files, 2 new folders — left out 1 system file/).waitFor({ timeout: 60_000 });
+				await folderRow("Trip").dblclick();
+				await folderRow("day 1").waitFor({ timeout: 15_000 });
+				await fileRow("notes.txt").waitFor({ timeout: 15_000 });
+				assert.equal(await fileRow(".DS_Store").count(), 0, "the system's litter stays behind");
+				await folderRow("day 1").dblclick();
+				await fileRow("beach.txt").waitFor({ timeout: 15_000 });
+				await top();
+
+				// Files dropped ON a folder go into it — here, from the top folder.
+				const dropped = (name, text) =>
+					page.evaluateHandle(([n, t]) => {
+						const dt = new DataTransfer();
+						dt.items.add(new File([t], n, { type: "text/plain" }));
+						return dt;
+					}, [name, text]);
+				await folderRow("Trip").dispatchEvent("drop", { dataTransfer: await dropped("onto-trip.txt", "dropped onto Trip, 39r") });
+				await page.waitForTimeout(300);
+				await folderRow("Trip").dblclick();
+				await fileRow("onto-trip.txt").waitFor({ timeout: 30_000 });
+				// …and files dropped on the list go into the folder on screen,
+				// with the outline saying where while they hover.
+				const body = page.locator(`${W} [data-body]`);
+				const onList = await dropped("on-the-list.txt", "dropped on Trip's list, 39r");
+				await body.dispatchEvent("dragover", { dataTransfer: onList });
+				await page.locator(`${W} [data-test="drop-hint"]`, { hasText: "Drop to upload into “Trip”" }).waitFor({ timeout: 5_000 });
+				await body.dispatchEvent("drop", { dataTransfer: onList });
+				await fileRow("on-the-list.txt").waitFor({ timeout: 30_000 });
+				// A breadcrumb takes a drop into ITS folder (the top one here).
+				await page.locator(`${W} nav button`).first().dispatchEvent("drop", { dataTransfer: await dropped("on-the-crumb.txt", "dropped on the top crumb, 39r") });
+				await page.getByText("on-the-crumb.txt").first().waitFor({ state: "attached", timeout: 30_000 }).catch(() => {});
+				await top();
+				await fileRow("on-the-crumb.txt").waitFor({ timeout: 30_000 });
+				// A drop where nothing takes it is refused by the window, with a
+				// word on where files go — never opened in place of the app.
+				await page.locator("header").first().dispatchEvent("drop", { dataTransfer: await dropped("stray.txt", "nowhere") });
+				await page.getByText("Drop files on the file list, or on a folder, to upload them").waitFor({ timeout: 5_000 });
+				assert.equal(await fileRow("stray.txt").count(), 0);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+			await assertNoViolations(page, "folder uploads");
+		}
+
 		// ── Streaming media through the service worker (O11) ───────────
 		// A video over the 8 MiB streaming threshold opens as /media/<id>,
 		// answered by the media service worker with decrypted bytes. Before
@@ -563,8 +630,8 @@ try {
 		const clip = Buffer.alloc(9 * 1024 * 1024);
 		for (let i = 0; i < clip.length; i++) clip[i] = (i * 7) % 251;
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "clip.mp4", mimeType: "video/mp4", buffer: clip });
-		await page.locator("text=clip.mp4").first().waitFor({ timeout: 120_000 });
-		await page.locator("text=clip.mp4").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "clip.mp4" }).first().waitFor({ timeout: 120_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "clip.mp4" }).first().dblclick();
 		const video = page.locator("gorani-viewer video").first();
 		await video.waitFor({ state: "attached", timeout: 30_000 });
 		const mediaUrl = (await video.getAttribute("src")) ?? "";
@@ -676,8 +743,8 @@ try {
 		// gone (not hidden), and no device hold may remain.
 		const PNG_1x1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "pixel.png", mimeType: "image/png", buffer: PNG_1x1 });
-		await page.locator("text=pixel.png").first().waitFor({ timeout: 60_000 });
-		await page.locator("text=pixel.png").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "pixel.png" }).first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "pixel.png" }).first().dblclick();
 		const img = page.locator("gorani-viewer img").first();
 		await img.waitFor({ timeout: 30_000 });
 		const src = (await img.getAttribute("src")) ?? "";
@@ -971,14 +1038,14 @@ try {
 			await page.locator('[data-test="intake-submit"]').click();
 		};
 		await fillIntake("mom's laptop, Downloads", "browser upload, as received");
-		await page.locator("text=case-note.txt").first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "case-note.txt" }).first().waitFor({ timeout: 60_000 });
 		const listed = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
 		assert.equal(listed.json.files.length, 1, "the upload landed in the CASE's store");
 		const keyed = await api(dev.base, "POST", "/api/v1/cases/ir-e2e/files/keys", { email: "mom@family.test", body: { ids: [listed.json.files[0].id] } });
 		assert.match(keyed.json.keys[listed.json.files[0].id].hash ?? "", /^GV04:/, "…carrying the browser's signed content hash, sealed (the evidence case requires it)");
 		assert.match(keyed.json.keys[listed.json.files[0].id].intake ?? "", /^GV04:/, "…and its intake record, sealed and signed in the browser");
 		assert.equal((await api(dev.base, "GET", "/api/v1/members/mom/files/list?folder=all", { email: "mom@family.test" })).json.files?.length ?? 0, 0, "…not in mom's own area");
-		await page.locator("text=case-note.txt").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "case-note.txt" }).first().dblclick();
 		await page.locator("text=sealed under the case key").first().waitFor({ timeout: 30_000 });
 		await page.keyboard.press("Escape");
 		// A malware sample (commit 29e), uploaded through its own input: an
@@ -986,10 +1053,10 @@ try {
 		// instead, and the page stays violation-free.
 		await page.locator("gorani-win11 [data-upload-sample]").setInputFiles({ name: "dropper.html", mimeType: "text/html", buffer: Buffer.from("<script>alert('pwned')</script>") });
 		await fillIntake("phishing mail attachment, ticket 4711", "saved from the mail gateway's quarantine");
-		await page.locator("text=dropper.html").first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "dropper.html" }).first().waitFor({ timeout: 60_000 });
 		const afterSample = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
 		assert.equal(afterSample.json.files.find((f) => f.sample)?.sample, true, "the server lists it as a sample");
-		await page.locator("text=dropper.html").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "dropper.html" }).first().dblclick();
 		await page.locator('[data-test="viewer-refused"]').waitFor({ timeout: 30_000 });
 		assert.equal(await page.locator("text=pwned").count(), 0, "nothing of the sample is rendered");
 		await page.keyboard.press("Escape");
@@ -1186,7 +1253,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

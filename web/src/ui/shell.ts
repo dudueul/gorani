@@ -34,6 +34,7 @@ import "./files/win11.ts";
 import "./files/finder.ts";
 import "./files/music.ts";
 import { registerMediaWorker, forgetMedia } from "../lib/media-worker.ts";
+import { carriesFiles } from "./files/dropped.ts";
 import "./team.ts";
 import { openTeam, refreshRecoveryCopy, type TeamCall, type TeamContext } from "../vault/team.ts";
 import { openCaseKey, type CaseRow } from "../vault/cases.ts";
@@ -83,9 +84,31 @@ export class GoraniShell extends LitElement {
 		void this.model.follow(place.folder);
 	};
 
+	/**
+	 * A file dropped where nothing takes it (commit 39r): the browser's own
+	 * answer is to OPEN it — in this tab, in place of the app, and the
+	 * unlocked session goes with the page. Every drop target in the
+	 * explorers handles its own drop first (and marks it handled); anything
+	 * left over reaching the window is refused here, with a word on where
+	 * files do go. (Our own dragged items carry no "Files" type and pass.)
+	 */
+	private readonly onStrayDragOver = (e: DragEvent): void => {
+		if (e.defaultPrevented || !carriesFiles(e.dataTransfer)) return;
+		e.preventDefault();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = "none";
+	};
+
+	private readonly onStrayDrop = (e: DragEvent): void => {
+		if (e.defaultPrevented || !carriesFiles(e.dataTransfer)) return;
+		e.preventDefault();
+		this.toast("Drop files on the file list, or on a folder, to upload them");
+	};
+
 	override connectedCallback(): void {
 		super.connectedCallback();
 		addEventListener("popstate", this.onPopState);
+		addEventListener("dragover", this.onStrayDragOver);
+		addEventListener("drop", this.onStrayDrop);
 	}
 
 	/**
@@ -103,6 +126,8 @@ export class GoraniShell extends LitElement {
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
 		removeEventListener("popstate", this.onPopState);
+		removeEventListener("dragover", this.onStrayDragOver);
+		removeEventListener("drop", this.onStrayDrop);
 		this.stopAutoLock?.();
 		this.stopOnLock?.();
 		this.stopAutoLock = this.stopOnLock = null;

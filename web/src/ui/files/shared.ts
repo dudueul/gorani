@@ -9,11 +9,13 @@
  * not here.
  */
 
-import { LitElement, html, nothing } from "lit";
+import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { Directive, directive, PartType, type ElementPart, type PartInfo } from "lit/directive.js";
 import type { FileKind } from "./icons.ts";
 import { folderPath, type TreeFolder } from "./paths.ts";
+import { carriesFiles, entriesOf, plainFiles, walkEntries, type PickedTree } from "./dropped.ts";
+import type { UploadProgress } from "./model.ts";
 
 export { folderPath };
 
@@ -103,6 +105,33 @@ export function dragIds(dt: DataTransfer): { kind: string; id: string }[] | null
 	} catch {
 		return null;
 	}
+}
+
+// ── Dropped files and folders (commit 39r, dropped.ts) ──────────────
+
+/** A drop's tree, its entries taken NOW — the DataTransfer empties once the
+ * drop handler returns, so this must be called inside it; the walk itself
+ * finishes later. */
+export function takeDrop(dt: DataTransfer): Promise<PickedTree> {
+	const { entries, files } = entriesOf(dt);
+	return entries ? walkEntries(entries) : Promise.resolve(plainFiles(files));
+}
+
+/** Is this drag one of ours (an item being moved), not files from outside? */
+export function isOwnDrag(dt: DataTransfer | null): boolean {
+	return Boolean(dt && [...(dt.types ?? [])].includes(DRAG_TYPE));
+}
+
+export { carriesFiles };
+
+/** The upload under way, for a status bar: how far, which file, and Stop. */
+export function uploadStatus(upload: UploadProgress | null, stop: () => void): TemplateResult | typeof nothing {
+	if (!upload) return nothing;
+	return html`<span class="flex min-w-0 items-center gap-2 text-neutral-300" data-test="upload-progress">
+		<span class="h-1.5 w-24 shrink-0 overflow-hidden rounded bg-neutral-800"><span class="block h-full bg-accent" ${cssom({ width: `${Math.round((100 * upload.done) / Math.max(1, upload.total))}%` })}></span></span>
+		<span class="truncate">Uploading ${upload.done + 1} of ${upload.total} · ${upload.name}</span>
+		<button class="shrink-0 rounded px-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 disabled:opacity-40" ?disabled=${upload.stopping} data-test="upload-stop" @click=${stop}>${upload.stopping ? "Stopping…" : "Stop"}</button>
+	</span>`;
 }
 
 // ── <gorani-menu>: the context menu both platforms share ────────────

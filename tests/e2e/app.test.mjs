@@ -554,6 +554,73 @@ try {
 			await assertNoViolations(page, "duplicates");
 		}
 
+		// ── Folder uploads (39r): a whole folder picked, files dropped ON a
+		// folder, files dropped on the list, and a stray drop. Until 39r a
+		// dropped folder arrived as one empty "file", a drop onto a folder
+		// went to the folder on screen, and the list itself took no drop. ──
+		{
+			const W = "gorani-win11";
+			const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+			const { join } = await import("node:path");
+			const { tmpdir } = await import("node:os");
+			const fileRow = (name) => page.locator(`${W} [data-body] [data-item^="file:"]`, { hasText: name }).first();
+			const folderRow = (name) => page.locator(`${W} [data-body] [data-item^="folder:"]`, { hasText: name }).first();
+			const top = async () => {
+				await page.locator(`${W} nav button`).first().click();
+				await folderRow("Trip").waitFor({ timeout: 15_000 }).catch(() => {});
+			};
+			const dir = mkdtempSync(join(tmpdir(), "gorani-e2e-folder-"));
+			try {
+				mkdirSync(join(dir, "Trip", "day 1"), { recursive: true });
+				writeFileSync(join(dir, "Trip", "day 1", "beach.txt"), "beach, 39r");
+				writeFileSync(join(dir, "Trip", "notes.txt"), "trip notes, 39r");
+				writeFileSync(join(dir, "Trip", ".DS_Store"), "Finder's litter");
+				// The folder picker (webkitdirectory): the folder, its subfolder, its files.
+				await page.locator(`${W} [data-upload-folder]`).setInputFiles(join(dir, "Trip"));
+				await page.getByText(/Uploaded “Trip”: 2 of 2 files, 2 new folders — left out 1 system file/).waitFor({ timeout: 60_000 });
+				await folderRow("Trip").dblclick();
+				await folderRow("day 1").waitFor({ timeout: 15_000 });
+				await fileRow("notes.txt").waitFor({ timeout: 15_000 });
+				assert.equal(await fileRow(".DS_Store").count(), 0, "the system's litter stays behind");
+				await folderRow("day 1").dblclick();
+				await fileRow("beach.txt").waitFor({ timeout: 15_000 });
+				await top();
+
+				// Files dropped ON a folder go into it — here, from the top folder.
+				const dropped = (name, text) =>
+					page.evaluateHandle(([n, t]) => {
+						const dt = new DataTransfer();
+						dt.items.add(new File([t], n, { type: "text/plain" }));
+						return dt;
+					}, [name, text]);
+				await folderRow("Trip").dispatchEvent("drop", { dataTransfer: await dropped("onto-trip.txt", "dropped onto Trip, 39r") });
+				await page.waitForTimeout(300);
+				await folderRow("Trip").dblclick();
+				await fileRow("onto-trip.txt").waitFor({ timeout: 30_000 });
+				// …and files dropped on the list go into the folder on screen,
+				// with the outline saying where while they hover.
+				const body = page.locator(`${W} [data-body]`);
+				const onList = await dropped("on-the-list.txt", "dropped on Trip's list, 39r");
+				await body.dispatchEvent("dragover", { dataTransfer: onList });
+				await page.locator(`${W} [data-test="drop-hint"]`, { hasText: "Drop to upload into “Trip”" }).waitFor({ timeout: 5_000 });
+				await body.dispatchEvent("drop", { dataTransfer: onList });
+				await fileRow("on-the-list.txt").waitFor({ timeout: 30_000 });
+				// A breadcrumb takes a drop into ITS folder (the top one here).
+				await page.locator(`${W} nav button`).first().dispatchEvent("drop", { dataTransfer: await dropped("on-the-crumb.txt", "dropped on the top crumb, 39r") });
+				await page.getByText("on-the-crumb.txt").first().waitFor({ state: "attached", timeout: 30_000 }).catch(() => {});
+				await top();
+				await fileRow("on-the-crumb.txt").waitFor({ timeout: 30_000 });
+				// A drop where nothing takes it is refused by the window, with a
+				// word on where files go — never opened in place of the app.
+				await page.locator("header").first().dispatchEvent("drop", { dataTransfer: await dropped("stray.txt", "nowhere") });
+				await page.getByText("Drop files on the file list, or on a folder, to upload them").waitFor({ timeout: 5_000 });
+				assert.equal(await fileRow("stray.txt").count(), 0);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+			await assertNoViolations(page, "folder uploads");
+		}
+
 		// ── Streaming media through the service worker (O11) ───────────
 		// A video over the 8 MiB streaming threshold opens as /media/<id>,
 		// answered by the media service worker with decrypted bytes. Before
@@ -1186,7 +1253,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

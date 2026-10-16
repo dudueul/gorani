@@ -39,6 +39,7 @@ import { SAMPLE_PASSWORD, isSampleType, originalType, sampleType, zipEncrypted }
 import { signIntake, type IntakeFields } from "../../vault/intake.ts";
 import { acceptCustody, offerCustody, verifyChain, type CustodyCall, type CustodyChain } from "../../vault/custody.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
+import type { PickedTree } from "./dropped.ts";
 
 /** What a name that does not open in its place is shown as (O6). */
 export const UNVERIFIED = "⚠ unverified — not sealed here";
@@ -96,6 +97,22 @@ export interface FilesState {
 	trashMode: boolean;
 	trashFiles: FileRow[];
 	trashFolders: FolderRow[];
+	/** The upload under way (commit 39r): how far it is, which file, and
+	 * whether Stop was asked — both skins show it in their status bar. */
+	upload: UploadProgress | null;
+}
+
+export interface UploadProgress {
+	done: number;
+	total: number;
+	name: string;
+	stopping: boolean;
+}
+
+/** One file of an upload batch and the folder it goes into. */
+export interface UploadItem {
+	file: File;
+	folderId: string | null;
 }
 
 /** The crypto + transport the model needs. The bridge (bridge.ts) knows about
@@ -207,7 +224,7 @@ export class FilesModel {
 		this.bridge = bridge;
 		this.memberId = memberId;
 		this.index = index;
-		this.state = store<FilesState>({ folderId: null, folders: [], tree: [], files: [], selection: [], sort: { by: "name", dir: "asc" }, loading: false, error: null, trashMode: false, trashFiles: [], trashFolders: [] });
+		this.state = store<FilesState>({ folderId: null, folders: [], tree: [], files: [], selection: [], sort: { by: "name", dir: "asc" }, loading: false, error: null, trashMode: false, trashFiles: [], trashFolders: [], upload: null });
 	}
 
 	subscribe(listener: () => void): () => void {
@@ -528,67 +545,159 @@ export class FilesModel {
 	}
 
 	async newFolder(parentId: string | null, name: string): Promise<string> {
+		const id = await this.createFolder(parentId, name);
+		await this.refresh();
+		return id;
+	}
+
+	/** A folder, without re-listing (a dropped tree makes many at once). */
+	private async createFolder(parentId: string | null, name: string): Promise<string> {
 		// The id first, then the name sealed into it (the place names the folder).
 		const id = newItemId();
 		const sealed = await sealPlacedText(await this.bridge.storePrivate(), places.folderName(this.memberId, id), name.trim());
 		const created = await this.bridge.apiSend<{ id: string }>("POST", `${areaPath(this.memberId)}/files/folders`, { id, name: sealed, parentId });
-		await this.refresh();
 		return created.id;
+	}
+
+	/** Uploads run one batch at a time: a second drop while the first is
+	 * still sealing waits its turn instead of interleaving with it (one
+	 * progress line, one duplicate prompt at a time). */
+	private uploadChain: Promise<void> = Promise.resolve();
+
+	private queueUpload(run: () => Promise<void>): Promise<void> {
+		const next = this.uploadChain.then(run);
+		this.uploadChain = next.catch(() => {});
+		return next;
 	}
 
 	/** Upload: seal in the browser, fingerprint, ask about duplicates, send.
 	 * `sample`: upload as malware samples (commit 29e) — marked from the
-	 * first byte, so nothing ever previews them in between. */
-	async upload(files: File[], { sample = false }: { sample?: boolean } = {}): Promise<void> {
-		await this.ensureSecrets();
-		const folderId = this.state.get().folderId;
-		// An evidence case asks where the batch came from, once, before a
-		// byte is sealed (commit 29g): each file signs its own record of it.
-		let intake: IntakeFields | null = null;
-		if (this.bridge.areaKind?.() === "evidence") {
-			intake = (await this.bridge.intake?.(files)) ?? null;
-			if (!intake) {
-				this.bridge.toast("Upload cancelled — an evidence file needs its intake record");
+	 * first byte, so nothing ever previews them in between. `into`: the
+	 * folder (commit 39r — a drop onto a folder goes INTO it; until then
+	 * every upload went to the folder on screen, whatever it was dropped on). */
+	async upload(files: File[], { sample = false, into }: { sample?: boolean; into?: string | null } = {}): Promise<void> {
+		const folderId = into === undefined ? this.state.get().folderId : into;
+		return this.queueUpload(async () => {
+			await this.uploadItems(files.map((file) => ({ file, folderId })), { sample });
+		});
+	}
+
+	/**
+	 * A dropped or picked folder (commit 39r, dropped.ts): its folders are
+	 * made under `into` — or found, when one of the same name is already
+	 * there (a second drop of the same folder adds to it, as copying onto a
+	 * folder does on a desktop) — and every file goes into its own. An
+	 * evidence case asks for the intake record before any folder is made.
+	 */
+	async uploadTree(tree: PickedTree, into: string | null, { sample = false }: { sample?: boolean } = {}): Promise<void> {
+		return this.queueUpload(async () => {
+			const litter = tree.skipped.length ? ` — left out ${tree.skipped.length} system file${tree.skipped.length === 1 ? "" : "s"} (.DS_Store, Thumbs.db…)` : "";
+			if (!tree.files.length && !tree.dirs.length) {
+				this.bridge.toast(`Nothing to upload${litter}`);
 				return;
 			}
+			const intake = await this.askIntake(tree.files.map((p) => p.file));
+			if (intake === false) return;
+			await this.ensureSecrets();
+			const ids = new Map<string, string | null>([["", into]]);
+			const known = [...this.state.get().tree];
+			let made = 0;
+			for (const dir of tree.dirs) {
+				const key = dir.join("/");
+				if (ids.has(key)) continue;
+				const parent = ids.get(dir.slice(0, -1).join("/")) ?? into;
+				const name = dir[dir.length - 1] ?? "";
+				const existing = known.find((f) => f.parent === parent && f.name === name && !f.deletedAt);
+				const id = existing?.id ?? (await this.createFolder(parent, name));
+				if (!existing) made++;
+				ids.set(key, id);
+			}
+			const items = tree.files.map((p) => ({ file: p.file, folderId: ids.get(p.dir.join("/")) ?? into }));
+			const sent = await this.uploadItems(items, { sample, intake });
+			const top = tree.dirs.filter((d) => d.length === 1).map((d) => `“${d[0]}”`);
+			if (top.length) this.bridge.toast(`Uploaded ${top.join(", ")}: ${sent} of ${items.length} file${items.length === 1 ? "" : "s"}${made ? `, ${made} new folder${made === 1 ? "" : "s"}` : ""}${litter}`);
+			else if (litter) this.bridge.toast(`Uploaded ${sent} of ${items.length}${litter}`);
+		});
+	}
+
+	/** Stop the upload under way after the file it is sending. */
+	stopUpload(): void {
+		const u = this.state.get().upload;
+		if (u) this.set({ upload: { ...u, stopping: true } });
+	}
+
+	/** An evidence case's intake record for a batch (commit 29g): asked once,
+	 * before a byte is sealed — each file signs its own record of it. Null
+	 * outside evidence; false when the person cancelled. */
+	private async askIntake(files: File[]): Promise<IntakeFields | null | false> {
+		if (this.bridge.areaKind?.() !== "evidence") return null;
+		const intake = (await this.bridge.intake?.(files)) ?? null;
+		if (!intake) {
+			this.bridge.toast("Upload cancelled — an evidence file needs its intake record");
+			return false;
 		}
+		return intake;
+	}
+
+	/** The upload loop: each file to its own folder. Returns how many were sent. */
+	private async uploadItems(items: UploadItem[], { sample = false, intake: given }: { sample?: boolean; intake?: IntakeFields | null } = {}): Promise<number> {
+		const intake = given !== undefined ? given : await this.askIntake(items.map((x) => x.file));
+		if (intake === false) return 0;
+		await this.ensureSecrets();
+		let sent = 0;
+		let skipped = 0;
 		// "Do the same for the rest of this upload", once answered.
 		let standing: "skip" | "keep" | null = null;
-		for (const [i, file] of files.entries()) {
-			if (file.size > MAX_FILE) {
-				this.bridge.toast(`“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GiB — a file is at most 255 GiB`);
-				continue;
-			}
-			// One SHA-256, two uses: the duplicate tag (keyed, below) and the
-			// signed content hash (uploadOne) — read once, streamed (D12).
-			const digest = await digestOf(file);
-			const tag = await this.fingerprint(digest);
-			// The duplicate check: same size on the server, compare tags locally.
-			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null; folder?: string | null; name?: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${file.size}`);
-			const twins = same.files.filter((x) => x.tag && x.tag === tag);
-			if (twins.length) {
-				let action = standing;
-				if (!action) {
-					const answer = await this.bridge.confirmDuplicate({ file: { name: file.name, size: file.size }, twins: await this.describeTwins(twins), later: files.length - i - 1 });
-					if (!answer) {
-						this.bridge.toast(`Upload stopped at “${file.name}”`);
-						break;
-					}
-					action = answer.action;
-					if (answer.forRest) standing = answer.action;
+		try {
+			for (const [i, { file, folderId }] of items.entries()) {
+				if (this.state.get().upload?.stopping) {
+					this.bridge.toast(`Upload stopped — ${sent} of ${items.length} sent`);
+					break;
 				}
-				if (action === "skip") {
-					this.bridge.toast(`Skipped “${file.name}” (already here)`);
+				this.set({ upload: { done: i, total: items.length, name: file.name, stopping: false } });
+				if (file.size > MAX_FILE) {
+					this.bridge.toast(`“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GiB — a file is at most 255 GiB`);
 					continue;
 				}
-				// "keep" and "version" both store the bytes again as a new file:
-				// identical bytes as a new VERSION of the twin would record
-				// nothing new. (A dead `asVersion` parameter used to pretend
-				// otherwise; removed in commit 25.)
+				// One SHA-256, two uses: the duplicate tag (keyed, below) and the
+				// signed content hash (uploadOne) — read once, streamed (D12).
+				const digest = await digestOf(file);
+				const tag = await this.fingerprint(digest);
+				// The duplicate check: same size on the server, compare tags locally.
+				const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null; folder?: string | null; name?: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${file.size}`);
+				const twins = same.files.filter((x) => x.tag && x.tag === tag);
+				if (twins.length) {
+					let action = standing;
+					if (!action) {
+						const answer = await this.bridge.confirmDuplicate({ file: { name: file.name, size: file.size }, twins: await this.describeTwins(twins), later: items.length - i - 1 });
+						if (!answer) {
+							this.bridge.toast(`Upload stopped at “${file.name}”`);
+							break;
+						}
+						action = answer.action;
+						if (answer.forRest) standing = answer.action;
+					}
+					if (action === "skip") {
+						// One line for a batch, not one per file (a dropped
+						// folder can hold hundreds of copies).
+						if (items.length === 1) this.bridge.toast(`Skipped “${file.name}” (already here)`);
+						skipped++;
+						continue;
+					}
+					// "keep" and "version" both store the bytes again as a new file:
+					// identical bytes as a new VERSION of the twin would record
+					// nothing new. (A dead `asVersion` parameter used to pretend
+					// otherwise; removed in commit 25.)
+				}
+				await this.uploadOne(file, tag, folderId, hexOf(digest), sample, intake);
+				sent++;
 			}
-			await this.uploadOne(file, tag, folderId, hexOf(digest), sample, intake);
+		} finally {
+			this.set({ upload: null });
 		}
+		if (skipped && items.length > 1) this.bridge.toast(`Skipped ${skipped} file${skipped === 1 ? "" : "s"} already here`);
 		await this.refresh();
+		return sent;
 	}
 
 	/** Find duplicates: the area's files that have exactly the same bytes as

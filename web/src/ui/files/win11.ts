@@ -27,7 +27,8 @@ import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, FolderRow, Selection, SortState } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, moveTargets, type MenuItem } from "./shared.ts";
+import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
+import { fromRelativePaths } from "./dropped.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -52,6 +53,10 @@ export class GoraniWin11 extends LitElement {
 	@state() private query = "";
 	@state() private searchHits: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; size?: number }[] | null = null;
 	@state() private recentsMode = false;
+	/** Files from outside are being dragged over the list (39r): the
+	 * outline that says where they will go. */
+	@state() private dropHint = false;
+	private dropHintTimer: ReturnType<typeof setTimeout> | undefined;
 	private typeBuffer = "";
 	private typeTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -99,6 +104,12 @@ export class GoraniWin11 extends LitElement {
 		crumbs.unshift({ id: null, name: this.memberName });
 		if (s.trashMode) crumbs.push({ id: null, name: "Trash" });
 		return crumbs;
+	}
+
+	/** The folder on screen, by name — where a drop on the list goes. */
+	private here(): string {
+		const crumbs = this.path();
+		return `“${crumbs[crumbs.length - 1]?.name ?? this.memberName}”`;
 	}
 
 	private isSelected(kind: string, id: string): boolean {
@@ -312,6 +323,7 @@ export class GoraniWin11 extends LitElement {
 				{ separator: true, label: "" },
 				{ label: "New folder", icon: icon("folder"), run: () => this.attempt(this.newFolder()) },
 				{ label: "Upload files…", icon: icon("file"), run: () => this.pick("[data-upload]") },
+				{ label: "Upload folder…", icon: icon("folder"), run: () => this.pickFolder() },
 				{ label: "Upload malware samples…", icon: icon("sample"), run: () => this.pick("[data-upload-sample]") },
 				{ label: "Request files into this folder…", run: () => this.openRequests("links", s.folderId) },
 				{ separator: true, label: "" },
@@ -636,9 +648,43 @@ export class GoraniWin11 extends LitElement {
 			this.attempt(this.model.moveItems(ids.map((x) => ({ kind: x.kind === "folder" ? "folder" : "file", id: x.id })), folderId));
 			return;
 		}
-		if (e.dataTransfer?.files?.length) {
-			void this.model.upload([...e.dataTransfer.files]);
+		// Files (and folders) from outside go INTO the folder they were
+		// dropped on (39r: they used to go to the folder on screen).
+		if (e.dataTransfer && carriesFiles(e.dataTransfer)) this.uploadDrop(e.dataTransfer, folderId);
+	}
+
+	/** Upload what was dropped — folders with their whole shape (dropped.ts). */
+	private uploadDrop(dt: DataTransfer, folderId: string | null): void {
+		if (this.s().trashMode) {
+			this.model.api.toast("Open a folder to upload into — not the Trash");
+			return;
 		}
+		const tree = takeDrop(dt); // during the event: the drop empties after it
+		this.attempt(tree.then((t) => this.model.uploadTree(t, folderId)));
+	}
+
+	/** Dragged over the list: files from outside may drop here (and show
+	 * where); our own items are moved by the rows they land on. */
+	private onBodyDragOver(e: DragEvent): void {
+		if (!e.dataTransfer || isOwnDrag(e.dataTransfer) || !carriesFiles(e.dataTransfer)) return;
+		e.preventDefault();
+		e.dataTransfer.dropEffect = "copy";
+		this.dropHint = true;
+		clearTimeout(this.dropHintTimer);
+		// dragover repeats every few hundred ms while the pointer stays; when
+		// it stops coming, the drag has left (dragleave fires for every child).
+		this.dropHintTimer = setTimeout(() => (this.dropHint = false), 400);
+	}
+
+	private onBodyDrop(e: DragEvent): void {
+		this.dropHint = false;
+		if (!e.dataTransfer || isOwnDrag(e.dataTransfer) || !carriesFiles(e.dataTransfer)) return;
+		e.preventDefault();
+		this.uploadDrop(e.dataTransfer, this.s().folderId);
+	}
+
+	private pickFolder(): void {
+		this.pick("[data-upload-folder]");
 	}
 
 	// ── render ──────────────────────────────────────────────────────────
@@ -654,8 +700,9 @@ export class GoraniWin11 extends LitElement {
 				<div class="flex min-h-0 flex-1">
 					${this.navPane()}
 					<div class="flex min-w-0 flex-1 flex-col">
-						<div data-body class="relative min-h-0 flex-1 overflow-auto outline-none" @pointerdown=${(e: PointerEvent) => this.onBodyPointerDown(e)} @contextmenu=${(e: MouseEvent) => this.backgroundMenu(e)}>
+						<div data-body class="relative min-h-0 flex-1 overflow-auto outline-none" @pointerdown=${(e: PointerEvent) => this.onBodyPointerDown(e)} @contextmenu=${(e: MouseEvent) => this.backgroundMenu(e)} @dragover=${(e: DragEvent) => this.onBodyDragOver(e)} @drop=${(e: DragEvent) => this.onBodyDrop(e)}>
 							${this.recentsMode ? this.recentsBody() : this.view === "details" ? this.detailsBody(folders, files) : this.iconsBody(folders, files)}
+							${this.dropHint ? html`<div class="pointer-events-none absolute inset-2 flex items-center justify-center rounded-xl border-2 border-dashed border-accent/70 bg-accent/5 text-sm text-neutral-200" data-test="drop-hint">Drop to upload into ${this.here()}</div>` : nothing}
 						</div>
 						${this.statusBar(folders.length, files.length)}
 					</div>
@@ -676,6 +723,7 @@ export class GoraniWin11 extends LitElement {
 					<button class="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 hover:bg-neutral-800" @click=${(e: MouseEvent) => showMenu([
 						{ label: "Folder", icon: icon("folder"), run: () => void this.newFolder() },
 						{ label: "Upload files…", icon: icon("file"), run: () => (this.querySelector<HTMLInputElement>("[data-upload]") as HTMLInputElement)?.click() },
+						{ label: "Upload folder…", icon: icon("folder"), run: () => this.pickFolder() },
 						// Marked from the first byte (commit 29e): never previewed, never linked.
 						{ label: "Upload malware samples…", icon: icon("sample"), run: () => (this.querySelector<HTMLInputElement>("[data-upload-sample]") as HTMLInputElement)?.click() },
 					], e.clientX, e.clientY)}>
@@ -699,6 +747,14 @@ export class GoraniWin11 extends LitElement {
 					const input = e.target as HTMLInputElement;
 					if (input.files?.length) void this.model.upload([...input.files], { sample: true });
 					input.value = "";
+				}} />
+				<!-- A whole folder, its subfolders included (39r): each file
+				     arrives with its webkitRelativePath. -->
+				<input data-upload-folder type="file" webkitdirectory multiple class="hidden" @change=${(e: Event) => {
+					const input = e.target as HTMLInputElement;
+					const files = [...(input.files ?? [])];
+					input.value = "";
+					if (files.length) this.attempt(Promise.resolve().then(() => this.model.uploadTree(fromRelativePaths(files), this.s().folderId)));
 				}} />
 			</div>
 		`;
@@ -730,11 +786,14 @@ export class GoraniWin11 extends LitElement {
 				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canBack} @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.back(); }}>←</button>
 				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-30" ?disabled=${!this.model.canForward} @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.forward(); }}>→</button>
 				<button class="rounded-md px-2 py-1 text-neutral-400 hover:bg-neutral-800" title="Up one folder" @click=${() => void this.go(this.s().tree.find((f) => f.id === this.s().folderId)?.parent ?? null)}>↑</button>
-				<nav class="mx-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto rounded-lg bg-neutral-950 px-2.5 py-1.5 text-sm" @drop=${(e: DragEvent) => this.onDropIntoFolder(e, null)} @dragover=${(e: DragEvent) => e.preventDefault()}>
-					${crumbs.map((c, i) =>
-						html`${i > 0 ? html`<span class="text-neutral-600">›</span>` : nothing}
-						<button class="whitespace-nowrap rounded px-1.5 py-0.5 hover:bg-neutral-800 ${i === crumbs.length - 1 ? "text-neutral-100" : "text-neutral-400"}" @click=${() => void this.go(c.id)}>${c.name}</button>`,
-					)}
+				<!-- Each crumb takes a drop into ITS folder (39r: the whole bar
+				     used to, into the top folder, whichever crumb it landed on). -->
+				<nav class="mx-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto rounded-lg bg-neutral-950 px-2.5 py-1.5 text-sm">
+					${crumbs.map((c, i) => {
+						const trash = this.s().trashMode && i === crumbs.length - 1;
+						return html`${i > 0 ? html`<span class="text-neutral-600">›</span>` : nothing}
+						<button class="whitespace-nowrap rounded px-1.5 py-0.5 hover:bg-neutral-800 ${i === crumbs.length - 1 ? "text-neutral-100" : "text-neutral-400"}" @click=${() => void this.go(c.id)} @drop=${(e: DragEvent) => !trash && this.onDropIntoFolder(e, c.id)} @dragover=${(e: DragEvent) => !trash && e.preventDefault()}>${c.name}</button>`;
+					})}
 				</nav>
 				<div class="relative">
 					<input class="w-52 rounded-lg bg-neutral-950 px-3 py-1.5 text-sm outline-none placeholder:text-neutral-600 focus:ring-1 focus:ring-accent" placeholder="Search (this device's index)" .value=${this.query} @input=${(e: InputEvent) => void this.onSearch((e.target as HTMLInputElement).value)} />
@@ -896,6 +955,7 @@ export class GoraniWin11 extends LitElement {
 			<footer class="flex items-center gap-4 border-t border-neutral-800 px-3 py-1.5 text-xs text-neutral-400">
 				<span>${folderCount + fileCount} item${folderCount + fileCount === 1 ? "" : "s"}</span>
 				${sel.length ? html`<span>${sel.length} selected${bytes ? ` · ${fmtSize(bytes)}` : ""}</span>` : nothing}
+				${uploadStatus(this.s().upload, () => this.model.stopUpload())}
 				<span class="flex-1"></span>
 				${this.s().trashMode ? html`<span class="text-amber-400">Trash — restore what you need; the rest is purged after 30 days</span>` : html`<span>sealed · end to end</span>`}
 			</footer>

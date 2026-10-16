@@ -460,6 +460,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gorani-fairplay"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "base64",
+ "getrandom",
+ "rsa",
+ "sha1",
+]
+
+[[package]]
 name = "gorani-formats"
 version = "0.1.0"
 dependencies = [
@@ -540,12 +551,16 @@ dependencies = [
 name = "gorani-worker"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "base64",
  "futures-util",
  "getrandom",
+ "gorani-fairplay",
  "gorani-formats",
  "gorani-s3",
  "hex",
+ "hkdf",
+ "hmac",
  "js-sys",
  "rand_core",
  "rsa",
@@ -1284,6 +1299,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

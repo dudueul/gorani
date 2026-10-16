@@ -1,0 +1,20 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# FairPlay Streaming's server half (commit 40b, docs/DRM.md): an SPC in, a
+# CKC out. The author's own `fairplay.rs` from mp4-hls-core (stream-worker),
+# vendored and ported to the crypto crates this workspace already builds
+# (aes 0.8, rsa 0.9). Pure Rust, no platform code: the Worker links it, and
+# `cargo test` runs it natively against keys made at run time.
+
+[package]
+name = "gorani-fairplay"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+aes = "0.8"
+rsa = "0.9"
+sha1 = "0.10"
+getrandom = "0.2"
+base64 = "0.22"

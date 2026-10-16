@@ -71,7 +71,42 @@ try {
 	// The family's role names are gone with the master key (a clean break).
 	assert.equal((await add({ id: "kid", name: "Old name", role: "child", emails: ["kid@team.test"] }, "bo@team.test")).status, 400, "parent/child are no longer roles");
 
-	console.log("ok  api:roles — lead/analyst/auditor/external scopes, audits for auditors, no registry for externals, last-lead guards, expiry, no act-for, no family roles");
+	// ── 7. What a lead types (commit 39l: Team › People manages members) ─
+	// Each field is checked the way it is used, and a change is all or
+	// nothing.
+	const member = async (id) => (await get("/api/v1/family", "bo@team.test")).json.members.find((m) => m.id === id);
+	assert.equal((await add({ id: "fay", name: "  Fay  ", role: "analyst", emails: [" Fay@Team.Test ", "fay@team.test"] }, "bo@team.test")).status, 200);
+	assert.deepEqual([(await member("fay")).name, (await member("fay")).emails], ["Fay", ["fay@team.test"]], "trimmed; addresses lower-cased (as Access compares them) and each once");
+	assert.equal((await api(dev.base, "GET", "/api/v1/me", { email: "FAY@team.test" })).json.member?.id, "fay", "…and found whatever case the sign-in uses");
+	for (const [body, what] of [
+		[{ id: "gus", name: "Gus", role: "analyst", emails: [] }, "no sign-in address"],
+		[{ id: "gus", name: "Gus", role: "analyst", emails: ["gus"] }, "not an address"],
+		[{ id: "gus", name: "Gus", role: "analyst", emails: ["gus@team.test, ana@team.test"] }, "two addresses in one"],
+		[{ id: "gus", name: "Gus\nlead: ana", role: "analyst", emails: ["gus@team.test"] }, "a control character in a name"],
+		[{ id: "gus", name: "", role: "analyst", emails: ["gus@team.test"] }, "an empty name"],
+		[{ id: "gus", name: "Gus", role: "external", emails: ["gus@team.test"], expiresAt: "never" }, "an expiry that is not a time"],
+	]) assert.equal((await add(body, "bo@team.test")).status, 400, `${what} is refused`);
+	assert.equal((await add({ id: "gus", name: "Gus", role: "external", emails: ["gus@partner.test"], expiresAt: "2099-12-31" }, "bo@team.test")).status, 200);
+	assert.equal((await member("gus")).expiresAt, "2099-12-31T23:59:59.999Z", "a bare day means the end of that day, UTC");
+	// All or nothing: the role change is not saved when the address is refused.
+	assert.equal((await patch("fay", { role: "auditor", emails: ["bo@team.test"] }, "bo@team.test")).status, 409, "an address another member holds");
+	assert.equal((await member("fay")).role, "analyst", "…and nothing of that change was saved");
+	assert.equal((await patch("fay", { expiresAt: "2099-01-01" }, "bo@team.test")).status, 400, "only externals expire — said, not silently ignored");
+	assert.equal((await patch("fay", { name: "Fay K.", emails: ["fay.k@team.test"] }, "bo@team.test")).status, 200);
+	assert.deepEqual([(await member("fay")).name, (await member("fay")).emails], ["Fay K.", ["fay.k@team.test"]]);
+	// A lead cannot sign themselves out of their own account.
+	assert.equal((await patch("bo", { emails: ["bo.new@team.test"] }, "bo@team.test")).status, 409, "the address you are signed in with stays");
+	assert.equal((await patch("bo", { emails: ["bo@team.test", "bo.new@team.test"] }, "bo@team.test")).status, 200, "…adding one is fine");
+	// Deactivation is final, and an address stays with its account.
+	assert.equal((await api(dev.base, "POST", "/api/v1/family/members/fay/deactivate", { email: "bo@team.test" })).status, 200);
+	assert.equal((await patch("fay", { name: "Fay again" }, "bo@team.test")).status, 409, "a deactivated member is not edited back into use");
+	const reuse = await add({ id: "fay2", name: "Fay", role: "analyst", emails: ["fay.k@team.test"] }, "bo@team.test");
+	assert.equal(reuse.status, 409);
+	assert.match(reuse.json.error, /deactivated/, "the refusal says why the address is not free");
+	const update = (await get("/api/v1/family", "bo@team.test")).json.audit.find((l) => l.action === "member.update" && l.target === "fay");
+	assert.match(update?.details ?? "", /fay\.k@team\.test/, "member.update records the new addresses — who can sign in AS the member");
+
+	console.log("ok  api:roles — lead/analyst/auditor/external scopes, audits for auditors, no registry for externals, last-lead guards, expiry, no act-for, no family roles; (39l) member fields checked as they are used (names, sign-in addresses, one expiry shape), changes all or nothing, no signing yourself out, deactivation final and addresses never reused");
 } finally {
 	await dev.close();
 }

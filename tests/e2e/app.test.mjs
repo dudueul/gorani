@@ -750,6 +750,41 @@ try {
 		const fp = (await page.locator('[data-test="my-fingerprint"]').textContent())?.trim() ?? "";
 		assert.match(fp, /^([0-9A-F]{4} ){7}[0-9A-F]{4}$/, "the fingerprint people read to each other");
 		assert.equal(fp.replace(/ /g, ""), ids.find((e) => e.member === "mom").keyId.slice(0, 32).toUpperCase(), "…is the registered identity's");
+		// Team › People › Members (39l): a lead adds an account, changes it
+		// and deactivates it from the web app — the registry's rules, its
+		// refusals shown in its own words. (Until 39l only an API call could.)
+		await page.locator('[data-test="members"]').waitFor({ timeout: 30_000 });
+		const adder = page.locator('[data-test="member-add"]');
+		await adder.locator('input[name="new-member-id"]').fill("kai");
+		await adder.locator('input[name="new-member-name"]').fill("Kai");
+		await adder.locator('input[name="new-member-emails"]').fill("Kai@Family.test, kai.alt@family.test");
+		await adder.getByRole("button", { name: "Add member" }).click();
+		await page.locator('[data-test="member-kai"]').waitFor({ timeout: 30_000 });
+		assert.match(await page.locator('[data-test="member-detail-kai"]').textContent(), /Analyst · kai@family\.test, kai\.alt@family\.test/, "addresses stored as Access compares them (lower case)");
+		await adder.locator('input[name="new-member-id"]').fill("kai2");
+		await adder.locator('input[name="new-member-emails"]').fill("kai@family.test");
+		await adder.getByRole("button", { name: "Add member" }).click();
+		await page.locator('[data-test="team-error"]', { hasText: "already belongs to another member" }).waitFor({ timeout: 30_000 });
+		await page.locator('[data-test="member-edit-kai"]').click();
+		const kaiEditor = page.locator('[data-test="member-editor-kai"]');
+		await kaiEditor.locator('select[name="edit-role"]').selectOption("external");
+		await kaiEditor.locator('input[name="edit-expires"]').fill("2099-12-31");
+		await kaiEditor.getByRole("button", { name: "Save" }).click();
+		await page.locator('[data-test="member-detail-kai"]', { hasText: "External" }).waitFor({ timeout: 30_000 });
+		const kai = (await api(dev.base, "GET", "/api/v1/family", { email: "mom@family.test" })).json.members.find((m) => m.id === "kai");
+		assert.deepEqual([kai.role, kai.expiresAt], ["external", "2099-12-31T23:59:59.999Z"], "a day means the end of that day, UTC");
+		// Mom cannot sign herself out by editing her own address away.
+		await page.locator('[data-test="member-edit-mom"]').click();
+		await page.locator('[data-test="member-editor-mom"] input[name="edit-emails"]').fill("someone-else@family.test");
+		await page.locator('[data-test="member-editor-mom"]').getByRole("button", { name: "Save" }).click();
+		await page.locator('[data-test="team-error"]', { hasText: "the address you are signed in with" }).waitFor({ timeout: 30_000 });
+		await page.locator('[data-test="member-editor-mom"]').getByRole("button", { name: "Cancel" }).click();
+		page.once("dialog", (d) => void d.accept());
+		await page.locator('[data-test="member-deactivate-kai"]').click();
+		await page.locator('[data-test="member-detail-kai"]', { hasText: "deactivated" }).waitFor({ timeout: 30_000 });
+		assert.equal((await api(dev.base, "GET", "/api/v1/me", { email: "kai@family.test" })).json.member, null, "a deactivated member is nobody at sign-in");
+		assert.equal(await page.locator('[data-test="member-edit-kai"]').count(), 0, "…and is not edited back into use");
+		await assertNoViolations(page, "Team › People › Members");
 		// The Devices tab: what protects each computer, and revoking a lost one.
 		await page.getByRole("button", { name: "Devices" }).click();
 		const deskProtection = page.locator(`[data-test="device-protection-${desk}"]`);

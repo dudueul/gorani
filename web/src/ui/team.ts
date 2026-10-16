@@ -17,7 +17,7 @@
 
 import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import type { Member } from "../lib/api.ts";
+import type { Member, TeamRole } from "../lib/api.ts";
 import type { VaultSession } from "../vault/session.ts";
 import type { VaultPrivateKey } from "../vault/vault-crypto.ts";
 import { fingerprint, pin, certify, buildTrust, type RegistryIdentity } from "../vault/identity.ts";
@@ -65,6 +65,12 @@ function describeProtection(p: string | null): { text: string; weak: boolean } {
 	};
 	return { text: p.split("+").map(part).join(" + "), weak: false };
 }
+
+const ROLE_LABEL: Record<TeamRole, string> = { lead: "Lead", analyst: "Analyst", auditor: "Auditor", external: "External" };
+/** Addresses typed in one box: commas, semicolons, spaces or new lines between them. */
+const splitEmails = (s: string) => s.split(/[\s,;]+/).map((e) => e.trim()).filter(Boolean);
+/** An expiry as a date input shows it (YYYY-MM-DD); the registry keeps the end of that day, UTC. */
+const dayOf = (iso?: string | null) => (iso ?? "").slice(0, 10);
 
 const input = "rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-sm outline-none focus:border-accent";
 const button = "rounded-lg border border-neutral-700 px-2.5 py-1.5 text-xs hover:border-accent disabled:opacity-40";
@@ -331,6 +337,159 @@ export class GoraniTeam extends LitElement {
 		`;
 	}
 
+	// ── Members (commit 39l) ──────────────────────────────────────────
+	//
+	// Who can sign in, as whom, with what role: the registry, managed by a
+	// lead from here. Until 39l only an API call could add or change a
+	// member — a team's first lead had no way to bring in the second.
+	// Every rule stays the registry's (family.rs): leads only, the last lead
+	// stays a lead, externals expire, an address belongs to one member, a
+	// lead cannot sign themselves out by editing their own address away.
+	// This screen shows the registry's refusals verbatim, like every other.
+
+	@state() private memberDraft: { id: string; name: string; role: TeamRole; emails: string; expires: string } = { id: "", name: "", role: "analyst", emails: "", expires: "" };
+	@state() private editing: string | null = null;
+	@state() private editDraft: { name: string; role: TeamRole; emails: string; expires: string } = { name: "", role: "analyst", emails: "", expires: "" };
+
+	private renderMembers() {
+		if (!this.members.length) return nothing;
+		const now = new Date().toISOString();
+		return html`
+			<section class="rounded-xl border border-neutral-800 p-3" data-test="members">
+				<h3 class="font-medium">Members</h3>
+				<p class="mt-1 text-xs text-neutral-400">${this.isLead
+					? "Who can sign in, and as whom: each address is one Cloudflare Access verifies. Access must also let the address in — its policy is set in Cloudflare, not here."
+					: "Who is on the team. Leads add and change members."}</p>
+				<ul class="mt-2 divide-y divide-neutral-800">
+					${this.members.map((m) => (this.editing === m.id ? this.memberEditor(m) : this.memberRow(m, now)))}
+				</ul>
+				${this.isLead ? this.memberAdder() : nothing}
+			</section>
+		`;
+	}
+
+	private memberRow(m: Member, now: string) {
+		const expired = !!m.expiresAt && m.expiresAt <= now;
+		const me = m.id === this.team.memberId;
+		return html`<li class="flex flex-wrap items-center gap-2 py-2" data-test="member-${m.id}">
+			<div class="min-w-0 flex-1">
+				<p class=${m.active ? "" : "text-neutral-500 line-through"}>${m.name} <span class="text-xs text-neutral-500">${m.id}${me ? " · you" : ""}</span></p>
+				<p class="text-xs text-neutral-400" data-test="member-detail-${m.id}">${ROLE_LABEL[m.role]} · ${m.emails.join(", ") || "no sign-in address"}${m.expiresAt
+					? html` · <span class=${expired ? "text-amber-400" : ""}>${expired ? "expired" : "until"} ${m.expiresAt.slice(0, 10)}</span>`
+					: nothing}${m.active ? nothing : " · deactivated"}</p>
+			</div>
+			${this.isLead && m.active
+				? html`<button class=${button} ?disabled=${this.busy} data-test="member-edit-${m.id}" @click=${() => {
+							this.editing = m.id;
+							this.editDraft = { name: m.name, role: m.role, emails: m.emails.join(", "), expires: dayOf(m.expiresAt) };
+						}}>Edit</button>
+						<button class=${button} ?disabled=${this.busy} data-test="member-deactivate-${m.id}" @click=${() => this.deactivateMember(m)}>Deactivate</button>`
+				: nothing}
+		</li>`;
+	}
+
+	/** The fields both forms share: role, addresses, and — for an external — the last day. */
+	private memberFields(d: { role: TeamRole; emails: string; expires: string }, set: (patch: Partial<{ role: TeamRole; emails: string; expires: string }>) => void, prefix: string) {
+		return html`
+			<label class="text-xs text-neutral-400">Role
+				<select class="${input} mt-1 block" name="${prefix}-role" .value=${d.role} @change=${(e: Event) => set({ role: (e.target as HTMLSelectElement).value as TeamRole })}>
+					${(Object.keys(ROLE_LABEL) as TeamRole[]).map((r) => html`<option value=${r} ?selected=${d.role === r}>${ROLE_LABEL[r]}</option>`)}
+				</select>
+			</label>
+			<label class="text-xs text-neutral-400">Sign-in addresses
+				<input class="${input} mt-1 block w-64" name="${prefix}-emails" placeholder="name@example.org" .value=${d.emails} @input=${(e: Event) => set({ emails: (e.target as HTMLInputElement).value })} />
+			</label>
+			${d.role === "external"
+				? html`<label class="text-xs text-neutral-400">Access ends after
+						<input class="${input} mt-1 block" type="date" name="${prefix}-expires" .value=${d.expires} @input=${(e: Event) => set({ expires: (e.target as HTMLInputElement).value })} />
+					</label>`
+				: nothing}
+		`;
+	}
+
+	private memberEditor(m: Member) {
+		const d = this.editDraft;
+		return html`<li class="py-2" data-test="member-editor-${m.id}">
+			<form class="flex flex-wrap items-end gap-2" @submit=${(ev: Event) => {
+				ev.preventDefault();
+				void this.saveMember(m);
+			}}>
+				<label class="text-xs text-neutral-400">Name
+					<input class="${input} mt-1 block w-40" name="edit-name" .value=${d.name} @input=${(e: Event) => (this.editDraft = { ...this.editDraft, name: (e.target as HTMLInputElement).value })} />
+				</label>
+				${this.memberFields(d, (patch) => (this.editDraft = { ...this.editDraft, ...patch }), "edit")}
+				<button class=${primary} ?disabled=${this.busy} type="submit">Save</button>
+				<button class=${button} type="button" @click=${() => (this.editing = null)}>Cancel</button>
+			</form>
+		</li>`;
+	}
+
+	private memberAdder() {
+		const d = this.memberDraft;
+		const set = (patch: Partial<typeof d>) => (this.memberDraft = { ...this.memberDraft, ...patch });
+		return html`<form class="mt-3 flex flex-wrap items-end gap-2 border-t border-neutral-800 pt-3" data-test="member-add" @submit=${(ev: Event) => {
+			ev.preventDefault();
+			void this.addMember();
+		}}>
+			<label class="text-xs text-neutral-400">Member id
+				<input class="${input} mt-1 block w-32" name="new-member-id" placeholder="bo" .value=${d.id} @input=${(e: Event) => set({ id: (e.target as HTMLInputElement).value })} />
+			</label>
+			<label class="text-xs text-neutral-400">Name
+				<input class="${input} mt-1 block w-40" name="new-member-name" .value=${d.name} @input=${(e: Event) => set({ name: (e.target as HTMLInputElement).value })} />
+			</label>
+			${this.memberFields(d, set, "new-member")}
+			<button class=${primary} ?disabled=${this.busy} type="submit">Add member</button>
+		</form>`;
+	}
+
+	private addMember(): Promise<void> {
+		const d = this.memberDraft;
+		const id = d.id.trim();
+		const emails = splitEmails(d.emails);
+		return this.act(`Adding ${id || "a member"}`, async () => {
+			// The registry decides; this only spares a round trip for the
+			// two mistakes a person makes most (its own words, too).
+			if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])$/.test(id)) throw new Error("Member id: 2–32 characters of a–z, 0–9 and dashes (not at either end)");
+			if (!emails.length) throw new Error("At least one sign-in address — the email Cloudflare Access verifies");
+			const name = d.name.trim() || id;
+			await this.call("POST", "/api/v1/family/members", { id, name, role: d.role, emails, ...(d.role === "external" ? { expiresAt: d.expires } : {}) });
+			this.memberDraft = { id: "", name: "", role: "analyst", emails: "", expires: "" };
+			return `${name} is a member. They sign in at ${location.origin} as ${emails[0]} (Cloudflare Access must let that address in) and set up their vault there; then compare their fingerprint with them and certify it below.`;
+		});
+	}
+
+	private saveMember(m: Member): Promise<void> {
+		const d = this.editDraft;
+		const body: Record<string, unknown> = {};
+		const emails = splitEmails(d.emails);
+		if (d.name.trim() !== m.name) body.name = d.name;
+		if (emails.join(",") !== m.emails.join(",")) body.emails = emails;
+		if (d.role !== m.role) body.role = d.role;
+		if (d.role === "external" && (d.role !== m.role || d.expires !== dayOf(m.expiresAt))) body.expiresAt = d.expires;
+		return this.act(`Saving ${m.name}`, async () => {
+			if (!Object.keys(body).length) {
+				this.editing = null;
+				return "Nothing changed";
+			}
+			await this.call("PATCH", `/api/v1/family/members/${m.id}`, body);
+			this.editing = null;
+			return body.emails ? `${m.name} now signs in as ${emails.join(", ")} (Cloudflare Access must let that address in).` : `${m.name}: saved`;
+		});
+	}
+
+	private deactivateMember(m: Member): void {
+		const me = m.id === this.team.memberId;
+		// Final (family.rs › deactivate): the dialog says so, and what stays.
+		const why = me
+			? "Deactivate your own account? You can no longer sign in, and deactivation is final: coming back means a new account with another address."
+			: `Deactivate ${m.name}? They can no longer sign in, and deactivation is final: their address stays with this account (the audit names people by it). Copies of case keys they were granted stay with them until each such case is rotated — those cases will say "rotation required".`;
+		if (!window.confirm(why)) return;
+		void this.act(`Deactivating ${m.name}`, async () => {
+			await this.call("POST", `/api/v1/family/members/${m.id}/deactivate`);
+			return `${m.name} is deactivated: they can no longer sign in.`;
+		});
+	}
+
 	// ── People ────────────────────────────────────────────────────────
 
 	private renderPeople() {
@@ -341,6 +500,7 @@ export class GoraniTeam extends LitElement {
 				<p class="mt-1 text-xs text-neutral-400">Read this to a lead when you join — they compare it on their screen before they certify you. Compare theirs with them, then trust it.</p>
 				<code class="mt-2 block font-mono text-accent" data-test="my-fingerprint">${fingerprint(mine.keyId)}</code>
 			</section>
+			${this.renderMembers()}
 			<section class="rounded-xl border border-neutral-800 p-3">
 				<h3 class="font-medium">Team identities</h3>
 				<ul class="mt-2 divide-y divide-neutral-800">

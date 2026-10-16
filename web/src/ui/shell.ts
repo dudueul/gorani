@@ -25,6 +25,7 @@ import { sessionBridge } from "./files/bridge.ts";
 import { askIntake } from "./files/intake-dialog.ts";
 import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
 import { readPlace } from "./files/place.ts";
+import { updateSettings } from "../vault/settings-store.ts";
 import { LocalIndex } from "../vault/index.ts";
 import "./viewer/viewer.ts";
 import type { ViewerTarget } from "./viewer/viewer.ts";
@@ -242,10 +243,23 @@ export class GoraniShell extends LitElement {
 	 * Best effort: a failed save just means the pin happens again next time.
 	 */
 	private async persistPinned(): Promise<void> {
-		const settings = this.session.takePinned();
-		if (!settings || this.session.locked) return;
+		const pinned = this.session.takePinned();
+		if (!pinned || this.session.locked) return;
 		try {
-			await api.put(`/api/v1/members/${this.member.id}/vault`, { settings });
+			// Only the pins (settings-store.ts): each stored record that is
+			// exactly the one the session opened gets its MAC, and nothing
+			// else is written — before 39l the session's whole object went
+			// back, unlock methods and identity as they were at unlock.
+			await updateSettings(teamCall, this.member.id, this.session.rootKeyId, (s) => ({
+				...s,
+				stores: Object.fromEntries(
+					Object.entries(s.stores ?? {}).map(([name, rec]) => {
+						const mine = pinned.stores[name];
+						const same = mine?.mac && mine.keyId === rec.keyId && mine.privateKeySealed === rec.privateKeySealed && mine.pqPublicKey === rec.pqPublicKey;
+						return [name, !rec.mac && same ? { ...rec, mac: mine.mac } : rec];
+					}),
+				),
+			}));
 		} catch (e) {
 			console.warn("could not save the pinned store records:", e);
 		}

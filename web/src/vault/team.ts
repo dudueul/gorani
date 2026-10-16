@@ -23,6 +23,7 @@ import type { VaultSettings } from "./methods.ts";
 import { buildTrust, createIdentity, hybridDigest, openIdentity, statements, type RegistryIdentity, type Signer, type Trust } from "./identity.ts";
 import { sealRecoveryCopy, type RecoveryRecord } from "./recovery.ts";
 import { openSealedText } from "./vault-crypto.ts";
+import { updateSettings } from "./settings-store.ts";
 
 /** The JSON API: GET / PUT / POST / DELETE with a body, throwing on refusals. */
 export type TeamCall = <T>(method: "GET" | "PUT" | "PATCH" | "POST" | "DELETE", path: string, body?: unknown) => Promise<T>;
@@ -43,8 +44,11 @@ export async function openTeam(call: TeamCall, session: VaultSession, memberId: 
 	let signer: Signer;
 	if (!settings.identity) {
 		const made = await createIdentity(memberId, session.root, rootPublic);
-		settings = { ...settings, identity: made.record };
-		await call("PUT", `/api/v1/members/${memberId}/vault`, { settings });
+		// Saved field by field (settings-store.ts), and into the session's
+		// own object as well: the shell later saves pinned store records
+		// from it, and before 39l that object lacked the identity made here.
+		settings = await updateSettings(call, memberId, session.rootKeyId, (s) => ({ ...s, identity: made.record }));
+		session.settings.identity = made.record;
 		signer = made.signer;
 	} else {
 		signer = await openIdentity(memberId, session.root, settings.identity);

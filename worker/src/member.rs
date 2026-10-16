@@ -929,9 +929,16 @@ impl GoraniMemberDO {
 				return json_error(409, "turning the vault on is a vault-route decision, not a settings save");
 			}
 		}
+		// (A member's own vault has its unlock methods checked on the way in
+		// — routes.rs, methods_refusal. A case's settings, written here by
+		// the Worker when a lead opens the case, have none: its key comes
+		// through grants.)
 		let v = serde_json::to_string(&body.settings).map_err(|_| Error::RustError("bad settings JSON".into()))?;
 		self.sql.exec("INSERT INTO vault (k, v) VALUES ('settings', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", Some(vec![v.into()]))?;
-		self.audit(actor, "vault.save", "settings", None, None).await?;
+		// Which kinds of way in the vault has after this save — kinds and
+		// counts only, nothing secret — so the trail shows a method added
+		// or removed, by whom and when (commit 39l).
+		self.audit(actor, "vault.save", "settings", None, methods_summary(&body.settings).as_deref()).await?;
 		self.get_vault().await
 	}
 
@@ -1349,3 +1356,83 @@ struct Drained {
 	failed: u64,
 	pending: u64,
 }
+
+/// The checks a member's settings save must pass on its unlock methods
+/// (commit 39l: Team › Unlock adds and removes them; routes.rs applies
+/// this to `PUT members/<id>/vault`, the only way a person's client writes
+/// a vault). The server cannot check that a method OPENS anything — it
+/// holds no secret — but it can refuse the saves that would lose a vault
+/// outright, whoever sends them:
+///
+/// - an ENABLED vault keeps at least one method: with none, the root key
+///   is sealed under nothing anyone has, and the vault is lost for good;
+/// - each method is an object of a known kind, with its wrap and salt;
+/// - at most MAX_PASSWORD_METHODS passwords (web/src/vault/kdf-bounds.ts,
+///   O8: each costs an Argon2 run at every unlock attempt, and a client
+///   tries only that many — a fifth would never open).
+pub(crate) fn methods_refusal(settings: &serde_json::Value) -> Option<&'static str> {
+	const MAX_PASSWORD_METHODS: usize = 4;
+	let enabled = settings.get("enabled").and_then(|e| e.as_bool()) == Some(true);
+	let Some(methods) = settings.get("methods") else {
+		return enabled.then_some("an enabled vault needs its unlock methods");
+	};
+	let Some(list) = methods.as_array() else { return Some("methods is a list") };
+	if enabled && list.is_empty() {
+		return Some("an enabled vault keeps at least one unlock method — with none it could never be opened again");
+	}
+	for m in list {
+		let present = |f: &str| m.get(f).and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty());
+		if !matches!(m.get("kind").and_then(|k| k.as_str()), Some("password" | "recovery" | "passkey")) || !present("wrapped") || !present("salt") {
+			return Some("each unlock method has a kind (password, recovery or passkey), its wrap and its salt");
+		}
+	}
+	if list.iter().filter(|m| m.get("kind").and_then(|k| k.as_str()) == Some("password")).count() > MAX_PASSWORD_METHODS {
+		return Some("at most 4 passwords — the unlock screen tries no more than that");
+	}
+	None
+}
+
+/// The trail's line for a save: which kinds of way in the vault has
+/// (`methods:password,recovery,passkey×2`) — kinds and counts, nothing
+/// secret. None for settings without methods (a case's).
+pub(crate) fn methods_summary(settings: &serde_json::Value) -> Option<String> {
+	let list = settings.get("methods")?.as_array()?;
+	let count = |k: &str| list.iter().filter(|m| m.get("kind").and_then(|x| x.as_str()) == Some(k)).count();
+	let parts: Vec<String> = ["password", "recovery", "passkey"]
+		.iter()
+		.filter(|k| count(k) > 0)
+		.map(|k| if count(k) > 1 { format!("{k}×{}", count(k)) } else { (*k).to_string() })
+		.collect();
+	Some(format!("methods:{}", if parts.is_empty() { "none".to_string() } else { parts.join(",") }))
+}
+
+#[cfg(test)]
+mod methods_tests {
+	use super::{methods_refusal, methods_summary};
+	use serde_json::json;
+
+	fn m(kind: &str) -> serde_json::Value {
+		json!({ "id": "x", "kind": kind, "wrapped": "R1cwMQ==", "salt": "c2FsdA==", "kdf": "argon2id", "createdAt": "2026-10-16T00:00:00.000Z" })
+	}
+
+	#[test]
+	fn an_enabled_vault_keeps_a_way_in() {
+		assert!(methods_refusal(&json!({ "enabled": true, "methods": [] })).is_some());
+		assert!(methods_refusal(&json!({ "enabled": true })).is_some());
+		assert_eq!(methods_refusal(&json!({ "enabled": false })), None, "a vault turned off, untouched");
+		let four = json!({ "enabled": true, "methods": [m("password"), m("recovery"), m("passkey"), m("passkey")] });
+		assert_eq!(methods_refusal(&four), None);
+		assert_eq!(methods_summary(&four).as_deref(), Some("methods:password,recovery,passkey×2"));
+		assert_eq!(methods_summary(&json!({ "enabled": true, "case": "ir-1" })), None, "a case's settings have no methods to summarise");
+	}
+
+	#[test]
+	fn methods_are_well_formed_and_bounded() {
+		assert!(methods_refusal(&json!({ "enabled": true, "methods": [{ "kind": "password" }] })).is_some(), "no wrap, no salt");
+		assert!(methods_refusal(&json!({ "enabled": true, "methods": [m("pin")] })).is_some(), "an unknown kind");
+		assert!(methods_refusal(&json!({ "enabled": true, "methods": "password" })).is_some());
+		let five = (0..5).map(|_| m("password")).collect::<Vec<_>>();
+		assert!(methods_refusal(&json!({ "enabled": true, "methods": five })).is_some(), "a fifth password would never be tried");
+	}
+}
+

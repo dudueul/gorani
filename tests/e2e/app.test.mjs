@@ -197,7 +197,7 @@ try {
 		// A sealed upload through the file picker; the listing decrypts the
 		// name in-browser — the whole round trip with no test-side crypto.
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "hello.txt", mimeType: "text/plain", buffer: Buffer.from("uploaded from the real browser") });
-		await page.locator("text=hello.txt").first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "hello.txt" }).first().waitFor({ timeout: 60_000 });
 		// Jinu's record was seeded by this test WITHOUT a MAC (as a record
 		// sealed to a member by someone else arrives): the first open pinned
 		// it, and the shell saved the pin (trust on first use, O3).
@@ -206,7 +206,7 @@ try {
 		// …and OPEN it: the viewer fetches the content key (POST files/keys —
 		// the app used to send a GET there, so no file could ever be opened)
 		// and decrypts in the page.
-		await page.locator("text=hello.txt").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "hello.txt" }).first().dblclick();
 		await page.locator("text=uploaded from the real browser").first().waitFor({ timeout: 30_000 });
 		await page.keyboard.press("Escape");
 		await assertNoViolations(page, "unlock → upload → open");
@@ -223,7 +223,7 @@ try {
 		// watcher (assertNoViolations) sees each.
 		{
 			await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "menu-a.txt", mimeType: "text/plain", buffer: Buffer.from("a file for the menus") });
-			await page.locator("text=menu-a.txt").first().waitFor({ timeout: 60_000 });
+			await page.locator('[data-body] [data-item^="file:"]', { hasText: "menu-a.txt" }).first().waitFor({ timeout: 60_000 });
 			const row = (host, name) => page.locator(`${host} [data-item^="file:"]`, { hasText: name }).first();
 			const openMenu = async (host, name) => {
 				await row(host, name).click({ button: "right" });
@@ -630,8 +630,8 @@ try {
 		const clip = Buffer.alloc(9 * 1024 * 1024);
 		for (let i = 0; i < clip.length; i++) clip[i] = (i * 7) % 251;
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "clip.mp4", mimeType: "video/mp4", buffer: clip });
-		await page.locator("text=clip.mp4").first().waitFor({ timeout: 120_000 });
-		await page.locator("text=clip.mp4").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "clip.mp4" }).first().waitFor({ timeout: 120_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "clip.mp4" }).first().dblclick();
 		const video = page.locator("gorani-viewer video").first();
 		await video.waitFor({ state: "attached", timeout: 30_000 });
 		const mediaUrl = (await video.getAttribute("src")) ?? "";
@@ -743,8 +743,8 @@ try {
 		// gone (not hidden), and no device hold may remain.
 		const PNG_1x1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "pixel.png", mimeType: "image/png", buffer: PNG_1x1 });
-		await page.locator("text=pixel.png").first().waitFor({ timeout: 60_000 });
-		await page.locator("text=pixel.png").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "pixel.png" }).first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "pixel.png" }).first().dblclick();
 		const img = page.locator("gorani-viewer img").first();
 		await img.waitFor({ timeout: 30_000 });
 		const src = (await img.getAttribute("src")) ?? "";
@@ -1038,14 +1038,14 @@ try {
 			await page.locator('[data-test="intake-submit"]').click();
 		};
 		await fillIntake("mom's laptop, Downloads", "browser upload, as received");
-		await page.locator("text=case-note.txt").first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "case-note.txt" }).first().waitFor({ timeout: 60_000 });
 		const listed = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
 		assert.equal(listed.json.files.length, 1, "the upload landed in the CASE's store");
 		const keyed = await api(dev.base, "POST", "/api/v1/cases/ir-e2e/files/keys", { email: "mom@family.test", body: { ids: [listed.json.files[0].id] } });
 		assert.match(keyed.json.keys[listed.json.files[0].id].hash ?? "", /^GV04:/, "…carrying the browser's signed content hash, sealed (the evidence case requires it)");
 		assert.match(keyed.json.keys[listed.json.files[0].id].intake ?? "", /^GV04:/, "…and its intake record, sealed and signed in the browser");
 		assert.equal((await api(dev.base, "GET", "/api/v1/members/mom/files/list?folder=all", { email: "mom@family.test" })).json.files?.length ?? 0, 0, "…not in mom's own area");
-		await page.locator("text=case-note.txt").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "case-note.txt" }).first().dblclick();
 		await page.locator("text=sealed under the case key").first().waitFor({ timeout: 30_000 });
 		await page.keyboard.press("Escape");
 		// A malware sample (commit 29e), uploaded through its own input: an
@@ -1053,10 +1053,10 @@ try {
 		// instead, and the page stays violation-free.
 		await page.locator("gorani-win11 [data-upload-sample]").setInputFiles({ name: "dropper.html", mimeType: "text/html", buffer: Buffer.from("<script>alert('pwned')</script>") });
 		await fillIntake("phishing mail attachment, ticket 4711", "saved from the mail gateway's quarantine");
-		await page.locator("text=dropper.html").first().waitFor({ timeout: 60_000 });
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "dropper.html" }).first().waitFor({ timeout: 60_000 });
 		const afterSample = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/files/list?folder=all", { email: "mom@family.test" });
 		assert.equal(afterSample.json.files.find((f) => f.sample)?.sample, true, "the server lists it as a sample");
-		await page.locator("text=dropper.html").first().dblclick();
+		await page.locator('[data-body] [data-item^="file:"]', { hasText: "dropper.html" }).first().dblclick();
 		await page.locator('[data-test="viewer-refused"]').waitFor({ timeout: 30_000 });
 		assert.equal(await page.locator("text=pwned").count(), 0, "nothing of the sample is rendered");
 		await page.keyboard.press("Escape");

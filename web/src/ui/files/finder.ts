@@ -13,7 +13,7 @@
  * | Quick Look (Space) | a modal preview — decrypted here, sealed everywhere else |
  * | Get Info (⌘I) | model.info — sizes, times, version |
  * | Enter = rename, ⌘O / ⌘↓ = open | Finder's convention, not Windows' |
- * | ⌘C/⌘X/⌘V, ⌘A, ⌘Delete → Trash | model clipboard + trash |
+ * | ⌘C/⌘X/⌘V, ⌘A, ⌘Delete → Trash; ⌥⌘Delete, and ⌘Delete in the Trash → Delete Forever (39v: a lead's, or the owner's) | model clipboard + trash / purge |
  * | Path bar at the bottom | breadcrumbs |
  * | Drag to move, drop on sidebar folder | model.moveItems; desktop drop → upload |
  * | Context menus (39m) | an item: Open / Get Info / Rename / Duplicate / Move to › / Move to Trash / Copy / Paste Item; empty space: New Folder / Upload / Paste Item / Select All / View as › / Sort By ›; sidebar rows; search and recent results; the menu key and Shift+F10 |
@@ -27,7 +27,7 @@ import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, Selection, SortState } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
+import { fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, deleteForever, emptyTrash, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
 import { fromRelativePaths } from "./dropped.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
@@ -182,6 +182,26 @@ export class GoraniFinder extends LitElement {
 		await this.model.trashItems(sel);
 	}
 
+	/** Delete Forever (39v) — asked first; offered only to whom the server
+	 * allows it (model.ts › canPurge), and the keys say why to the rest. */
+	private async purgeSelection(): Promise<void> {
+		const sel = this.selection();
+		if (!sel.length) return;
+		if (!this.model.canPurge()) {
+			this.model.api.toast(this.model.areaKind() === "evidence" ? "An evidence case's files are never deleted" : "Only a lead deletes forever here — ⌘Delete moves it to the Trash");
+			return;
+		}
+		await deleteForever(this.model, sel);
+	}
+
+	private purgeItem(target: { kind: "file" | "folder"; id: string }[]): MenuItem[] {
+		return this.model.canPurge() ? [{ label: "Delete Forever…", run: () => this.attempt(deleteForever(this.model, target)) }] : [];
+	}
+
+	private emptyTrashItem(): MenuItem[] {
+		return this.model.canPurge() ? [{ label: "Empty Trash…", run: () => this.attempt(emptyTrash(this.model)) }] : [];
+	}
+
 	/** A menu's action: a failure becomes a toast in the server's words
 	 * instead of an unhandled rejection (as in the Windows skin). */
 	private attempt(p: Promise<unknown>): void {
@@ -227,6 +247,7 @@ export class GoraniFinder extends LitElement {
 			showMenu(
 				[
 					{ label: "Put Back", run: () => this.attempt(this.model.restore(sel.filter((x) => x.kind === "file").map((x) => x.id), sel.filter((x) => x.kind === "folder").map((x) => x.id))) },
+					...this.purgeItem(sel),
 					{ separator: true, label: "" },
 					{ label: "Select All", run: () => this.model.selectAll() },
 				],
@@ -244,6 +265,7 @@ export class GoraniFinder extends LitElement {
 			{ label: "Duplicate", run: () => { this.model.copy(); this.attempt(this.model.paste()); }, disabled: !sel.some((x) => x.kind === "file") },
 			{ label: "Move to", submenu: moveTargets(s.tree, sel, s.folderId, this.memberName || "Home", (to) => this.attempt(this.model.moveItems(sel, to))) },
 			{ label: "Move to Trash", run: () => this.attempt(this.deleteSelection()) },
+			...this.purgeItem(sel),
 			{ separator: true, label: "" },
 			{ label: "Copy", run: () => this.model.copy() },
 			{ label: "Cut", run: () => this.model.cut() },
@@ -297,6 +319,7 @@ export class GoraniFinder extends LitElement {
 			showMenu(
 				[
 					{ label: "Put Back All", run: () => this.attempt(this.model.restore(s.trashFiles.map((f) => f.id), s.trashFolders.map((f) => f.id))), disabled: !any },
+					...this.emptyTrashItem().map((m) => ({ ...m, disabled: !any })),
 					{ label: "Select All", run: () => this.model.selectAll(), disabled: !any },
 				],
 				x,
@@ -355,6 +378,7 @@ export class GoraniFinder extends LitElement {
 							{ separator: true, label: "" },
 							{ label: "Move to", submenu: moveTargets(s.tree, target, s.tree.find((f) => f.id === id)?.parent ?? null, this.memberName || "Home", (to) => this.attempt(this.model.moveItems(target, to))) },
 							{ label: "Move to Trash", run: () => this.attempt(this.model.trashItems(target)) },
+							...this.purgeItem(target),
 						] as MenuItem[])
 					: []),
 			],
@@ -379,6 +403,7 @@ export class GoraniFinder extends LitElement {
 							})(),
 						),
 				},
+				...this.emptyTrashItem(),
 			],
 			e.clientX,
 			e.clientY,
@@ -506,7 +531,9 @@ export class GoraniFinder extends LitElement {
 				e.preventDefault();
 				return;
 			case "Backspace":
-				if (cmd) void this.deleteSelection();
+				// ⌥⌘Delete, and ⌘Delete in the Trash: for good (asked first).
+				if (cmd && (e.altKey || this.s().trashMode)) this.attempt(this.purgeSelection());
+				else if (cmd) this.attempt(this.deleteSelection());
 				else void this.go(this.s().tree.find((f) => f.id === this.s().folderId)?.parent ?? null);
 				e.preventDefault();
 				return;
@@ -693,7 +720,7 @@ export class GoraniFinder extends LitElement {
 					input.value = "";
 					if (files.length) this.attempt(Promise.resolve().then(() => this.model.uploadTree(fromRelativePaths(files), this.s().folderId)));
 				}} />
-				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800 disabled:opacity-40" ?disabled=${!this.selection().length} @click=${() => void this.deleteSelection()}>🗑</button>
+				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800 disabled:opacity-40" ?disabled=${!this.selection().length} @click=${() => this.attempt(this.s().trashMode ? this.purgeSelection() : this.deleteSelection())}>🗑</button>
 				<button class="rounded-md px-2.5 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800" title="Upload links for people outside the team, and what they sent" data-test="files-requests" @click=${() => this.openRequests("inbox")}>📥 Inbox</button>
 				<div class="flex-1"></div>
 				<div class="relative">

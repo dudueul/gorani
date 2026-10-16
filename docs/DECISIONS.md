@@ -74,6 +74,17 @@ Lock enabled. Crypto-shredding remains available for working areas only.
 versions kept 1 year. Audit: 7 years, no line cap** — the audit moves out
 of the member database (the 500-line family cap goes).
 
+**Delete forever (39v): a lead's act, or the owner's.** Deleted files wait
+30 days in the Trash, where a lead can restore them. Delete forever (and
+Empty Trash) skips that wait, so it is offered only to a lead, anywhere,
+and to a member in their own area. An analyst with a write grant on a
+case still moves things to the Trash. It takes every version's bytes from
+the bucket and revokes the file's share links. Evidence and a legal hold
+refuse it, as they refuse the Trash.
+*Rejected:* anyone who can trash (one mistake, or one insider, and the
+Trash's safety net is gone); leaving share links live until they expire
+(a deleted file would still be downloadable). **Design: docs/TRASH.md.**
+
 ## D8 — Malware samples
 
 **Marked as samples, never rendered.** The viewer refuses to preview a

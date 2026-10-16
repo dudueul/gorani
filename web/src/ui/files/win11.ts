@@ -15,7 +15,7 @@
  * | Four views | Details / List / Small icons / Large icons |
  * | Marquee rubber-band selection | pointer tracking on the body |
  * | Ctrl/Shift selection, Ctrl+A | same keys, same semantics |
- * | F2 rename, Enter open, Delete → Trash | model.rename / setFolder / trash |
+ * | F2 rename, Enter open, Delete → Trash; Shift+Delete, and Delete in the Trash → Delete forever (39v: a lead's, or the owner's) | model.rename / setFolder / trash / purge |
  * | Backspace = up one folder | model.setFolder(parent) |
  * | Status bar | counts + selection size |
  * | Context menus (39m) | an item: Open / Download / Cut / Copy / Paste into / Move to › / Rename / Delete; empty space: View › / Sort by › / Refresh / Paste / New / Upload / Select all; the tree, Home and Trash rows; search and recent results; the menu key and Shift+F10 |
@@ -27,7 +27,7 @@ import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, FolderRow, Selection, SortState } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
+import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, deleteForever, emptyTrash, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
 import { fromRelativePaths } from "./dropped.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
@@ -189,6 +189,27 @@ export class GoraniWin11 extends LitElement {
 		await this.model.trashItems(sel);
 	}
 
+	/** Delete forever (39v) — asked first; offered only to whom the server
+	 * allows it (model.ts › canPurge), and the keys say why to the rest. */
+	private async purgeSelection(): Promise<void> {
+		const sel = this.selection();
+		if (!sel.length) return;
+		if (!this.model.canPurge()) {
+			this.model.api.toast(this.model.areaKind() === "evidence" ? "An evidence case's files are never deleted" : "Only a lead deletes forever here — Delete moves it to the Trash");
+			return;
+		}
+		await deleteForever(this.model, sel);
+	}
+
+	/** "Delete forever…" — in a menu where the person may, else nothing. */
+	private purgeItem(target: { kind: "file" | "folder"; id: string }[], label = "Delete forever…"): MenuItem[] {
+		return this.model.canPurge() ? [{ label, run: () => this.attempt(deleteForever(this.model, target)) }] : [];
+	}
+
+	private emptyTrashItem(): MenuItem[] {
+		return this.model.canPurge() ? [{ label: "Empty Trash…", run: () => this.attempt(emptyTrash(this.model)) }] : [];
+	}
+
 	/** A menu's action: its failure becomes a toast, in the server's words
 	 * (an evidence case refusing a deletion, say), instead of vanishing as
 	 * an unhandled rejection. */
@@ -251,6 +272,7 @@ export class GoraniWin11 extends LitElement {
 			showMenu(
 				[
 					{ label: "Restore", run: () => this.attempt(this.model.restore(sel.filter((x) => x.kind === "file").map((x) => x.id), sel.filter((x) => x.kind === "folder").map((x) => x.id))) },
+					...this.purgeItem(sel),
 					{ separator: true, label: "" },
 					{ label: "Select all", run: () => this.model.selectAll() },
 				],
@@ -278,6 +300,7 @@ export class GoraniWin11 extends LitElement {
 			{ label: "Rename", run: () => void this.renameSelection(), disabled: many },
 			{ label: "Move to", submenu: moveTargets(s.tree, sel, s.folderId, this.memberName, (to) => this.attempt(this.model.moveItems(sel, to))) },
 			{ label: "Delete", run: () => this.attempt(this.deleteSelection()) },
+			...this.purgeItem(sel),
 			{ separator: true, label: "" },
 			{ label: "Properties", run: () => void this.previewId(id), disabled: many || kind === "folder" },
 		];
@@ -302,6 +325,7 @@ export class GoraniWin11 extends LitElement {
 			showMenu(
 				[
 					{ label: "Restore all", run: () => this.attempt(this.model.restore(s.trashFiles.map((f) => f.id), s.trashFolders.map((f) => f.id))), disabled: !any },
+					...this.emptyTrashItem().map((m) => ({ ...m, disabled: !any })),
 					{ label: "Select all", run: () => this.model.selectAll(), disabled: !any },
 					{ separator: true, label: "" },
 					{ label: "Refresh", run: () => this.attempt(this.model.refresh()) },
@@ -366,6 +390,7 @@ export class GoraniWin11 extends LitElement {
 				{ label: "Rename", run: () => this.attempt(this.renameFolderInPlace(f.id)) },
 				{ label: "Move to", submenu: moveTargets(tree, target, f.parent ?? null, this.memberName, (to) => this.attempt(this.model.moveItems(target, to))) },
 				{ label: "Delete", run: () => this.attempt(this.model.trashItems(target)) },
+				...this.purgeItem(target),
 			],
 			e.clientX,
 			e.clientY,
@@ -388,8 +413,9 @@ export class GoraniWin11 extends LitElement {
 		);
 	}
 
-	/** The Trash. (Nothing deletes for good from here: the Trash empties
-	 * itself after 30 days — housekeeping — and an evidence case never does.) */
+	/** The Trash. It empties itself after 30 days (housekeeping); Empty
+	 * Trash does it now, for whom may delete forever (39v). An evidence
+	 * case's Trash stays empty: nothing there is ever deleted. */
 	private trashNavMenu(e: MouseEvent): void {
 		e.preventDefault();
 		showMenu(
@@ -406,6 +432,7 @@ export class GoraniWin11 extends LitElement {
 							})(),
 						),
 				},
+				...this.emptyTrashItem(),
 			],
 			e.clientX,
 			e.clientY,
@@ -524,7 +551,10 @@ export class GoraniWin11 extends LitElement {
 				e.preventDefault();
 				return;
 			case "Delete":
-				void this.deleteSelection();
+				// Shift+Delete, and Delete in the Trash: for good, as Explorer
+				// does (asked first). Plain Delete: to the Trash.
+				if (e.shiftKey || s.trashMode) this.attempt(this.purgeSelection());
+				else this.attempt(this.deleteSelection());
 				e.preventDefault();
 				return;
 			case "Backspace":
@@ -730,7 +760,7 @@ export class GoraniWin11 extends LitElement {
 						<span class="text-accent">＋</span> New <span class="text-neutral-500">▾</span>
 					</button>
 				</div>
-				<button class="rounded-md px-2.5 py-1.5 hover:bg-neutral-800 disabled:opacity-40" ?disabled=${!sel.length} @click=${() => void this.deleteSelection()}>🗑 Delete</button>
+				<button class="rounded-md px-2.5 py-1.5 hover:bg-neutral-800 disabled:opacity-40" ?disabled=${!sel.length} @click=${() => this.attempt(this.s().trashMode ? this.purgeSelection() : this.deleteSelection())}>🗑 Delete</button>
 				<button class="rounded-md px-2.5 py-1.5 hover:bg-neutral-800 disabled:opacity-40" ?disabled=${!one} @click=${() => void this.renameSelection()}>✏️ Rename</button>
 				<button class="rounded-md px-2.5 py-1.5 hover:bg-neutral-800" title="Upload links for people outside the team, and what they sent" data-test="files-requests" @click=${() => this.openRequests("inbox")}>📥 Inbox</button>
 				<div class="mx-1 h-5 border-l border-neutral-800"></div>

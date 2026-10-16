@@ -31,6 +31,8 @@ export interface FilesHooks {
 	intake?(files: File[]): Promise<IntakeFields | null>;
 	/** The signed-in member's own id — in a case, not the area's (39o: where they left off in a video is theirs). */
 	selfId?(): string;
+	/** The signed-in member's team role (39v: who is offered Delete forever). */
+	teamRole?(): string;
 }
 
 /**
@@ -145,6 +147,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 		areaKind: () => hooks.areaKind?.() ?? null,
 		intake: (files) => hooks.intake?.(files) ?? Promise.resolve(null),
 		selfId: () => hooks.selfId?.() ?? "",
+		teamRole: () => hooks.teamRole?.() ?? "",
 	};
 }
 

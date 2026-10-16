@@ -67,7 +67,8 @@ What it does:
 - The view (`duplicates-dialog.ts`) groups the copies. In each set, every
   copy except the oldest starts ticked, and the ticked copies go to the
   Trash.
-- Nothing is deleted outright: the Trash keeps a file for 30 days. An
+- Nothing is deleted outright: the Trash keeps a file for 30 days (a lead,
+  or the owner, may delete it for good from there — docs/TRASH.md). An
   evidence case refuses the move, and says so.
 - "Show" goes to a copy's folder and selects it.
 

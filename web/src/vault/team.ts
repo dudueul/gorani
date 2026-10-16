@@ -25,7 +25,7 @@ import { sealRecoveryCopy, type RecoveryRecord } from "./recovery.ts";
 import { openSealedText } from "./vault-crypto.ts";
 
 /** The JSON API: GET / PUT / POST / DELETE with a body, throwing on refusals. */
-export type TeamCall = <T>(method: "GET" | "PUT" | "POST" | "DELETE", path: string, body?: unknown) => Promise<T>;
+export type TeamCall = <T>(method: "GET" | "PUT" | "PATCH" | "POST" | "DELETE", path: string, body?: unknown) => Promise<T>;
 
 export interface TeamContext {
 	memberId: string;

@@ -250,6 +250,103 @@ pub(crate) fn normalize_role(role: &str) -> Option<&'static str> {
 	}
 }
 
+// ── What a lead types about a member (commit 39l) ───────────────────────
+//
+// Until Team › People could add and change members, these fields came only
+// from scripts and tests, and the registry stored them as sent. A screen
+// is a different source: anyone with a lead's sign-in can type anything
+// into it. So the registry now checks each field the way it is USED:
+//
+// - a name is read by people, in every list and audit line;
+// - an email is what Cloudflare Access vouches for at sign-in, matched
+//   without regard to case (actor_of) — it decides who IS this member;
+// - an expiry is compared as TEXT with SQLite's
+//   strftime('%Y-%m-%dT%H:%M:%fZ','now'), so only that exact shape
+//   compares right. Before 39l "never" sorted after every date and an
+//   external given it never expired; "2026-12-31" (no time) expired at the
+//   first instant of the day it named.
+
+/// A display name: trimmed, 1–80 characters, no control characters (a
+/// newline in a name forges a line in anything that prints it plainly).
+pub(crate) fn clean_name(name: &str) -> std::result::Result<String, &'static str> {
+	let n = name.trim();
+	if n.is_empty() || n.chars().count() > 80 {
+		return Err("a name is 1–80 characters");
+	}
+	if n.chars().any(char::is_control) {
+		return Err("a name has no control characters");
+	}
+	Ok(n.to_string())
+}
+
+/// Sign-in addresses: lower-cased, trimmed, each once, 1–10 of them, each
+/// `local@domain.tld` in plain ASCII with nothing a list or a header could
+/// split on. (At least one: an account no address signs in as is one
+/// nobody can use — and nobody can be told why.)
+pub(crate) fn clean_emails(emails: &[String]) -> std::result::Result<Vec<String>, String> {
+	let mut out: Vec<String> = Vec::new();
+	for raw in emails {
+		let e = raw.trim().to_ascii_lowercase();
+		let shaped = e.len() <= 254
+			&& e.chars().all(|c| c.is_ascii_graphic() && !matches!(c, ',' | ';' | '<' | '>' | '"' | '(' | ')' | '[' | ']' | '\\'))
+			&& match e.split_once('@') {
+				Some((local, domain)) => !local.is_empty() && !domain.contains('@') && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') && !domain.contains(".."),
+				None => false,
+			};
+		if !shaped {
+			return Err(format!("not a sign-in address: {}", raw.trim()));
+		}
+		if !out.contains(&e) {
+			out.push(e);
+		}
+	}
+	match out.len() {
+		0 => Err("at least one sign-in address — the email Cloudflare Access verifies".into()),
+		n if n > 10 => Err("at most 10 sign-in addresses".into()),
+		_ => Ok(out),
+	}
+}
+
+/// An expiry in the one shape the registry compares, `YYYY-MM-DDThh:mm:ss.fffZ`
+/// (UTC). Accepts that, without the fraction or the seconds, or a bare date
+/// — which means the END of that day, UTC (an external "until the 31st"
+/// still works on the 31st). Anything else is refused.
+/// The refusal for an expiry in any other shape.
+const EXPIRY_SHAPE: &str = "expiresAt is a day (YYYY-MM-DD, through its end, UTC) or a UTC time (YYYY-MM-DDThh:mm[:ss[.fff]]Z)";
+
+pub(crate) fn clean_expiry(raw: &str) -> Option<String> {
+	let s = raw.trim();
+	let b = s.as_bytes();
+	let digits = |from: usize, to: usize| (from..to).all(|i| b.get(i).is_some_and(u8::is_ascii_digit));
+	if b.len() < 10 || !digits(0, 4) || b[4] != b'-' || !digits(5, 7) || b[7] != b'-' || !digits(8, 10) {
+		return None;
+	}
+	let (month, day): (u32, u32) = (s[5..7].parse().ok()?, s[8..10].parse().ok()?);
+	if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+		return None;
+	}
+	let date = &s[..10];
+	if b.len() == 10 {
+		return Some(format!("{date}T23:59:59.999Z"));
+	}
+	let time = s[10..].strip_prefix('T')?.strip_suffix('Z')?;
+	let (hms, frac) = match time.split_once('.') {
+		Some((hms, frac)) if (1..=3).contains(&frac.len()) && frac.bytes().all(|c| c.is_ascii_digit()) => (hms, frac),
+		Some(_) => return None,
+		None => (time, ""),
+	};
+	let parts: Vec<&str> = hms.split(':').collect();
+	if !(parts.len() == 3 || (parts.len() == 2 && frac.is_empty())) || parts.iter().any(|p| p.len() != 2 || !p.bytes().all(|c| c.is_ascii_digit())) {
+		return None;
+	}
+	let (h, m): (u32, u32) = (parts[0].parse().ok()?, parts[1].parse().ok()?);
+	let sec: u32 = parts.get(2).map_or(Some(0), |p| p.parse().ok())?;
+	if h > 23 || m > 59 || sec > 59 {
+		return None;
+	}
+	Some(format!("{date}T{h:02}:{m:02}:{sec:02}.{frac:0<3}Z"))
+}
+
 #[derive(Debug, Deserialize)]
 struct MemberRow {
 	id: String,
@@ -641,6 +738,19 @@ impl GoraniFamilyDO {
 	/// would make "who is this caller?" depend on row order — a parent's
 	/// identity resolving to a child's row, or worse, the reverse. `except`
 	/// is the member being edited (its own emails don't conflict with it).
+	/// email_taken, in words: an address held by a deactivated member stays
+	/// theirs — the audit names people by address, and a line by
+	/// "bo@team.test" must keep meaning the Bo who wrote it.
+	fn email_refusal(&self, emails: &[String], except: Option<&str>) -> Result<Option<String>> {
+		let Some(e) = self.email_taken(emails, except)? else { return Ok(None) };
+		let holder: Vec<IdActiveRow> = self.sql.exec("SELECT id, active, emails FROM members", None)?.to_array()?;
+		let inactive = holder.iter().find(|r| serde_json::from_str::<Vec<String>>(&r.emails).unwrap_or_default().iter().any(|x| x.eq_ignore_ascii_case(&e)));
+		Ok(Some(match inactive {
+			Some(r) if r.active == 0 => format!("{e} belonged to {}, who was deactivated — an address is never given to another account (the audit names people by it)", r.id),
+			_ => format!("{e} already belongs to another member"),
+		}))
+	}
+
 	fn email_taken(&self, emails: &[String], except: Option<&str>) -> Result<Option<String>> {
 		let rows: Vec<EmailRoleRow> = self.sql.exec("SELECT id, role, emails FROM members", None)?.to_array()?;
 		for r in rows.iter().filter(|r| Some(r.id.as_str()) != except) {
@@ -686,6 +796,12 @@ impl GoraniFamilyDO {
 		let Some(role) = normalize_role(&body.role) else {
 			return json_error(400, "role must be lead, analyst, auditor or external");
 		};
+		// One shape for every expiry (clean_expiry: the registry compares it
+		// as text), refused here rather than stored to compare wrong.
+		if let Some(raw) = body.expires_at.take() {
+			let Some(exp) = clean_expiry(&raw) else { return json_error(400, EXPIRY_SHAPE) };
+			body.expires_at = Some(exp);
+		}
 		// Externals need an expiry (docs/CASES.md: their access ends on its
 		// own); nobody else may have one.
 		match (role, body.expires_at.as_deref()) {
@@ -715,8 +831,25 @@ impl GoraniFamilyDO {
 				body.emails = vec![actor.to_string()];
 			}
 		}
-		if let Some(e) = self.email_taken(&body.emails, None)? {
-			return json_error(409, &format!("{e} already belongs to another member"));
+		// A taken id first: it is the more specific refusal (the INSERT's
+		// UNIQUE would say so too, but only after the fields were judged).
+		let exists = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE id = ?1", Some(vec![body.id.clone().into()]))?.one::<Count>()?.n > 0;
+		if exists {
+			return json_error(409, "member id already exists");
+		}
+		// The fields as people type them (commit 39l: Team › People adds
+		// members now) — after the authority checks above, so a refusal
+		// never tells someone who may not add members how to word one.
+		body.name = match clean_name(&body.name) {
+			Ok(n) => n,
+			Err(why) => return json_error(400, why),
+		};
+		body.emails = match clean_emails(&body.emails) {
+			Ok(e) => e,
+			Err(why) => return json_error(400, &why),
+		};
+		if let Some(refusal) = self.email_refusal(&body.emails, None)? {
+			return json_error(409, &refusal);
 		}
 		let emails = serde_json::to_string(&body.emails).unwrap_or_else(|_| "[]".into());
 		if let Err(e) = self.sql.exec(
@@ -729,47 +862,107 @@ impl GoraniFamilyDO {
 		self.state().await
 	}
 
+	/// Change a member: name, sign-in addresses, role, an external's last
+	/// day. Every field is checked before anything is written (until 39l a
+	/// role change was saved and THEN an address conflict refused — half a
+	/// change, reported as none).
 	async fn patch_member(&self, actor: &str, id: &str, body: PatchMember) -> Result<Response> {
 		if !self.is_lead(actor).await? {
 			return json_error(403, "only a lead may change members");
 		}
-		let Some(current) = self.sql.exec("SELECT role FROM members WHERE id = ?1", Some(vec![id.into()]))?.to_array::<RoleRow>()?.into_iter().next() else {
+		let Some(current) = self.sql.exec("SELECT role, active FROM members WHERE id = ?1", Some(vec![id.into()]))?.to_array::<RoleActiveRow>()?.into_iter().next() else {
 			return json_error(404, "no such member");
 		};
+		// Deactivation is final (see deactivate): a deactivated account is
+		// part of the record, not something to edit back into use.
+		if current.active == 0 {
+			return json_error(409, "a deactivated member is not changed — deactivation is final");
+		}
 		// A role change (commit 26): promotion, demotion, an analyst made
 		// auditor. The last active lead cannot be demoted — the team would
 		// have nobody left to manage it.
-		if let Some(r) = &body.role {
-			let Some(role) = normalize_role(r) else { return json_error(400, "role must be lead, analyst, auditor or external") };
-			if current.role == "lead" && role != "lead" && self.active_leads()? <= 1 {
-				return json_error(409, "cannot demote the last lead");
+		let role = match &body.role {
+			Some(r) => match normalize_role(r) {
+				Some(role) => Some(role),
+				None => return json_error(400, "role must be lead, analyst, auditor or external"),
+			},
+			None => None,
+		};
+		let becomes = role.unwrap_or(current.role.as_str());
+		let expires_at = match &body.expires_at {
+			Some(raw) => match clean_expiry(raw) {
+				Some(exp) => Some(exp),
+				None => return json_error(400, EXPIRY_SHAPE),
+			},
+			None => None,
+		};
+		if role == Some("external") && expires_at.is_none() {
+			return json_error(400, "an external member needs expiresAt");
+		}
+		if expires_at.is_some() && becomes != "external" {
+			return json_error(400, "only external members expire");
+		}
+		if current.role == "lead" && becomes != "lead" && self.active_leads()? <= 1 {
+			return json_error(409, "cannot demote the last lead");
+		}
+		let name = match &body.name {
+			Some(n) => match clean_name(n) {
+				Ok(n) => Some(n),
+				Err(why) => return json_error(400, why),
+			},
+			None => None,
+		};
+		let emails = match &body.emails {
+			Some(list) => match clean_emails(list) {
+				Ok(e) => Some(e),
+				Err(why) => return json_error(400, &why),
+			},
+			None => None,
+		};
+		if let Some(emails) = &emails {
+			if let Some(refusal) = self.email_refusal(emails, Some(id))? {
+				return json_error(409, &refusal);
 			}
-			if role == "external" && body.expires_at.is_none() {
-				return json_error(400, "an external member needs expiresAt");
+			// A lead editing their OWN addresses keeps the one they are
+			// signed in with: the next request would otherwise find nobody,
+			// and nothing in the app could undo it for them.
+			if self.actor_row(actor)?.is_some_and(|me| me.id == id) && !emails.iter().any(|e| e.eq_ignore_ascii_case(actor)) {
+				return json_error(409, "keep the address you are signed in with — removing it would sign you out of your own account for good");
 			}
+		}
+		// All checked: now the writes.
+		let mut changed: Vec<&str> = Vec::new();
+		if let Some(role) = role.filter(|r| *r != current.role) {
 			self.sql.exec("UPDATE members SET role = ?1 WHERE id = ?2", Some(vec![role.into(), id.into()]))?;
-			if role != "external" {
-				self.sql.exec("UPDATE members SET expires_at = NULL WHERE id = ?1", Some(vec![id.into()]))?;
-			}
+			changed.push("role");
 		}
-		if let Some(exp) = &body.expires_at {
-			self.sql.exec("UPDATE members SET expires_at = ?1 WHERE id = ?2 AND role = 'external'", Some(vec![exp.clone().into(), id.into()]))?;
+		if becomes != "external" {
+			self.sql.exec("UPDATE members SET expires_at = NULL WHERE id = ?1", Some(vec![id.into()]))?;
 		}
-		if let Some(emails) = &body.emails {
-			if let Some(e) = self.email_taken(emails, Some(id))? {
-				return json_error(409, &format!("{e} already belongs to another member"));
-			}
+		if let Some(exp) = &expires_at {
+			self.sql.exec("UPDATE members SET expires_at = ?1 WHERE id = ?2", Some(vec![exp.clone().into(), id.into()]))?;
+			changed.push("expiresAt");
 		}
-		if let Some(name) = &body.name {
+		if let Some(name) = &name {
 			self.sql.exec("UPDATE members SET name = ?1 WHERE id = ?2", Some(vec![name.clone().into(), id.into()]))?;
+			changed.push("name");
 		}
-		if let Some(emails) = &body.emails {
+		if let Some(emails) = &emails {
 			self.sql.exec("UPDATE members SET emails = ?1 WHERE id = ?2", Some(vec![serde_json::to_string(emails).unwrap_or_else(|_| "[]".into()).into(), id.into()]))?;
+			changed.push("emails");
 		}
-		self.audit(actor, "member.update", id, Some(&serde_json::json!({ "role": body.role, "expiresAt": body.expires_at }))).await?;
+		// The addresses go into the line too: who can sign in AS this
+		// member is exactly what an auditor reading member.update wants.
+		self.audit(actor, "member.update", id, Some(&serde_json::json!({ "changed": changed, "role": role, "expiresAt": expires_at, "name": name, "emails": emails }))).await?;
 		self.state().await
 	}
 
+	/// Deactivate a member: they can no longer sign in. Final, on purpose —
+	/// there is no reactivation: their ended grants were counted as revoked
+	/// (each case they held says "rotation required"), and an account
+	/// switched back on would make those grants live again behind the
+	/// managers' backs. Someone who returns is added again, under a new id
+	/// and a new address (email_refusal says why the old one stays theirs).
 	async fn deactivate(&self, actor: &str, id: &str) -> Result<Response> {
 		if !self.is_lead(actor).await? {
 			return json_error(403, "only a lead may deactivate members");
@@ -1348,6 +1541,17 @@ struct RoleRow {
 	role: String,
 }
 #[derive(serde::Deserialize)]
+struct RoleActiveRow {
+	role: String,
+	active: i64,
+}
+#[derive(serde::Deserialize)]
+struct IdActiveRow {
+	id: String,
+	active: i64,
+	emails: String,
+}
+#[derive(serde::Deserialize)]
 struct EmailRow {
 	emails: String,
 }
@@ -1490,4 +1694,42 @@ pub fn json_error(status: u16, message: &str) -> Result<Response> {
 /// The same, as a bare Response (for `Result<_, Response>` refusals).
 fn json_error_raw(status: u16, message: &str) -> Response {
 	json_error(status, message).unwrap_or_else(|_| Response::error(message, status).expect("a plain error response"))
+}
+#[cfg(test)]
+mod member_input_tests {
+	use super::{clean_emails, clean_expiry, clean_name};
+
+	#[test]
+	fn names() {
+		assert_eq!(clean_name("  Bo  ").unwrap(), "Bo");
+		assert!(clean_name("   ").is_err(), "empty after trimming");
+		assert!(clean_name(&"x".repeat(81)).is_err());
+		assert!(clean_name("Bo\nlead: ana").is_err(), "a newline would forge a line wherever a name is printed");
+		assert_eq!(clean_name("이수진").unwrap(), "이수진", "any script — counted in characters, not bytes");
+	}
+
+	#[test]
+	fn emails() {
+		let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+		assert_eq!(clean_emails(&v(&[" Bo@Team.Test ", "bo@team.test", "b.o+ir@team.test"])).unwrap(), v(&["bo@team.test", "b.o+ir@team.test"]), "lower-cased, trimmed, each once");
+		assert!(clean_emails(&[]).is_err(), "an account nobody can sign in as");
+		for bad in ["bo", "@team.test", "bo@", "bo@team", "bo@@team.test", "bo@team..test", "bo@.team.test", "bo @team.test", "bo,ana@team.test", "<bo@team.test>", "bö@team.test"] {
+			assert!(clean_emails(&v(&[bad])).is_err(), "{bad} is refused");
+		}
+		assert!(clean_emails(&(0..11).map(|i| format!("m{i}@team.test")).collect::<Vec<_>>()).is_err());
+	}
+
+	#[test]
+	fn expiries() {
+		assert_eq!(clean_expiry("2026-12-31").as_deref(), Some("2026-12-31T23:59:59.999Z"), "a day is the end of that day, UTC");
+		assert_eq!(clean_expiry("2026-12-31T08:30Z").as_deref(), Some("2026-12-31T08:30:00.000Z"));
+		assert_eq!(clean_expiry("2026-12-31T08:30:15Z").as_deref(), Some("2026-12-31T08:30:15.000Z"));
+		assert_eq!(clean_expiry("2026-12-31T08:30:15.5Z").as_deref(), Some("2026-12-31T08:30:15.500Z"));
+		assert_eq!(clean_expiry("2026-12-31T08:30:15.123Z").as_deref(), Some("2026-12-31T08:30:15.123Z"), "a browser's toISOString, unchanged");
+		for bad in ["never", "9999", "", "2026-13-01", "2026-12-32", "2026-12-31T24:00Z", "2026-12-31T08:30:15+02:00", "2026-12-31 08:30:15Z", "2026-12-31T08:30.5Z", "2026-12-31T08:30:15.Z", "2026-12-31T08:30:15.1234Z", "26-12-31"] {
+			assert_eq!(clean_expiry(bad), None, "{bad:?} is refused");
+		}
+		// The normalised shape compares as time does, which is the point.
+		assert!(clean_expiry("2026-12-31").unwrap() > "2026-12-31T12:00:00.000Z".to_string());
+	}
 }

@@ -250,8 +250,10 @@ memory.
    not configured (POLICY_AUD/TEAM_DOMAIN missing)*, which the app shows. A
    `secret put` takes effect without a redeploy.
 3. People: an Allow policy for the family (One-time PIN / GitHub / your
-   IdP). Each member's Access email is registered on their member row
-   (`POST /api/v1/family/members` with `emails`).
+   IdP). Each member's Access email is registered on their member row —
+   by a lead in Team › People › Members (commit 39l), or
+   `POST /api/v1/family/members` with `emails`. Both are needed: Access
+   lets the address through, the registry says whose account it is.
 4. **Bypass for the public share surface**: the share pages and the
    upload-link pages (`/s/r/*`, commit 38) authenticate with the link's
    fragment secret, not Access — a sender has no account. So everything such
@@ -409,8 +411,9 @@ piped the token straight into wrangler — so nobody ever saw it — and asked
 for a hand-made API call the browser could not make.)
 
 Then, in the app: your own vault (the setup screen — a password, and the
-recovery code it shows once), the other members (Team › People; each sets
-up their own vault at first sign-in), and — once there are two or more
+recovery code it shows once), the other members (Team › People › Members:
+id, name, role and the address Access verifies; each sets up their own
+vault at first sign-in, then reads you their fingerprint to certify), and — once there are two or more
 leads — the **team recovery key** (Team › Recovery: k of n leads must
 approve any recovery, docs/CASES.md). Until it exists, a member who loses
 every unlock method loses their area.

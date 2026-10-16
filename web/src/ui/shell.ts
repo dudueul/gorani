@@ -37,8 +37,8 @@ import { openTeam, refreshRecoveryCopy, type TeamCall, type TeamContext } from "
 import { openCaseKey, type CaseRow } from "../vault/cases.ts";
 
 /** The browser's TeamCall: the same-origin JSON API (lib/api.ts). */
-const teamCall: TeamCall = <T>(method: "GET" | "PUT" | "POST" | "DELETE", path: string, body?: unknown) =>
-	(method === "GET" ? api.get<T>(path) : method === "PUT" ? api.put<T>(path, body) : method === "POST" ? api.post<T>(path, body) : api.del<T>(path)) as Promise<T>;
+const teamCall: TeamCall = <T>(method: "GET" | "PUT" | "PATCH" | "POST" | "DELETE", path: string, body?: unknown) =>
+	(method === "GET" ? api.get<T>(path) : method === "PUT" ? api.put<T>(path, body) : method === "PATCH" ? api.patch<T>(path, body) : method === "POST" ? api.post<T>(path, body) : api.del<T>(path)) as Promise<T>;
 
 @customElement("gorani-shell")
 export class GoraniShell extends LitElement {

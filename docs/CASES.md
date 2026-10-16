@@ -41,6 +41,42 @@ Rules worth stating because they are easy to get wrong:
   grants carry an expiry the server enforces, and the case key rotates when
   they leave (the rotation walk of O5, per case).
 
+### Managing members (Team › People › Members, commit 39l)
+
+A lead adds a member (an id, a name, a role, the sign-in addresses
+Cloudflare Access verifies, and for an external the last day), changes one,
+or deactivates one — from the web app; the same calls as
+`POST/PATCH /api/v1/family/members[/<id>]` and `…/<id>/deactivate`. The
+registry checks each field the way it is USED (family.rs › clean_name,
+clean_emails, clean_expiry):
+
+- **A sign-in address** decides who IS the member. It is stored lower-case
+  (Access's matching and actor_of ignore case), each once, plain ASCII
+  `local@domain.tld`, at least one per member. An address belongs to one
+  account for good — a deactivated member's included: the audit names
+  people by address, and a line by `bo@team.test` must keep meaning the
+  Bo who wrote it.
+- **An expiry** is compared as text against SQLite's clock, so it is stored
+  in exactly that shape (`YYYY-MM-DDThh:mm:ss.fffZ`); a bare day means the
+  end of that day, UTC. Anything else is refused (before 39l "never"
+  sorted after every date: an external given it never expired).
+- **A name** is 1–80 characters with no control characters.
+- **A change is all or nothing**: every field is checked before any is
+  written (before 39l a role change was saved, then an address conflict
+  refused the rest).
+- **A lead cannot sign themselves out**: editing your own addresses keeps
+  the one you are signed in with.
+- **Deactivation is final.** There is no reactivation: the member's ended
+  grants were counted as revoked (their cases say "rotation required"),
+  and switching the account back on would make those grants live again
+  behind the managers' backs. Someone who returns gets a new account.
+- `member.update` audit lines carry the fields changed, and the new
+  addresses — who can sign in AS a member is exactly what an auditor asks.
+
+Access itself must also let a new address in (its Allow policy, in the
+Cloudflare dashboard — docs/PRODUCTION.md › 2); the registry decides who the
+person is once they are through.
+
 ## Areas and their keys
 
 ```text
@@ -305,7 +341,7 @@ the person — they are the security checks, not errors to hide.
 |---|---|---|
 | **first unlock** | creates the member's identity (if missing) and registers it; seals or refreshes their own area's recovery copy (if the team has a recovery key and the copy is missing or stale) | the fingerprint to read to a lead |
 | **area switcher** (shell header) | "My files" and every case the member is granted; choosing a case opens the same explorer over `case:<id>` with the case key | "signed by X, whom you have not verified" — the copy is refused until they pin X or a lead they pinned certified X |
-| **Team › People** | each member's fingerprint; "I compared it — trust" (pin); leads: "Certify" | the fingerprint, eight groups, side by side with "read it to them" |
+| **Team › People** | each member's fingerprint; "I compared it — trust" (pin); leads: "Certify"; **Members** (39l): leads add, edit and deactivate accounts | the fingerprint, eight groups, side by side with "read it to them"; the registry's refusals (an address already held, the last lead, your own sign-in address) |
 | **Team › Cases** | open (leads), grant (managers: member, permission, expiry for externals), revoke, rotate (owed after a revoke or an ended grant; resumes an interrupted walk), close | "rotation required" until it is done |
 | **Team › Recovery** (leads; auditors read) | set up / rotate (M of every lead); coverage; ceremonies: open (target, reason), approve (after the signature check), complete (coordinator) | for a member target, the coordinator types the fingerprint the member reads aloud; a mismatch refuses |
 | **unlock screen › "Lost every method?"** | re-enrol: a new root, methods and identity, posted as a draft | the new root's fingerprint, to read to the coordinating lead |

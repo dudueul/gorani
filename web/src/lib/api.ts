@@ -51,6 +51,7 @@ async function call<T>(method: string, path: string, body?: unknown, extra: Reco
 export const api = {
 	get: <T>(path: string) => call<T>("GET", path),
 	put: <T>(path: string, body: unknown) => call<T>("PUT", path, body),
+	patch: <T>(path: string, body: unknown) => call<T>("PATCH", path, body),
 	/** `headers`: one request's own, e.g. the bootstrap token (app-root.ts). */
 	post: <T>(path: string, body?: unknown, headers?: Record<string, string>) => call<T>("POST", path, body, headers),
 	del: <T>(path: string) => call<T>("DELETE", path),

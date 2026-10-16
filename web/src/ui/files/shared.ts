@@ -127,9 +127,14 @@ export { carriesFiles };
 /** The upload under way, for a status bar: how far, which file, and Stop. */
 export function uploadStatus(upload: UploadProgress | null, stop: () => void): TemplateResult | typeof nothing {
 	if (!upload) return nothing;
+	const parts = upload.parts;
+	// The bar: the files sent, plus the share of this one's parts the server
+	// holds (39x) — so a single big file moves the bar as it goes.
+	const share = (upload.done + (parts && parts.total ? parts.done / parts.total : 0)) / Math.max(1, upload.total);
 	return html`<span class="flex min-w-0 items-center gap-2 text-neutral-300" data-test="upload-progress">
-		<span class="h-1.5 w-24 shrink-0 overflow-hidden rounded bg-neutral-800"><span class="block h-full bg-accent" ${cssom({ width: `${Math.round((100 * upload.done) / Math.max(1, upload.total))}%` })}></span></span>
+		<span class="h-1.5 w-24 shrink-0 overflow-hidden rounded bg-neutral-800"><span class="block h-full bg-accent" ${cssom({ width: `${Math.round(100 * share)}%` })}></span></span>
 		<span class="truncate">Uploading ${upload.done + 1} of ${upload.total} · ${upload.name}</span>
+		${parts ? html`<span class="shrink-0 tabular-nums text-neutral-400" data-test="upload-parts" title="Sent in parts, each sealed in this browser; a stopped upload resumes from the first missing one">${parts.done.toLocaleString()} of ${parts.total.toLocaleString()} parts</span>` : nothing}
 		<button class="shrink-0 rounded px-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 disabled:opacity-40" ?disabled=${upload.stopping} data-test="upload-stop" @click=${stop}>${upload.stopping ? "Stopping…" : "Stop"}</button>
 	</span>`;
 }

@@ -337,9 +337,18 @@ assert.equal((await model.verify(row.id)).status, "verified");
 {
 	const big = new Uint8Array(WHOLE_LIMIT + 1024 * 1024);
 	for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, Math.min(big.length, i + 65536)));
+	// The status bar's part count (39x), as the state carried it.
+	const seen: string[] = [];
+	const stopWatching = model.state.subscribe((st) => {
+		const p = st.upload?.parts;
+		if (p && seen.at(-1) !== `${p.done}/${p.total}`) seen.push(`${p.done}/${p.total}`);
+	});
 	await model.upload([new File([big as BlobPart], "memory.raw", { type: "application/octet-stream" })]);
+	stopWatching();
 	const call = multipartCalls.at(-1)!;
 	assert.deepEqual(call, { chunk: chunkFor(big.length), count: frameCount(big.length, chunkFor(big.length)) }, "the chunk chunkFor picks, one frame per part");
+	assert.deepEqual(seen, Array.from({ length: call.count + 1 }, (_, n) => `${n}/${call.count}`), "the status bar counted every part as the server confirmed it, from none to all");
+	assert.equal(model.state.get().upload, null, "and the bar is gone once the file is in");
 	const bigRow = model.state.get().files.find((f) => f.name === "memory.raw")!;
 	assert.equal(objects.get(versions.get(bigRow.id)!.object)!.length, sealedSize(big.length, call.chunk), "every frame, in order");
 	assert.equal((await model.verify(bigRow.id)).status, "verified", "the streamed SHA-256 is the one the frames open to");
@@ -361,8 +370,15 @@ assert.equal((await model.verify(row.id)).status, "verified");
 	assert.deepEqual(stopped.map((u) => [u.name, u.done]), [["disk.E01", 3]], "the journal says what stopped, its name opened from the sealed field");
 	assert.ok(!JSON.stringify(await journal.list("jinu")).includes("disk.E01"), "no plaintext name at rest");
 	partsSent.length = 0;
+	let firstCount: string | null = null;
+	const watchResume = model.state.subscribe((st) => {
+		const p = st.upload?.parts;
+		if (p && !firstCount) firstCount = `${p.done}/${p.total}`;
+	});
 	await model.upload([disk]);
+	watchResume();
 	assert.deepEqual(partsSent, [4, 5, 6, 7, 8], "only the missing parts are sent");
+	assert.equal(firstCount, "3/8", "the status bar starts from the parts the earlier try landed (39x)");
 	assert.match(toasts.find((t) => /Resuming/.test(t)) ?? "", /Resuming “disk\.E01” from part 4 of 8/);
 	const row = model.state.get().files.find((f) => f.name === "disk.E01")!;
 	assert.equal((await model.verify(row.id)).status, "verified", "the resumed file opens to the bytes its signature names");

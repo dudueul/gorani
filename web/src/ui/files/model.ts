@@ -112,6 +112,11 @@ export interface UploadProgress {
 	total: number;
 	name: string;
 	stopping: boolean;
+	/** The file being sent, when it goes in parts (D12): how many of its
+	 * parts the server holds — an earlier, resumed try's included — out of
+	 * how many (39x). Null for a file sent whole. Without it, one 100 GB
+	 * file sat at "Uploading 1 of 1" and 0% until its last part landed. */
+	parts: { done: number; total: number } | null;
 }
 
 /** One file of an upload batch and the folder it goes into. */
@@ -728,7 +733,7 @@ export class FilesModel {
 					this.bridge.toast(`Upload stopped — ${sent} of ${items.length} sent`);
 					break;
 				}
-				this.set({ upload: { done: i, total: items.length, name: file.name, stopping: false } });
+				this.set({ upload: { done: i, total: items.length, name: file.name, stopping: false, parts: null } });
 				if (file.size > MAX_FILE) {
 					this.bridge.toast(`“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GiB — a file is at most 255 GiB`);
 					continue;
@@ -913,18 +918,28 @@ export class FilesModel {
 			rec = { area: this.memberId, fileId, uploadId: start.uploadId, objectKey: start.key, chunk, size: file.size, fields, parts: [], startedAt: new Date().toISOString() };
 			await resume?.journal.put(resume.key, rec);
 		}
+		this.partsProgress(rec.parts.length, count);
 		const step = Math.max(1, Math.floor(count / 4));
 		for (let p = rec.parts.length + 1; p <= count; p++) {
 			const i = p - 1;
 			const frame = await sealChunk(key, new Uint8Array(await file.slice(i * chunk, Math.min(file.size, p * chunk)).arrayBuffer()), i, p === count);
 			rec.parts.push(await this.bridge.multipartPart(this.memberId, rec.uploadId, rec.objectKey, p, frame));
 			await resume?.journal.put(resume.key, rec);
+			this.partsProgress(rec.parts.length, count);
 			if (count >= 100 && p % step === 0 && p < count) this.bridge.toast(`Uploading “${file.name}” — ${Math.round((100 * p) / count)}% (${p} of ${count} parts)`);
 		}
 		const { file_id: _id, ...rest } = rec.fields;
 		void _id;
 		await this.bridge.multipartComplete(this.memberId, rec.uploadId, { ...rest, key: rec.objectKey, parts: JSON.stringify(rec.parts) });
 		await resume?.journal.delete(resume.key);
+	}
+
+	/** The status bar's part count for the file being sent (39x) — counted
+	 * when the server has confirmed a part, and kept beside whatever else
+	 * the upload state says (a Stop asked meanwhile included). */
+	private partsProgress(done: number, total: number): void {
+		const u = this.state.get().upload;
+		if (u) this.set({ upload: { ...u, parts: { done, total } } });
 	}
 
 	/**

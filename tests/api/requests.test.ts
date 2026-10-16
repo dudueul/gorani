@@ -417,9 +417,13 @@ try {
 	const tE = await sendToken(senderE, password);
 	const frames = await Promise.all(Array.from({ length: 70 }, (_, n) => fetch(`${dev.base}/s/r/${linkE.row.id}/uploads/no-such-upload/${n + 1}`, { method: "PUT", headers: { "x-gorani-request-send": tE }, body: new Uint8Array(1) }).then((r) => r.status)));
 	assert.ok(!frames.includes(429), `frames are never rate limited (got ${[...new Set(frames)].join(", ")})`);
+	// Up to 2 × 60 + 10 asks: the limiter counts in FIXED one-minute
+	// windows, so 70 asks that straddle a window's end can split 20 + 50
+	// and never pass 60 in either (it happened, 39s). Twice the limit and
+	// more puts at least one window over it, wherever the edge falls.
 	const metas: number[] = [];
-	for (let n = 0; n < 70 && !metas.includes(429); n++) metas.push((await fetch(`${dev.base}/s/r/${linkE.row.id}/meta`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ view: "x" }) })).status);
-	assert.ok(metas.includes(429), "…the rest of a link's routes are");
+	for (let n = 0; n < 130 && !metas.includes(429); n++) metas.push((await fetch(`${dev.base}/s/r/${linkE.row.id}/meta`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ view: "x" }) })).status);
+	assert.ok(metas.includes(429), `…the rest of a link's routes are (${metas.length} asks, none refused)`);
 
 	console.log("ok  api:requests — area inbox keys, links with passwords and limits, key substitution refused, lockout, whole + framed uploads, samples by default, case links by managers, rotation, the hash lookup sends the hash only");
 } finally {

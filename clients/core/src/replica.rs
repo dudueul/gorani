@@ -200,7 +200,10 @@ impl HttpRemote {
 	/// `base`. Whole up to WRITE_LIMIT — read once, hashed and sealed from
 	/// the same buffer; GC01 frames above, re-hashed as they are sealed.
 	fn send(&mut self, id: &str, base: Option<i64>, parent: &str, name: &str, path: &Path) -> Result<(), FsError> {
-		let size = std::fs::metadata(path).map_err(|e| FsError::Io(e.to_string()))?.len();
+		let meta = std::fs::metadata(path).map_err(|e| FsError::Io(e.to_string()))?;
+		let size = meta.len();
+		// The local copy's modified time, kept with the version (39y).
+		let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
 		let ck = gorani_formats::formats::new_content_key();
 		let key = gorani_formats::formats::import_content_key(&ck);
 		let area = self.engine.area();
@@ -219,10 +222,12 @@ impl HttpRemote {
 					if let Some(f) = &folder {
 						form.push(("folder_id".into(), f.clone()));
 					}
+					form.extend(area.modified_field(id, 1, mtime)?);
 					client.upload_whole(&UploadFields { form }, &sealed)?;
 				}
 				Some(base) => {
-					let form = area.version_fields(id, base, &ck, plain.len() as u64, &sha256)?;
+					let mut form = area.version_fields(id, base, &ck, plain.len() as u64, &sha256)?;
+					form.extend(area.modified_field(id, base + 1, mtime)?);
 					client.upload_version(id, &UploadFields { form }, &sealed)?;
 				}
 			}
@@ -248,6 +253,7 @@ impl HttpRemote {
 			// completion carries base_version, as the browser's does.)
 			Some(base) => area.version_fields(id, base, &ck, size, &sha256)?,
 		};
+		fields.extend(area.modified_field(id, base.map_or(1, |b| b + 1), mtime)?);
 		fields.push(("chunk".into(), chunk.to_string()));
 		// (A replica re-sends a stopped upload from the start: the journal
 		// only keeps two runs from mixing, it does not resume — yet.)

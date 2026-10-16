@@ -1738,7 +1738,8 @@ async fn form_of(req: &mut Request) -> Result<UploadForm> {
 	// evidence file's sealed, signed intake record — commit 29g. `stamp`:
 	// the timestamp imprint, SHA-256 of the hash record's signature — 29j.)
 	// (`item_id`, `inbox_key_id`, `meta`: a collector's drop — commit 37b.)
-	const KNOWN: [&str; 19] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake", "stamp", "item_id", "inbox_key_id", "meta"];
+	// (`modified`: the original file's modified date, sealed — 39y.)
+	const KNOWN: [&str; 20] = ["name", "type", "size", "folder_id", "ck", "tag", "base_version", "key", "chunk", "parts", "file_id", "mmeta", "hash", "sample", "intake", "stamp", "item_id", "inbox_key_id", "meta", "modified"];
 	let mut fields = std::collections::BTreeMap::new();
 	for k in KNOWN {
 		if let Some(v) = form.get_field(k) {
@@ -1818,6 +1819,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"modified": form.fields.get("modified"),
 		"hash": form.fields.get("hash"),
 		"stamp": form.fields.get("stamp"),
 		"sample": form.fields.get("sample").is_some_and(|v| v == "1"),
@@ -1910,6 +1912,7 @@ async fn file_version_upload(mut req: Request, env: Env, identity: &Identity, me
 		"ck": form.fields.get("ck"),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"modified": form.fields.get("modified"),
 		"hash": form.fields.get("hash"),
 		"stamp": form.fields.get("stamp"),
 		"objectKey": object_key,
@@ -2086,6 +2089,7 @@ async fn upload_complete(mut req: Request, env: Env, identity: &Identity, member
 		"baseVersion": form.fields.get("base_version").and_then(|s| s.parse::<u64>().ok()),
 		"tag": form.fields.get("tag"),
 		"mmeta": form.fields.get("mmeta"),
+		"modified": form.fields.get("modified"),
 		"hash": form.fields.get("hash"),
 		"stamp": form.fields.get("stamp"),
 		// (A new file only: a version of a sample is a sample already.)

@@ -98,6 +98,25 @@ impl Area {
 		Ok(fields)
 	}
 
+	/// The `modified` form field (39y): the local copy's modified time —
+	/// seconds since the epoch — sealed into version `version`'s place, as
+	/// the browser seals File.lastModified. None for a time the clock does
+	/// not know (0: before 1970, or a file system without one).
+	pub fn modified_field(&self, file_id: &str, version: i64, secs: u64) -> Result<Option<(String, String)>, Error> {
+		if secs == 0 {
+			return Ok(None);
+		}
+		Ok(Some(("modified".into(), self.seal(&Place::file_modified(&self.name, file_id, version), &crate::engine::iso_of(secs))?)))
+	}
+
+	/// A version's original modified date, opened from its place — seconds
+	/// since the epoch, or None (absent, opens nowhere, or not a date).
+	pub fn open_modified(&self, file_id: &str, version: i64, sealed: &str) -> Option<u64> {
+		let text = self.open(&Place::file_modified(&self.name, file_id, version), sealed)?;
+		let secs = crate::engine::iso_seconds(&text);
+		(secs > 0).then_some(secs)
+	}
+
 	/// The `tag` form field, when the area has its fingerprint secret.
 	fn tag_field(&self, sha256: &str) -> Option<(String, String)> {
 		Some(("tag".into(), duplicate_tag(self.fp.as_deref()?, sha256)?))

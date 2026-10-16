@@ -52,7 +52,7 @@ try {
 		// (Each version carries a content-hash record — commit 29d: a backup
 		// must keep the claim that makes a version evidence.)
 		const head = new TextEncoder().encode(
-			[...Object.entries(fields), ["size", String(f.bytes.length)], ["hash", await store.fileHash(id, 1, { v: 1, stand: "in" })]]
+			[...Object.entries(fields), ["size", String(f.bytes.length)], ["hash", await store.fileHash(id, 1, { v: 1, stand: "in" })], ["modified", await store.fileModified(id, 1, "2001-02-03T04:05:06.000Z")]]
 				.map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)
 				.join("") + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`,
 		);
@@ -87,6 +87,7 @@ try {
 	const versionEntries = parsed.entries.filter((e) => e.json.kind === "version");
 	assert.ok(versionEntries.length && versionEntries.every((v) => /^GV04:/.test(String(v.json.hash))), "each version's content-hash record rides along, still sealed");
 	assert.equal(versionEntries.length, 2, "both version rows with their sealed objects");
+	assert.ok(versionEntries.every((v) => /^GV04:/.test(String(v.json.modified))), "and each version's original modified date, still sealed (39y)");
 	const folderEntries = parsed.entries.filter((e) => e.json.kind === "folder");
 	const fileEntries = parsed.entries.filter((e) => e.json.kind === "file");
 	assert.ok(folderEntries.length >= 0 && fileEntries.length === 2);
@@ -162,6 +163,8 @@ try {
 	const ckBack = await api(dev.base, "POST", "/api/v1/members/jinu/files/keys", { email: "jinu@family.test", body: { ids: [victim.id] } });
 	const ckKey = await store.openFileKey(victim.id, ckBack.json.keys[victim.id].version, ckBack.json.keys[victim.id].key);
 	assert.match(String(ckBack.json.keys[victim.id].hash), /^GV04:/, "the restored version keeps its content-hash record");
+	const restoredRow = after.json.files.find((f) => f.id === victim.id);
+	assert.equal(await store.openFileModified(victim.id, restoredRow.version, restoredRow.modified), "2001-02-03T04:05:06.000Z", "…and its original modified date (39y)");
 	const dlBack = await fetch(`${dev.base}/api/v1/members/jinu/files/${victim.id}`, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
 	const got = new Uint8Array(await dlBack.arrayBuffer());
 	// The download serves the SEALED object (GV02 = magic ‖ nonce ‖ ct ‖ tag);

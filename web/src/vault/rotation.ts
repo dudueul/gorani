@@ -40,7 +40,7 @@ import { areaPath } from "../lib/area.ts";
 // (`intake`, `custody`: evidence's intake records and custody reasons — 29g.)
 // (`collection`, `reject`: an accepted inbox item's record, a rejection's reason — 37c.)
 // (`inboxkey`, `requestlabel`: a member's own inbox keys and upload-link labels — 38.)
-export const SEALED_KINDS = ["version", "file", "folder", "music", "video", "position", "share", "secrets", "hash", "intake", "custody", "collection", "reject", "inboxkey", "requestlabel"] as const;
+export const SEALED_KINDS = ["version", "file", "folder", "music", "video", "position", "share", "secrets", "hash", "modified", "intake", "custody", "collection", "reject", "inboxkey", "requestlabel"] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
 
 /** A JSON call against the API (the browser's bridge, or a test's helper). */
@@ -89,6 +89,9 @@ function placesOf(memberId: string, kind: SealedKind, it: SealedItem): [Uint8Arr
 			return [places.storeSecrets(memberId), null];
 		case "hash":
 			return [places.fileHash(memberId, id, version), null];
+		case "modified":
+			// (The original file's modified date, 39y.)
+			return [places.fileModified(memberId, id, version), null];
 		case "intake":
 			return [places.fileIntake(memberId, id), null];
 		case "custody":

@@ -102,6 +102,7 @@ text      = "GV04:" + base64
 | `file.type` | file id | n | version n's MIME type — for a malware sample, `application/x-gorani-sample; original=…` (commit 29e, `samples.ts`) |
 | `file.music` | file id | n | version n's tag summary |
 | `file.hash` | file id | n | version n's signed content hash (commit 29d, `content-hash.ts`) |
+| `file.modified` | file id | n | version n's original modified date: the uploader's File.lastModified or mtime, ISO 8601 (39y) |
 | `file.intake` | file id | — | an evidence file's signed intake record (commit 29g, `intake.ts`) |
 | `custody.reason` | file id | n | custody link n's reason (commit 29g, `custody.ts`) |
 | `folder.name` | folder id | — | a folder's name |
@@ -274,7 +275,7 @@ bytes; at most 4 password methods tried per unlock. gorani writes 64 MiB /
 
 ## What the server can read
 
-Sizes, versions, times, folder shape, ids, the change feed's structure — and **nothing else**: names, types, folder names, dates-inside-documents are GV-sealed text; content keys are stored wrapped; the Worker refuses any unsealed byte or name before storing it (`worker/src/routes.rs`, `files_store.rs`).
+Sizes, versions, its own times (when a file arrived or changed here), folder shape, ids, the change feed's structure — and **nothing else**: names, types, folder names, a file's own modified date (39y), dates-inside-documents are GV-sealed text; content keys are stored wrapped; the Worker refuses any unsealed byte or name before storing it (`worker/src/routes.rs`, `files_store.rs`).
 
 ## Verifying
 

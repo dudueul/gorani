@@ -75,6 +75,8 @@ export const places = {
 	/** Where a member left off in a video (commit 39o): bound to the file and the member. */
 	filePosition: (store: string, file: string, member: string) => place("file.position", store, `${file}/${member}`),
 	fileHash: (store: string, file: string, version: number) => place("file.hash", store, file, version),
+	/** Version n's original modified date (39y): when the uploader's copy was last changed. */
+	fileModified: (store: string, file: string, version: number) => place("file.modified", store, file, version),
 	fileIntake: (store: string, file: string) => place("file.intake", store, file),
 	custodyReason: (store: string, file: string, seq: number) => place("custody.reason", store, file, seq),
 	folderName: (store: string, folder: string) => place("folder.name", store, folder),

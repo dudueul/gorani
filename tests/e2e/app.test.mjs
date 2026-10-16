@@ -710,6 +710,32 @@ try {
 			await assertNoViolations(page, "a chunked upload's part count");
 		}
 
+		// ── The original's modified date (39y) ─────────────────────────
+		// A file picked from disk keeps its own date: the explorer shows it,
+		// not the upload time — and the server holds it only sealed.
+		{
+			const { mkdtempSync, writeFileSync, utimesSync, rmSync } = await import("node:fs");
+			const { join } = await import("node:path");
+			const { tmpdir } = await import("node:os");
+			const dir = mkdtempSync(join(tmpdir(), "gorani-e2e-dated-"));
+			try {
+				const path = join(dir, "minutes-2001.txt");
+				writeFileSync(path, "the minutes of a meeting long ago");
+				const when = new Date("2001-02-03T12:00:00Z");
+				utimesSync(path, when, when);
+				await page.locator("gorani-win11 [data-upload]").first().setInputFiles(path);
+				const dated = page.locator('[data-body] [data-item^="file:"]', { hasText: "minutes-2001.txt" }).first();
+				await dated.waitFor({ timeout: 60_000 });
+				assert.match(await dated.innerText(), /Feb 3, 2001/, `the list shows the file's own date, not today's (${await dated.innerText()})`);
+				const datedId = (await dated.getAttribute("data-item")).slice("file:".length);
+				const listedRow = (await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" })).json.files.find((f) => f.id === datedId);
+				assert.match(listedRow.modified ?? "", /^GV04:/, "…which the server holds only sealed");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+			await assertNoViolations(page, "the original's modified date");
+		}
+
 		// ── The in-page player (39p): sealed MP4s played through MSE ───
 		// The engine (gorani-media in WebAssembly) builds fMP4 segments from
 		// plaintext this page decrypted; the browser decodes. VP9 + Opus:
@@ -1567,7 +1593,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), a chunked upload counting its parts in the status bar, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), music (an M4A through the same engine, an MP3 streamed by the media worker), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), a chunked upload counting its parts in the status bar, a file keeping its own modified date, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), music (an M4A through the same engine, an MP3 streamed by the media worker), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
 } finally {
 	await dev.close();
 }

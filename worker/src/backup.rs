@@ -131,7 +131,7 @@ impl GoraniMemberDO {
 			.to_array()?;
 		let versions: Vec<VersionJsonRow> = self
 			.sql
-			.exec("SELECT v.file_id, v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.hash_sealed, v.stamp_imprint, v.stamp_token, v.stamped_at, v.created_at FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.deleted_at IS NULL", None)?
+			.exec("SELECT v.file_id, v.version, v.content_key, v.vault_key_id, v.object_key, v.type_sealed, v.size, v.chunk_size, v.hash_sealed, v.stamp_imprint, v.stamp_token, v.stamped_at, v.modified_sealed, v.created_at FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.deleted_at IS NULL", None)?
 			.to_array()?;
 		let secrets: Vec<KvRow> = self.sql.exec("SELECT v FROM files_secrets LIMIT 1", None)?.to_array()?;
 
@@ -222,8 +222,9 @@ impl GoraniMemberDO {
 			// (`hash`: the uploader's signed content hash, still sealed — commit
 			// 29d. A restored evidence version keeps the claim that makes it
 			// evidence. `stamp`: its RFC 3161 imprint and token — 29j; a token
-			// cannot be asked for again with the original time.)
-			let mut entry = serde_json::json!({ "kind": "version", "file": v.file_id, "version": v.version, "key": v.content_key, "vaultKeyId": v.vault_key_id, "type": v.type_sealed, "size": v.size, "chunk": v.chunk_size, "hash": v.hash_sealed, "stamp": { "imprint": v.stamp_imprint, "token": v.stamp_token, "at": v.stamped_at }, "createdAt": v.created_at });
+			// cannot be asked for again with the original time. `modified`:
+			// the original file's modified date, still sealed — 39y.)
+			let mut entry = serde_json::json!({ "kind": "version", "file": v.file_id, "version": v.version, "key": v.content_key, "vaultKeyId": v.vault_key_id, "type": v.type_sealed, "size": v.size, "chunk": v.chunk_size, "hash": v.hash_sealed, "stamp": { "imprint": v.stamp_imprint, "token": v.stamp_token, "at": v.stamped_at }, "modified": v.modified_sealed, "createdAt": v.created_at });
 			let mut resp = crate::s3::stream_uncached(&self.env, &v.object_key).await?;
 			if resp.status_code() == 404 {
 				// Recorded, not fatal: the entry says so, and so does the run.
@@ -334,6 +335,8 @@ struct VersionJsonRow {
 	stamp_imprint: Option<String>,
 	stamp_token: Option<String>,
 	stamped_at: Option<String>,
+	#[serde(default)]
+	modified_sealed: Option<String>,
 	created_at: String,
 }
 #[derive(serde::Deserialize)]
@@ -468,7 +471,7 @@ impl GoraniMemberDO {
 				let object_key = format!("{}/{file_for_key}/r-{}", crate::area::key_prefix(member), crate::files_store::uuid());
 				self.sql
 					.exec(
-						"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, created_at, hash_sealed, stamp_imprint, stamp_token, stamped_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?10, ?11, ?12, ?13) ON CONFLICT(file_id, version) DO UPDATE SET content_key = ?3, object_key = ?5, type_sealed = COALESCE(?6, type_sealed), size = ?7, hash_sealed = COALESCE(?10, hash_sealed), stamp_imprint = COALESCE(stamp_imprint, ?11), stamp_token = COALESCE(stamp_token, ?12), stamped_at = COALESCE(stamped_at, ?13)",
+						"INSERT INTO file_versions (file_id, version, content_key, vault_key_id, object_key, type_sealed, size, chunk_size, created_at, hash_sealed, stamp_imprint, stamp_token, stamped_at, modified_sealed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?10, ?11, ?12, ?13, ?14) ON CONFLICT(file_id, version) DO UPDATE SET content_key = ?3, object_key = ?5, type_sealed = COALESCE(?6, type_sealed), size = ?7, hash_sealed = COALESCE(?10, hash_sealed), stamp_imprint = COALESCE(stamp_imprint, ?11), stamp_token = COALESCE(stamp_token, ?12), stamped_at = COALESCE(stamped_at, ?13), modified_sealed = COALESCE(?14, modified_sealed)",
 						Some(vec![
 							file.clone().into(),
 							version.into(),
@@ -483,6 +486,9 @@ impl GoraniMemberDO {
 							bind(imprint),
 							bind(token),
 							bind(stamped_at),
+							// (Sealed text only: a restore never writes what the
+							// app would not have — 39y.)
+							bind(get("modified").filter(|m| gorani_formats::placed::is_placed_text(m))),
 						]),
 					)
 					.map_err(|e| worker::Error::RustError(format!("restore version: {e}")))?;

@@ -431,6 +431,12 @@ pub const MIGRATIONS: &[&str] = &[
 	// link's data is useless without them; a license is not). The page
 	// derives a proof from both; only its SHA-256 is stored.
 	"ALTER TABLE shares ADD COLUMN claim_hash TEXT",
+	// The original file's modified date (39y): when the uploader's copy was
+	// last changed — File.lastModified in a browser, the mtime on a desktop.
+	// Per version, as the type is, and sealed into its place like the name:
+	// the server keeps its own times (created_at, updated_at) and never
+	// learns this one, nor can it change it unseen.
+	"ALTER TABLE file_versions ADD COLUMN modified_sealed TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first

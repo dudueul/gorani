@@ -105,6 +105,11 @@ impl Place {
 	pub fn file_hash(store: &str, file: &str, version: i64) -> Self {
 		Self::new("file.hash", store, file, Some(version))
 	}
+	/// Version n's original modified date (39y): when the uploader's copy
+	/// was last changed — the browser's File.lastModified, a desktop's mtime.
+	pub fn file_modified(store: &str, file: &str, version: i64) -> Self {
+		Self::new("file.modified", store, file, Some(version))
+	}
 	/// An evidence file's signed intake record (commit 29g, stage 6).
 	pub fn file_intake(store: &str, file: &str) -> Self {
 		Self::new("file.intake", store, file, None)

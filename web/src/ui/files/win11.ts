@@ -26,6 +26,7 @@
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, FolderRow, Selection, SortState } from "./model.ts";
+import { shownModified } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
 import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, deleteForever, emptyTrash, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
 import { fromRelativePaths } from "./dropped.ts";
@@ -143,7 +144,7 @@ export class GoraniWin11 extends LitElement {
 	}
 
 	@state() private previewFile: { id: string; name: string; url?: string; text?: string; kind: FileKind } | null = null;
-	@state() private shareTarget: { id: string; name: string; size: number; version: number } | null = null;
+	@state() private shareTarget: { id: string; name: string; size: number; version: number; modified: string | null } | null = null;
 	/** The upload-links dialog (commit 38): its tab, and the folder a new link files into. */
 	@state() private requests: { tab: "inbox" | "links"; folderId: string | null; folderName: string } | null = null;
 
@@ -154,7 +155,7 @@ export class GoraniWin11 extends LitElement {
 	private openShare(id: string, name: string): void {
 		const row = this.s().files.find((f) => f.id === id);
 		if (!row) return;
-		this.shareTarget = { id, name, size: row.size, version: row.version };
+		this.shareTarget = { id, name, size: row.size, version: row.version, modified: row.modified };
 	}
 
 	private async previewId(id: string): Promise<void> {
@@ -925,7 +926,7 @@ export class GoraniWin11 extends LitElement {
 			</div>
 			<div class="p-2 [content-visibility:auto]">
 				${folders.map((f) => item("folder", f.id, f.name, "folder", f.updatedAt, null))}
-				${files.map((f) => item("file", f.id, f.name, f.kind, f.updatedAt, f.size))}
+				${files.map((f) => item("file", f.id, f.name, f.kind, shownModified(f), f.size))}
 				${!folders.length && !files.length ? html`<p class="p-8 text-center text-sm text-neutral-500">${this.s().loading ? "Opening…" : "This folder is empty"}</p>` : nothing}
 			</div>
 		`;
@@ -1008,7 +1009,8 @@ export class GoraniWin11 extends LitElement {
 							${row
 								? html`<dl class="mt-3 space-y-1 text-xs text-neutral-400">
 										<div class="flex justify-between"><dt>Size</dt><dd>${fmtSize(row.size)}</dd></div>
-										<div class="flex justify-between"><dt>Modified</dt><dd>${fmtDate(row.updatedAt)}</dd></div>
+										<div class="flex justify-between"><dt>Modified</dt><dd data-test="preview-modified">${fmtDate(shownModified(row))}</dd></div>
+										<div class="flex justify-between"><dt>Uploaded</dt><dd>${fmtDate(row.createdAt)}</dd></div>
 										<div class="flex justify-between"><dt>Version</dt><dd>v${row.version}</dd></div>
 									</dl>`
 								: nothing}

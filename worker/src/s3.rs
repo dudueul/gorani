@@ -50,7 +50,7 @@ pub fn config(env: &Env) -> Result<S3Config> {
 	// (`echo … | wrangler secret put`, a copied console field) carries a
 	// newline or a space that no key, region or bucket name ever contains —
 	// signed in, it fails every request as a bad signature, with nothing in
-	// the dashboard to show it. Team › People › Check storage says when a
+	// the dashboard to show it. Team › Status › Test connection says when a
 	// value had any (`settings_shape`).
 	let var = |name: &str| -> Result<String> {
 		env.var(name).map(|v| v.to_string().trim().to_string()).map_err(|_| Error::RustError(format!("missing {name} for the S3 backend")))
@@ -505,11 +505,21 @@ pub async fn multipart_abort(env: &Env, key: &str, upload_id: &str) -> Result<()
 	}
 }
 
-// ── Team › People › Check storage (commit 39s) ────────────────────
+// ── Team › Status › Test connection (commits 39s, 39u) ─────────────
 
 /// One probe step's outcome.
 fn step(name: &str, ok: bool, status: u16, reason: Option<String>, server: &str) -> serde_json::Value {
 	serde_json::json!({ "step": name, "ok": ok, "status": status, "reason": reason, "server": server })
+}
+
+/// How long the step just pushed took (commit 39u: Team › Status shows
+/// it — a storage that answers in 4 s is "working" and still the problem).
+fn timed(steps: &mut [serde_json::Value], clock: &mut u64) {
+	let now = Date::now().as_millis();
+	if let Some(last) = steps.last_mut() {
+		last["ms"] = serde_json::json!(now.saturating_sub(*clock));
+	}
+	*clock = now;
 }
 
 /// The five settings as the deployment holds them — never their values
@@ -564,20 +574,34 @@ fn settings_warnings(cfg: &S3Config) -> Vec<String> {
 
 /// A real round trip — write, read the size back, read the bytes back,
 /// delete — on a probe object of 16 random bytes under `probe/`, each
-/// step's answer explained. It stops at the first refusal (the later steps
-/// would only repeat it). A lead runs it from Team › People; routes.rs ›
-/// storage_probe checks the role.
+/// step's answer explained and timed. It stops at the first refusal (the
+/// later steps would only repeat it). Any member runs it from Team ›
+/// Status › Test connection (commit 39u; routes.rs › status_storage, rate
+/// limited); `settings` — the five settings' shape and the warnings about
+/// them — is for a lead's eyes only, so it is left out for everyone else.
 ///
 /// On a versioned bucket (every Object Lock bucket is one) the delete
 /// leaves a 16-byte noncurrent version and a delete marker, which the
 /// bucket's noncurrent-version lifecycle rule removes (docs/PRODUCTION.md).
-pub async fn probe(env: &Env) -> Result<serde_json::Value> {
+pub async fn probe(env: &Env, settings: bool) -> Result<serde_json::Value> {
+	let mut v = probe_all(env).await?;
+	if !settings {
+		if let Some(o) = v.as_object_mut() {
+			o.remove("settings");
+			o.remove("warnings");
+		}
+	}
+	Ok(v)
+}
+
+async fn probe_all(env: &Env) -> Result<serde_json::Value> {
 	let mut id = [0u8; 8];
 	getrandom::getrandom(&mut id).map_err(|e| Error::RustError(format!("no randomness: {e}")))?;
 	let key = format!("probe/{}", hex::encode(id));
 	let mut bytes = [0u8; 16];
 	getrandom::getrandom(&mut bytes).map_err(|e| Error::RustError(format!("no randomness: {e}")))?;
 	let mut steps = Vec::new();
+	let mut clock = Date::now().as_millis();
 
 	if let Some(bucket) = r2_bucket(env).await? {
 		// The binding signs nothing and has no statuses: each step either
@@ -590,6 +614,7 @@ pub async fn probe(env: &Env) -> Result<serde_json::Value> {
 		let put = bucket.put(&key, bytes.to_vec()).execute().await.map(|_| true).map_err(|e| e.to_string());
 		let ok = put.is_ok();
 		steps.push(r2("write", put));
+		timed(&mut steps, &mut clock);
 		if ok {
 			let got = match bucket.get(&key).execute().await {
 				Ok(Some(o)) => match o.body() {
@@ -600,7 +625,9 @@ pub async fn probe(env: &Env) -> Result<serde_json::Value> {
 				Err(e) => Err(e.to_string()),
 			};
 			steps.push(r2("read", got));
+			timed(&mut steps, &mut clock);
 			steps.push(r2("delete", bucket.delete(&key).await.map(|_| true).map_err(|e| e.to_string())));
+			timed(&mut steps, &mut clock);
 		}
 		let ok = steps.iter().all(|s| s["ok"].as_bool() == Some(true));
 		return Ok(serde_json::json!({ "backend": "r2", "ok": ok, "steps": steps }));
@@ -609,7 +636,7 @@ pub async fn probe(env: &Env) -> Result<serde_json::Value> {
 	let settings = settings_shape(env);
 	let cfg = match config(env) {
 		Ok(cfg) => cfg,
-		Err(e) => return Ok(serde_json::json!({ "backend": "s3", "ok": false, "settings": settings, "warnings": [e.to_string()], "steps": [] })),
+		Err(e) => return Ok(serde_json::json!({ "backend": "s3", "ok": false, "problem": "the storage settings are incomplete — a lead sees which in Team › Status", "settings": settings, "warnings": [e.to_string()], "steps": [] })),
 	};
 	let warnings = settings_warnings(&cfg);
 	let server_of = |r: &Response| r.headers().get("Server").ok().flatten().unwrap_or_default();
@@ -620,23 +647,28 @@ pub async fn probe(env: &Env) -> Result<serde_json::Value> {
 	if status != 200 {
 		let body = resp.text().await.unwrap_or_default();
 		steps.push(step("write", false, status, Some(refusal_reason(status, xml_val(&body, "Code").as_deref(), &server, true)), &server));
+		timed(&mut steps, &mut clock);
 	} else {
 		steps.push(step("write", true, status, None, &server));
+		timed(&mut steps, &mut clock);
 		// 2. size
 		let resp = fetch_signed(&cfg, "HEAD", &key, &[], None, None, None).await?;
 		let (status, server) = (resp.status_code(), server_of(&resp));
 		let size = resp.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok());
 		let size_ok = status == 200 && size == Some(16);
 		steps.push(step("size", size_ok, status, (!size_ok).then(|| if status == 200 { format!("the size read back is {size:?}, not 16") } else { refusal_reason(status, None, &server, false) }), &server));
+		timed(&mut steps, &mut clock);
 		// 3. read
 		let mut resp = fetch_signed(&cfg, "GET", &key, &[], None, None, None).await?;
 		let (status, server) = (resp.status_code(), server_of(&resp));
 		if status == 200 {
 			let same = resp.bytes().await? == bytes;
 			steps.push(step("read", same, status, (!same).then(|| "the bytes read back are not the ones written".to_string()), &server));
+			timed(&mut steps, &mut clock);
 		} else {
 			let body = resp.text().await.unwrap_or_default();
 			steps.push(step("read", false, status, Some(refusal_reason(status, xml_val(&body, "Code").as_deref(), &server, true)), &server));
+			timed(&mut steps, &mut clock);
 		}
 		// 4. delete (tried even after a failed read: the probe cleans up)
 		let mut resp = fetch_signed(&cfg, "DELETE", &key, &[], None, None, None).await?;
@@ -644,6 +676,7 @@ pub async fn probe(env: &Env) -> Result<serde_json::Value> {
 		let ok = status == 204 || status == 200;
 		let reason = if ok { None } else { Some(refusal_reason(status, xml_val(&resp.text().await.unwrap_or_default(), "Code").as_deref(), &server, true)) };
 		steps.push(step("delete", ok, status, reason, &server));
+		timed(&mut steps, &mut clock);
 	}
 	let ok = steps.iter().all(|s| s["ok"].as_bool() == Some(true));
 	Ok(serde_json::json!({ "backend": "s3", "ok": ok, "settings": settings, "warnings": warnings, "steps": steps }))

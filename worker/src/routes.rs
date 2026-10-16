@@ -246,10 +246,80 @@ async fn tsa_probe(env: &Env, email: &str) -> Result<Response> {
 async fn storage_probe(env: &Env, email: &str) -> Result<Response> {
 	match actor_of(env, email, None).await? {
 		Some(a) if a.role == "lead" => {}
-		Some(_) => return json_error(403, "only a lead checks the deployment's storage"),
+		Some(_) => return json_error(403, "only a lead checks the deployment's storage settings — Team › Status › Test connection checks the storage itself"),
 		None => return json_error(403, "not a team member"),
 	}
-	Response::from_json(&crate::s3::probe(env).await?)
+	Response::from_json(&crate::s3::probe(env, true).await?)
+}
+
+/// `GET /status` (commit 39u, Team › Status): what any signed-in member —
+/// an external included — can see of the deployment's health, cheaply and
+/// without writing anything:
+///
+/// - **the app**: this answer itself (and the version that gave it);
+/// - **the team registry**: the round trip to the registry's database that
+///   names the caller (every request makes it — when it fails, nothing
+///   else works);
+/// - **your files**: the caller's own area's database (an external has
+///   none);
+/// - **storage**: whether it is configured, and which kind — not whether
+///   it works: that takes a write (`POST /status/storage`, a button);
+/// - **timestamps**: whether a TSA is configured.
+///
+/// Times are what the Worker measured, not the network to the browser
+/// (the page measures that itself).
+async fn system_status(env: &Env, email: &str) -> Result<Response> {
+	let started = Date::now().as_millis();
+	let Some(actor) = actor_of(env, email, None).await? else {
+		return json_error(403, "not a team member");
+	};
+	let registry_ms = Date::now().as_millis().saturating_sub(started);
+	let files = if actor.role == "external" {
+		serde_json::Value::Null
+	} else {
+		let at = Date::now().as_millis();
+		let answer = forward_member(env, &actor.id, "GET", "stats", None, actor.email.as_str()).await;
+		let ms = Date::now().as_millis().saturating_sub(at);
+		match answer {
+			Ok(resp) if resp.status_code() == 200 => serde_json::json!({ "ok": true, "ms": ms }),
+			Ok(resp) => serde_json::json!({ "ok": false, "ms": ms, "problem": format!("its database answered HTTP {}", resp.status_code()) }),
+			Err(e) => {
+				console_log!("gorani: status: the member database of {}: {e}", actor.id);
+				serde_json::json!({ "ok": false, "ms": ms, "problem": "its database did not answer" })
+			}
+		}
+	};
+	let backend = if env.bucket("R2BUCKET").is_ok() {
+		"r2"
+	} else if crate::s3::config(env).is_ok() {
+		"s3"
+	} else {
+		"none"
+	};
+	Response::from_json(&serde_json::json!({
+		"version": env!("CARGO_PKG_VERSION"),
+		"app": { "ok": true },
+		"registry": { "ok": true, "ms": registry_ms },
+		"files": files,
+		"storage": { "backend": backend, "configured": backend != "none" },
+		"timestamps": { "configured": crate::tsa::configured(env).is_some() },
+		"lead": actor.role == "lead",
+	}))
+}
+
+/// `POST /status/storage` (commit 39u, Team › Status › Test connection):
+/// the storage round trip of s3.rs › probe for any member — the steps every
+/// upload and download takes, each answered and timed. A lead also gets
+/// the settings' shape. Rate limited per member: each press writes and
+/// deletes an object.
+async fn status_storage(env: &Env, email: &str) -> Result<Response> {
+	let Some(actor) = actor_of(env, email, None).await? else {
+		return json_error(403, "not a team member");
+	};
+	if let Some(limited) = rate_limited(env, "DEVICE_LIMITER", format!("status:{}", actor.id)).await {
+		return Ok(limited);
+	}
+	Response::from_json(&crate::s3::probe(env, actor.role == "lead").await?)
 }
 
 async fn actor_of(env: &Env, email: &str, target: Option<&str>) -> Result<Option<Actor>> {
@@ -575,6 +645,9 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// before certifying it: a token over a random imprint carries it.
 		("POST", ["family", "tsa", "probe"]) => tsa_probe(&env, &identity.email).await,
 		("POST", ["family", "storage", "probe"]) => storage_probe(&env, &identity.email).await,
+		// Team › Status (commit 39u): every member's view of the system's health.
+		("GET", ["status"]) => system_status(&env, &identity.email).await,
+		("POST", ["status", "storage"]) => status_storage(&env, &identity.email).await,
 		// The opt-in hash lookup (commit 38c, malware.rs): any active member,
 		// rate limited per member — a button, not a pipeline.
 		("POST", ["malware", "lookup"]) => {
@@ -1692,7 +1765,7 @@ async fn file_upload_whole(mut req: Request, env: Env, identity: &Identity, memb
 ///    has none of them is not this deployment's bucket (a wrong S3_BUCKET
 ///    or endpoint would make EVERY file look lost — and trashing them all
 ///    is exactly the wrong answer), so nothing is changed and a lead is
-///    pointed at Check storage.
+///    pointed at Team › Status › Test connection.
 ///
 /// Only then does the store act (files_store.rs › file_lost): a working
 /// file goes to the Trash with the reason on its trail; evidence, a held
@@ -1705,7 +1778,7 @@ async fn lost_object(env: &Env, member_id: &str, file_id: &str, meta: &serde_jso
 	let mut canary = forward_member(env, member_id, "GET", format!("files/canary?not={file_id}"), None, actor.to_string()).await?;
 	let others: Vec<String> = canary.json::<serde_json::Value>().await?.get("objectKeys").and_then(|k| k.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
 	if others.is_empty() {
-		return json_error(502, "the storage has no bytes for this file, and this area holds no other file to tell a lost file from a wrong bucket — nothing was changed; a lead can run Team › People › Check storage");
+		return json_error(502, "the storage has no bytes for this file, and this area holds no other file to tell a lost file from a wrong bucket — nothing was changed; anyone can run Team › Status › Test connection");
 	}
 	let mut answering = false;
 	for key in &others {
@@ -1715,7 +1788,7 @@ async fn lost_object(env: &Env, member_id: &str, file_id: &str, meta: &serde_jso
 		}
 	}
 	if !answering {
-		return json_error(502, "the storage has neither this file nor the other files of this area it was asked about — it is probably not this deployment's bucket (S3_BUCKET, S3_ENDPOINT); nothing was changed — a lead can run Team › People › Check storage");
+		return json_error(502, "the storage has neither this file nor the other files of this area it was asked about — it is probably not this deployment's bucket (S3_BUCKET, S3_ENDPOINT); nothing was changed — anyone can run Team › Status › Test connection");
 	}
 	let version = meta.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
 	let mut done = forward_member(env, member_id, "POST", format!("files-lost/{file_id}"), Some(serde_json::json!({ "version": version, "objectKey": object_key })), actor.to_string()).await?;
@@ -2045,7 +2118,7 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 		// production 403 of 39s), every file looked lost.
 		_ => {
 			let reason = s3::public_reason(&s3::refused(&format!("read {object_key}"), s3_resp).await.to_string()).unwrap_or_else(|| format!("HTTP {status}"));
-			return json_error(502, &format!("the storage refused this read ({reason}) — a lead can run Team › People › Check storage"));
+			return json_error(502, &format!("the storage refused this read ({reason}) — anyone can run Team › Status › Test connection"));
 		}
 	}
 	let headers = Headers::new();

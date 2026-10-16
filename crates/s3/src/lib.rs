@@ -344,7 +344,7 @@ pub fn refusal_reason(status: u16, code: Option<&str>, server: &str, bodied: boo
 		Some("RequestTimeTooSkewed") => "the request's clock and the server's disagree by more than 15 minutes",
 		Some("InvalidRequest") => "the server refused the request's form (on an Object Lock bucket: is a default retention set? gorani needs none)",
 		Some(other) => return format!("HTTP {status} {other}"),
-		None if !bodied && !server.to_ascii_lowercase().contains("cloudflare") => return format!("HTTP {status} (a HEAD answer carries no reason — Team › People › Check storage shows the write's)"),
+		None if !bodied && !server.to_ascii_lowercase().contains("cloudflare") => return format!("HTTP {status} (a HEAD answer carries no reason — Team › Status › Test connection shows the write's)"),
 		None if server.to_ascii_lowercase().contains("cloudflare") => "not an S3 answer: Cloudflare in front of S3_ENDPOINT refused the request (Access, WAF or bot rules on that host) — let the Worker's requests through, or use the storage's own host",
 		None if (300..400).contains(&status) => "not an S3 answer: a redirect — S3_ENDPOINT is not the storage's S3 API host (some providers answer unknown requests with a redirect to their homepage)",
 		None => "not an S3 answer (no error code): something in front of S3_ENDPOINT refused it — a reverse proxy, a login page, or the provider's web console instead of its S3 API host",

@@ -37,7 +37,7 @@ import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
-type Tab = "people" | "cases" | "recovery" | "devices" | "unlock" | "collectors";
+type Tab = "people" | "cases" | "recovery" | "devices" | "unlock" | "collectors" | "status";
 
 /** One of the member's computers, as `GET /api/v1/members/<id>/devices` lists it. */
 interface DeviceRow {
@@ -74,14 +74,30 @@ const splitEmails = (s: string) => s.split(/[\s,;]+/).map((e) => e.trim()).filte
 /** An expiry as a date input shows it (YYYY-MM-DD); the registry keeps the end of that day, UTC. */
 const dayOf = (iso?: string | null) => (iso ?? "").slice(0, 10);
 
-/** `POST /family/storage/probe` (commit 39s, worker/src/s3.rs › probe). */
+/** `POST /status/storage` (commits 39s, 39u, worker/src/s3.rs › probe):
+ * `settings` and `warnings` come to a lead only. */
 interface StorageCheck {
 	backend: "s3" | "r2";
 	ok: boolean;
-	steps: { step: string; ok: boolean; status: number; reason: string | null; server: string }[];
+	problem?: string;
+	steps: { step: string; ok: boolean; status: number; reason: string | null; server: string; ms?: number }[];
 	warnings?: string[];
 	settings?: { name: string; set: boolean; padded?: boolean; shown?: string }[];
 }
+
+/** `GET /status` (commit 39u, routes.rs › system_status). */
+interface SystemStatus {
+	version: string;
+	app: { ok: boolean };
+	registry: { ok: boolean; ms: number };
+	files: { ok: boolean; ms: number; problem?: string } | null;
+	storage: { backend: "r2" | "s3" | "none"; configured: boolean };
+	timestamps: { configured: boolean };
+	lead: boolean;
+}
+
+/** What each probe step is, in the words of what it stands for. */
+const STEP_LABEL: Record<string, string> = { write: "Upload (write)", size: "Size check", read: "Download (read)", delete: "Clean up (delete)" };
 
 const input = "rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-sm outline-none focus:border-accent";
 const button = "rounded-lg border border-neutral-700 px-2.5 py-1.5 text-xs hover:border-accent disabled:opacity-40";
@@ -111,8 +127,10 @@ export class GoraniTeam extends LitElement {
 	@state() private tsa: { configured: boolean; certs: TsaCert[] } | null = null;
 	@state() private tsaTrusted: TrustedTsas = new Map();
 	@state() private tsaProbe: TsaIdentity | null = null;
-	/** A lead's storage check (commit 39s): each step of a real round trip, explained. */
+	/** The storage round trip (commits 39s, 39u): each step explained and timed. */
 	@state() private storageCheck: StorageCheck | null = null;
+	/** Team › Status (commit 39u): the cheap checks, the browser's own round trip, and when. */
+	@state() private systemStatus: { at: Date; ms: number; status: SystemStatus | null; error: string } | null = null;
 	/** This member's computers (commit 34): what protects each, and revocation. */
 	@state() private devices: DeviceRow[] = [];
 	/** The team's collectors (commit 37a), each with THIS member's verdict on it (null = counted). */
@@ -218,11 +236,14 @@ export class GoraniTeam extends LitElement {
 	// ── render ────────────────────────────────────────────────────────
 
 	protected override render() {
-		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"], ["unlock", "Unlock"], ...(this.member.role === "external" ? [] : ([["collectors", "Collectors"]] as [Tab, string][]))];
+		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"], ["unlock", "Unlock"], ...(this.member.role === "external" ? [] : ([["collectors", "Collectors"]] as [Tab, string][])), ["status", "Status"]];
 		return html`
 			<div class="mx-auto flex h-full max-w-4xl flex-col gap-3 overflow-y-auto p-4 text-sm" data-test="team">
 				<nav class="flex gap-1">
-					${tabs.map(([t, label]) => html`<button class="${button} ${this.tab === t ? "border-accent text-white" : "text-neutral-400"}" @click=${() => (this.tab = t)}>${label}</button>`)}
+					${tabs.map(([t, label]) => html`<button class="${button} ${this.tab === t ? "border-accent text-white" : "text-neutral-400"}" data-test="team-tab-${t}" @click=${() => {
+						this.tab = t;
+						if (t === "status" && !this.systemStatus) void this.checkStatus();
+					}}>${label}</button>`)}
 					<span class="ml-auto self-center text-xs text-neutral-500">${this.busy ? "working…" : ""}</span>
 				</nav>
 				${this.error ? html`<p class="rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-red-300" data-test="team-error">${this.error}</p>` : nothing}
@@ -237,7 +258,9 @@ export class GoraniTeam extends LitElement {
 								? html`<gorani-methods .session=${this.session} .memberName=${this.member.name} .call=${this.call}></gorani-methods>`
 								: this.tab === "collectors"
 									? this.renderCollectors()
-									: this.renderRecovery()}
+									: this.tab === "status"
+										? this.renderStatus()
+										: this.renderRecovery()}
 			</div>
 		`;
 	}
@@ -552,40 +575,106 @@ export class GoraniTeam extends LitElement {
 					})}
 				</ul>
 			</section>
-			${this.renderStorage()}
 			${this.renderTsa()}
 		`;
 	}
 
+	// ── Status (commit 39u) ───────────────────────────────────────────
+
 	/**
-	 * The deployment's object storage (commit 39s, s3.rs › probe): a lead
-	 * writes, sizes, reads and deletes a 16-byte probe object, and sees each
-	 * answer explained — and the five settings as the Worker holds them (the
-	 * access key's last four characters, the secret's length, never the
-	 * secret). Built after the first production upload failed with "HTTP
-	 * 403" and nothing to say why.
+	 * The cheap checks of `GET /status`, timed from here: no write, so it
+	 * runs whenever the tab opens. A failure of the request itself is the
+	 * first line of the answer — the app (or the network to it) is down.
+	 */
+	private async checkStatus(): Promise<void> {
+		const started = performance.now();
+		try {
+			const status = await this.call<SystemStatus>("GET", "/api/v1/status");
+			this.systemStatus = { at: new Date(), ms: Math.round(performance.now() - started), status, error: "" };
+		} catch (e) {
+			this.systemStatus = { at: new Date(), ms: Math.round(performance.now() - started), status: null, error: e instanceof Error ? e.message : String(e) };
+		}
+	}
+
+	/**
+	 * Team › Status: is the system up, and can I upload and download?
+	 * Asked for in those words — so the answer leads with them: one row per
+	 * part (the app, the team registry, this member's files, the storage,
+	 * the timestamp authority), then uploads and downloads as the storage
+	 * round trip found them. That round trip writes an object, so it waits
+	 * for Test connection.
+	 */
+	private renderStatus() {
+		const s = this.systemStatus;
+		const c = this.storageCheck;
+		const stepOf = (name: string) => c?.steps.find((x) => x.step === name);
+		const row = (test: string, label: string, ok: boolean | null, detail: string) => html`<li class="flex items-baseline gap-2 py-1.5" data-test=${test} data-ok=${ok === null ? "unknown" : String(ok)}>
+			<span class="w-4 ${ok === null ? "text-neutral-500" : ok ? "text-emerald-400" : "text-red-400"}">${ok === null ? "–" : ok ? "✓" : "✗"}</span>
+			<span class="w-40 text-neutral-200">${label}</span>
+			<span class="text-xs text-neutral-400">${detail}</span>
+		</li>`;
+		const st = s?.status;
+		const backend = st?.storage.backend === "r2" ? "Cloudflare R2" : "S3-compatible storage";
+		const write = stepOf("write");
+		const read = stepOf("read");
+		return html`
+			<section class="rounded-xl border border-neutral-800 p-3" data-test="status">
+				<div class="flex items-center gap-2">
+					<h3 class="font-medium">System status</h3>
+					<span class="text-xs text-neutral-500">${s ? `checked ${s.at.toLocaleTimeString()}` : "checking…"}</span>
+					<button class="${button} ml-auto" ?disabled=${this.busy} data-test="status-refresh" @click=${() => void this.checkStatus()}>Refresh</button>
+				</div>
+				<ul class="mt-2 divide-y divide-neutral-900 text-sm">
+					${s
+						? st
+							? html`
+									${row("status-app", "App", true, `answered in ${s.ms} ms · version ${st.version}`)}
+									${row("status-registry", "Team registry", st.registry.ok, `its database answered in ${st.registry.ms} ms`)}
+									${st.files ? row("status-files", "Your files", st.files.ok, st.files.ok ? `its database answered in ${st.files.ms} ms` : (st.files.problem ?? "not answering")) : nothing}
+									${row("status-storage", "Storage", st.storage.configured ? (c ? c.ok : null) : false, !st.storage.configured ? "not configured — uploads and downloads cannot work (a lead sets it up: docs/PRODUCTION.md)" : c ? `${backend} — ${c.ok ? "working" : "not working"}` : `${backend} — not tested yet: Test connection writes, reads and deletes a small object`)}
+									${row("status-uploads", "Uploads", c ? (write?.ok ?? false) : null, c ? (write?.ok ? `a write took ${write.ms ?? "?"} ms` : (write?.reason ?? c.problem ?? "the storage was not reached")) : "found by Test connection")}
+									${row("status-downloads", "Downloads", c ? (read?.ok ?? false) : null, c ? (read?.ok ? `a read took ${read.ms ?? "?"} ms` : (read?.reason ?? (write && !write.ok ? "not tried: the write failed first" : (c.problem ?? "the storage was not reached")))) : "found by Test connection")}
+									${row("status-timestamps", "Timestamp authority", st.timestamps.configured ? true : null, st.timestamps.configured ? "configured: evidence is stamped by a third party" : "not configured: evidence is dated by the audit trail alone")}
+								`
+							: row("status-app", "App", false, `not answering (${s.error}) — check your connection, then Refresh`)
+						: html`<li class="py-1.5 text-xs text-neutral-500">Checking…</li>`}
+				</ul>
+			</section>
+			${this.renderStorage()}
+		`;
+	}
+
+	/**
+	 * The deployment's object storage (commit 39s, s3.rs › probe): write,
+	 * size, read and delete a 16-byte probe object, each answer explained
+	 * and timed. Since 39u any member runs it, from Team › Status; a lead
+	 * also sees the five settings as the Worker holds them (the access key's
+	 * last four characters, the secret's length, never the secret). Built
+	 * after the first production upload failed with "HTTP 403" and nothing
+	 * to say why.
 	 */
 	private renderStorage() {
-		if (!this.isLead) return nothing;
 		const c = this.storageCheck;
 		return html`
 			<section class="rounded-xl border border-neutral-800 p-3" data-test="storage">
 				<div class="flex items-center gap-2">
-					<h3 class="font-medium">Storage</h3>
-					<button class="${button} ml-auto" ?disabled=${this.busy} data-test="storage-check" @click=${() => this.act("Checking the storage", async () => {
-						this.storageCheck = await this.call<StorageCheck>("POST", "/api/v1/family/storage/probe");
-						return this.storageCheck.ok ? "The storage took a write, a read and a delete." : "The storage refused a step — see below.";
-					})}>Check storage</button>
+					<h3 class="font-medium">Storage connection</h3>
+					<button class="${button} ml-auto" ?disabled=${this.busy} data-test="storage-check" @click=${() => this.act("Testing the storage connection", async () => {
+						this.storageCheck = await this.call<StorageCheck>("POST", "/api/v1/status/storage");
+						return this.storageCheck.ok ? "The storage took a write, a read and a delete: uploads and downloads work." : "The storage refused a step — see below.";
+					})}>Test connection</button>
 				</div>
-				<p class="mt-1 text-xs text-neutral-400">Writes a 16-byte probe object, reads it back and deletes it — the steps every upload and download takes.</p>
+				<p class="mt-1 text-xs text-neutral-400">Writes a 16-byte probe object, reads it back and deletes it — the steps every upload and download takes.${this.isLead ? " As a lead you also see the storage settings." : ""}</p>
 				${c
 					? html`
 							<p class="mt-2 text-xs ${c.ok ? "text-emerald-400" : "text-red-300"}" data-test="storage-verdict">${c.backend === "r2" ? "R2 binding" : "S3-compatible endpoint"} — ${c.ok ? "working" : "not working"}</p>
 							<ul class="mt-1 space-y-1 text-xs">
+								${c.problem ? html`<li class="text-red-300">${c.problem}</li>` : nothing}
 								${c.steps.map((st) => html`<li data-test="storage-step" data-step=${st.step} data-ok=${String(st.ok)}>
 									<span class=${st.ok ? "text-emerald-400" : "text-red-400"}>${st.ok ? "✓" : "✗"}</span>
-									<span class="text-neutral-300">${st.step}</span>
+									<span class="text-neutral-300">${STEP_LABEL[st.step] ?? st.step}</span>
 									${st.status ? html`<span class="text-neutral-500">HTTP ${st.status}${st.server ? ` · ${st.server}` : ""}</span>` : nothing}
+									${st.ms !== undefined ? html`<span class="text-neutral-500">${st.ms} ms</span>` : nothing}
 									${st.reason ? html`<p class="ml-4 text-neutral-400">${st.reason}</p>` : nothing}
 								</li>`)}
 							</ul>

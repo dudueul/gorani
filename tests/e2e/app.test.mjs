@@ -511,6 +511,49 @@ try {
 			await assertNoViolations(page, "context menus");
 		}
 
+		// ── Duplicates (39n): the prompt names the twin and where it is; the
+		// answer can stand for the rest of an upload; Find duplicates lists
+		// the sets and trashes the extras. ─────────────────────────────
+		{
+			const W = "gorani-win11";
+			const fileRow = (name) => page.locator(`${W} [data-body] [data-item^="file:"]`, { hasText: name }).first();
+			const dialog = page.locator('[data-test="duplicate-dialog"]');
+			const same = Buffer.from("these bytes, more than once");
+			const put = (files) => page.locator(`${W} [data-upload]`).first().setInputFiles(files.map((name) => ({ name, mimeType: "text/plain", buffer: same })));
+			await put(["twin.txt"]);
+			await fileRow("twin.txt").waitFor({ timeout: 30_000 });
+			await put(["twin-again.txt"]);
+			await dialog.waitFor({ timeout: 30_000 });
+			assert.match(await page.locator('[data-test="duplicate-twins"]').innerText(), /twin\.txt\s+in the top folder/, "the prompt says which file is already here, and where");
+			assert.equal(await page.locator('[data-test="duplicate-for-rest"]').count(), 0, "one file: nothing to apply to the rest");
+			await page.locator('[data-test="duplicate-skip"]').click();
+			await dialog.waitFor({ state: "detached" });
+			await page.waitForTimeout(500);
+			assert.equal(await fileRow("twin-again.txt").count(), 0, "skipped");
+			// Two more copies in one upload: one question, its answer for both.
+			await put(["copy-1.txt", "copy-2.txt"]);
+			await dialog.waitFor({ timeout: 30_000 });
+			await page.locator('[data-test="duplicate-for-rest"]').check();
+			await page.locator('[data-test="duplicate-keep"]').click();
+			await fileRow("copy-2.txt").waitFor({ timeout: 30_000 });
+			await fileRow("copy-1.txt").waitFor({ timeout: 30_000 });
+			assert.equal(await dialog.count(), 0, "asked once for the whole upload");
+			// Find duplicates: three copies, two ticked, moved to the Trash.
+			const box = await page.locator(`${W} [data-body]`).boundingBox();
+			await page.mouse.click(box.x + box.width - 20, box.y + box.height - 20, { button: "right" });
+			await page.locator("gorani-menu").getByRole("menuitem", { name: "Find duplicates…" }).click();
+			const view = page.locator('[data-test="duplicates-dialog"]');
+			await page.locator('[data-test="duplicate-group"]').first().waitFor({ timeout: 30_000 });
+			assert.equal(await page.locator('[data-test="duplicate-copy"]').count(), 3, "twin, copy-1 and copy-2");
+			assert.match(await page.locator('[data-test="duplicates-trash"]').innerText(), /Move 2 to the Trash/, "every copy but the oldest is ticked");
+			await page.locator('[data-test="duplicates-trash"]').click();
+			await page.locator('[data-test="duplicates-none"]').waitFor({ timeout: 30_000 });
+			await view.getByRole("button", { name: "Close" }).click();
+			await fileRow("copy-1.txt").waitFor({ state: "detached", timeout: 15_000 });
+			assert.equal(await fileRow("twin.txt").count(), 1, "the oldest stays");
+			await assertNoViolations(page, "duplicates");
+		}
+
 		// ── Streaming media through the service worker (O11) ───────────
 		// A video over the 8 MiB streaming threshold opens as /media/<id>,
 		// answered by the media service worker with decrypted bytes. Before
@@ -1136,7 +1179,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

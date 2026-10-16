@@ -212,6 +212,9 @@ impl HttpRemote {
 			let client = self.engine.client();
 			match base {
 				None => {
+					if let Some(note) = area.duplicate_note(client, name, plain.len() as u64, &sha256) {
+						eprintln!("gorani: {note}");
+					}
 					let mut form = area.new_file_fields(id, name, &ck, plain.len() as u64, &sha256, None)?;
 					if let Some(f) = &folder {
 						form.push(("folder_id".into(), f.clone()));
@@ -232,6 +235,9 @@ impl HttpRemote {
 		}
 		let mut fields = match base {
 			None => {
+				if let Some(note) = area.duplicate_note(self.engine.client(), name, size, &sha256) {
+					eprintln!("gorani: {note}");
+				}
 				let mut f = area.new_file_fields(id, name, &ck, size, &sha256, None)?;
 				if let Some(p) = &folder {
 					f.push(("folder_id".into(), p.clone()));

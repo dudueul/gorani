@@ -80,7 +80,7 @@ const server = {
 		// contract now: POST with { ids }, see send() below.)
 		if (p.endsWith("/files/match")) {
 			const size = url.searchParams.get("size");
-			return { files: [...rows.values()].filter((r) => String(r.size) === size && !r.trashedWith).map((r) => ({ id: r.id, tag: tags.get(r.id) ?? null })) };
+			return { files: [...rows.values()].filter((r) => String(r.size) === size && !r.trashedWith).map((r) => ({ id: r.id, tag: tags.get(r.id) ?? null, folder: r.folder, name: r.name })) };
 		}
 		if (p.endsWith("/files/sealed")) {
 			// (Only the one-file version walk the sample mark uses.)
@@ -256,8 +256,9 @@ const bridge: FilesBridge = {
 		feedCursor++;
 		feed.push({ seq: feedCursor, kind: "file.put", data: { id } });
 	},
-	confirmDuplicate: async (count) => {
-		dupAsked = count;
+	confirmDuplicate: async (question) => {
+		dupAsked = question.twins.length;
+		dupQuestion = question;
 		return dupAnswer;
 	},
 	toast: (m) => void toasts.push(m),
@@ -274,7 +275,8 @@ const me = { signer: made.signer, trust: await buildTrust("jinu", rootKey, made.
 const toasts: string[] = [];
 
 let dupAsked = 0;
-let dupAnswer: "skip" | "keep" | "version" | null = null;
+let dupAnswer: { action: "skip" | "keep"; forRest: boolean } | null = null;
+let dupQuestion: { file: { name: string }; twins: { name: string; where: string }[]; later: number } | null = null;
 
 // ── the tests ───────────────────────────────────────────────────────
 const model = new FilesModel(bridge, "jinu");
@@ -292,7 +294,7 @@ assert.equal(listed?.name, "Photos", "the tree shows the decrypted name");
 assert.ok(isPlacedText(folders.get(folderId)!.name), "the server never saw the name (GV04, sealed into the folder's place)");
 
 // 3. Upload with a duplicate check: the first copy just lands.
-dupAnswer = "keep";
+dupAnswer = { action: "keep", forRest: false };
 const bytes = new TextEncoder().encode("family photo bytes");
 const file = new File([bytes as BlobPart], "beach.png", { type: "image/png" });
 await model.upload([file]);
@@ -312,6 +314,7 @@ assert.deepEqual(plain, bytes);
 // 4. The SAME bytes again → the fingerprint question fires.
 await model.upload([new File([bytes as BlobPart], "beach copy.png", { type: "image/png" })]);
 assert.equal(dupAsked, 1, "the fingerprint caught the twin");
+assert.deepEqual([dupQuestion?.file.name, dupQuestion?.twins[0]?.name, dupQuestion?.twins[0]?.where, dupQuestion?.later], ["beach copy.png", "beach.png", "", 0], "the prompt says which file is already there, and where (39n)");
 assert.equal(model.state.get().files.length, 2, "keep both → two files");
 
 // 5. Download round-trips the exact bytes — and checks the uploader's

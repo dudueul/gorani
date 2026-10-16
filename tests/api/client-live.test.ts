@@ -89,6 +89,14 @@ try {
 	const devices = await api(dev.base, "GET", "/api/v1/members/jinu/devices", { email: "jinu@family.test" });
 	assert.ok(devices.json.find((d) => d.platform === "linux"), "the enrolled device is listed");
 
+	// The area's files secrets, as a browser makes them at its first upload
+	// (model.ts › ensureSecrets): with them the CLI tags what it pushes the
+	// way the browser does, and checks for duplicates (commit 39n).
+	const jinuStore = await storeSealer(filesStore.bundle, "jinu");
+	const fp = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64");
+	const idx = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64");
+	assert.equal((await api(dev.base, "PUT", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test", body: { sealed: await jinuStore.secrets(JSON.stringify({ fp, idx })) } })).status, 200);
+
 	// ── 2. push: the native write path — the CLI seals and uploads ──────
 	// (The old stall had two stacked causes, both found by bisecting raw
 	// sockets and a TCP dump proxy: spawnSync froze this process's S3 stub
@@ -103,6 +111,20 @@ try {
 	assert.equal(push.status, 0, `push failed: ${push.out}`);
 	const fileId = push.out.match(/pushed: (\S+)/)?.[1];
 	assert.ok(fileId && fileId !== "?", `push printed the file id: ${push.out}`);
+	// The same bytes again (commit 39n): not a terminal, so skipped — with a
+	// line naming the copy already there; `--duplicates keep` stores it.
+	const tagged = (await api(dev.base, "GET", `/api/v1/members/jinu/files/match?size=${plainHello.length}`, { email: "jinu@family.test" })).json.files.find((f) => f.id === fileId);
+	assert.match(tagged?.tag ?? "", /^[0-9a-f]{64}$/, "the CLI tagged its upload, as the browser does");
+	const again = await sync(["push", "--file", localFile, "--name", "hello again.txt", "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	assert.equal(again.status, 0, again.out);
+	assert.match(again.out, /"skipped":"hello again\.txt"/, `a duplicate push is skipped: ${again.out}`);
+	assert.match(again.out, /already here as “hello\.txt”/, "…saying which file has the bytes");
+	const kept = await sync(["push", "--file", localFile, "--name", "hello kept.txt", "--duplicates", "keep", "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json"), "--secret", recoveryCode]);
+	const keptId = kept.out.match(/pushed: (\S+)/)?.[1];
+	assert.ok(keptId, `--duplicates keep stores a second copy: ${kept.out}`);
+	const dupSets = (await api(dev.base, "GET", "/api/v1/members/jinu/files/duplicates", { email: "jinu@family.test" })).json.files.map((f) => f.id).sort();
+	assert.deepEqual(dupSets, [fileId, keptId].sort(), "and Find duplicates lists the pair — a CLI copy is found like a browser one");
+	assert.equal((await api(dev.base, "DELETE", `/api/v1/members/jinu/files/${keptId}`, { email: "jinu@family.test" })).status, 200);
 
 	// ── 3. ls: the change feed with names opened by the client ─────────
 	console.error("STEP ls");
@@ -185,7 +207,7 @@ try {
 	assert.notEqual(refused.status, 0, "push with a swapped store record is refused");
 	assert.match(refused.out, /failed authentication/, `the refusal names the reason: ${refused.out}`);
 
-	console.log("ok  live:client — enrol, push, ls, pull, round trip, a 60 MiB file in GC01 frames stopped after 3 parts and resumed from part 4, pulled streamed and byte-equal, a sample refused by pull, zero-trust, a swapped store record refused");
+	console.log("ok  live:client — enrol, push (a duplicate skipped and named, kept on --duplicates keep, listed by Find duplicates), ls, pull, round trip, a 60 MiB file in GC01 frames stopped after 3 parts and resumed from part 4, pulled streamed and byte-equal, a sample refused by pull, zero-trust, a swapped store record refused");
 } finally {
 	await dev.close();
 }

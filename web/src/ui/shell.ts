@@ -23,6 +23,7 @@ import { revokeAllBlobURLs } from "../lib/blob-urls.ts";
 import { FilesModel } from "./files/model.ts";
 import { sessionBridge } from "./files/bridge.ts";
 import { askIntake } from "./files/intake-dialog.ts";
+import { askDuplicate } from "./files/duplicate-dialog.ts";
 import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
 import { readPlace } from "./files/place.ts";
 import { updateSettings } from "../vault/settings-store.ts";
@@ -212,10 +213,7 @@ export class GoraniShell extends LitElement {
 					return openCaseKey(this.session.root, row, this.team.trust);
 				};
 		this.model = new FilesModel(sessionBridge(this.session, {
-			confirmDuplicate: async (count) =>
-				window.confirm(`${count} identical file${count > 1 ? "s" : ""} already here.\n\nOK — keep both copies\nCancel — skip the upload`)
-					? "keep"
-					: "skip",
+			confirmDuplicate: (question) => askDuplicate(question),
 			toast: (m) => this.toast(m),
 			// Signs what this member uploads, checks what others did (commit
 			// 29d) — read at each use, so it works from the moment the team

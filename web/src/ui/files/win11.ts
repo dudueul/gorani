@@ -34,6 +34,7 @@ import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import "../viewer/viewer.ts";
 import "./share-dialog.ts";
 import "./requests-dialog.ts";
+import { showDuplicates } from "./duplicates-dialog.ts";
 
 type ViewMode = "details" | "list" | "small" | "large";
 
@@ -315,10 +316,23 @@ export class GoraniWin11 extends LitElement {
 				{ label: "Request files into this folder…", run: () => this.openRequests("links", s.folderId) },
 				{ separator: true, label: "" },
 				{ label: "Select all", run: () => this.model.selectAll(), disabled: !(s.folders.length + s.files.length) },
+				{ label: "Find duplicates…", run: () => this.openDuplicates() },
 				{ label: this.showPreview ? "Hide the preview pane" : "Show the preview pane", run: () => (this.showPreview = !this.showPreview) },
 			],
 			x,
 			y,
+		);
+	}
+
+	/** Find duplicates (39n): the whole area, wherever the menu was opened. */
+	private openDuplicates(): void {
+		showDuplicates(this.model, (folderId, id) =>
+			this.attempt(
+				(async () => {
+					await this.go(folderId);
+					this.model.select({ kind: "file", id });
+				})(),
+			),
 		);
 	}
 

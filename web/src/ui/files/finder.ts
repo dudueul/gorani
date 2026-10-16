@@ -34,6 +34,7 @@ import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import "../viewer/viewer.ts";
 import "./share-dialog.ts";
 import "./requests-dialog.ts";
+import { showDuplicates } from "./duplicates-dialog.ts";
 
 type ViewMode = "icon" | "list" | "column";
 
@@ -309,6 +310,7 @@ export class GoraniFinder extends LitElement {
 				{ separator: true, label: "" },
 				{ label: "Paste Item", run: () => this.attempt(this.model.paste()), disabled: !this.model.canPaste },
 				{ label: "Select All", run: () => this.model.selectAll(), disabled: !(s.folders.length + s.files.length) },
+				{ label: "Find Duplicates…", run: () => this.openDuplicates() },
 				{ separator: true, label: "" },
 				{ label: "View", submenu: this.viewItems() },
 				{ label: "Sort By", submenu: this.sortItems() },
@@ -316,6 +318,17 @@ export class GoraniFinder extends LitElement {
 			],
 			x,
 			y,
+		);
+	}
+
+	private openDuplicates(): void {
+		showDuplicates(this.model, (folderId, id) =>
+			this.attempt(
+				(async () => {
+					await this.go(folderId);
+					this.model.select({ kind: "file", id });
+				})(),
+			),
 		);
 	}
 

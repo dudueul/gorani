@@ -716,6 +716,9 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "music/feed", None, actor)).await
 		}
 		("GET", ["members", id, "files", "match"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/match", &req, actor)).await,
+		// Find duplicates (commit 39n): every live file that shares its size
+		// and keyed tag with another — files_store.rs › files_duplicates.
+		("GET", ["members", id, "files", "duplicates"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/duplicates", None, actor)).await,
 		("GET", ["members", id, "files", "meta"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/meta", &req, actor)).await,
 		("GET", ["members", id, "files", "secrets"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/secrets", None, actor)).await,
 		("GET", ["members", id, "files", "trash"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/trash", None, actor)).await,

@@ -384,6 +384,7 @@ never in the repository), and all four parts in this phase:
 | 39f | **Installers**: an MSIX and a signed, notarized app — signed in CI only when the signing secrets exist. |
 | 39g | **Distribution** (asked 2026-10-15): Windows through the Microsoft Store as a private app (Microsoft signs it); beside it, unsigned builds — a Windows 11 MSIX, a Windows ZIP, the macOS CLI — whose users check a SHA256SUMS the release manager signs with their own key. |
 | 39i | **Releases** (asked 2026-10-15): every build of main that changes the programs, and every `v*` tag, published to GitHub Releases as Latest — the newest 10 main builds kept — with SHA256SUMS signed in CI by a key held as an Actions secret; a Linux tarball joins the files. |
+| 39n | **Duplicates** (asked 2026-10-16): the native clients tag what they upload exactly as the browser does (`area.rs › duplicate_tag`); `push` skips a file whose bytes are already in the area (`--duplicates skip|keep|ask`; asks on a terminal); the sync engines upload a copy anyway and log which file it duplicates — docs/DUPLICATES.md. |
 
 ### 39a as built
 

@@ -489,6 +489,9 @@ fn run(args: &[String]) -> Result<(), Error> {
 				if hashed != size {
 					return Err(Error::Config("the file changed while it was being read".into()));
 				}
+				if !duplicate_go_ahead(&client, &area, &name, size, &sha256, flag("duplicates").as_deref())? {
+					return Ok(());
+				}
 				let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
 				let journal = transfer::Journal::new(journal_dir);
 				let jkey = transfer::Journal::key_for(&member, &area.name, &name, size, modified, &sha256);
@@ -527,6 +530,9 @@ fn run(args: &[String]) -> Result<(), Error> {
 			}
 			let bytes = std::fs::read(&path)?;
 			let sha256 = transfer::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+			if !duplicate_go_ahead(&client, &area, &name, bytes.len() as u64, &sha256, flag("duplicates").as_deref())? {
+				return Ok(());
+			}
 			// The id first — the name, type, key, hash and intake are sealed
 			// into places that name it (O6); a new file is version 1.
 			let file_id = gorani_client_core::new_item_id();
@@ -538,11 +544,44 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file (Windows: +dpapi +hello; macOS: enclave +keychain +presence) --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash]");
+			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file (Windows: +dpapi +hello; macOS: enclave +keychain +presence) --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash --duplicates skip|keep|ask]");
 			std::process::exit(2);
 		}
 	}
 	Ok(())
+}
+
+/// `push`'s duplicate check (commit 39n): a file whose bytes are already in
+/// the area — the same keyed tag the browser compares — is skipped or kept
+/// per `--duplicates skip|keep|ask`. The default asks on a terminal and
+/// skips otherwise (a script pushing the same file twice gets one copy, and
+/// a line saying where the other is). Returns whether to upload.
+fn duplicate_go_ahead(client: &api::Client, area: &gorani_client_core::area::Area, name: &str, size: u64, sha256: &str, policy: Option<&str>) -> Result<bool, Error> {
+	use std::io::{IsTerminal, Write};
+	let policy = match policy {
+		Some(p @ ("skip" | "keep" | "ask")) => p,
+		Some(other) => return Err(Error::Config(format!("--duplicates {other}: skip, keep or ask"))),
+		None if std::io::stdin().is_terminal() => "ask",
+		None => "skip",
+	};
+	if policy == "keep" {
+		return Ok(true);
+	}
+	let twins = area.twins(client, size, sha256)?;
+	let Some(first) = twins.first() else { return Ok(true) };
+	let more = if twins.len() > 1 { format!(" (and {} more)", twins.len() - 1) } else { String::new() };
+	eprintln!("{name}: the same bytes are already here as “{}”{more}, id {}", first.name, first.id);
+	if policy == "ask" {
+		eprint!("Store a second copy? [y/N] ");
+		std::io::stderr().flush().ok();
+		let mut answer = String::new();
+		std::io::stdin().read_line(&mut answer)?;
+		if answer.trim().eq_ignore_ascii_case("y") {
+			return Ok(true);
+		}
+	}
+	println!("{}", serde_json::json!({ "skipped": name, "duplicateOf": twins.iter().map(|t| serde_json::json!({ "id": t.id, "name": t.name, "folder": t.folder })).collect::<Vec<_>>() }));
+	Ok(false)
 }
 
 fn collector_profile_path(flag: &dyn Fn(&str) -> Option<String>) -> PathBuf {

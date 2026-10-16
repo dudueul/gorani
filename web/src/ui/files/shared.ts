@@ -13,6 +13,9 @@ import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { Directive, directive, PartType, type ElementPart, type PartInfo } from "lit/directive.js";
 import type { FileKind } from "./icons.ts";
+import { folderPath, type TreeFolder } from "./paths.ts";
+
+export { folderPath };
 
 // ── cssom(): styles through the CSSOM, never the style attribute ─────
 //
@@ -270,23 +273,6 @@ export class GoraniMenu extends LitElement {
 				: nothing}
 		`;
 	}
-}
-
-/** A folder as the menus need it: its id, its parent, its name. */
-interface TreeFolder {
-	id: string;
-	parent?: string | null;
-	name: string;
-}
-
-/** "Holiday › 2026 › Beach": a folder's whole path, so a Move to list with
- * two folders called "2026" says which is which. */
-export function folderPath(tree: TreeFolder[], id: string): string {
-	const names: string[] = [];
-	for (let cur: string | null = id; cur && names.length < 64; cur = tree.find((f) => f.id === cur)?.parent ?? null) {
-		names.unshift(tree.find((f) => f.id === cur)?.name ?? "…");
-	}
-	return names.join(" › ");
 }
 
 /**

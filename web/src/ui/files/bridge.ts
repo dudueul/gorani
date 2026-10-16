@@ -10,7 +10,7 @@
  * up before recording it.
  */
 
-import type { FilesBridge } from "./model.ts";
+import type { DuplicateAnswer, DuplicateQuestion, FilesBridge } from "./model.ts";
 import { devIdentityHeaders } from "../../lib/api.ts";
 import { areaPath } from "../../lib/area.ts";
 import { browserJournal } from "../../lib/upload-journal.ts";
@@ -22,7 +22,7 @@ import type { IntakeFields } from "../../vault/intake.ts";
 import { openChunkedStream } from "../../vault/chunked-file.ts";
 
 export interface FilesHooks {
-	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
+	confirmDuplicate(question: DuplicateQuestion): Promise<DuplicateAnswer>;
 	toast(message: string): void;
 	/** The member's signer and trust, once the team context is open (model.ts › FilesBridge.identity). */
 	identity?(): { signer: Signer; trust: Trust } | null;

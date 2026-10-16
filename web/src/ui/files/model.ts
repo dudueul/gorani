@@ -28,6 +28,7 @@ import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
 import { toBase64, fromBase64 } from "../../lib/encoding.ts";
 import { areaPath } from "../../lib/area.ts";
 import { writePlace } from "./place.ts";
+import { folderPath } from "./paths.ts";
 import { kindOf, type FileKind } from "./icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import type { LocalIndexLike } from "../../vault/index.ts";
@@ -128,7 +129,9 @@ export interface FilesBridge {
 	multipartComplete(memberId: string, uploadId: string, fields: Record<string, string>): Promise<void>;
 	/** Where unfinished uploads are remembered (this browser's IndexedDB); absent → not resumable. */
 	uploadJournal?: UploadJournal;
-	confirmDuplicate(count: number): Promise<"skip" | "keep" | "version" | null>;
+	/** The duplicate prompt (commit 39n): which file, where its twins are,
+	 * how many files are still to come; the answer may stand for the rest. */
+	confirmDuplicate(question: DuplicateQuestion): Promise<DuplicateAnswer>;
 	toast(message: string): void;
 	/** The member's identity (commit 29d, docs/CUSTODY.md › stage 4): the
 	 * signer that vouches for what they upload, and the trust that checks
@@ -144,7 +147,34 @@ export interface FilesBridge {
 	intake?(files: File[]): Promise<IntakeFields | null>;
 }
 
-export type DuplicateAnswer = "skip" | "keep" | "version" | null;
+/** A file already in the area with exactly the same bytes. */
+export interface DuplicateTwin {
+	id: string;
+	name: string;
+	/** Its folder's path; "" at the top. */
+	where: string;
+}
+
+/** What the duplicate prompt is told: the file, its twins, and how many
+ * files of this upload are still to come. */
+export interface DuplicateQuestion {
+	file: { name: string; size: number };
+	twins: DuplicateTwin[];
+	later: number;
+}
+
+/** Skip this file or keep both — and whether that stands for every other
+ * duplicate in this upload; null stops the upload. (Until 39n the prompt
+ * was a bare OK/Cancel with a count: it never said WHICH file was already
+ * there, or where, and a batch asked once per twin.) */
+export type DuplicateAnswer = { action: "skip" | "keep"; forRest: boolean } | null;
+
+/** Find duplicates (commit 39n): one set of files with exactly the same
+ * bytes, oldest first. */
+export interface DuplicateGroup {
+	size: number;
+	files: { id: string; name: string; folderId: string | null; where: string; updatedAt: string }[];
+}
 
 export class FilesModel {
 	readonly state: Store<FilesState>;
@@ -522,7 +552,9 @@ export class FilesModel {
 				return;
 			}
 		}
-		for (const file of files) {
+		// "Do the same for the rest of this upload", once answered.
+		let standing: "skip" | "keep" | null = null;
+		for (const [i, file] of files.entries()) {
 			if (file.size > MAX_FILE) {
 				this.bridge.toast(`“${file.name}” is ${(file.size / 1024 ** 3).toFixed(1)} GiB — a file is at most 255 GiB`);
 				continue;
@@ -532,11 +564,20 @@ export class FilesModel {
 			const digest = await digestOf(file);
 			const tag = await this.fingerprint(digest);
 			// The duplicate check: same size on the server, compare tags locally.
-			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${file.size}`);
+			const same = await this.bridge.apiGet<{ files: { id: string; tag: string | null; folder?: string | null; name?: string | null }[] }>(`${areaPath(this.memberId)}/files/match?size=${file.size}`);
 			const twins = same.files.filter((x) => x.tag && x.tag === tag);
 			if (twins.length) {
-				const answer = await this.bridge.confirmDuplicate(twins.length);
-				if (answer === "skip") {
+				let action = standing;
+				if (!action) {
+					const answer = await this.bridge.confirmDuplicate({ file: { name: file.name, size: file.size }, twins: await this.describeTwins(twins), later: files.length - i - 1 });
+					if (!answer) {
+						this.bridge.toast(`Upload stopped at “${file.name}”`);
+						break;
+					}
+					action = answer.action;
+					if (answer.forRest) standing = answer.action;
+				}
+				if (action === "skip") {
 					this.bridge.toast(`Skipped “${file.name}” (already here)`);
 					continue;
 				}
@@ -548,6 +589,37 @@ export class FilesModel {
 			await this.uploadOne(file, tag, folderId, hexOf(digest), sample, intake);
 		}
 		await this.refresh();
+	}
+
+	/** Find duplicates: the area's files that have exactly the same bytes as
+	 * another (same size and keyed tag — files_store.rs › files_duplicates),
+	 * grouped, each copy named (opened here) and placed in its folder. */
+	async findDuplicates(): Promise<DuplicateGroup[]> {
+		const res = await this.bridge.apiGet<{ files: { id: string; size: number; tag: string; folder: string | null; name: string; updatedAt: string }[] }>(`${areaPath(this.memberId)}/files/duplicates`);
+		const priv = await this.bridge.storePrivate();
+		const tree = this.state.get().tree;
+		const groups = new Map<string, DuplicateGroup>();
+		for (const r of res.files) {
+			const key = `${r.size}:${r.tag}`;
+			const group = groups.get(key) ?? { size: Number(r.size), files: [] };
+			group.files.push({ id: r.id, folderId: r.folder ?? null, name: await this.openName(priv, places.fileName(this.memberId, r.id), r.id, r.name), where: r.folder ? folderPath(tree, r.folder) : "", updatedAt: r.updatedAt });
+			groups.set(key, group);
+		}
+		return [...groups.values()].filter((g) => g.files.length > 1);
+	}
+
+	/** The twins as the prompt shows them: each one's name (opened here,
+	 * from the sealed name the match route returns) and its folder's path. */
+	private async describeTwins(rows: { id: string; folder?: string | null; name?: string | null }[]): Promise<DuplicateTwin[]> {
+		const priv = await this.bridge.storePrivate();
+		const tree = this.state.get().tree;
+		return Promise.all(
+			rows.map(async (r) => ({
+				id: r.id,
+				name: r.name ? await this.openName(priv, places.fileName(this.memberId, r.id), r.id, r.name) : (this.names.get(r.id) ?? "a file"),
+				where: r.folder ? folderPath(tree, r.folder) : "",
+			})),
+		);
 	}
 
 	private async uploadOne(file: File, tag: string, folderId: string | null, sha256: string, sample = false, intakeFields: IntakeFields | null = null): Promise<void> {

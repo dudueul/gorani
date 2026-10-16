@@ -275,6 +275,26 @@ impl Client {
 	}
 
 	/// One page of every living file, with every folder (`files/list?folder=all`).
+	/// An area's sealed files secrets (`{fp, idx}`, placed into
+	/// `store.secrets`) — None before any browser made them. The area is
+	/// named, not taken from `in_area`: open_area asks before the client is
+	/// scoped to the area it is opening.
+	pub fn files_secrets_of(&self, area: &str) -> Result<Option<String>, Error> {
+		let url = match area.strip_prefix("case:") {
+			Some(case) => format!("{}/api/v1/cases/{case}/files/secrets", self.server()),
+			None => format!("{}/api/v1/members/{area}/files/secrets", self.server()),
+		};
+		let v = self.json_at("GET", &url, None)?;
+		Ok(v.get("sealed").and_then(|s| s.as_str()).map(str::to_string))
+	}
+
+	/// The live files of exactly `size` bytes, each with its duplicate tag,
+	/// folder and sealed name (the duplicate check, commit 39n).
+	pub fn files_match(&self, size: u64) -> Result<Vec<Value>, Error> {
+		let v = self.area_json("GET", &format!("/files/match?size={size}"), None)?;
+		Ok(v.get("files").and_then(|f| f.as_array()).cloned().unwrap_or_default())
+	}
+
 	pub fn list(&self, offset: u64, limit: u32) -> Result<Value, Error> {
 		self.area_json("GET", &format!("/files/list?folder=all&offset={offset}&limit={limit}"), None)
 	}

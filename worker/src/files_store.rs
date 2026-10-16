@@ -429,19 +429,48 @@ impl GoraniMemberDO {
 	}
 
 	/// `GET files/match?size=` — the duplicate check: every live file of that
-	/// exact size with its fingerprint tag (opaque; the browser compares
-	/// tags, the server learns only which files are the same size).
+	/// exact size with its fingerprint tag (opaque: an HMAC under a secret
+	/// only the area's members hold), and — since commit 39n — its folder
+	/// and SEALED name, so the browser's prompt can say which file is
+	/// already there and where. (The browser compares the tags. The server
+	/// stores them, so it could always see that two tags are equal — what
+	/// it cannot learn is what the bytes are, or match them to a hash it
+	/// knows.)
 	pub(crate) async fn files_match(&self, req: Request) -> Result<Response> {
 		let url = req.url()?;
 		let Some(size) = urlquery(url.query().unwrap_or("")).get("size").and_then(|v| v.parse::<i64>().ok()) else { return json_error(400, "size required") };
 		let rows: Vec<MatchRow> = self
 			.sql
 			.exec(
-				"SELECT f.id, v.tag, f.owner AS owner, (SELECT group_concat(member, ',') FROM file_contributors c WHERE c.file_id = f.id) AS contributors FROM files f JOIN file_versions v ON v.file_id = f.id AND v.version = f.version WHERE f.size = ?1 AND f.deleted_at IS NULL",
+				"SELECT f.id, v.tag, f.folder_id, f.name_sealed, f.owner AS owner, (SELECT group_concat(member, ',') FROM file_contributors c WHERE c.file_id = f.id) AS contributors FROM files f JOIN file_versions v ON v.file_id = f.id AND v.version = f.version WHERE f.size = ?1 AND f.deleted_at IS NULL",
 				Some(vec![size.into()]),
 			)?
 			.to_array()?;
-		Ok(Response::from_json(&serde_json::json!({ "files": rows.into_iter().map(|r| serde_json::json!({ "id": r.id, "tag": r.tag, "owner": r.owner, "contributors": r.contributors })).collect::<Vec<_>>() }))?)
+		Ok(Response::from_json(&serde_json::json!({ "files": rows.into_iter().map(|r| serde_json::json!({ "id": r.id, "tag": r.tag, "folder": r.folder_id, "name": r.name_sealed, "owner": r.owner, "contributors": r.contributors })).collect::<Vec<_>>() }))?)
+	}
+
+	/// `GET files/duplicates` (commit 39n, Find duplicates): every live file
+	/// whose living version shares its size AND its fingerprint tag with
+	/// another — folder, sealed name and time, for the browser to group,
+	/// open and show. Nothing new is told to anyone: the tags are opaque
+	/// HMACs the server already stores (it could always see that two are
+	/// equal); the names stay sealed. Capped at 5 000 rows, largest first —
+	/// the copies worth finding.
+	pub(crate) async fn files_duplicates(&self) -> Result<Response> {
+		let rows: Vec<DuplicateRow> = self
+			.sql
+			.exec(
+				"SELECT f.id, f.size, v.tag, f.folder_id, f.name_sealed, f.updated_at FROM files f JOIN file_versions v ON v.file_id = f.id AND v.version = f.version \
+				 WHERE f.deleted_at IS NULL AND v.tag IS NOT NULL AND (f.size, v.tag) IN ( \
+				   SELECT f2.size, v2.tag FROM files f2 JOIN file_versions v2 ON v2.file_id = f2.id AND v2.version = f2.version \
+				   WHERE f2.deleted_at IS NULL AND v2.tag IS NOT NULL GROUP BY f2.size, v2.tag HAVING COUNT(*) > 1) \
+				 ORDER BY f.size DESC, v.tag, f.updated_at, f.id LIMIT 5000",
+				None,
+			)?
+			.to_array()?;
+		Ok(Response::from_json(&serde_json::json!({
+			"files": rows.into_iter().map(|r| serde_json::json!({ "id": r.id, "size": r.size, "tag": r.tag, "folder": r.folder_id, "name": r.name_sealed, "updatedAt": r.updated_at })).collect::<Vec<_>>(),
+		}))?)
 	}
 
 	/// The `files-object/:id` route: the object's location + wrapped key, for
@@ -1419,9 +1448,20 @@ struct JournalRow {
 	at: String,
 }
 #[derive(serde::Deserialize)]
+struct DuplicateRow {
+	id: String,
+	size: i64,
+	tag: String,
+	folder_id: Option<String>,
+	name_sealed: String,
+	updated_at: String,
+}
+#[derive(serde::Deserialize)]
 struct MatchRow {
 	id: String,
 	tag: Option<String>,
+	folder_id: Option<String>,
+	name_sealed: String,
 	owner: Option<String>,
 	contributors: Option<String>,
 }

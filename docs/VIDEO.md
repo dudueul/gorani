@@ -71,7 +71,8 @@ the <video> wants time T
   missing.
 - **Which files**:
   - A regular MP4 (moov at either end) whose codecs this browser's MSE
-    plays.
+    plays. Since 39w that includes music in MP4 (M4A, M4B), played through
+    an `<audio>` element with an `audio/mp4` type (docs/MUSIC.md).
   - Everything else plays the older way: through the media service worker
     below. That covers fragmented MP4s, other containers, codecs MSE
     refuses, and any failure of the engine or the decoder.
@@ -112,3 +113,11 @@ the <video> wants time T
 - **39p**: the sidecar and the in-page player above. A regular MP4 now plays
   through MSE, with keyframe-accurate seeks and no service worker in the
   way. The streaming path above remains for everything else.
+- **39w**: films over 256 MB play. Until then the viewer's 256 MB cap
+  (`MAX_INLINE`, ⑩a's "read whole into a tab") was checked before the
+  file's kind, so a large film showed "No inline preview yet". That is the
+  case the streamer exists for. The cap now applies only where a file is
+  read whole: an image, or media when neither streaming path is available.
+  Video and audio stream at any size. Music joined the in-page player
+  (M4A), and the rest of it streams from the first byte
+  (docs/MUSIC.md).

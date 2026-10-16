@@ -19,7 +19,10 @@
  *      several) the reader returns the very same bytes, keeps frames it
  *      just opened, and the segments built from it equal the plain ones;
  *   5. a moov the engine cannot read is refused with its reason, and the
- *      engine goes on to index the next video.
+ *      engine goes on to index the next video;
+ *   6. music in MP4 (39w) — an M4A, AAC or Opus — is indexed and cut into
+ *      segments as a film is, under an audio/mp4 type; an MP3 is not the
+ *      engine's, and is left to the media worker.
  */
 
 import assert from "node:assert/strict";
@@ -31,6 +34,7 @@ import { layoutOf, parseBoxHeader, parseVideoMeta, segmentAt, nextSegment, topBo
 import { sealChunked, openChunk } from "../../web/src/vault/chunked-file.ts";
 import { newContentKey, importContentKey } from "../../web/src/vault/vault-crypto.ts";
 import { videoFixture, mediaWasm, probeDuration } from "../lib/video-fixtures.mjs";
+import { isMp4 } from "../../web/src/ui/files/model.ts";
 
 const wasm = mediaWasm();
 const engine = await mediaEngine(wasm);
@@ -162,6 +166,46 @@ assert.equal(await indexVideo(local(noise), noise.length, null, engine).catch(()
 	plain.index!.drop();
 }
 
+// ── 6. Music in MP4 (39w): the same engine, no picture ─────────────
+// An M4A plays through the in-page player as a film does — indexed, cut
+// into segments, appended as fMP4 — with an audio/mp4 MediaSource type.
+for (const name of ["aac.m4a", "opus.m4a"] as const) {
+	const path = videoFixture(name, { seconds: 20 });
+	const file = new Uint8Array(fs.readFileSync(path));
+	const found = await indexVideo(local(file), file.length, null, engine);
+	assert.ok(found?.index, `${name}: indexed`);
+	const { index, meta } = found;
+	assert.deepEqual(meta.tracks.map((t) => t.type), ["audio"], `${name}: one track, audio`);
+	assert.match(index.summary.codecs, name === "aac.m4a" ? /^mp4a\.40\.2$/ : /^opus$/, `${name}: the codec MSE is asked for (${index.summary.codecs})`);
+	assert.equal(mseType(index.summary.codecs, false), `audio/mp4; codecs="${index.summary.codecs}"`);
+	const seconds = probeDuration(path);
+	assert.ok(Math.abs(index.summary.durationMs / 1000 - seconds) < 0.25, `${name}: duration ${index.summary.durationMs} ms ≈ ffprobe's ${seconds} s`);
+	const segs = index.segments;
+	assert.ok(segs.length >= 2, `${name}: a track is cut into segments too (${segs.length}), so a seek fetches only its own`);
+	const end = segs[segs.length - 1]![0] + segs[segs.length - 1]![1];
+	assert.ok(Math.abs(end - seconds) < 0.25, `${name}: the segments cover the track (${end} s)`);
+	for (let n = 0; n < segs.length; n++) {
+		const blocks = index.plan(n);
+		const joined = new Uint8Array(blocks.reduce((a, [, l]) => a + l, 0));
+		let at = 0;
+		for (const [o, l] of blocks) {
+			joined.set(file.subarray(o, o + l), at);
+			at += l;
+		}
+		const seg = index.segment(n, joined);
+		assert.equal(String.fromCharCode(...seg.subarray(4, 8)), "moof", `${name}: segment ${n} is a moof`);
+	}
+	index.drop();
+}
+// An MP3 is not the engine's: the viewer never asks it (isMp4), and the
+// box walk would refuse it anyway — the media worker plays it.
+{
+	const mp3 = new Uint8Array(fs.readFileSync(videoFixture("tone.mp3", { seconds: 5 })));
+	assert.equal(isMp4("tone.mp3", "audio/mpeg"), false, "an MP3 goes to the media worker");
+	assert.equal(isMp4("track.m4a", null) && isMp4("book.m4b", null) && isMp4("x", "audio/x-m4a"), true, "an M4A (and an M4B) goes to the engine");
+	await assert.rejects(indexVideo(local(mp3), mp3.length, null, engine), /does not fit the file/, "…which would refuse an MP3's bytes, not misread them");
+}
+
 // ── 5. A file the engine cannot read is a refusal, not a crash ─────
 {
 	const module = await WebAssembly.compile(wasm);
@@ -176,4 +220,4 @@ assert.equal(await indexVideo(local(noise), noise.length, null, engine).catch(()
 	again.index!.drop();
 }
 
-console.log("ok  unit:video — the walk (moov at either end, boxes that do not fit refused), the engine (ffprobe's duration, the MSE codecs, every segment moof+mdat, a short input refused), the sidecar (round trip, malformed refused, a wrong place corrected, fragmented described, non-MP4 nothing), the same bytes and segments through GC01 frames, an unreadable moov refused without breaking the engine");
+console.log("ok  unit:video — the walk (moov at either end, boxes that do not fit refused), the engine (ffprobe's duration, the MSE codecs, every segment moof+mdat, a short input refused), the sidecar (round trip, malformed refused, a wrong place corrected, fragmented described, non-MP4 nothing), the same bytes and segments through GC01 frames, music in MP4 (AAC and Opus M4As indexed and cut like films, an audio/mp4 type; an MP3 left to the media worker), an unreadable moov refused without breaking the engine");

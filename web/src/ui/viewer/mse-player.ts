@@ -83,13 +83,14 @@ export class MsePlayer {
 	/** Segments built and appended (for the tests and the panel). */
 	appended = 0;
 
-	private readonly video: HTMLVideoElement;
+	/** A `<video>` — or, for music (39w), an `<audio>`: MSE feeds either. */
+	private readonly video: HTMLMediaElement;
 	private readonly index: MediaIndex;
 	private readonly source: PlainSource;
 	private readonly type: string;
 	private readonly opts: MsePlayerOptions;
 
-	constructor(video: HTMLVideoElement, index: MediaIndex, source: PlainSource, type: string, opts: MsePlayerOptions = {}) {
+	constructor(video: HTMLMediaElement, index: MediaIndex, source: PlainSource, type: string, opts: MsePlayerOptions = {}) {
 		this.video = video;
 		this.index = index;
 		this.source = source;
@@ -101,7 +102,7 @@ export class MsePlayer {
 		// ManagedMediaSource plays only with remote playback (AirPlay) off,
 		// unless an alternative source is offered — there is none here: the
 		// bytes exist only in this page.
-		(video as HTMLVideoElement & { disableRemotePlayback?: boolean }).disableRemotePlayback = true;
+		(video as HTMLMediaElement & { disableRemotePlayback?: boolean }).disableRemotePlayback = true;
 		this.url = URL.createObjectURL(this.ms);
 		this.ms.addEventListener("sourceopen", this.onOpen, { once: true });
 		this.ms.addEventListener("startstreaming", this.kick);
@@ -132,7 +133,7 @@ export class MsePlayer {
 
 	private readonly onVideoError = (): void => {
 		const err = this.video.error;
-		this.fail(new Error(`the browser could not decode this video${err?.message ? ` (${err.message})` : ""}`));
+		this.fail(new Error(`the browser could not decode this file${err?.message ? ` (${err.message})` : ""}`));
 	};
 
 	private readonly onOpen = async (): Promise<void> => {

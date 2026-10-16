@@ -763,6 +763,52 @@ try {
 			await page.waitForFunction(async ({ id }) => (await fetch(`/api/v1/members/jinu/files/${id}/video`, { headers: { "x-gorani-dev-email": "jinu@family.test" } })).status === 200, { id: file.id }, { timeout: 15_000 });
 			await assertNoViolations(page, "in-page video player");
 
+			// Music (39w): an M4A through the same in-page engine — its
+			// sidecar written at upload, segments appended to an <audio> —
+			// and an MP3, which the MP4 engine does not cut, streamed by the
+			// media worker from the first byte (it used to be read whole
+			// below 8 MiB before a note played).
+			const tune = videoFixture("opus.m4a", { seconds: 20 });
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "tune.m4a", mimeType: "audio/mp4", buffer: readFileSync(tune) });
+			await row("tune.m4a").waitFor({ timeout: 60_000 });
+			const tuneId = (await row("tune.m4a").getAttribute("data-item")).slice("file:".length);
+			await page.waitForFunction(() => !document.querySelector('[data-test="upload-progress"]'), null, { timeout: 60_000 });
+			assert.equal(await sidecarOf(tuneId), 200, "an M4A gets its sidecar at upload, as a film does");
+			await row("tune.m4a").dblclick();
+			await page.locator("gorani-viewer audio[data-engine=mse]").waitFor({ state: "attached", timeout: 30_000 });
+			const heard = await page.evaluate(async () => {
+				const a = document.querySelector("gorani-viewer audio[data-engine=mse]");
+				const until = (f, ms) => new Promise((ok, no) => { const t0 = Date.now(); const tick = () => (f() ? ok(true) : Date.now() - t0 > ms ? no(new Error(`timed out: t=${a.currentTime} rs=${a.readyState} err=${a.error?.message}`)) : setTimeout(tick, 50)); tick(); });
+				a.muted = true;
+				await until(() => a.readyState >= 2, 20_000);
+				await a.play();
+				await until(() => a.currentTime > 0.5, 20_000);
+				a.currentTime = 15;
+				await until(() => !a.seeking && a.currentTime >= 15 && a.readyState >= 3, 20_000);
+				const at = a.currentTime;
+				await until(() => a.currentTime > at + 0.3, 20_000);
+				return { src: a.src, at: a.currentTime, duration: a.duration };
+			});
+			assert.match(heard.src, /^blob:/, "a MediaSource fed by the engine, not a file URL");
+			assert.ok(heard.at >= 15 && Math.abs(heard.duration - 20) < 0.5, `played, sought to 15 s and on (${JSON.stringify(heard)})`);
+			await page.keyboard.press("Escape");
+			const song = readFileSync(videoFixture("tone.mp3", { seconds: 5 }));
+			assert.ok(song.length < 8 * 1024 * 1024, "a small file — it used to be read whole");
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "song.mp3", mimeType: "audio/mpeg", buffer: song });
+			await row("song.mp3").waitFor({ timeout: 60_000 });
+			await row("song.mp3").dblclick();
+			const player = page.locator("gorani-viewer audio").first();
+			await player.waitFor({ state: "attached", timeout: 30_000 });
+			assert.match((await player.getAttribute("src")) ?? "", /^\/media\//, "an MP3 streams through the media worker");
+			assert.ok(await page.evaluate(async () => {
+				const a = document.querySelector("gorani-viewer audio");
+				const t0 = Date.now();
+				while (a.readyState < 1 && Date.now() - t0 < 20_000) await new Promise((r) => setTimeout(r, 50));
+				return a.readyState >= 1 && Math.abs(a.duration - 5) < 0.5;
+			}), "…and the browser reads its length from the streamed bytes");
+			await page.keyboard.press("Escape");
+			await assertNoViolations(page, "music through the in-page player and the media worker");
+
 			// ── The Movie tab (39o): collections by folder, the card's
 			// poster and length from sealed sidecars, resume where this
 			// member left off, subtitles found beside the video. ─────
@@ -1499,7 +1545,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), music (an M4A through the same engine, an MP3 streamed by the media worker), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
 } finally {
 	await dev.close();
 }

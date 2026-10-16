@@ -77,19 +77,31 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 		}
 		// /api/v1 is authenticated+routed in routes.rs; /s/* is the PUBLIC
 		// share surface (the link's fragment secret is the credential).
-		(_, p) if p.starts_with("/api/v1/") || p.starts_with("/s/") => match routes::route(req, env).await {
-			Ok(resp) => harden(resp),
-			// An unexpected fault (a storage outage, a malformed body the
-			// route did not anticipate): logged in full for the operator,
-			// answered generically to the caller — internal messages (object
-			// keys, endpoints, SQL) are reconnaissance — and hardened like any
-			// other response. Expected refusals never come this way: routes
-			// answer those themselves with honest 4xx statuses.
-			Err(e) => {
-				console_log!("gorani: unhandled error: {e}");
-				harden(Response::from_json(&serde_json::json!({ "error": "internal error" }))?.with_status(500))
+		(_, p) if p.starts_with("/api/v1/") || p.starts_with("/s/") => {
+			let req_is_api = p.starts_with("/api/v1/");
+			match routes::route(req, env).await {
+				Ok(resp) => harden(resp),
+				// An unexpected fault (a storage outage, a malformed body the
+				// route did not anticipate): logged in full for the operator,
+				// answered generically to the caller — internal messages (object
+				// keys, endpoints, SQL) are reconnaissance — and hardened like any
+				// other response. Expected refusals never come this way: routes
+				// answer those themselves with honest 4xx statuses.
+				Err(e) => {
+					let message = e.to_string();
+					console_log!("gorani: unhandled error: {message}");
+					// A storage refusal is not "internal": the caller is told
+					// the status and the storage's own code (commit 39s) — never
+					// the object key or the endpoint, which stay in the log —
+					// and where a lead finds the rest. Only to signed-in callers:
+					// /api/v1 is behind Access, the public share pages are not.
+					match crate::s3::public_reason(&message).filter(|_| req_is_api) {
+						Some(reason) => harden(Response::from_json(&serde_json::json!({ "error": format!("the storage refused this ({reason}) — a lead can run Team › People › Check storage") }))?.with_status(502)),
+						None => harden(Response::from_json(&serde_json::json!({ "error": "internal error" }))?.with_status(500)),
+					}
+				}
 			}
-		},
+		}
 		// The asset layer handles static files and the SPA fallback; the
 		// Worker only ever sees what `run_worker_first` names.
 		_ => Response::error("Not Found", 404),

@@ -74,6 +74,15 @@ const splitEmails = (s: string) => s.split(/[\s,;]+/).map((e) => e.trim()).filte
 /** An expiry as a date input shows it (YYYY-MM-DD); the registry keeps the end of that day, UTC. */
 const dayOf = (iso?: string | null) => (iso ?? "").slice(0, 10);
 
+/** `POST /family/storage/probe` (commit 39s, worker/src/s3.rs › probe). */
+interface StorageCheck {
+	backend: "s3" | "r2";
+	ok: boolean;
+	steps: { step: string; ok: boolean; status: number; reason: string | null; server: string }[];
+	warnings?: string[];
+	settings?: { name: string; set: boolean; padded?: boolean; shown?: string }[];
+}
+
 const input = "rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-sm outline-none focus:border-accent";
 const button = "rounded-lg border border-neutral-700 px-2.5 py-1.5 text-xs hover:border-accent disabled:opacity-40";
 const primary = "rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-neutral-950 hover:opacity-90 disabled:opacity-40";
@@ -102,6 +111,8 @@ export class GoraniTeam extends LitElement {
 	@state() private tsa: { configured: boolean; certs: TsaCert[] } | null = null;
 	@state() private tsaTrusted: TrustedTsas = new Map();
 	@state() private tsaProbe: TsaIdentity | null = null;
+	/** A lead's storage check (commit 39s): each step of a real round trip, explained. */
+	@state() private storageCheck: StorageCheck | null = null;
 	/** This member's computers (commit 34): what protects each, and revocation. */
 	@state() private devices: DeviceRow[] = [];
 	/** The team's collectors (commit 37a), each with THIS member's verdict on it (null = counted). */
@@ -541,7 +552,55 @@ export class GoraniTeam extends LitElement {
 					})}
 				</ul>
 			</section>
+			${this.renderStorage()}
 			${this.renderTsa()}
+		`;
+	}
+
+	/**
+	 * The deployment's object storage (commit 39s, s3.rs › probe): a lead
+	 * writes, sizes, reads and deletes a 16-byte probe object, and sees each
+	 * answer explained — and the five settings as the Worker holds them (the
+	 * access key's last four characters, the secret's length, never the
+	 * secret). Built after the first production upload failed with "HTTP
+	 * 403" and nothing to say why.
+	 */
+	private renderStorage() {
+		if (!this.isLead) return nothing;
+		const c = this.storageCheck;
+		return html`
+			<section class="rounded-xl border border-neutral-800 p-3" data-test="storage">
+				<div class="flex items-center gap-2">
+					<h3 class="font-medium">Storage</h3>
+					<button class="${button} ml-auto" ?disabled=${this.busy} data-test="storage-check" @click=${() => this.act("Checking the storage", async () => {
+						this.storageCheck = await this.call<StorageCheck>("POST", "/api/v1/family/storage/probe");
+						return this.storageCheck.ok ? "The storage took a write, a read and a delete." : "The storage refused a step — see below.";
+					})}>Check storage</button>
+				</div>
+				<p class="mt-1 text-xs text-neutral-400">Writes a 16-byte probe object, reads it back and deletes it — the steps every upload and download takes.</p>
+				${c
+					? html`
+							<p class="mt-2 text-xs ${c.ok ? "text-emerald-400" : "text-red-300"}" data-test="storage-verdict">${c.backend === "r2" ? "R2 binding" : "S3-compatible endpoint"} — ${c.ok ? "working" : "not working"}</p>
+							<ul class="mt-1 space-y-1 text-xs">
+								${c.steps.map((st) => html`<li data-test="storage-step" data-step=${st.step} data-ok=${String(st.ok)}>
+									<span class=${st.ok ? "text-emerald-400" : "text-red-400"}>${st.ok ? "✓" : "✗"}</span>
+									<span class="text-neutral-300">${st.step}</span>
+									${st.status ? html`<span class="text-neutral-500">HTTP ${st.status}${st.server ? ` · ${st.server}` : ""}</span>` : nothing}
+									${st.reason ? html`<p class="ml-4 text-neutral-400">${st.reason}</p>` : nothing}
+								</li>`)}
+							</ul>
+							${c.warnings?.length ? html`<ul class="mt-2 space-y-1 text-xs text-amber-300" data-test="storage-warnings">${c.warnings.map((w) => html`<li>⚠ ${w}</li>`)}</ul>` : nothing}
+							${c.settings
+								? html`<table class="mt-2 text-xs" data-test="storage-settings">
+										${c.settings.map((v) => html`<tr>
+											<td class="pr-3 font-mono text-neutral-400">${v.name}</td>
+											<td class=${v.set ? "text-neutral-200" : "text-red-300"}>${v.set ? v.shown : "not set"}${v.padded ? html` <span class="text-amber-300">— stored with spaces or a line end around it; set it again without</span>` : nothing}</td>
+										</tr>`)}
+									</table>`
+								: nothing}
+						`
+					: nothing}
+			</section>
 		`;
 	}
 

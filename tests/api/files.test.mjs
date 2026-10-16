@@ -322,6 +322,31 @@ try {
 	assert.ok(stillTrashed.json.files.some((f) => f.id === fileId), "the letter trashed on its own stays in the Trash");
 	assert.ok(!stillTrashed.json.folders.length, "no folder is left behind in the Trash");
 
+	// ── 8c. Duplicates (commit 39n) ────────────────────────────────────
+	// The upload check now says which file is the twin and where (match
+	// returns its folder and SEALED name), and Find duplicates lists every
+	// set of live files sharing a size and a keyed tag — opaque strings
+	// the server already holds; the names stay sealed.
+	const twinBytes = enc.encode("the same bytes, twice");
+	const twinTag = "ab".repeat(32);
+	const twins = [];
+	for (const [nm, tag] of [["a.txt", twinTag], ["b.txt", twinTag], ["c.txt", "cd".repeat(32)]]) {
+		const ckT = newContentKey();
+		const f = await store.newFile(nm, "text/plain", ckT);
+		const r = await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...f.fields, size: String(twinBytes.length), tag }, await sealWith(await importContentKey(ckT), twinBytes));
+		assert.equal(r.status, 200, JSON.stringify(r.json));
+		twins.push(f.id);
+	}
+	const matched = (await api(dev.base, "GET", `/api/v1/members/jinu/files/match?size=${twinBytes.length}`, { email: "jinu@family.test" })).json.files;
+	const aRow = matched.find((m) => m.id === twins[0]);
+	assert.ok(aRow && aRow.tag === twinTag && aRow.folder === null && /^GV04:/.test(aRow.name), "match names the twin — sealed — and its folder");
+	const dups = (await api(dev.base, "GET", "/api/v1/members/jinu/files/duplicates", { email: "jinu@family.test" })).json.files;
+	assert.deepEqual(dups.map((d) => d.id).sort(), [twins[0], twins[1]].sort(), "the two with the same size and tag, and not the third (same size, another tag)");
+	assert.ok(dups.every((d) => /^GV04:/.test(d.name)), "names stay sealed");
+	assert.equal((await api(dev.base, "GET", "/api/v1/members/jinu/files/duplicates", { email: "mom@family.test" })).status, 403, "only the area's own");
+	assert.equal((await api(dev.base, "DELETE", `/api/v1/members/jinu/files/${twins[1]}`, { email: "jinu@family.test" })).status, 200);
+	assert.equal((await api(dev.base, "GET", "/api/v1/members/jinu/files/duplicates", { email: "jinu@family.test" })).json.files.length, 0, "a copy in the Trash is no longer a duplicate");
+
 	// ── 9. Secrets, stored sealed ──────────────────────────────────────
 	const secrets = await store.secrets(JSON.stringify({ fp: "x".repeat(43), idx: "y".repeat(43) }));
 	const putS = await api(dev.base, "PUT", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test", body: { sealed: secrets } });

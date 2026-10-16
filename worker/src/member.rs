@@ -827,6 +827,7 @@ impl GoraniMemberDO {
 			}
 			("GET", "files/changes") => self.files_changes(req).await,
 			("GET", "files/match") => self.files_match(req).await,
+			("GET", "files/duplicates") => self.files_duplicates().await,
 			("GET", "files/secrets") => self.secrets_get().await,
 			("PUT", "files/secrets") => {
 				let body = req.json::<serde_json::Value>().await?;

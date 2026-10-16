@@ -692,6 +692,11 @@ impl Engine {
 		let folder = self.nodes.get(&node.parent).and_then(|p| p.id.clone());
 		match base {
 			None => {
+				// A copy of something already here (commit 39n): said, not
+				// refused — the mount must keep what was put into it.
+				if let Some(note) = self.area.duplicate_note(&self.client, &node.name, plain.len() as u64, &sha256) {
+					eprintln!("gorani-mount: {note}");
+				}
 				let mut form = self.area.new_file_fields(&id, &node.name, &ck, plain.len() as u64, &sha256, None)?;
 				if let Some(f) = &folder {
 					form.push(("folder_id".into(), f.clone()));

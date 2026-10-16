@@ -223,17 +223,27 @@ try {
 	// ── 10. O13: rate limits on what a script would hammer ──────────────
 	// The share routes are public; a script could loop on one link (its
 	// claims, its owner's bucket egress). Per caller + link, 60 a minute.
+	// The limiter counts in FIXED one-minute windows, so a burst that
+	// straddles a window's end can split (30 + 40) and pass neither limit:
+	// ask until refused, up to two windows' worth and more — the burst must
+	// pass the limit in at least one window, wherever the edge falls. (Both
+	// checks below asked a fixed 70 and 40 until 39t, and failed so.)
 	const hammered = newShareId();
 	const statuses = [];
-	for (let i = 0; i < 70; i++) statuses.push((await fetch(`${dev.base}/s/f/${hammered}/meta`)).status);
+	let limited = null;
+	for (let i = 0; i < 130 && !limited; i++) {
+		const r = await fetch(`${dev.base}/s/f/${hammered}/meta`);
+		statuses.push(r.status);
+		if (r.status === 429) limited = r;
+	}
 	assert.ok(statuses.slice(0, 50).every((s) => s === 404), "a person's requests are untouched (an unknown link is an honest 404)");
-	const limited = await fetch(`${dev.base}/s/f/${hammered}/meta`);
-	assert.equal(limited.status, 429, `the 71st request in a minute is refused (${statuses.slice(-5)})`);
+	assert.ok(limited, `a burst past 60 in a minute is refused (${statuses.length} asks)`);
+	assert.ok(statuses.length > 60, `…and never before 60 have been answered (${statuses.length})`);
 	assert.equal(limited.headers.get("retry-after"), "60");
 	assert.equal((await fetch(`${dev.base}/s/f/${newShareId()}/meta`)).status, 404, "another link is not affected");
 	// Device-token checks: 30 a minute per caller + device.
 	let deviceLimited = false;
-	for (let i = 0; i < 40 && !deviceLimited; i++) {
+	for (let i = 0; i < 70 && !deviceLimited; i++) {
 		const r = await fetch(`${dev.base}/api/v1/members/jinu/devices/no-such-device/check`, { method: "POST", headers: { "content-type": "application/json", "x-gorani-dev-email": "jinu@family.test", "x-gorani-device-token": "guess" }, body: "{}" });
 		deviceLimited = r.status === 429;
 	}

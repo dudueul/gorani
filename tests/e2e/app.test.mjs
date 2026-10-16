@@ -688,6 +688,28 @@ try {
 		assert.equal(await page.evaluate(async () => (await fetch("/api/healthz")).status), 200);
 		await assertNoViolations(page, "streamed media");
 
+		// ── A chunked upload's part count in the status bar (39x) ──────
+		// A file past the whole-upload limit (48 MiB) goes in 8 MiB parts; the
+		// status bar says how many the server holds as it goes. Every count
+		// the page draws is recorded by a MutationObserver: nothing to race.
+		{
+			await page.evaluate(() => {
+				window.__parts = [];
+				new MutationObserver(() => {
+					const t = document.querySelector('[data-test="upload-parts"]')?.textContent?.trim();
+					if (t && window.__parts.at(-1) !== t) window.__parts.push(t);
+				}).observe(document.body, { subtree: true, childList: true, characterData: true });
+			});
+			await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "capture.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(49 * 1024 * 1024, 7) });
+			await page.locator('[data-body] [data-item^="file:"]', { hasText: "capture.bin" }).first().waitFor({ timeout: 120_000 });
+			await page.waitForFunction(() => !document.querySelector('[data-test="upload-progress"]'), null, { timeout: 120_000 });
+			const counted = await page.evaluate(() => window.__parts);
+			const numbers = counted.map((t) => /^(\d+) of 7 parts$/.exec(t)?.[1]).map(Number);
+			assert.ok(numbers.every((n, i) => Number.isInteger(n) && (i === 0 || n > numbers[i - 1])), `the bar counted up, part by part (${JSON.stringify(counted)})`);
+			assert.deepEqual([numbers[0], numbers.at(-1)], [0, 7], `from none of 7 parts to all 7 (${JSON.stringify(counted)})`);
+			await assertNoViolations(page, "a chunked upload's part count");
+		}
+
 		// ── The in-page player (39p): sealed MP4s played through MSE ───
 		// The engine (gorani-media in WebAssembly) builds fMP4 segments from
 		// plaintext this page decrypted; the browser decodes. VP9 + Opus:
@@ -1545,7 +1567,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), music (an M4A through the same engine, an MP3 streamed by the media worker), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), a chunked upload counting its parts in the status bar, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), music (an M4A through the same engine, an MP3 streamed by the media worker), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
 } finally {
 	await dev.close();
 }

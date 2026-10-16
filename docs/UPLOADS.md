@@ -56,9 +56,17 @@ there is one duplicate prompt and one progress line. The status bar shows
 "Uploading 12 of 340 · IMG_0012.jpg" and **Stop**: the file being sent
 finishes, the rest are not sent, and the toast says how many went.
 
+**A big file shows its parts (39x).** A file past the whole-upload limit
+(48 MiB) is sealed and sent in parts (docs/LARGE-FILES.md). While one is
+going, the bar adds "37 of 1,200 parts" beside its name. A part counts
+once the server has confirmed it, and a resumed upload starts from the
+parts its earlier try landed. The bar fills by parts too, so one 100 GB
+file no longer sits at 0% until its last part lands
+(`model.ts › partsProgress`, `shared.ts › uploadStatus`).
+
 ## Tests
 
 | Suite | What it checks |
 |---|---|
-| `unit:explorer` | The walk past readEntries' first 100, the litter left out, empty folders kept, the picker's paths, an oversized folder refused whole; a tree uploaded into its folders, a second drop merged into the folder already there, a drop onto a folder landing in it, Stop after the file being sent, a drop of nothing but litter said so |
-| `e2e:app` | In the browser: a folder picked whole (subfolder, files, litter left out), files dropped onto a folder row, onto the list (with the outline), onto a breadcrumb, and a stray drop refused |
+| `unit:explorer` | The walk past readEntries' first 100, the litter left out, empty folders kept, the picker's paths, an oversized folder refused whole; a tree uploaded into its folders, a second drop merged into the folder already there, a drop onto a folder landing in it, Stop after the file being sent, a drop of nothing but litter said so; (39x) a chunked upload's part count, every step from none to all, and a resumed one starting from the parts already landed |
+| `e2e:app` | In the browser: a folder picked whole (subfolder, files, litter left out), files dropped onto a folder row, onto the list (with the outline), onto a breadcrumb, and a stray drop refused; (39x) a 49 MiB file's status bar counting "0 of 7 parts" up to "7 of 7 parts", every drawn count recorded |

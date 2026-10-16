@@ -12,6 +12,8 @@
  *   data key = HKDF-SHA256(ikm, salt = "gorani-share" ‖ id, info = "gorani-share-data-v1")
  *   meta key = HKDF-SHA256(ikm, salt = "gorani-share" ‖ id, info = "gorani-share-meta-v1")
  *   meta     = base64("GS01" ‖ nonce (12) ‖ AES-256-GCM(meta key, JSON)) with AAD "GS01" ‖ id
+ *   claim    = base64url(HKDF-SHA256(ikm, salt = "gorani-share" ‖ id, info = "gorani-share-view-claim-v1"))
+ *              a view-only link's claim proof (40c)
  *
  * Argon2id comes from the vendored UMD beside it (/vendor/argon2.umd.min.js,
  * hash-wasm, MIT — see NOTICE), which the page loads BEFORE this module; it
@@ -44,11 +46,14 @@ export async function shareKeys(id, secret, password, kdf) {
 	ikmBytes.set(p, s.length);
 	try {
 		const subtle = crypto.subtle;
-		const ikm = await subtle.importKey("raw", ikmBytes, "HKDF", false, ["deriveKey"]);
+		const ikm = await subtle.importKey("raw", ikmBytes, "HKDF", false, ["deriveKey", "deriveBits"]);
 		const salt = enc.encode(`gorani-share${id}`);
 		const derive = (info) =>
 			subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt, info: enc.encode(info) }, ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-		return { data: await derive("gorani-share-data-v1"), meta: await derive("gorani-share-meta-v1") };
+		// A view-only link's claim proof (commit 40c): the page shows the
+		// server it holds the link's secret and password, without either.
+		const claim = new Uint8Array(await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info: enc.encode("gorani-share-view-claim-v1") }, ikm, 256));
+		return { data: await derive("gorani-share-data-v1"), meta: await derive("gorani-share-meta-v1"), claim: bytesToB64(claim).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") };
 	} finally {
 		ikmBytes.fill(0);
 		s.fill(0);

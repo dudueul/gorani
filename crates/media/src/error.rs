@@ -12,6 +12,11 @@ pub enum CoreError {
     #[error("parse error: {0}")]
     Parse(String),
 
+    /// A file the engine understands but deliberately will not handle —
+    /// said to the person as it is (commit 40a: what cannot be protected).
+    #[error("{0}")]
+    Refused(String),
+
     #[error("track {0} not found")]
     TrackNotFound(u32),
 

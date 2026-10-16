@@ -8,6 +8,13 @@
  * (password links) and a download counter; this page opens the name and
  * assembles the file from GC01 frames in the browser.
  *
+ * A VIEW-ONLY link (commit 40c, docs/DRM.md) has no sealed copy: the page
+ * opens the name the same way, derives the link's claim proof from the
+ * secret and password, and plays the file's protected copy through Safari's
+ * FairPlay — the CKC goes from the Worker into Apple's DRM module, past
+ * this page, which never holds the key. Other browsers are told where it
+ * plays; there is no way around that here.
+ *
  * It is a static file served from 'self' because the page's CSP allows
  * nothing else (no inline script, no inline style, Trusted Types with no
  * policies at all — so every DOM write here is textContent/classList).
@@ -35,7 +42,12 @@ let keys = null;
 
 async function show() {
 	$("name").textContent = meta.name;
-	$("meta").textContent = `${fmt(meta.size)} · expires ${new Date(info.expiresAt).toLocaleString()} · ${info.downloadsLeft} download${info.downloadsLeft === 1 ? "" : "s"} left`;
+	const what = info.viewOnly ? "viewing" : "download";
+	$("meta").textContent = `${fmt(meta.size)} · expires ${new Date(info.expiresAt).toLocaleString()} · ${info.downloadsLeft} ${what}${info.downloadsLeft === 1 ? "" : "s"} left`;
+	if (info.viewOnly) {
+		$("download").textContent = "Play";
+		$("note").textContent = "View-only: a protected copy that plays in Safari on a Mac, iPhone or iPad, and cannot be saved.";
+	}
 	// An emoji as TEXT — this used to be `innerHTML = "<span style=…>"`, which
 	// the page's Trusted Types CSP now refuses outright.
 	$("icon").textContent = kindGlyph(meta.name);
@@ -88,6 +100,7 @@ async function unlock() {
 }
 
 $("download").addEventListener("click", async () => {
+	if (info?.viewOnly) return void play();
 	const btn = $("download");
 	btn.disabled = true;
 	say("Downloading and decrypting…");
@@ -134,6 +147,78 @@ $("download").addEventListener("click", async () => {
 		btn.disabled = false;
 	}
 });
+
+// ── A view-only link: the protected copy, through FairPlay (40c) ─────
+// The same steps as the app's web/src/ui/viewer/fairplay.ts, in plain
+// JavaScript under this page's stricter CSP.
+
+const FPS_CONFIG = [{ initDataTypes: ["skd"], videoCapabilities: [{ contentType: 'application/vnd.apple.mpegurl; codecs="avc1.640028"' }], distinctiveIdentifier: "not-allowed", persistentState: "not-allowed", sessionTypes: ["temporary"] }];
+
+async function fairPlaySupported() {
+	if (!navigator.requestMediaKeySystemAccess || !document.createElement("video").canPlayType("application/vnd.apple.mpegurl")) return false;
+	try {
+		await navigator.requestMediaKeySystemAccess("com.apple.fps", FPS_CONFIG);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function drmNote(text) {
+	$("drmnote").textContent = text;
+	$("drmnote").classList.remove("hidden");
+}
+
+async function play() {
+	const btn = $("download");
+	if (!(await fairPlaySupported())) {
+		drmNote("This video plays in Safari on a Mac, iPhone or iPad — open this link there. It cannot be played or saved in this browser.");
+		return;
+	}
+	btn.disabled = true;
+	say("Starting a viewing session…");
+	try {
+		// The claim proves the link's secret and password (keys.claim) and
+		// spends one viewing; the session's token goes only to the license.
+		const claim = await fetch(`/s/f/${id}/claim`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ proof: keys.claim }) });
+		if (!claim.ok) throw new Error((await claim.json().catch(() => ({}))).error ?? `viewing refused (${claim.status})`);
+		const { token, playlist } = await claim.json();
+		const video = $("player");
+		const access = await navigator.requestMediaKeySystemAccess("com.apple.fps", FPS_CONFIG);
+		const mediaKeys = await access.createMediaKeys();
+		const cert = await fetch(`/s/f/${id}/drm/certificate`);
+		if (!cert.ok) throw new Error((await cert.json().catch(() => ({}))).error ?? "this deployment cannot play protected videos yet");
+		await mediaKeys.setServerCertificate(new Uint8Array(await cert.arrayBuffer()));
+		await video.setMediaKeys(mediaKeys);
+		video.addEventListener("encrypted", (e) => {
+			if (!e.initData) return;
+			const session = mediaKeys.createSession("temporary");
+			session.addEventListener("message", async (m) => {
+				try {
+					const r = await fetch(`/s/f/${id}/drm/license`, { method: "POST", headers: { "x-gorani-share-token": token }, body: m.message });
+					if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? `license refused (${r.status})`);
+					await session.update(new Uint8Array(await r.arrayBuffer()));
+				} catch (err) {
+					drmNote(err instanceof Error ? err.message : String(err));
+				}
+			});
+			session.addEventListener("keystatuseschange", () => {
+				for (const [, status] of session.keyStatuses) {
+					if (status === "output-restricted" || status === "output-downscaled") drmNote("This display or its connection is not HDCP-protected, which this video requires — play it on this screen, over AirPlay, or an HDCP-capable cable.");
+				}
+			});
+			session.generateRequest(e.initDataType, e.initData).catch((err) => drmNote(err instanceof Error ? err.message : String(err)));
+		});
+		video.src = `/s/f/${id}/${playlist}`;
+		video.classList.remove("hidden");
+		btn.classList.add("hidden");
+		say("");
+		await video.play().catch(() => {});
+	} catch (e) {
+		say(e instanceof Error ? e.message : String(e));
+		btn.disabled = false;
+	}
+}
 
 function fmt(n) {
 	if (n < 1024) return `${n} B`;

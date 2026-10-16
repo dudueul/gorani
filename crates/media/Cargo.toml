@@ -1,10 +1,14 @@
 # Copyright 2026- Seongwoo Hong. All rights reserved.
 
 # The MP4 engine of the video sidecar (src/lib.rs, docs/VIDEO.md): the
-# author's mp4-hls-core, vendored and trimmed (no FairPlay, AES-HLS, DASH or
-# token code — and so none of their crypto dependencies). Pure Rust, no
-# platform code: the browser runs it as WASM (crates/media-wasm), the native
-# clients link it directly.
+# author's mp4-hls-core, vendored and trimmed (no AES-HLS, DASH or token
+# code). Pure Rust, no platform code: the browser runs it as WASM
+# (crates/media-wasm), the native clients link it directly.
+#
+# One crypto dependency, `aes`, for the `cbcs` protected copies the lead's
+# browser packages (src/cbcs.rs, docs/DRM.md). The license server's half of
+# FairPlay lives in the Worker, which holds the keys; this crate never
+# decides who may watch.
 
 [package]
 name = "gorani-media"
@@ -17,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 base64 = "0.22"
+aes = "0.8"
 
 [features]
 fixtures = []

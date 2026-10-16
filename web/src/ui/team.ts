@@ -93,6 +93,7 @@ interface SystemStatus {
 	files: { ok: boolean; ms: number; problem?: string } | null;
 	storage: { backend: "r2" | "s3" | "none"; configured: boolean };
 	timestamps: { configured: boolean };
+	drm?: { copies: boolean; playable: boolean; problem: string | null };
 	lead: boolean;
 }
 
@@ -635,6 +636,7 @@ export class GoraniTeam extends LitElement {
 									${row("status-uploads", "Uploads", c ? (write?.ok ?? false) : null, c ? (write?.ok ? `a write took ${write.ms ?? "?"} ms` : (write?.reason ?? c.problem ?? "the storage was not reached")) : "found by Test connection")}
 									${row("status-downloads", "Downloads", c ? (read?.ok ?? false) : null, c ? (read?.ok ? `a read took ${read.ms ?? "?"} ms` : (read?.reason ?? (write && !write.ok ? "not tried: the write failed first" : (c.problem ?? "the storage was not reached")))) : "found by Test connection")}
 									${row("status-timestamps", "Timestamp authority", st.timestamps.configured ? true : null, st.timestamps.configured ? "configured: evidence is stamped by a third party" : "not configured: evidence is dated by the audit trail alone")}
+									${st.drm ? row("status-drm", "Protected videos", st.drm.copies && st.drm.playable ? true : null, !st.drm.copies ? "off: DRM_KEY_SECRET is not set (docs/DRM.md)" : st.drm.playable ? "copies can be made and play in Safari (FairPlay)" : `copies can be made; ${st.drm.problem ?? "FairPlay is not set up"}`) : nothing}
 								`
 							: row("status-app", "App", false, `not answering (${s.error}) — check your connection, then Refresh`)
 						: html`<li class="py-1.5 text-xs text-neutral-500">Checking…</li>`}

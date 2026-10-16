@@ -8,7 +8,9 @@
 #   • refuse any byte or name that is not already sealed (GV*),
 #   • hold metadata in GoraniMemberDO (SQLite-backed Durable Objects),
 #   • move ciphertext between clients and any S3-compatible bucket (MinIO…),
-#   • never decrypt anything.
+#   • never decrypt anything — with one exception the owner chose: the
+#     content keys of protected video copies, which the FairPlay license
+#     server must hand to Apple's DRM module (drm.rs, docs/DRM.md).
 #
 # Dependencies are added with `cargo add` so versions stay pinned in this
 # file; see the [dependencies] section below.
@@ -47,3 +49,11 @@ rand_core = "0.6"
 # RSA, used to VERIFY only. (It replaced p256 here, the ES256 that had been
 # assumed.)
 rsa = { version = "0.9", features = ["sha2"] }
+# Protected copies (commit 40b, drm.rs, docs/DRM.md): the FairPlay license
+# server, and the custody of content keys — sealed (AES-256-GCM) under a key
+# derived (HKDF) from the DRM_KEY_SECRET Worker secret; HMAC signs a
+# view-only link's media URLs.
+gorani-fairplay = { version = "0.1.0", path = "../crates/fairplay" }
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"

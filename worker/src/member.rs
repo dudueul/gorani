@@ -392,6 +392,45 @@ pub const MIGRATIONS: &[&str] = &[
 		updated_at TEXT NOT NULL,
 		PRIMARY KEY (file_id, member)
 	)",
+	// Migration v21 (commit 40b, docs/DRM.md): protected copies.
+	//
+	// `drm_files` is the switch: a row means a lead chose Protect, and from
+	// then on the original's bytes go only to those routes.rs › drm says may
+	// have them. `drm_copies` is one FairPlay copy per file version — its
+	// content key SEALED under the Worker secret DRM_KEY_SECRET (never the
+	// store key: the license server must open it, and nobody who holds only
+	// this database can), its key id and constant IV (public: they are in the
+	// copy's own boxes), where it lives, and its layout (the playlist's byte
+	// ranges, written once it is uploaded).
+	"CREATE TABLE IF NOT EXISTS drm_files (
+		file_id TEXT PRIMARY KEY,
+		protected_by TEXT NOT NULL,
+		protected_at TEXT NOT NULL
+	)",
+	"CREATE TABLE IF NOT EXISTS drm_copies (
+		file_id TEXT NOT NULL, version INTEGER NOT NULL,
+		kid TEXT NOT NULL,
+		key_sealed TEXT NOT NULL,
+		iv TEXT NOT NULL,
+		object_key TEXT NOT NULL,
+		upload_id TEXT,
+		state TEXT NOT NULL,
+		size INTEGER,
+		layout TEXT,
+		created_by TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		ready_at TEXT,
+		PRIMARY KEY (file_id, version)
+	)",
+	// A view-only link plays the protected copy of its file (40b): no
+	// sealed copy of its own (object_key stays empty), and its claims are
+	// viewing sessions rather than downloads.
+	"ALTER TABLE shares ADD COLUMN drm INTEGER NOT NULL DEFAULT 0",
+	// …and since its page plays without ever opening a sealed byte, the
+	// claim itself must prove the link's secret and password (an ordinary
+	// link's data is useless without them; a license is not). The page
+	// derives a proof from both; only its SHA-256 is stored.
+	"ALTER TABLE shares ADD COLUMN claim_hash TEXT",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -774,8 +813,20 @@ impl GoraniMemberDO {
 			("POST", id) if id.starts_with("shares/") && id.ends_with("/public-meta") => {
 				self.share_public_meta(&id["shares/".len()..id.len() - "/public-meta".len()]).await
 			}
+			// A view-only link's viewing session (40b, drm_store.rs).
+			("POST", id) if id.starts_with("shares/") && id.ends_with("/drm-copy") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let session = body.get("session").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+				self.share_drm_copy(&id["shares/".len()..id.len() - "/drm-copy".len()], &session).await
+			}
+			("POST", id) if id.starts_with("shares/") && id.ends_with("/drm-license") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let (file, version) = (body.get("file").and_then(|f| f.as_str()).unwrap_or_default(), body.get("version").and_then(|v| v.as_i64()).unwrap_or(0));
+				self.drm_license_audit(&format!("share-link:{}", &id["shares/".len()..id.len() - "/drm-license".len()]), file, &version.to_string()).await
+			}
 			("POST", id) if id.starts_with("shares/") && id.ends_with("/claim") => {
-				self.share_claim(&id["shares/".len()..id.len() - "/claim".len()]).await
+				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+				self.share_claim(&id["shares/".len()..id.len() - "/claim".len()], &body).await
 			}
 			("POST", id) if id.starts_with("shares/") && id.ends_with("/public-object") => {
 				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
@@ -862,6 +913,33 @@ impl GoraniMemberDO {
 			}
 			// The video sidecars (commit 39p, files_store.rs › video_*).
 			("GET", "files/videos") => self.videos_feed().await,
+			// ── Protected copies (commit 40b, worker/src/drm_store.rs) ──
+			("GET", id) if id.starts_with("files-drm/") => self.drm_state(&id["files-drm/".len()..]).await,
+			("POST", id) if id.starts_with("files-drm/") && id.ends_with("/complete") => {
+				let body = req.json::<serde_json::Value>().await?;
+				let rest = &id["files-drm/".len()..id.len() - "/complete".len()];
+				match rest.split_once('/') {
+					Some((file, version)) => self.drm_complete(&actor, file, version, body).await,
+					None => json_error(400, "files-drm/<file>/<version>/complete"),
+				}
+			}
+			("POST", id) if id.starts_with("files-drm/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.drm_start(&actor, &id["files-drm/".len()..], body).await
+			}
+			("DELETE", id) if id.starts_with("files-drm/") => self.drm_unprotect(&actor, &id["files-drm/".len()..]).await,
+			// The copy itself (its sealed key included) — for the Worker's
+			// playlist, media and license routes, never for a browser.
+			("GET", id) if id.starts_with("files-drm-copy/") => match id["files-drm-copy/".len()..].split_once('/') {
+				Some((file, version)) => self.drm_copy(file, version).await,
+				None => json_error(400, "files-drm-copy/<file>/<version>"),
+			},
+			// A license handed out — recorded in the area's trail, with the
+			// viewer as the actor (a member's address, or `share-link`).
+			("POST", id) if id.starts_with("files-drm-license/") => match id["files-drm-license/".len()..].split_once('/') {
+				Some((file, version)) => self.drm_license_audit(&actor, file, version).await,
+				None => json_error(400, "files-drm-license/<file>/<version>"),
+			},
 			("GET", id) if id.starts_with("files-video/") => {
 				let q = req.url()?.query().map(urlquery).unwrap_or_default();
 				let version = q.get("version").and_then(|x| x.parse::<i64>().ok());
@@ -1113,6 +1191,10 @@ impl GoraniMemberDO {
 		// the working-file retention prunes after a year.)
 		self.sql.exec("DELETE FROM video_meta WHERE NOT EXISTS (SELECT 1 FROM file_versions v WHERE v.file_id = video_meta.file_id AND v.version = video_meta.version)", None)?;
 		self.sql.exec("DELETE FROM watch_positions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		// A protected copy goes with its version too — its object queued for
+		// deletion, its sealed key with the row: once both are gone the copy
+		// can never be opened again, from any backup of the bucket (40b).
+		self.drm_purge_orphans()?;
 		self.sql.exec("DELETE FROM file_contributors WHERE file_id NOT IN (SELECT id FROM files)", None)?;
 		let n_folders_purged = self
 			.sql
@@ -1255,7 +1337,7 @@ impl GoraniMemberDO {
 
 	/// Queue an object (or, with `upload_id`, a multipart upload) for
 	/// deletion. Idempotent: a key already queued keeps its history.
-	fn enqueue_delete(&self, key: &str, upload_id: Option<&str>, reason: &str) -> Result<()> {
+	pub(crate) fn enqueue_delete(&self, key: &str, upload_id: Option<&str>, reason: &str) -> Result<()> {
 		self.sql.exec(
 			"INSERT OR IGNORE INTO pending_deletes (key, upload_id, reason, since) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
 			Some(vec![key.into(), crate::files_store::bind(upload_id.map(str::to_string)), reason.into()]),

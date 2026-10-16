@@ -694,6 +694,9 @@ impl GoraniMemberDO {
 	/// a read served from cache is still a read on record. One merged row per
 	/// reader × version × client × 5 minutes (a seek is many requests).
 	pub(crate) async fn file_object_route(&self, file_id: &str, version: Option<i64>, reader: &str, client: Option<&str>) -> Result<Response> {
+		// A protected video (commit 40b): routes.rs › file_download serves the
+		// original only to those drm.rs › original_allowed names.
+		let protected = self.drm_protected(file_id)?;
 		match self.file_object(file_id, version).await? {
 			Some(o) if reader != "internal" => {
 				// (Sanitised: the client kind is a short label the caller picks.)
@@ -705,11 +708,13 @@ impl GoraniMemberDO {
 				Ok(Response::from_json(&serde_json::json!({
 					"objectKey": o.object_key, "ck": o.content_key, "vaultKeyId": o.vault_key_id,
 					"chunk": o.chunk_size, "size": o.size, "version": o.version, "hash": o.hash_sealed,
+					"protected": protected,
 				}))?)
 			}
 			Some(o) => Ok(Response::from_json(&serde_json::json!({
 				"objectKey": o.object_key, "ck": o.content_key, "vaultKeyId": o.vault_key_id,
 				"chunk": o.chunk_size, "size": o.size, "version": o.version, "hash": o.hash_sealed,
+				"protected": protected,
 			}))?),
 			None => json_error(404, "no such file"),
 		}
@@ -1059,7 +1064,27 @@ impl GoraniMemberDO {
 		if let Some(msg) = share_policy_refusal(body.get("kdf"), &expires_at, downloads_left, worker::Date::now().as_millis() as f64) {
 			return json_error(400, &msg);
 		}
-		let Some(s3_upload_id) = get("s3UploadId") else { return json_error(400, "s3UploadId required") };
+		// A view-only link (commit 40b) plays the file's protected copy: no
+		// sealed copy of its own, so no upload — and it is made only for a
+		// protected file whose current version's copy is ready.
+		let drm = body.get("drm").and_then(|v| v.as_bool()) == Some(true);
+		let claim_hash = get("claimHash");
+		if drm {
+			let Some(file_id) = get("fileId") else { return json_error(400, "a view-only link names its file") };
+			if !self.drm_ready_current(&file_id)? {
+				return json_error(409, "a view-only link plays the protected copy — protect this video first, and wait until its copy is ready");
+			}
+			// SHA-256 of the proof the page derives from the link's secret
+			// and password, base64url: 43 characters.
+			if !claim_hash.as_deref().is_some_and(|h| h.len() == 43 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+				return json_error(400, "a view-only link carries claimHash: SHA-256 (base64url) of the proof its page derives from the link's secret and password");
+			}
+		}
+		let s3_upload_id = match get("s3UploadId") {
+			Some(u) => u,
+			None if drm => String::new(),
+			None => return json_error(400, "s3UploadId required"),
+		};
 		// A malware sample never leaves by link (D8, commit 29e): a link's
 		// recipient gets the bytes in a browser, outside every rule here. A
 		// partner who needs the sample gets the case (D11) — and the zip.
@@ -1070,23 +1095,25 @@ impl GoraniMemberDO {
 		}
 		self.sql
 			.exec(
-				"INSERT INTO shares (id, file_id, version, name_sealed, object_key, meta_sealed, kdf, expires_at, downloads_left, created_at, s3_upload_id, ready, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?10, 0, ?11)",
+				"INSERT INTO shares (id, file_id, version, name_sealed, object_key, meta_sealed, kdf, expires_at, downloads_left, created_at, s3_upload_id, ready, size, drm, claim_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?10, ?12, ?11, ?12, ?13)",
 				Some(vec![
 					id.clone().into(),
 					bind(get("fileId")),
 					body.get("version").and_then(|v| v.as_i64()).unwrap_or(1).into(),
 					name.into(),
-					format!("shares/{id}").into(),
+					if drm { String::new() } else { format!("shares/{id}") }.into(),
 					meta.into(),
 					bind(body.get("kdf").map(|k| k.to_string())),
 					expires_at.into(),
 					downloads_left.into(),
 					s3_upload_id.into(),
 					body.get("size").and_then(|v| v.as_i64()).into(),
+					i64::from(drm).into(),
+					bind(claim_hash.filter(|_| drm)),
 				]),
 			)
 			.map_err(|e| worker::Error::RustError(format!("share insert: {e}")))?;
-		self.audit(actor, "share.create", &id, None, None).await?;
+		self.audit(actor, "share.create", &id, None, drm.then_some("view-only (protected copy)")).await?;
 		Ok(Response::from_json(&serde_json::json!({ "ok": true }))?)
 	}
 
@@ -1113,7 +1140,7 @@ impl GoraniMemberDO {
 	pub(crate) async fn shares_list(&self) -> Result<Response> {
 		let rows: Vec<ShareListRow> = self
 			.sql
-			.exec("SELECT id, file_id, name_sealed, expires_at, downloads_left, created_at, revoked_at, ready, size FROM shares ORDER BY created_at DESC", None)?
+			.exec("SELECT id, file_id, name_sealed, expires_at, downloads_left, created_at, revoked_at, ready, size, drm FROM shares ORDER BY created_at DESC", None)?
 			.to_array()?;
 		Ok(Response::from_json(&serde_json::Value::Array(
 			rows.into_iter()
@@ -1122,7 +1149,7 @@ impl GoraniMemberDO {
 						"id": r.id, "fileId": r.file_id, "name": r.name_sealed,
 						"expiresAt": r.expires_at, "downloadsLeft": r.downloads_left,
 						"createdAt": r.created_at, "revoked": r.revoked_at.is_some(),
-						"ready": r.ready != 0, "size": r.size,
+						"ready": r.ready != 0, "size": r.size, "viewOnly": r.drm != 0,
 					})
 				})
 				.collect(),
@@ -1150,7 +1177,7 @@ impl GoraniMemberDO {
 	async fn share_public_check(&self, id: &str) -> std::result::Result<ShareRow2, Response> {
 		let rows: Vec<ShareRow2> = match self
 			.sql
-			.exec("SELECT meta_sealed, kdf, expires_at, downloads_left, ready, revoked_at, expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') AS expired FROM shares WHERE id = ?1", Some(vec![id.into()]))
+			.exec("SELECT meta_sealed, kdf, expires_at, downloads_left, ready, revoked_at, expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') AS expired, drm, claim_hash FROM shares WHERE id = ?1", Some(vec![id.into()]))
 		{
 			Ok(c) => match c.to_array() {
 				Ok(rows) => rows,
@@ -1179,6 +1206,9 @@ impl GoraniMemberDO {
 			Ok(r) => Ok(Response::from_json(&serde_json::json!({
 				"metaSealed": r.meta_sealed, "kdf": r.kdf.and_then(|k| serde_json::from_str::<serde_json::Value>(&k).ok()),
 				"expiresAt": r.expires_at, "downloadsLeft": r.downloads_left,
+				// A view-only link (40b): the page plays it, and each claim
+				// is a viewing session instead of a download.
+				"viewOnly": r.drm != 0,
 			}))?),
 			Err(resp) => Ok(resp),
 		}
@@ -1199,21 +1229,36 @@ impl GoraniMemberDO {
 	/// SHA-256 is stored), valid for an hour — long enough for a large copy
 	/// fetched in Range pieces, short enough that a token found later in a
 	/// history file is dead.
-	pub(crate) async fn share_claim(&self, id: &str) -> Result<Response> {
+	pub(crate) async fn share_claim(&self, id: &str, body: &serde_json::Value) -> Result<Response> {
 		match self.share_public_check(id).await {
 			Ok(r) => {
+				// A view-only link's claim proves the link's secret and password
+				// (40b): the hash of the page's proof must be the stored one.
+				if r.drm != 0 {
+					let proof = body.get("proof").and_then(|p| p.as_str()).unwrap_or_default();
+					let ok = !proof.is_empty() && r.claim_hash.as_deref().is_some_and(|h| constant_eq(h.as_bytes(), token_hash(proof).as_bytes()));
+					if !ok {
+						self.audit("share-link", "share.refused", id, None, Some("a view-only claim without the link's proof")).await?;
+						return json_error(403, "the password is not this link's");
+					}
+				}
 				let left = r.downloads_left - 1;
 				self.sql.exec("UPDATE shares SET downloads_left = ?1 WHERE id = ?2", Some(vec![left.into(), id.into()]))?;
 				let mut raw = [0u8; 32];
 				OsRng.fill_bytes(&mut raw);
 				let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+				// A view-only link's claim is a viewing session (40b): long
+				// enough for a film watched with pauses — and a license is
+				// asked for at the start, so the session ending stops the next
+				// play, not the one in progress.
+				let ttl = if r.drm != 0 { 8 * 3600 } else { 3600 };
 				self.sql.exec(
-					"INSERT INTO share_tokens (hash, share_id, expires_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 hour'))",
+					&format!("INSERT INTO share_tokens (hash, share_id, expires_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','+{ttl} seconds'))"),
 					Some(vec![token_hash(&token).into(), id.into()]),
 				)?;
 				// The owner's audit records each download of their link (O14).
-				self.audit("share-link", "share.claim", id, None, Some(&format!("downloadsLeft:{left}"))).await?;
-				Ok(Response::from_json(&serde_json::json!({ "downloadsLeft": left, "token": token, "tokenExpiresIn": 3600 }))?)
+				self.audit("share-link", if r.drm != 0 { "share.view" } else { "share.claim" }, id, None, Some(&format!("downloadsLeft:{left}"))).await?;
+				Ok(Response::from_json(&serde_json::json!({ "downloadsLeft": left, "token": token, "tokenExpiresIn": ttl, "viewOnly": r.drm != 0 }))?)
 			}
 			Err(resp) => Ok(resp),
 		}
@@ -1243,6 +1288,8 @@ impl GoraniMemberDO {
 			.and_then(|c| c.to_array())
 			.map_err(|e| json_error_raw(500, &e.to_string()))?;
 		match rows.into_iter().next() {
+			// A view-only link has no copy to download (40b).
+			Some(r) if r.object_key.is_empty() => Err(json_error_raw(409, "this link is view-only: it plays in its page and has nothing to download")),
 			Some(r) if r.ready != 0 && r.revoked_at.is_none() && r.expired == 0 => Ok(r.object_key),
 			Some(r) if r.expired == 1 => Err(json_error_raw(410, "this link has expired")),
 			_ => Err(json_error_raw(404, "no such share")),
@@ -1739,7 +1786,12 @@ struct ShareLive {
 /// A share token as stored: SHA-256, base64url. (The token itself is a
 /// 256-bit random secret, so a plain hash — not a slow KDF — is the right
 /// tool: there is nothing to brute-force.)
-fn token_hash(token: &str) -> String {
+/// Equal bytes, compared in time that does not depend on where they differ.
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+	a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+pub(crate) fn token_hash(token: &str) -> String {
 	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(gorani_formats::unlock::sha256(&[token.as_bytes()]))
 }
 
@@ -1763,6 +1815,7 @@ struct ShareListRow {
 	revoked_at: Option<String>,
 	ready: i64,
 	size: Option<i64>,
+	drm: i64,
 }
 #[derive(Clone, serde::Deserialize)]
 struct ShareRow2 {
@@ -1773,9 +1826,11 @@ struct ShareRow2 {
 	ready: i64,
 	revoked_at: Option<String>,
 	expired: i64,
+	drm: i64,
+	claim_hash: Option<String>,
 }
 
-fn json_error_raw(status: u16, message: &str) -> Response {
+pub(crate) fn json_error_raw(status: u16, message: &str) -> Response {
 	Response::from_json(&serde_json::json!({ "error": message })).unwrap().with_status(status)
 }
 #[derive(serde::Deserialize)]

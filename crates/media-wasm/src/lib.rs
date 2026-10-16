@@ -32,12 +32,13 @@ use gorani_media::schema::MediaIndex;
 /// The safe core — what the C ABI below wraps, and what the tests call.
 pub mod core {
 	use gorani_media::boxes::parse_top_header;
+	pub use gorani_media::cbcs::{Packager, Protection};
 	use gorani_media::index_builder::BuildOptions;
 	use gorani_media::indexer::index_moov_box;
 	use gorani_media::moof_builder::build_segment_with;
 	use gorani_media::moov_builder::build_init_segment;
 	use gorani_media::readplan::{concat_ranges, plan_reads, segment_ranges, DEFAULT_MAX_BLOCK, DEFAULT_MAX_GAP};
-	use gorani_media::schema::{ByteRange, MediaIndex, SourceInfo, TrackType};
+	use gorani_media::schema::{ByteRange, MediaIndex, Segment, SourceInfo, TrackType};
 	use serde_json::{json, Value};
 
 	/// A top-level box header (8 or 16 bytes) at `offset` of a file of
@@ -85,6 +86,13 @@ pub mod core {
 	/// Segment `n` (moof + mdat), from the blocks of [`plan`] joined in
 	/// order. A block of the wrong total length is refused, not guessed at.
 	pub fn segment(idx: &MediaIndex, n: usize, joined: &[u8]) -> Result<Vec<u8>, String> {
+		let (seg, payloads) = payloads_of(idx, n, joined)?;
+		build_segment_with(idx, seg, n, payloads).map_err(|e| e.to_string())
+	}
+
+	/// Each track's sample bytes of segment `n`, cut out of its planned
+	/// blocks joined in order.
+	fn payloads_of<'i>(idx: &'i MediaIndex, n: usize, joined: &[u8]) -> Result<(&'i Segment, Vec<Vec<u8>>), String> {
 		let seg = idx.segments.get(n).ok_or_else(|| format!("no segment {n} (of {})", idx.segments.len()))?;
 		let blocks = plan(idx, n)?;
 		let want: u64 = blocks.iter().map(|b| b.length).sum();
@@ -103,7 +111,32 @@ pub mod core {
 			.iter()
 			.map(|st| concat_ranges(&owned, &st.byte_ranges).ok_or_else(|| format!("segment {n}: the plan does not cover a track's samples")))
 			.collect::<Result<Vec<_>, _>>()?;
-		build_segment_with(idx, seg, n, payloads).map_err(|e| e.to_string())
+		Ok((seg, payloads))
+	}
+
+	/// A packager for a `cbcs` protected copy (commit 40a, docs/DRM.md):
+	/// `material` is the key, the key id and the constant IV, 16 bytes
+	/// each, as the Worker handed them to this lead's browser. A track
+	/// FairPlay cannot play is refused here, before anything is uploaded.
+	pub fn protect(idx: &MediaIndex, material: &[u8]) -> Result<Packager, String> {
+		let part = |i: usize| -> Result<[u8; 16], String> { material.get(i * 16..i * 16 + 16).and_then(|b| b.try_into().ok()).ok_or_else(|| "protection material is 48 bytes: key, key id, IV".to_string()) };
+		if material.len() != 48 {
+			return Err("protection material is 48 bytes: key, key id, IV".into());
+		}
+		Packager::new(idx, &Protection { key: part(0)?, kid: part(1)?, iv: part(2)? }).map_err(|e| e.to_string())
+	}
+
+	/// The protected copy's init segment.
+	pub fn protect_init(p: &Packager, idx: &MediaIndex) -> Result<Vec<u8>, String> {
+		p.init(idx).map_err(|e| e.to_string())
+	}
+
+	/// Protected segment `n`, from the same planned blocks as [`segment`].
+	/// Segments must be packaged in order (parameter sets sent in band
+	/// carry over).
+	pub fn protect_segment(p: &mut Packager, idx: &MediaIndex, n: usize, joined: &[u8]) -> Result<Vec<u8>, String> {
+		let (seg, payloads) = payloads_of(idx, n, joined)?;
+		p.segment(idx, seg, n, payloads).map_err(|e| e.to_string())
 	}
 
 	/// The fMP4 init segment (ftyp + moov with empty tables and mvex).
@@ -120,6 +153,8 @@ pub mod core {
 thread_local! {
 	static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 	static INDEXES: RefCell<Vec<Option<MediaIndex>>> = const { RefCell::new(Vec::new()) };
+	/// Packagers of protected copies, each with the handle of its index.
+	static PACKAGERS: RefCell<Vec<Option<(i32, core::Packager)>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn put(bytes: Vec<u8>) {
@@ -238,6 +273,54 @@ pub extern "C" fn gm_plan(h: i32, n: u32) -> i32 {
 pub unsafe extern "C" fn gm_segment(h: i32, n: u32, p: *const u8, len: usize) -> i32 {
 	let joined = std::slice::from_raw_parts(p, len);
 	answer(with_index(h, |idx| core::segment(idx, n as usize, joined)).and_then(|r| r))
+}
+
+/// Open a packager for index `h` with the 48 bytes of key material at `p`
+/// (copied in; the page zeroes and frees its buffer). Returns its handle.
+///
+/// # Safety
+/// `p` points at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gm_protect(h: i32, p: *const u8, len: usize) -> i32 {
+	let material = std::slice::from_raw_parts(p, len);
+	match with_index(h, |idx| core::protect(idx, material)).and_then(|r| r) {
+		Ok(packager) => PACKAGERS.with(|ps| {
+			let mut ps = ps.borrow_mut();
+			ps.push(Some((h, packager)));
+			(ps.len() - 1) as i32
+		}),
+		Err(e) => fail(e),
+	}
+}
+
+fn with_packager<T>(ph: i32, f: impl FnOnce(&mut core::Packager, &MediaIndex) -> Result<T, String>) -> Result<T, String> {
+	PACKAGERS.with(|ps| {
+		let mut ps = ps.borrow_mut();
+		let (h, packager) = usize::try_from(ph).ok().and_then(|i| ps.get_mut(i)).and_then(Option::as_mut).ok_or_else(|| format!("no packager {ph}"))?;
+		with_index(*h, |idx| f(packager, idx)).and_then(|r| r)
+	})
+}
+
+#[no_mangle]
+pub extern "C" fn gm_protect_init(ph: i32) -> i32 {
+	answer(with_packager(ph, |p, idx| core::protect_init(p, idx)))
+}
+
+/// # Safety
+/// `p` points at `len` readable bytes: segment `n`'s planned blocks, joined.
+#[no_mangle]
+pub unsafe extern "C" fn gm_protect_segment(ph: i32, n: u32, p: *const u8, len: usize) -> i32 {
+	let joined = std::slice::from_raw_parts(p, len);
+	answer(with_packager(ph, |pk, idx| core::protect_segment(pk, idx, n as usize, joined)))
+}
+
+#[no_mangle]
+pub extern "C" fn gm_protect_drop(ph: i32) {
+	PACKAGERS.with(|ps| {
+		if let Some(slot) = usize::try_from(ph).ok().and_then(|i| ps.borrow_mut().get_mut(i).map(Option::take)) {
+			drop(slot);
+		}
+	});
 }
 
 #[cfg(test)]

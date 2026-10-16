@@ -15,6 +15,10 @@
  *              link, so the link opens nothing else (not the file's other versions, not the vault)
  *   meta     = base64("GS01" ‖ nonce (12) ‖ AES-256-GCM(meta key, JSON { name, type, size, modified }))
  *              with AAD "GS01" ‖ id
+ *   claim    = base64url(HKDF-SHA256(ikm, salt = "gorani-share" ‖ id, info = "gorani-share-view-claim-v1"), 32 bytes)
+ *              a VIEW-ONLY link's proof (commit 40c, docs/DRM.md): its page plays a protected copy and opens no
+ *              sealed byte, so the claim itself must show the link's secret and password — the server keeps
+ *              only SHA-256 of it (claimHash) and compares
  *
  * The id is in both keys' salt and in the meta's AAD: a share's object or
  * meta moved under another id opens nothing. The server keeps the object,
@@ -56,8 +60,9 @@ async function passwordBytes(password: string, kdf: ShareKdf): Promise<Uint8Arra
 	return argon2id({ password: password.normalize("NFKC"), salt, memorySize: kdf.m, iterations: kdf.t, parallelism: kdf.p, hashLength: 32, outputType: "binary" });
 }
 
-/** The two keys of a share (the data key opens GC01 frames, the meta key the name and type). */
-export async function shareKeys(id: string, secret: string, password?: string | null, kdf?: ShareKdf | null): Promise<{ data: CryptoKey; meta: CryptoKey }> {
+/** The two keys of a share (the data key opens GC01 frames, the meta key
+ * the name and type), and a view-only link's claim proof (40c). */
+export async function shareKeys(id: string, secret: string, password?: string | null, kdf?: ShareKdf | null): Promise<{ data: CryptoKey; meta: CryptoKey; claim: string }> {
 	const s = fromB64Url(secret);
 	if (s.length !== 32) throw new Error("This link is incomplete");
 	if (kdf && !password) throw new Error("This link needs its password");
@@ -67,10 +72,11 @@ export async function shareKeys(id: string, secret: string, password?: string | 
 	ikmBytes.set(p, s.length);
 	try {
 		const subtle = crypto.subtle;
-		const ikm = await subtle.importKey("raw", ikmBytes as BufferSource, "HKDF", false, ["deriveKey"]);
+		const ikm = await subtle.importKey("raw", ikmBytes as BufferSource, "HKDF", false, ["deriveKey", "deriveBits"]);
 		const salt = enc.encode(`gorani-share${id}`);
 		const derive = (info: string) => subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: salt as BufferSource, info: enc.encode(info) as BufferSource }, ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-		return { data: await derive("gorani-share-data-v1"), meta: await derive("gorani-share-meta-v1") };
+		const claim = new Uint8Array(await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: salt as BufferSource, info: enc.encode("gorani-share-view-claim-v1") as BufferSource }, ikm, 256));
+		return { data: await derive("gorani-share-data-v1"), meta: await derive("gorani-share-meta-v1"), claim: toB64Url(claim) };
 	} finally {
 		ikmBytes.fill(0);
 		s.fill(0);
@@ -101,3 +107,10 @@ export async function openShareMeta(metaKey: CryptoKey, id: string, sealed: stri
 
 /** Is it a sealed meta value (as the server checks before keeping one)? */
 export const isSealedShareMeta = (s: string) => { try { const b = fromBase64(s); return b.length >= 32 && MAGIC.every((x, i) => b[i] === x); } catch { return false; } };
+
+/** What the server keeps of a view-only link's claim proof (40c): its
+ * SHA-256, base64url — the same hash it computes of the proof a claim
+ * brings (worker/src/files_store.rs › token_hash). */
+export async function claimHashOf(proof: string): Promise<string> {
+	return toB64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(proof) as BufferSource)));
+}

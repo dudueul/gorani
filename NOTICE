@@ -25,9 +25,12 @@ portions are marked, their original notices are retained in place.
    His own code, not a third party's: the ISO-BMFF parser, the keyframe
    index builder and the fMP4 segment assembly, vendored under crates/media/
    as gorani-media (commit 39p) and built to WebAssembly by
-   crates/media-wasm for the in-page video player (docs/VIDEO.md). The
-   server-side parts of stream-worker (request handling, DASH output, its
-   DRM test material) stayed behind. The S3 transport in worker/src/s3.rs
+   crates/media-wasm for the in-page video player (docs/VIDEO.md); and
+   its FairPlay Streaming key server (fairplay.rs), vendored as
+   crates/fairplay (gorani-fairplay, commit 40b) for protected copies
+   (docs/DRM.md). The server-side parts of stream-worker (request
+   handling, DASH output, its DRM test material and Apple's test
+   credentials) stayed behind. The S3 transport in worker/src/s3.rs
    follows the adapter he wrote for the same project.
 
 3. Vendored file (served as-is, not built): web/public/vendor/argon2.umd.min.js

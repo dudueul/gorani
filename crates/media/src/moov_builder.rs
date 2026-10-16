@@ -9,7 +9,7 @@ use crate::bytes::ByteWriter;
 use crate::error::{CoreError, Result};
 use crate::schema::*;
 
-fn decode_stsd(t: &Track) -> Result<Vec<u8>> {
+pub(crate) fn decode_stsd(t: &Track) -> Result<Vec<u8>> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&t.stsd_b64)
@@ -63,6 +63,19 @@ pub fn ftyp_bytes() -> Vec<u8> {
 ///
 /// The result is byte-compatible with what shaka/Bento4 emit for CMAF.
 pub fn build_init_segment(idx: &MediaIndex) -> Result<Vec<u8>> {
+    build_init_segment_with(idx, &|_, entry| Ok(entry))
+}
+
+/// What build_init_segment_with does to each track's sample entry.
+pub type EntryMap<'a> = dyn Fn(&Track, Vec<u8>) -> Result<Vec<u8>> + 'a;
+
+/// The same init, each track's sample entry passed through `entry_of`
+/// first — how crate::cbcs turns `avc1`/`mp4a` into `encv`/`enca` with
+/// their `sinf` (commit 40a). Everything else is identical.
+pub fn build_init_segment_with(
+    idx: &MediaIndex,
+    entry_of: &EntryMap,
+) -> Result<Vec<u8>> {
     let mut w = ByteWriter::new();
     w.bytes(&ftyp_bytes());
 
@@ -99,7 +112,7 @@ pub fn build_init_segment(idx: &MediaIndex) -> Result<Vec<u8>> {
     w.close_box(v)?;
 
     for t in &idx.tracks {
-        let entry = decode_stsd(t)?;
+        let entry = entry_of(t, decode_stsd(t)?)?;
         let is_video = t.track_type == TrackType::Video;
         let track_movie_dur = t.duration as u128 * movie_ts as u128 / t.timescale.max(1) as u128;
         let trak = w.open_box(b"trak");

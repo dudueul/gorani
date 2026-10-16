@@ -30,14 +30,22 @@ use crate::s3;
 
 /// Who is calling (the registry's answer for the Access email), plus what
 /// the registry says about the member the URL addresses.
-struct Actor {
+pub(crate) struct Actor {
 	/// The caller's member id — the upload paths record it as the owner.
-	id: String,
-	role: String,
+	pub(crate) id: String,
+	pub(crate) role: String,
 	/// The Access email, forwarded to the DOs as the audit actor.
-	email: String,
+	pub(crate) email: String,
 	target_exists: bool,
 	target_active: bool,
+}
+
+#[cfg(test)]
+impl Actor {
+	/// An actor for unit tests of the rules that read one (drm.rs).
+	pub(crate) fn test(id: &str, role: &str) -> Actor {
+		Actor { id: id.into(), role: role.into(), email: format!("{id}@team.test"), target_exists: true, target_active: true }
+	}
 }
 
 /// Resolve the caller's registry row, then enforce the member scope: a
@@ -61,7 +69,7 @@ struct Actor {
 /// It returns the whole Actor so no caller resolves the caller twice — the
 /// upload paths used to make a second registry round trip just to learn
 /// the owner's id.
-async fn member_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<Actor, Response> {
+pub(crate) async fn member_ctx(env: &Env, identity: &Identity, id: &str) -> std::result::Result<Actor, Response> {
 	scope_ctx(env, identity, id, false).await
 }
 
@@ -289,6 +297,7 @@ async fn system_status(env: &Env, email: &str) -> Result<Response> {
 			}
 		}
 	};
+	let fairplay = crate::drm::fairplay(env).map(|_| ());
 	let backend = if env.bucket("R2BUCKET").is_ok() {
 		"r2"
 	} else if crate::s3::config(env).is_ok() {
@@ -303,6 +312,14 @@ async fn system_status(env: &Env, email: &str) -> Result<Response> {
 		"files": files,
 		"storage": { "backend": backend, "configured": backend != "none" },
 		"timestamps": { "configured": crate::tsa::configured(env).is_some() },
+		// Protected videos (40b, docs/DRM.md): whether copies can be made
+		// (DRM_KEY_SECRET) and played (the three FairPlay secrets) — named,
+		// never shown.
+		"drm": {
+			"copies": crate::drm::custody(env).is_some(),
+			"playable": fairplay.is_ok(),
+			"problem": fairplay.err(),
+		},
 		"lead": actor.role == "lead",
 	}))
 }
@@ -533,6 +550,9 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		// Where a member left off in a video (39o) is theirs, not the
 		// file's: a read-only grantee saves it too.
 		("PUT", ["files", _, "position"]) => Some(Need::Read),
+		// A protected copy's license (40b) is a way of reading: every
+		// grantee who may watch asks for one. (Its GETs are reads anyway.)
+		("POST", ["files", _, "drm", _, "license"]) => Some(Need::Read),
 		// Custody (commit 29g) is a record of responsibility, not access:
 		// anyone on the case may hold an item — a read-only analyst too, and
 		// after the case closed. custody.rs decides WHO, link by link.
@@ -648,6 +668,9 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// Team › Status (commit 39u): every member's view of the system's health.
 		("GET", ["status"]) => system_status(&env, &identity.email).await,
 		("POST", ["status", "storage"]) => status_storage(&env, &identity.email).await,
+		// The FairPlay certificate (40b): public material, for any member's
+		// player (a view-only link's page has its own route under /s/).
+		("GET", ["drm", "fairplay", "certificate"]) => crate::drm::certificate(&env),
 		// The opt-in hash lookup (commit 38c, malware.rs): any active member,
 		// rate limited per member — a button, not a pipeline.
 		("POST", ["malware", "lookup"]) => {
@@ -839,6 +862,37 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			let body = req.json::<serde_json::Value>().await?;
 			let path = format!("files-video/{file}");
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", path, Some(body), actor)).await
+		}
+		// Protected copies (commit 40b, drm.rs, docs/DRM.md). In a case,
+		// case_need classifies the GETs and the license as reads, the rest
+		// as writes; drm.rs then asks for a lead where it must.
+		(m, ["members", id, "files", file, "drm", rest @ ..]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			match (m, rest) {
+				("POST", []) => {
+					let body = req.json::<serde_json::Value>().await?;
+					crate::drm::protect_start(&env, &actor, id, file, body).await
+				}
+				("GET", []) => crate::drm::state(&env, &actor, id, file).await,
+				("DELETE", []) => crate::drm::unprotect(&env, &actor, id, file).await,
+				("PUT", [version, "parts", part]) => crate::drm::protect_part(req, &env, &actor, id, file, version, part).await,
+				("POST", [version, "complete"]) => {
+					let body = req.json::<serde_json::Value>().await?;
+					crate::drm::protect_complete(&env, &actor, id, file, version, body).await
+				}
+				("GET", [version, "playlist"]) => crate::drm::playlist_route(&env, &actor, id, file, version).await,
+				("GET", [version, "media"]) => crate::drm::media(&req, &env, &actor, id, file, version).await,
+				("POST", [version, "license"]) => {
+					if let Some(limited) = rate_limited(&env, "DEVICE_LIMITER", format!("license:{}", actor.id)).await {
+						return Ok(limited);
+					}
+					crate::drm::license(req, &env, &actor, id, file, version).await
+				}
+				_ => json_error(404, "no such route"),
+			}
 		}
 		("GET", ["members", id, "files", "meta"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/meta", &req, actor)).await,
 		("GET", ["members", id, "files", "secrets"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/secrets", None, actor)).await,
@@ -1591,7 +1645,7 @@ async fn forward_family(env: &Env, actor: &str, method: &str, path: impl Into<St
 	do_request(&stub, method, path, body, Some(actor), None).await
 }
 
-async fn forward_member(env: &Env, member_id: &str, method: &str, path: impl Into<String>, body: Option<serde_json::Value>, actor: impl Into<String>) -> Result<Response> {
+pub(crate) async fn forward_member(env: &Env, member_id: &str, method: &str, path: impl Into<String>, body: Option<serde_json::Value>, actor: impl Into<String>) -> Result<Response> {
 	let namespace = env.durable_object("MEMBER")?;
 	// `member_id` is an AREA: a member id, or `case:<id>` (area.rs).
 	let stub = namespace.id_from_name(&crate::area::do_name(member_id))?.get_stub()?;
@@ -1942,7 +1996,7 @@ async fn upload_part(mut req: Request, env: Env, identity: &Identity, member_id:
 /// backend is told it before the first byte — and it is at most one frame
 /// of the largest chunk. A body that then runs short or long fails the
 /// stream, and the part with it.
-fn part_length(req: &Request) -> Result<std::result::Result<u64, Response>> {
+pub(crate) fn part_length(req: &Request) -> Result<std::result::Result<u64, Response>> {
 	let max = gorani_formats::chunked::MAX_CHUNK + gorani_formats::chunked::FRAME_OVERHEAD;
 	Ok(match req.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok()) {
 		None => Err(json_error(411, "a part declares its length (Content-Length) — it is streamed to storage")?),
@@ -1953,7 +2007,7 @@ fn part_length(req: &Request) -> Result<std::result::Result<u64, Response>> {
 
 /// S3's part-number range (1-based, at most 10 000). Parsed before the body
 /// is read, so a bad number costs nothing.
-fn part_number(raw: &str) -> Option<u32> {
+pub(crate) fn part_number(raw: &str) -> Option<u32> {
 	raw.parse::<u32>().ok().filter(|n| (1..=10_000).contains(n))
 }
 
@@ -2086,6 +2140,11 @@ async fn file_download(req: Request, env: Env, identity: &Identity, member_id: &
 		Ok(r) => return Ok(r),
 		Err(e) => return json_error(500, &e.to_string()),
 	};
+	// A protected video's original (commit 40b): to a lead and an own
+	// area's owner only — everyone else plays the protected copy.
+	if meta.get("protected").and_then(|p| p.as_bool()) == Some(true) && !crate::drm::original_allowed(&actor, member_id) {
+		return crate::drm::original_refused();
+	}
 	let object_key = meta.get("objectKey").and_then(|x| x.as_str()).unwrap_or_default().to_string();
 	let range = parse_range(&req.headers().get("Range")?.unwrap_or_default());
 	// The cache keys CHUNKED media by its frame span (docs/PRODUCTION.md ›
@@ -2259,12 +2318,33 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 			Ok(Response::from_json(&v)?.with_status(status))
 		}
 		Some(&"claim") => {
-			let resp = do_call(format!("shares/{id}/claim"), Some(serde_json::json!({}))).await?;
+			// (A view-only link's page sends its proof — files_store.rs ›
+			// share_claim. An ordinary link's claim needs none.)
+			let mut req = req;
+			let proof = req.json::<serde_json::Value>().await.ok().and_then(|b| b.get("proof").cloned()).unwrap_or(serde_json::Value::Null);
+			let resp = do_call(format!("shares/{id}/claim"), Some(serde_json::json!({ "proof": proof }))).await?;
 			let mut resp = resp;
 			let status = resp.status_code();
-			let v: serde_json::Value = resp.json().await?;
+			let mut v: serde_json::Value = resp.json().await?;
+			// A view-only link's session (40b): the playlist URL Safari's own
+			// player fetches — it cannot send the token in a header, so the
+			// URL carries the session's HASH, its end, and the Worker's
+			// signature over both. Found in a log later, it plays nothing:
+			// the license needs the token itself, and the session ends.
+			if status == 200 && v.get("viewOnly").and_then(|d| d.as_bool()) == Some(true) {
+				let (Some(token), Some(ttl)) = (v.get("token").and_then(|t| t.as_str()), v.get("tokenExpiresIn").and_then(|t| t.as_u64())) else {
+					return json_error(500, "the claim did not return a session");
+				};
+				let Some(custody) = crate::drm::custody(&env) else { return json_error(503, "protected copies are not set up on this deployment") };
+				let session = crate::files_store::token_hash(token);
+				let until = Date::now().as_millis() / 1000 + ttl;
+				let sig = custody.sign(&format!("{id}|{session}|{until}"));
+				v["playlist"] = serde_json::json!(format!("drm/playlist?{}", crate::drm::session_query(&session, until, &sig)));
+			}
 			Ok(Response::from_json(&v)?.with_status(status))
 		}
+		// ── A view-only link's player (40b, drm.rs) ──
+		Some(&"drm") => crate::drm::public_drm(req, &env, &id, &member, segs.get(3).copied(), &stub).await,
 		Some(&"data") => {
 			// The claim's token (O12) and the share's state, checked by the DO;
 			// then the sealed object streams from S3. A header, not a query
@@ -2313,7 +2393,7 @@ async fn public_share(req: Request, env: Env, segs: &[&str]) -> Result<Response>
 /// Only the closed form `a-b` is honoured; suffix (`-n`) and open (`a-`)
 /// ranges and multi-range lists fall back to a whole read — correct, if
 /// less efficient, and the media worker always sends `a-b`.
-fn parse_range(header: &str) -> Option<(u64, u64)> {
+pub(crate) fn parse_range(header: &str) -> Option<(u64, u64)> {
 	let r = header.trim().strip_prefix("bytes=")?;
 	let (a, b) = r.split_once('-')?;
 	let start: u64 = a.parse().ok()?;
@@ -2321,7 +2401,7 @@ fn parse_range(header: &str) -> Option<(u64, u64)> {
 	(end >= start).then(|| (start, end - start + 1))
 }
 
-async fn http_text(status: u16, text: &str) -> Result<Response> {
+pub(crate) async fn http_text(status: u16, text: &str) -> Result<Response> {
 	let h = Headers::new();
 	h.set("Content-Type", "text/plain; charset=utf-8")?;
 	let mut r = Response::from_bytes(text.as_bytes().to_vec())?;
@@ -2330,7 +2410,7 @@ async fn http_text(status: u16, text: &str) -> Result<Response> {
 }
 
 /// The share recipient page's CSP (also in web/public/_headers › /s.html).
-const SHARE_PAGE_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
+const SHARE_PAGE_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; media-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 
 // ── Share plumbing (the Worker's half; the DO owns rows) ───────────────────
 
@@ -2367,6 +2447,14 @@ async fn share_create(env: &Env, member_id: &str, actor: String, mut body: serde
 		let _ = do_request(&env.durable_object("FAMILY")?.id_from_name("family")?.get_stub()?, "DELETE", format!("shares-index/{id}"), None, Some("internal"), Some(member_id)).await;
 		Ok::<(), Error>(())
 	};
+	// A view-only link (40b) plays the protected copy: nothing to upload.
+	if body.get("drm").and_then(|d| d.as_bool()) == Some(true) {
+		let resp = forward_member(env, member_id, "POST", "files/shares", Some(body), actor).await?;
+		if resp.status_code() >= 400 {
+			release().await?;
+		}
+		return Ok(resp);
+	}
 	let s3_upload_id = match s3::multipart_init(env, &object_key).await {
 		Ok(u) => u,
 		Err(e) => {
@@ -2547,7 +2635,7 @@ async fn backup_object_fill(mut req: Request, env: Env, identity: &Identity, mem
 
 /// The caller's address as Cloudflare saw it (`CF-Connecting-IP`; absent
 /// on the dev server, where every caller is "local").
-fn client_ip(req: &Request) -> String {
+pub(crate) fn client_ip(req: &Request) -> String {
 	req.headers().get("CF-Connecting-IP").ok().flatten().unwrap_or_else(|| "local".into())
 }
 
@@ -2560,7 +2648,7 @@ fn client_ip(req: &Request) -> String {
 /// token). Cloudflare's limiter is also per location and eventually
 /// consistent, so it bounds a flood, it does not count exactly; the WAF
 /// rules in docs/PRODUCTION.md are the second layer.
-async fn rate_limited(env: &Env, binding: &str, key: String) -> Option<Response> {
+pub(crate) async fn rate_limited(env: &Env, binding: &str, key: String) -> Option<Response> {
 	let limiter = env.rate_limiter(binding).ok()?;
 	match limiter.limit(key).await {
 		Ok(outcome) if !outcome.success => {
@@ -2573,6 +2661,6 @@ async fn rate_limited(env: &Env, binding: &str, key: String) -> Option<Response>
 }
 
 /// Percent-encode a query value (only what the read log's `client` needs).
-fn urlencode(v: &str) -> String {
+pub(crate) fn urlencode(v: &str) -> String {
 	v.bytes().map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b':' { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }

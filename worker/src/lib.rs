@@ -36,6 +36,8 @@ mod cache;
 mod cron;
 mod custody;
 mod devices;
+mod drm;
+mod drm_store;
 mod family;
 mod files_store;
 mod inbox;

@@ -828,6 +828,13 @@ impl GoraniMemberDO {
 			("GET", "files/changes") => self.files_changes(req).await,
 			("GET", "files/match") => self.files_match(req).await,
 			("GET", "files/duplicates") => self.files_duplicates().await,
+			// Lost bytes (commit 39t, routes.rs › lost_object): the Worker's
+			// questions — never a route of the public API.
+			("GET", "files/canary") => self.canary(req).await,
+			("POST", id) if id.starts_with("files-lost/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.file_lost(&actor, &id["files-lost/".len()..], body).await
+			}
 			("GET", "files/secrets") => self.secrets_get().await,
 			("PUT", "files/secrets") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -1140,6 +1147,34 @@ impl GoraniMemberDO {
 			)?
 			.rows_written();
 
+		// 2c. Strays (commit 39t): living files and folders whose folder is
+		// gone — purged, or in the Trash while they are not (a file sent into
+		// a folder deleted meanwhile, before file_put refused that). No
+		// listing shows them: the explorer lists a folder's items only inside
+		// it. They come back at the top, each move on the trail — never
+		// deleted: the bytes are fine, only the place was lost. Folders
+		// first, so a re-homed folder brings its contents back with it.
+		#[derive(serde::Deserialize)]
+		struct StrayRow {
+			id: String,
+		}
+		let stray_folders: Vec<StrayRow> = self
+			.sql
+			.exec("SELECT id FROM file_folders WHERE deleted_at IS NULL AND parent_id IS NOT NULL AND parent_id NOT IN (SELECT id FROM file_folders WHERE deleted_at IS NULL) LIMIT 500", None)?
+			.to_array()?;
+		for f in &stray_folders {
+			self.sql.exec("UPDATE file_folders SET parent_id = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1", Some(vec![f.id.clone().into()]))?;
+			self.audit(actor, "folder.rehome", &f.id, None, Some("its folder was gone — moved to the top")).await?;
+		}
+		let stray_files: Vec<StrayRow> = self
+			.sql
+			.exec("SELECT id FROM files WHERE deleted_at IS NULL AND folder_id IS NOT NULL AND folder_id NOT IN (SELECT id FROM file_folders WHERE deleted_at IS NULL) LIMIT 500", None)?
+			.to_array()?;
+		for f in &stray_files {
+			self.sql.exec("UPDATE files SET folder_id = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1", Some(vec![f.id.clone().into()]))?;
+			self.audit(actor, "file.rehome", &f.id, None, Some("its folder was gone — moved to the top")).await?;
+		}
+
 		// 3. The journal and the audit: the two append-only tables.
 		let journal_pruned = self
 			.sql
@@ -1167,6 +1202,7 @@ impl GoraniMemberDO {
 			"purgedFiles": n_files_purged, "purgedFolders": n_folders_purged, "purgedShares": n_shares_purged, "versionsPruned": n_versions_pruned, "evidence": evidence, "held": held,
 			"journalPruned": journal_pruned, "auditPruned": audit_pruned, "objectsDeleted": drained.done,
 			"uploadsAborted": stale_uploads.len(), "deletesFailed": drained.failed, "deletesPending": drained.pending,
+			"rehomedFolders": stray_folders.len(), "rehomedFiles": stray_files.len(),
 		}))?)
 	}
 

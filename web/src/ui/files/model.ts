@@ -516,6 +516,12 @@ export class FilesModel {
 				await this.bridge.apiSend("PATCH", path, it.kind === "file" ? { folderId } : { parentId: folderId });
 				moved++;
 			} catch (e) {
+				// The target went meanwhile (39t): every other item would be
+				// refused the same way — stop, and show what is there now.
+				if (await this.ifFolderGone(e)) {
+					this.bridge.toast(`${moved ? `Moved ${moved}; the rest were` : "Nothing was"} not moved — that folder was deleted or moved to the Trash (on another device?)`);
+					return;
+				}
 				failed.push(`“${this.names.get(it.id) ?? it.id}”: ${e instanceof Error ? e.message : String(e)}`);
 			}
 		}
@@ -545,9 +551,28 @@ export class FilesModel {
 	}
 
 	async newFolder(parentId: string | null, name: string): Promise<string> {
-		const id = await this.createFolder(parentId, name);
-		await this.refresh();
-		return id;
+		try {
+			const id = await this.createFolder(parentId, name);
+			await this.refresh();
+			return id;
+		} catch (e) {
+			await this.ifFolderGone(e);
+			throw e;
+		}
+	}
+
+	/**
+	 * The server said a folder is gone (commit 39t: it was deleted or moved
+	 * to the Trash on another device, while this view still showed it): the
+	 * view follows — re-listed, and at the top if the folder on screen is
+	 * the one that went. The caller still reports the refusal.
+	 */
+	private async ifFolderGone(e: unknown): Promise<boolean> {
+		if (!/no such folder/.test(e instanceof Error ? e.message : String(e))) return false;
+		await this.refresh().catch(() => {});
+		const here = this.state.get().folderId;
+		if (here && !this.state.get().tree.some((f) => f.id === here)) await this.list(null).catch(() => {});
+		return true;
 	}
 
 	/** A folder, without re-listing (a dropped tree makes many at once). */
@@ -689,7 +714,17 @@ export class FilesModel {
 					// nothing new. (A dead `asVersion` parameter used to pretend
 					// otherwise; removed in commit 25.)
 				}
-				await this.uploadOne(file, tag, folderId, hexOf(digest), sample, intake);
+				try {
+					await this.uploadOne(file, tag, folderId, hexOf(digest), sample, intake);
+				} catch (e) {
+					// The folder went while the batch ran (39t): say so once,
+					// show what is there now, and stop — the rest was going there too.
+					if (await this.ifFolderGone(e)) {
+						this.bridge.toast(`Upload stopped at “${file.name}”: its folder was deleted or moved to the Trash — ${sent} of ${items.length} sent`);
+						break;
+					}
+					throw e;
+				}
 				sent++;
 			}
 		} finally {

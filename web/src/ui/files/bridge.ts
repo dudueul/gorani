@@ -67,7 +67,9 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 			const headers: Record<string, string> = { ...devIdentityHeaders(), "x-gorani-client": "web" };
 			if (range) headers.Range = `bytes=${range[0]}-${range[1]}`;
 			const res = await fetch(`${areaPath(memberId)}/files/${id}${version ? `?version=${version}` : ""}`, { headers });
-			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
+			// (The server's own words — "moved to the Trash", "the storage
+			// refused this read (HTTP 403 …)" — not just the status, 39t.)
+			if (!res.ok && res.status !== 206) await throwIfError(res);
 			return {
 				body: new Uint8Array(await res.arrayBuffer()),
 				ck: res.headers.get("x-gorani-ck") ?? "",
@@ -79,7 +81,9 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 
 		async fetchObjectStream(memberId, id, version, sink) {
 			const res = await fetch(`${areaPath(memberId)}/files/${id}${version ? `?version=${version}` : ""}`, { headers: { ...devIdentityHeaders(), "x-gorani-client": "web" } });
-			if (!res.ok && res.status !== 206) throw new Error(`download failed: ${res.status}`);
+			// (The server's own words — "moved to the Trash", "the storage
+			// refused this read (HTTP 403 …)" — not just the status, 39t.)
+			if (!res.ok && res.status !== 206) await throwIfError(res);
 			const ck = res.headers.get("x-gorani-ck") ?? "";
 			const chunk = Number(res.headers.get("x-gorani-chunk")) || 0;
 			const served = servedVersion(res);
@@ -195,7 +199,9 @@ async function sendPart(url: string, frame: Uint8Array, n: number): Promise<{ pa
 		}
 		if (res.ok) return (await res.json()) as { partNumber: number; etag: string };
 		if (res.status < 500 && res.status !== 429) await throwIfError(res);
-		lastError = new Error(`part ${n}: HTTP ${res.status}`);
+		// (The server's reason when it gave one — a storage refusal names its
+		// code, 39s — so "failed three times" says why.)
+		lastError = await throwIfError(res).catch((e: unknown) => e);
 	}
 	throw new Error(`part ${n} failed three times — ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }

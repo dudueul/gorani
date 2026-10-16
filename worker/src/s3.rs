@@ -132,12 +132,19 @@ async fn fetch_signed_js(cfg: &S3Config, method: &str, object_key: &str, query_p
 /// `gorani_s3::refusal_reason` — "HTTP 403" alone has five causes and five
 /// different fixes. `what` names the operation and key for the operator's
 /// log; the browser is told only the reason (lib.rs › `public_reason`).
-async fn refused(what: &str, mut resp: Response) -> Error {
+pub(crate) async fn refused(what: &str, mut resp: Response) -> Error {
 	let status = resp.status_code();
 	let server = resp.headers().get("Server").ok().flatten().unwrap_or_default();
 	let bodied = !what.starts_with("head ");
 	let body = if bodied { resp.text().await.unwrap_or_default() } else { String::new() };
 	Error::RustError(format!("S3 {what}: {}", refusal_reason(status, xml_val(&body, "Code").as_deref(), &server, bodied)))
+}
+
+/// Was this storage error a 404 — the object (or the multipart upload) is
+/// not there? (Commit 39t: an upload whose multipart upload the storage no
+/// longer knows answers "no such upload", so the client starts it over.)
+pub fn is_missing(e: &Error) -> bool {
+	public_reason(&e.to_string()).is_some_and(|r| r.starts_with("HTTP 404"))
 }
 
 /// What a caller may be told of a storage error: "HTTP 403 AccessDenied"
@@ -670,5 +677,16 @@ mod tests {
 		assert_eq!(public_reason(&m).as_deref(), Some("HTTP 403 AccessDenied"));
 		assert_eq!(public_reason(&format!("S3 head files/x: {}", refusal_reason(403, None, "", false))).as_deref(), Some("HTTP 403"));
 		assert_eq!(public_reason("no such member"), None);
+	}
+
+	/// 39t: a 404 from the storage — an object or a multipart upload it does
+	/// not have — is told apart from a refusal.
+	#[test]
+	fn missing_is_a_404() {
+		let missing = Error::RustError(format!("S3 part 1 of files/x/u-1: {}", refusal_reason(404, Some("NoSuchUpload"), "", true)));
+		assert!(is_missing(&missing));
+		let refused = Error::RustError(format!("S3 part 1 of files/x/u-1: {}", refusal_reason(403, Some("AccessDenied"), "", true)));
+		assert!(!is_missing(&refused));
+		assert!(!is_missing(&Error::RustError("no such member".into())));
 	}
 }

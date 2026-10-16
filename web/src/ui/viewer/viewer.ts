@@ -128,6 +128,10 @@ export class GoraniViewer extends LitElement {
 			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
+			// Its bytes were confirmed gone and the file went to the Trash
+			// (39t, routes.rs › lost_object): the list behind should not
+			// still show it.
+			if (/moved to the Trash/.test(this.error)) void this.model.refresh();
 		} finally {
 			this.busy = false;
 			void this.requestUpdate();

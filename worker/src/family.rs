@@ -831,6 +831,12 @@ impl GoraniFamilyDO {
 				body.emails = vec![actor.to_string()];
 			}
 		}
+		// A taken id first: it is the more specific refusal (the INSERT's
+		// UNIQUE would say so too, but only after the fields were judged).
+		let exists = self.sql.exec("SELECT COUNT(*) AS n FROM members WHERE id = ?1", Some(vec![body.id.clone().into()]))?.one::<Count>()?.n > 0;
+		if exists {
+			return json_error(409, "member id already exists");
+		}
 		// The fields as people type them (commit 39l: Team › People adds
 		// members now) — after the authority checks above, so a refusal
 		// never tells someone who may not add members how to word one.

@@ -448,6 +448,53 @@ export async function markSample(model: { markSample(id: string): Promise<void>;
 	}
 }
 
+/** What Delete forever and Empty Trash need of the model (model.ts). */
+interface Purging {
+	purgePreview(what: { kind: "file" | "folder"; id: string }[] | "trash"): Promise<{ files: number; folders: number; shares: number }>;
+	purge(what: { kind: "file" | "folder"; id: string }[] | "trash"): Promise<{ files: number; folders: number; sharesRevoked: number }>;
+	names: Map<string, string>;
+	api: { toast(m: string): void };
+}
+
+/** "1 file", "3 files". */
+const counted = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/**
+ * "Delete forever…" (39v): no Trash, no restore — so the person is asked
+ * first, told what it takes. The server counts it (a folder's contents,
+ * the share links that stop) before anything changes; the menus offer it
+ * only to whom the server allows it (model.ts › canPurge).
+ */
+export async function deleteForever(model: Purging, items: { kind: "file" | "folder"; id: string }[]): Promise<void> {
+	if (!items.length) return;
+	const p = await model.purgePreview(items);
+	const name = items.length === 1 ? model.names.get(items[0]!.id) : undefined;
+	const it = items.length === 1 ? "It" : "They";
+	const lines = [
+		`Delete ${name ? `“${name}”` : `${items.length} items`} forever?`,
+		`${it} skip${items.length === 1 ? "s" : ""} the Trash and cannot be restored: every version goes, from storage too.`,
+	];
+	if (items.some((x) => x.kind === "folder")) lines.push(`That is ${counted(p.files, "file")} and ${counted(p.folders, "folder")}, with everything inside the folders.`);
+	if (p.shares) lines.push(`${counted(p.shares, "share link")} to ${p.files === 1 ? "it" : "them"} stop${p.shares === 1 ? "s" : ""} working now.`);
+	if (!window.confirm(lines.join("\n\n"))) return;
+	const r = await model.purge(items);
+	model.api.toast(`Deleted ${counted(r.files, "file")}${r.folders ? ` and ${counted(r.folders, "folder")}` : ""} forever${r.sharesRevoked ? ` · ${counted(r.sharesRevoked, "share link")} revoked` : ""}`);
+}
+
+/** "Empty Trash…" (39v): everything in the Trash, deleted forever — asked first. */
+export async function emptyTrash(model: Purging): Promise<void> {
+	const p = await model.purgePreview("trash");
+	if (!p.files && !p.folders) {
+		model.api.toast("The Trash is empty");
+		return;
+	}
+	const lines = [`Empty the Trash?`, `${counted(p.files, "file")} and ${counted(p.folders, "folder")} are deleted forever. This cannot be undone.`];
+	if (p.shares) lines.push(`${counted(p.shares, "share link")} to them stop${p.shares === 1 ? "s" : ""} working now.`);
+	if (!window.confirm(lines.join("\n\n"))) return;
+	const r = await model.purge("trash");
+	model.api.toast(`Emptied the Trash: ${counted(r.files, "file")} and ${counted(r.folders, "folder")} deleted forever${r.sharesRevoked ? ` · ${counted(r.sharesRevoked, "share link")} revoked` : ""}`);
+}
+
 /**
  * "Custody…" (commit 29g): the file's chain as THIS client verified it, and
  * the one action open to this member — accept an offer made to them, or,

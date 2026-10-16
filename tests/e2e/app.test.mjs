@@ -281,10 +281,43 @@ try {
 			await renameF.fill("menu-c.txt");
 			await renameF.press("Enter");
 			await row("gorani-finder", "menu-c.txt").waitFor({ timeout: 30_000 });
+			const finderMenu = await openMenu("gorani-finder", "menu-c.txt");
+			assert.equal(await finderMenu.getByRole("menuitem", { name: "Delete Forever…", exact: true }).count(), 1, "Finder offers Delete Forever… in the member's own area");
+			await page.keyboard.press("Escape");
 			await choose("gorani-finder", "menu-c.txt", "Move to Trash");
 			await row("gorani-finder", "menu-c.txt").waitFor({ state: "detached", timeout: 30_000 });
 			await page.getByRole("button", { name: "Windows", exact: true }).click();
 			await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached" });
+
+			// Delete forever (39v), asked first: the prompt says what it does;
+			// No keeps the file, Yes deletes it — no Trash, no restore. Then
+			// from the Trash, where Finder just put menu-c.txt.
+			await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "menu-d.txt", mimeType: "text/plain", buffer: Buffer.from("deleted for good") });
+			await row("gorani-win11", "menu-d.txt").waitFor({ timeout: 60_000 });
+			const doomedId = (await row("gorani-win11", "menu-d.txt").getAttribute("data-item")).slice("file:".length);
+			const asked = page.waitForEvent("dialog");
+			await choose("gorani-win11", "menu-d.txt", "Delete forever…");
+			const no = await asked;
+			assert.match(no.message(), /^Delete “menu-d\.txt” forever\?\n\nIt skips the Trash and cannot be restored/, `the prompt says what it does (${no.message()})`);
+			await no.dismiss();
+			const listedIds = async () => (await api(dev.base, "GET", "/api/v1/members/jinu/files/list?folder=all", { email: "jinu@family.test" })).json.files.map((f) => f.id);
+			assert.ok((await listedIds()).includes(doomedId), "No keeps it");
+			const yes = page.waitForEvent("dialog");
+			await choose("gorani-win11", "menu-d.txt", "Delete forever…");
+			await (await yes).accept();
+			await row("gorani-win11", "menu-d.txt").waitFor({ state: "detached", timeout: 30_000 });
+			const binIds = async () => (await api(dev.base, "GET", "/api/v1/members/jinu/files/trash", { email: "jinu@family.test" })).json.files.map((f) => f.id);
+			assert.ok(!(await listedIds()).includes(doomedId) && !(await binIds()).includes(doomedId), "Yes deletes it — not in the Trash either");
+			await page.locator("gorani-win11 aside button", { hasText: "Trash" }).first().click();
+			await row("gorani-win11", "menu-c.txt").waitFor({ timeout: 30_000 });
+			const binnedId = (await row("gorani-win11", "menu-c.txt").getAttribute("data-item")).slice("file:".length);
+			const fromBin = page.waitForEvent("dialog");
+			await choose("gorani-win11", "menu-c.txt", "Delete forever…");
+			await (await fromBin).accept();
+			await row("gorani-win11", "menu-c.txt").waitFor({ state: "detached", timeout: 30_000 });
+			assert.ok(!(await binIds()).includes(binnedId), "…and from the Trash");
+			await page.locator("gorani-win11 aside button", { hasText: /^\s*Home\s*$/ }).first().click();
+			await row("gorani-win11", "hello.txt").waitFor({ timeout: 10_000 });
 			await assertNoViolations(page, "the context menus, both explorers");
 		}
 
@@ -1466,7 +1499,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
 } finally {
 	await dev.close();
 }

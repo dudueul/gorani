@@ -524,6 +524,16 @@ async fn route_case(mut req: Request, env: Env, identity: Identity, method: &str
 	dispatch(req, env, &identity, method, &segments).await
 }
 
+/// Who may delete for good (commit 39v, the team's decision): a lead,
+/// anywhere they may delete at all; and the owner of a member's own area,
+/// in it. Everyone else on a case — an analyst with a write grant, say —
+/// moves things to the Trash, where a lead can still restore them for 30
+/// days: the one deletion that cannot be taken back is not left to whoever
+/// can edit. (The same shape as drm.rs › original_allowed.)
+pub(crate) fn purge_allowed(actor: &Actor, area: &str) -> bool {
+	actor.role == "lead" || actor.id == area
+}
+
 /// What a case content route needs from the caller's grant: `Some(None)`
 /// for the audit views (audit_ctx decides), `None` for a route a case does
 /// not have. The default is WRITE: a route nobody classified is treated as
@@ -908,6 +918,20 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		("POST", ["members", id, "files", "trash", "restore"]) => {
 			let body = req.json::<serde_json::Value>().await?;
 			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", "files/trash/restore", Some(body), actor)).await
+		}
+		// Delete forever and Empty Trash (commit 39v, files_store.rs ›
+		// files_purge). In a case, case_need asks for a write grant as for
+		// any deletion; this asks for more — see purge_allowed.
+		("POST", ["members", id, "files", "purge"]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			if !purge_allowed(&actor, id) {
+				return json_error(403, "only a lead deletes forever in a case — Move to Trash instead: a lead can restore it for 30 days, or delete it for good");
+			}
+			let body = req.json::<serde_json::Value>().await?;
+			forward_member(&env, id, "POST", "files/purge", Some(body), actor.email).await
 		}
 		// The rotation walk's input: every value sealed to the files store
 		// key, by kind, paged (files_store.rs › sealed_page).
@@ -2663,4 +2687,23 @@ pub(crate) async fn rate_limited(env: &Env, binding: &str, key: String) -> Optio
 /// Percent-encode a query value (only what the read log's `client` needs).
 pub(crate) fn urlencode(v: &str) -> String {
 	v.bytes().map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b':' { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn delete_forever_is_a_leads_act_or_the_owners() {
+		// A lead, in a case or in someone's area; the owner, in their own.
+		assert!(purge_allowed(&Actor::test("lena", "lead"), "case:ir-1"));
+		assert!(purge_allowed(&Actor::test("lena", "lead"), "ana"));
+		assert!(purge_allowed(&Actor::test("ana", "analyst"), "ana"));
+		// Anyone else moves things to the Trash: an analyst or an auditor
+		// on a case, an external with a write grant, an analyst elsewhere.
+		for role in ["analyst", "auditor", "external"] {
+			assert!(!purge_allowed(&Actor::test("ana", role), "case:ir-1"), "{role} on a case");
+		}
+		assert!(!purge_allowed(&Actor::test("ana", "analyst"), "bob"));
+	}
 }

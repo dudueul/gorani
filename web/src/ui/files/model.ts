@@ -157,6 +157,9 @@ export interface FilesBridge {
 	toast(message: string): void;
 	/** The signed-in member's own id (39o) — in a case area, not the area's. */
 	selfId?(): string;
+	/** The signed-in member's team role ("lead", "analyst", …) — what the
+	 * menus offer; the server decides (39v: Delete forever). */
+	teamRole?(): string;
 	/** Protected copies (commit 40c, docs/DRM.md): one part of a copy, sent
 	 * as an upload part is (retried what the network lost); and raw bytes
 	 * in, raw bytes out — a license's SPC and CKC. Optional: a test bridge
@@ -557,9 +560,42 @@ export class FilesModel {
 		this.bridge.toast(`Moved ${items.length} item${items.length > 1 ? "s" : ""} to the Trash`);
 	}
 
+	/**
+	 * May THIS member delete for good here (39v)? A lead; the owner, in
+	 * their own area; nobody in an evidence case. The menus offer Delete
+	 * forever only then — the Worker decides the same (routes.rs ›
+	 * purge_allowed), and a legal hold refuses in the server's words.
+	 */
+	canPurge(): boolean {
+		const kind = this.areaKind();
+		if (kind === "evidence") return false;
+		return kind === "own" || this.bridge.teamRole?.() === "lead";
+	}
+
+	/** What a Delete forever would take — files, folders (each folder with
+	 * everything inside it), and the share links that would stop working —
+	 * asked of the server, which alone sees inside folders not listed here.
+	 * `"trash"` is Empty Trash. Nothing changes. */
+	async purgePreview(what: Selection[] | "trash"): Promise<{ files: number; folders: number; shares: number }> {
+		return this.bridge.apiSend("POST", `${areaPath(this.memberId)}/files/purge`, { ...purgeBody(what), preview: true });
+	}
+
+	/** Delete for good — no Trash, no restore (39v). The caller has asked
+	 * the person first (shared.ts › deleteForever). */
+	async purge(what: Selection[] | "trash"): Promise<{ files: number; folders: number; sharesRevoked: number; deletesPending: number }> {
+		try {
+			return await this.bridge.apiSend("POST", `${areaPath(this.memberId)}/files/purge`, purgeBody(what));
+		} finally {
+			await this.refresh(); // the Trash or the folder, wherever the person is now
+		}
+	}
+
 	async restore(files: string[], folders: string[]): Promise<void> {
 		await this.bridge.apiSend("POST", `${areaPath(this.memberId)}/files/trash/restore`, { files, folders });
-		await this.openTrash();
+		// Wherever the person is NOW (39v): this used to re-open the Trash,
+		// so Home clicked while the restore was on its way was undone by it
+		// — the explorer jumped back into the Trash.
+		await this.refresh();
 		this.bridge.toast(`Restored ${files.length + folders.length} item${files.length + folders.length > 1 ? "s" : ""}`);
 	}
 
@@ -1810,6 +1846,12 @@ export function toWebVtt(text: string): string {
 	const t = text.replace(/\r\n?/g, "\n");
 	if (/^WEBVTT/.test(t)) return t;
 	return `WEBVTT\n\n${t.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}`;
+}
+
+/** The body of `files/purge`: the items by kind, or Empty Trash. */
+function purgeBody(what: Selection[] | "trash"): { files?: string[]; folders?: string[]; trash?: true } {
+	if (what === "trash") return { trash: true };
+	return { files: what.filter((x) => x.kind === "file").map((x) => x.id), folders: what.filter((x) => x.kind === "folder").map((x) => x.id) };
 }
 
 function concatBytes(parts: Uint8Array[]): Uint8Array {

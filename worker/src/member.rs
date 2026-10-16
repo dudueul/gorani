@@ -797,6 +797,13 @@ impl GoraniMemberDO {
 				let body = req.json::<serde_json::Value>().await?;
 				self.trash_restore(&actor, body).await
 			}
+			// Delete forever and Empty Trash (commit 39v): the Worker has
+			// already asked for a lead, or the area's owner (routes.rs ›
+			// purge_allowed).
+			("POST", "files/purge") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.files_purge(&actor, body).await
+			}
 			("POST", "files/shares") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.share_create(&actor, body).await
@@ -1180,22 +1187,7 @@ impl GoraniMemberDO {
 				None,
 			)?
 			.rows_written();
-		// The purged files' dependent rows go too. `files` has no foreign keys
-		// (SQLite DOs run without them), so `DELETE FROM files` used to leave
-		// every version row — wrapped content key, object key — plus music
-		// blobs and contributor rows behind forever: unbounded growth, and
-		// key material outliving the file it belonged to.
-		self.sql.exec("DELETE FROM file_versions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
-		self.sql.exec("DELETE FROM music_meta WHERE file_id NOT IN (SELECT id FROM files)", None)?;
-		// (A video sidecar goes with its file — and with its VERSION, which
-		// the working-file retention prunes after a year.)
-		self.sql.exec("DELETE FROM video_meta WHERE NOT EXISTS (SELECT 1 FROM file_versions v WHERE v.file_id = video_meta.file_id AND v.version = video_meta.version)", None)?;
-		self.sql.exec("DELETE FROM watch_positions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
-		// A protected copy goes with its version too — its object queued for
-		// deletion, its sealed key with the row: once both are gone the copy
-		// can never be opened again, from any backup of the bucket (40b).
-		self.drm_purge_orphans()?;
-		self.sql.exec("DELETE FROM file_contributors WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		self.purge_dependents()?;
 		let n_folders_purged = self
 			.sql
 			.exec(
@@ -1337,6 +1329,30 @@ impl GoraniMemberDO {
 
 	/// Queue an object (or, with `upload_id`, a multipart upload) for
 	/// deletion. Idempotent: a key already queued keeps its history.
+	/// The rows that hang off a file, for the files that are gone — after
+	/// the Trash's purge (housekeeping) and after Delete forever
+	/// (files_store.rs › files_purge, commit 39v), the same list for both.
+	/// `files` has no foreign keys (SQLite DOs run without them), so
+	/// `DELETE FROM files` used to leave every version row — wrapped content
+	/// key, object key — plus music blobs and contributor rows behind
+	/// forever: unbounded growth, and key material outliving the file it
+	/// belonged to. (The version OBJECTS must already be in the deletion
+	/// outbox: these rows were the last pointers to them.)
+	pub(crate) fn purge_dependents(&self) -> Result<()> {
+		self.sql.exec("DELETE FROM file_versions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		self.sql.exec("DELETE FROM music_meta WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		// (A video sidecar goes with its file — and with its VERSION, which
+		// the working-file retention prunes after a year.)
+		self.sql.exec("DELETE FROM video_meta WHERE NOT EXISTS (SELECT 1 FROM file_versions v WHERE v.file_id = video_meta.file_id AND v.version = video_meta.version)", None)?;
+		self.sql.exec("DELETE FROM watch_positions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		// A protected copy goes with its version too — its object queued for
+		// deletion, its sealed key with the row: once both are gone the copy
+		// can never be opened again, from any backup of the bucket (40b).
+		self.drm_purge_orphans()?;
+		self.sql.exec("DELETE FROM file_contributors WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		Ok(())
+	}
+
 	pub(crate) fn enqueue_delete(&self, key: &str, upload_id: Option<&str>, reason: &str) -> Result<()> {
 		self.sql.exec(
 			"INSERT OR IGNORE INTO pending_deletes (key, upload_id, reason, since) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
@@ -1349,7 +1365,7 @@ impl GoraniMemberDO {
 	/// confirmed it (S3's 204, or 404 — already gone counts as done). A
 	/// failure stays queued with its attempt count and the error, for the
 	/// next pass and for whoever reads `storage/pending`.
-	async fn drain_deletes(&self) -> Result<Drained> {
+	pub(crate) async fn drain_deletes(&self) -> Result<Drained> {
 		let rows: Vec<PendingDelete> = self.sql.exec("SELECT key, upload_id FROM pending_deletes ORDER BY since LIMIT 500", None)?.to_array()?;
 		let (mut done, mut failed) = (0u64, 0u64);
 		for r in rows {
@@ -1517,10 +1533,10 @@ struct PendingDeleteRow {
 	last_error: Option<String>,
 }
 
-struct Drained {
-	done: u64,
-	failed: u64,
-	pending: u64,
+pub(crate) struct Drained {
+	pub(crate) done: u64,
+	pub(crate) failed: u64,
+	pub(crate) pending: u64,
 }
 
 /// The checks a member's settings save must pass on its unlock methods

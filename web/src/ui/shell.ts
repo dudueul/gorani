@@ -250,6 +250,8 @@ export class GoraniShell extends LitElement {
 			areaKind: () => (own ? "own" : (this.grantedCases.find((c) => c.id === caseId)?.kind ?? null)),
 			intake: (files) => askIntake(files, this.member.id),
 			selfId: () => this.member.id,
+			// Who is offered Delete forever (39v): a lead, or anyone in their own area.
+			teamRole: () => this.member.role,
 		}, openKey), area, own ? (this.index ?? undefined) : undefined);
 		this.area = area;
 		this.areaTitle = title;

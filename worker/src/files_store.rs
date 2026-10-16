@@ -1460,6 +1460,180 @@ impl GoraniMemberDO {
 		Ok(Response::from_json(&serde_json::json!({ "files": n_files, "folders": n_folders }))?)
 	}
 
+	// ── Delete forever (commit 39v) ─────────────────────────────────────
+
+	/// What one deletion for good takes. Named files; named folders with
+	/// everything beneath them, living or already in the Trash (a folder
+	/// takes what is inside it, as Shift+Delete does); or, for Empty Trash,
+	/// exactly what the Trash holds — nothing living, even a stray that sits
+	/// in a trashed folder (housekeeping re-homes those, 39t).
+	fn purge_targets(&self, files: &[String], folders: &[String], trash: bool) -> Result<(std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)> {
+		#[derive(serde::Deserialize)]
+		struct IdRow {
+			id: String,
+		}
+		let ids = |rows: Vec<IdRow>| rows.into_iter().map(|r| r.id);
+		let mut out_files = std::collections::BTreeSet::new();
+		let mut out_folders = std::collections::BTreeSet::new();
+		if trash {
+			out_files.extend(ids(self.sql.exec("SELECT id FROM files WHERE deleted_at IS NOT NULL", None)?.to_array()?));
+			out_folders.extend(ids(self.sql.exec("SELECT id FROM file_folders WHERE deleted_at IS NOT NULL", None)?.to_array()?));
+		}
+		// (UNION, not UNION ALL: folder_patch refuses cycles, and if one
+		// ever got in, the walk would still end.)
+		const TREE: &str = "WITH RECURSIVE d(id) AS (SELECT id FROM file_folders WHERE id = ?1 UNION SELECT f.id FROM file_folders f JOIN d ON f.parent_id = d.id)";
+		for id in folders {
+			let p = Some(vec![id.as_str().into()]);
+			out_folders.extend(ids(self.sql.exec(&format!("{TREE} SELECT id FROM d"), p.clone())?.to_array()?));
+			out_files.extend(ids(self.sql.exec(&format!("{TREE} SELECT id FROM files WHERE folder_id IN (SELECT id FROM d)"), p)?.to_array()?));
+		}
+		// Named files that exist (a second device may have been first).
+		for chunk in files.chunks(PURGE_CHUNK) {
+			let (qs, params) = in_clause(chunk);
+			out_files.extend(ids(self.sql.exec(&format!("SELECT id FROM files WHERE id IN ({qs})"), Some(params))?.to_array()?));
+		}
+		Ok((out_files, out_folders))
+	}
+
+	/// `POST files/purge` — Delete forever, and Empty Trash (commit 39v).
+	/// Body: `{ files: [ids], folders: [ids] }`, or `{ trash: true }` for
+	/// everything in the Trash; `preview: true` answers what it WOULD take
+	/// — `{ files, folders, shares }` — and changes nothing, so the
+	/// confirmation can say it before anyone agrees.
+	///
+	/// Only a lead, or the area's owner, gets here (routes.rs ›
+	/// purge_allowed). Evidence is never deleted and a legal hold deletes
+	/// nothing (evidence_refusal) — neither through the Trash, nor around it.
+	///
+	/// What goes, in the order the Trash's purge uses (member.rs ›
+	/// housekeeping): every object into the deletion outbox FIRST — the
+	/// version objects, the share links' copies, unfinished uploads — then
+	/// the rows that pointed at them, then the outbox is drained. A file's
+	/// share links are revoked at once — they answer as any revoked link
+	/// does — and their copies leave storage now rather than at their
+	/// expiry. The change feed's
+	/// triggers journal each `file.purge` and `folder.purge`, so a synced
+	/// device removes its copies too.
+	pub(crate) async fn files_purge(&self, actor: &str, body: serde_json::Value) -> Result<Response> {
+		if let Some(refused) = self.evidence_refusal().await? {
+			return Ok(refused);
+		}
+		let list = |k: &str| body.get(k).and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok()).unwrap_or_default();
+		let (asked_files, asked_folders) = (list("files"), list("folders"));
+		let trash = body.get("trash").and_then(|v| v.as_bool()) == Some(true);
+		let preview = body.get("preview").and_then(|v| v.as_bool()) == Some(true);
+		if asked_files.len() + asked_folders.len() > PURGE_ASK_CAP {
+			return json_error(400, &format!("at most {PURGE_ASK_CAP} items at a time — a folder counts once, whatever it holds"));
+		}
+		if !trash && asked_files.is_empty() && asked_folders.is_empty() {
+			return json_error(400, "name the files and folders to delete forever");
+		}
+		let (file_set, folder_set) = self.purge_targets(&asked_files, &asked_folders, trash)?;
+		let (files, folders): (Vec<String>, Vec<String>) = (file_set.iter().cloned().collect(), folder_set.iter().cloned().collect());
+		if files.is_empty() && folders.is_empty() {
+			return if trash {
+				Ok(Response::from_json(&serde_json::json!({ "files": 0, "folders": 0, "shares": 0 }))?)
+			} else {
+				json_error(404, "nothing to delete: those items are gone already (on another device?) — refresh")
+			};
+		}
+		// Links that work now — the ones the confirmation warns about (one
+		// still being sealed works for nobody yet; it is revoked all the same).
+		let mut live_shares = 0i64;
+		for chunk in files.chunks(PURGE_CHUNK) {
+			let (qs, params) = in_clause(chunk);
+			live_shares += self
+				.sql
+				.exec(&format!("SELECT COUNT(*) AS n FROM shares WHERE file_id IN ({qs}) AND ready = 1 AND revoked_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')"), Some(params))?
+				.one::<TotalCount>()?
+				.n;
+		}
+		if preview {
+			return Ok(Response::from_json(&serde_json::json!({ "files": files.len(), "folders": folders.len(), "shares": live_shares }))?);
+		}
+
+		// 1. Mark what goes, so every step after reads one predicate rather
+		// than id lists (the bound-parameter ceiling): into the Trash, if it
+		// was not there yet, under this deletion's own mark.
+		let mark = format!("purge:{}", uuid());
+		for chunk in files.chunks(PURGE_CHUNK) {
+			let (qs, mut params) = in_clause(chunk);
+			params.push(mark.as_str().into());
+			self.sql.exec(&format!("UPDATE files SET deleted_at = COALESCE(deleted_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')), trashed_with = ?{} WHERE id IN ({qs})", chunk.len() + 1), Some(params))?;
+		}
+		for chunk in folders.chunks(PURGE_CHUNK) {
+			let (qs, mut params) = in_clause(chunk);
+			params.push(mark.as_str().into());
+			self.sql.exec(&format!("UPDATE file_folders SET deleted_at = COALESCE(deleted_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')), trashed_with = ?{} WHERE id IN ({qs})", chunk.len() + 1), Some(params))?;
+		}
+		let m = || Some(vec![mark.as_str().into()]);
+		const MARKED: &str = "SELECT id FROM files WHERE trashed_with = ?1";
+
+		// 2. Objects into the outbox, before the rows that point at them.
+		#[derive(serde::Deserialize)]
+		struct GoneObject {
+			object_key: String,
+			s3_upload_id: Option<String>,
+		}
+		let gone = |sql: &str| -> Result<Vec<GoneObject>> { Ok(self.sql.exec(sql, m())?.to_array()?) };
+		let delete = |rows: &[GoneObject], reason: &str| -> Result<()> {
+			for r in rows.iter().filter(|r| !r.object_key.is_empty()) {
+				self.enqueue_delete(&r.object_key, None, reason)?;
+			}
+			Ok(())
+		};
+		// (An open multipart upload holds billed parts until aborted, and its
+		// upload id is all that frees them — "pending" means S3 never gave one.)
+		let abort = |rows: &[GoneObject], reason: &str| -> Result<()> {
+			for r in rows {
+				if let Some(u) = r.s3_upload_id.as_deref().filter(|u| !u.is_empty() && *u != "pending") {
+					self.enqueue_delete(&format!("{}#upload:{u}", r.object_key), Some(u), reason)?;
+				}
+			}
+			Ok(())
+		};
+		delete(&gone(&format!("SELECT object_key, NULL AS s3_upload_id FROM file_versions WHERE file_id IN ({MARKED})"))?, "deleted forever")?;
+		// The share links' copies — and the upload of one still being sealed
+		// (a view-only link has no copy: its object_key is empty, 40b).
+		let shares = gone(&format!("SELECT object_key, s3_upload_id FROM shares WHERE file_id IN ({MARKED})"))?;
+		delete(&shares, "share copy of a file deleted forever")?;
+		abort(&shares, "share copy of a file deleted forever")?;
+		// A new version still uploading into one of these files.
+		abort(&gone(&format!("SELECT object_key, s3_upload_id FROM uploads WHERE file_id IN ({MARKED})"))?, "upload into a file deleted forever")?;
+
+		// 3. The rows. Shares are revoked here, as Revoke does, and
+		// housekeeping removes the rows a day later as it does every revoked
+		// one's (their copies are already in the outbox).
+		let revoked = self.sql.exec(&format!("SELECT COUNT(*) AS n FROM shares WHERE file_id IN ({MARKED}) AND revoked_at IS NULL"), m())?.one::<TotalCount>()?.n;
+		self.sql.exec(&format!("UPDATE shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE file_id IN ({MARKED}) AND revoked_at IS NULL"), m())?;
+		self.sql.exec(&format!("DELETE FROM uploads WHERE file_id IN ({MARKED})"), m())?;
+		// Count first, then delete: rows_written includes the change feed's
+		// trigger writes (trash_restore says the same).
+		let n_files = self.sql.exec("SELECT COUNT(*) AS n FROM files WHERE trashed_with = ?1", m())?.one::<TotalCount>()?.n;
+		self.sql.exec("DELETE FROM files WHERE trashed_with = ?1", m())?;
+		self.purge_dependents()?;
+		let n_folders = self.sql.exec("SELECT COUNT(*) AS n FROM file_folders WHERE trashed_with = ?1", m())?.one::<TotalCount>()?.n;
+		self.sql.exec("DELETE FROM file_folders WHERE trashed_with = ?1", m())?;
+
+		// 4. The trail: each item asked for by name, then what it all came
+		// to — so a review reads both who chose what and how much went.
+		for id in asked_files.iter().filter(|id| file_set.contains(*id)) {
+			self.audit(actor, "file.purge", id, None, Some("deleted forever")).await?;
+		}
+		for id in asked_folders.iter().filter(|id| folder_set.contains(*id)) {
+			self.audit(actor, "folder.purge", id, None, Some("deleted forever, with everything in it")).await?;
+		}
+		let summary = format!("files:{n_files},folders:{n_folders},sharesRevoked:{revoked}");
+		self.audit(actor, if trash { "trash.empty" } else { "files.purge" }, &summary, None, None).await?;
+
+		// 5. Storage now (what fails stays queued for housekeeping).
+		let drained = self.drain_deletes().await?;
+		Ok(Response::from_json(&serde_json::json!({
+			"files": n_files, "folders": n_folders, "sharesRevoked": revoked,
+			"objectsDeleted": drained.done, "deletesPending": drained.pending,
+		}))?)
+	}
+
 	/// Everything in this member's database that is sealed to the files STORE
 	/// key, one kind at a time, paged by SQLite rowid — the input of a store
 	/// rotation (docs/FAMILY.md › Removing a member, docs/SECURITY-REVIEW.md
@@ -1839,8 +2013,14 @@ struct TrashedWithRow {
 	trashed_with: Option<String>,
 }
 
+/// How many ids one Delete forever names at most (a folder counts once,
+/// whatever it holds), and how many go into one `IN (…)` — the DO's SQL
+/// takes at most 100 bound parameters a statement.
+const PURGE_ASK_CAP: usize = 1000;
+const PURGE_CHUNK: usize = 50;
+
 /// `id IN (?, ?, …)` — placeholders plus the bound values, for the handful of
-/// dynamic-list queries (trash restore).
+/// dynamic-list queries (trash restore, Delete forever — in chunks).
 pub(crate) fn in_clause(ids: &[String]) -> (String, Vec<worker::SqlStorageValue>) {
 	let qs = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
 	let params = ids.iter().map(|s| worker::SqlStorageValue::String(s.clone())).collect();

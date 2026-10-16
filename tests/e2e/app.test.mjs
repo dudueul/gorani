@@ -407,6 +407,110 @@ try {
 			await assertNoViolations(page, "navigation, both explorers");
 		}
 
+		// ── Context menus everywhere (39m) ─────────────────────────────
+		// Empty space, the tree, Home, search results, the menu key; flyout
+		// submenus; Paste into a folder; Move to and Delete with files and
+		// folders selected together (each used to go as the first one's kind).
+		{
+			const W = "gorani-win11";
+			const menu = page.locator("gorani-menu");
+			const item = (name) => menu.getByRole("menuitem", { name, exact: true });
+			const folderRow = (name) => page.locator(`${W} [data-body] [data-item^="folder:"]`, { hasText: name }).first();
+			const fileRow = (name) => page.locator(`${W} [data-body] [data-item^="file:"]`, { hasText: name }).first();
+			const emptySpace = async () => {
+				const box = await page.locator(`${W} [data-body]`).boundingBox();
+				await page.mouse.click(box.x + box.width - 20, box.y + box.height - 20, { button: "right" });
+				await menu.waitFor({ state: "attached" });
+			};
+			const named = async (name) => {
+				const input = page.locator("div.fixed input").last();
+				await input.fill(name);
+				await input.press("Enter");
+			};
+
+			// Empty space: View › as a flyout (the menu stays open behind it).
+			await emptySpace();
+			assert.equal(await item("Paste").isDisabled(), true, "nothing cut or copied — Paste is greyed");
+			await item("View").hover();
+			await menu.getByRole("menuitemcheckbox", { name: "Large icons" }).click();
+			await menu.waitFor({ state: "detached" });
+			await page.locator(`${W} [data-body] .grid`).first().waitFor();
+			await emptySpace();
+			await item("View").click();
+			assert.equal(await menu.getByRole("menuitemcheckbox", { name: "Large icons" }).getAttribute("aria-checked"), "true", "the view in force is ticked");
+			await page.keyboard.press("ArrowDown");
+			await menu.getByRole("menuitemcheckbox", { name: "Details" }).click();
+			// New folder from empty space; a file uploaded beside it.
+			await emptySpace();
+			await item("New folder").click();
+			await named("MenuDir");
+			await folderRow("MenuDir").waitFor({ timeout: 15_000 });
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "cutme.txt", mimeType: "text/plain", buffer: Buffer.from("moved by the menus") });
+			await fileRow("cutme.txt").waitFor({ timeout: 30_000 });
+			// Cut, then Paste INTO a folder from that folder's own menu.
+			await fileRow("cutme.txt").click({ button: "right" });
+			await item("Cut").click();
+			await folderRow("MenuDir").click({ button: "right" });
+			await item("Paste into folder").click();
+			await fileRow("cutme.txt").waitFor({ state: "detached", timeout: 15_000 });
+			await folderRow("MenuDir").dblclick();
+			await fileRow("cutme.txt").waitFor({ timeout: 15_000 });
+			await page.locator(`${W} nav button`).first().click();
+			await folderRow("MenuDir").waitFor({ timeout: 15_000 });
+			// The tree: a folder made inside another from its row's menu.
+			await page.locator(`${W} [data-tree]`, { hasText: "MenuDir" }).first().click({ button: "right" });
+			await item("New folder inside").click();
+			await named("Inner");
+			await folderRow("MenuDir").dblclick();
+			await folderRow("Inner").waitFor({ timeout: 15_000 });
+			// Files and folders selected together: Move to › and Delete take each by its own kind.
+			await page.locator(`${W} nav button`).first().click();
+			await folderRow("MenuDir").waitFor({ timeout: 15_000 });
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "mixed.txt", mimeType: "text/plain", buffer: Buffer.from("moves with a folder") });
+			await fileRow("mixed.txt").waitFor({ timeout: 30_000 });
+			await folderRow("MenuDir").click();
+			await fileRow("mixed.txt").click({ modifiers: ["Control"] });
+			await fileRow("mixed.txt").click({ button: "right" });
+			await item("Move to").hover();
+			const navA = menu.getByRole("menuitem", { name: "NavA", exact: true });
+			await navA.click();
+			await folderRow("MenuDir").waitFor({ state: "detached", timeout: 15_000 });
+			await fileRow("mixed.txt").waitFor({ state: "detached", timeout: 15_000 });
+			await folderRow("NavA").dblclick();
+			await folderRow("MenuDir").waitFor({ timeout: 15_000 });
+			await fileRow("mixed.txt").waitFor({ timeout: 15_000 });
+			// The menu key (Shift+F10) opens the selection's menu; Delete
+			// trashes the file and the folder together.
+			await folderRow("MenuDir").click();
+			await fileRow("mixed.txt").click({ modifiers: ["Control"] });
+			await page.keyboard.press("Shift+F10");
+			await item("Delete").click();
+			await folderRow("MenuDir").waitFor({ state: "detached", timeout: 15_000 });
+			await fileRow("mixed.txt").waitFor({ state: "detached", timeout: 15_000 });
+			// Home's menu goes to the top; the Trash's empty space restores everything.
+			await page.locator(`${W} [data-nav="trash"]`).click();
+			await folderRow("MenuDir").waitFor({ timeout: 15_000 });
+			await emptySpace();
+			await item("Restore all").click();
+			await folderRow("MenuDir").waitFor({ state: "detached", timeout: 15_000 });
+			await page.locator(`${W} [data-nav="home"]`).click({ button: "right" });
+			await item("Open").click();
+			await folderRow("NavA").dblclick();
+			await folderRow("MenuDir").waitFor({ timeout: 15_000 }); // back where it was, with its contents
+			await fileRow("mixed.txt").waitFor({ timeout: 15_000 });
+			await page.locator(`${W} nav button`).first().click();
+			await folderRow("NavA").waitFor({ timeout: 15_000 });
+			// A search hit's menu: Open file location goes to the folder and selects the file.
+			await page.getByPlaceholder("Search (this device's index)").fill("mixed");
+			await page.locator(`${W} [data-hit]`).first().click({ button: "right" });
+			await item("Open file location").click();
+			await fileRow("mixed.txt").waitFor({ timeout: 15_000 });
+			assert.match((await fileRow("mixed.txt").getAttribute("class")) ?? "", /ring-accent/, "…and the file is selected there");
+			await page.locator(`${W} nav button`).first().click();
+			await folderRow("NavA").waitFor({ timeout: 15_000 });
+			await assertNoViolations(page, "context menus");
+		}
+
 		// ── Streaming media through the service worker (O11) ───────────
 		// A video over the 8 MiB streaming threshold opens as /media/<id>,
 		// answered by the media service worker with decrypted bytes. Before

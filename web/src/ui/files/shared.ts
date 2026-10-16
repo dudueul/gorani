@@ -10,7 +10,7 @@
  */
 
 import { LitElement, html, nothing } from "lit";
-import { customElement, property } from "lit/decorators.js";
+import { customElement, property, state } from "lit/decorators.js";
 import { Directive, directive, PartType, type ElementPart, type PartInfo } from "lit/directive.js";
 import type { FileKind } from "./icons.ts";
 
@@ -116,6 +116,12 @@ export interface MenuItem {
 	run?: () => void;
 	separator?: boolean;
 	disabled?: boolean;
+	/** A tick before the label: the current view, the sort in force. */
+	checked?: boolean;
+	/** A flyout (commit 39m): View ›, Sort by ›, Move to › — opened by
+	 * hovering, clicking or → and closed by ← or Esc, the parent menu
+	 * staying open behind it, as in both real file managers. */
+	submenu?: MenuItem[];
 }
 
 @customElement("gorani-menu")
@@ -126,9 +132,19 @@ export class GoraniMenu extends LitElement {
 	/** Where the focus was: it goes back there when the menu closes, so the
 	 * explorer keeps its keyboard (commit 39l). */
 	returnFocus: HTMLElement | null = null;
+	/** The open flyout: which item it hangs off, and where. */
+	@state() private sub: { index: number; x: number; y: number; left: number } | null = null;
+
+	/** A pointer down anywhere outside closes the menu. (Until 39m this was a
+	 * `once` listener: a click INSIDE the menu used it up, and the menu then
+	 * stayed open whatever was clicked outside.) */
+	private readonly outside = (e: Event) => {
+		if (!this.contains(e.target as Node)) this.remove();
+	};
 
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
+		document.removeEventListener("pointerdown", this.outside, { capture: true });
 		if (this.returnFocus?.isConnected) this.returnFocus.focus({ preventScroll: true });
 	}
 
@@ -137,32 +153,101 @@ export class GoraniMenu extends LitElement {
 	}
 
 	protected override firstUpdated(): void {
-		const close = (e: Event) => {
-			if (!this.contains(e.target as Node)) this.remove();
-		};
-		document.addEventListener("pointerdown", close, { capture: true, once: true });
-		this.addEventListener("keydown", (e) => {
-			if (e.key === "Escape") this.remove();
-			if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-				e.preventDefault();
-				const buttons = [...this.querySelectorAll<HTMLButtonElement>("button:not([disabled])")];
-				const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
-				buttons[(at + (e.key === "ArrowDown" ? 1 : buttons.length - 1)) % buttons.length]?.focus();
-			}
-		});
-		// Where it goes: at the pointer, moved in by its measured size so it
-		// never hangs off the window (the estimate this replaced guessed 34 px
-		// a row).
-		const box = this.querySelector<HTMLElement>('[role="menu"]');
-		if (box) {
-			const { width, height } = box.getBoundingClientRect();
-			box.style.setProperty("left", `${Math.max(8, Math.min(this.x, innerWidth - width - 8))}px`);
-			box.style.setProperty("top", `${Math.max(8, Math.min(this.y, innerHeight - height - 8))}px`);
-		}
+		document.addEventListener("pointerdown", this.outside, { capture: true });
+		this.addEventListener("keydown", (e) => this.onKey(e));
 		requestAnimationFrame(() => (this.querySelector("button") as HTMLElement | null)?.focus());
 	}
 
+	protected override updated(): void {
+		// Where it goes: at the pointer, moved in by its measured size so it
+		// never hangs off the window (the estimate this replaced guessed 34 px
+		// a row). After EVERY render: cssom() sets left/top again each time,
+		// and opening a flyout re-renders.
+		const box = this.querySelector<HTMLElement>('[role="menu"]:not([data-flyout])');
+		if (box) clampInto(box, this.x, this.y);
+		// A flyout opens to the right of its item, or to the left where the
+		// window ends.
+		const flyout = this.querySelector<HTMLElement>("[data-flyout]");
+		if (flyout && this.sub) {
+			const { width } = flyout.getBoundingClientRect();
+			const x = this.sub.x + width > innerWidth - 8 ? this.sub.left - width : this.sub.x;
+			clampInto(flyout, x, this.sub.y);
+		}
+	}
+
+	private onKey(e: KeyboardEvent): void {
+		const active = document.activeElement as HTMLElement | null;
+		const inFlyout = !!active?.closest("[data-flyout]");
+		if (e.key === "Escape" || (e.key === "ArrowLeft" && inFlyout)) {
+			e.preventDefault();
+			e.stopPropagation();
+			if (inFlyout && this.sub) {
+				const at = this.sub.index;
+				this.sub = null;
+				this.querySelector<HTMLElement>(`[data-index="${at}"]`)?.focus();
+			} else this.remove();
+			return;
+		}
+		if (e.key === "ArrowRight" && !inFlyout && active?.dataset.index) {
+			const index = Number(active.dataset.index);
+			if (this.items[index]?.submenu) {
+				e.preventDefault();
+				this.openSub(index, active, true);
+			}
+			return;
+		}
+		if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+			e.preventDefault();
+			const box = active?.closest<HTMLElement>('[role="menu"]') ?? this.querySelector<HTMLElement>('[role="menu"]');
+			const buttons = [...(box?.querySelectorAll<HTMLButtonElement>(":scope > button:not([disabled])") ?? [])];
+			const at = buttons.indexOf(active as HTMLButtonElement);
+			buttons[(at + (e.key === "ArrowDown" ? 1 : buttons.length - 1)) % buttons.length]?.focus();
+		}
+	}
+
+	private openSub(index: number, button: HTMLElement, focus = false): void {
+		const r = button.getBoundingClientRect();
+		if (this.sub?.index !== index) this.sub = { index, x: r.right - 4, y: r.top - 6, left: r.left + 4 };
+		if (focus) void this.updateComplete.then(() => this.querySelector<HTMLElement>("[data-flyout] > button:not([disabled])")?.focus());
+	}
+
+	private row(item: MenuItem, index: number | null) {
+		if (item.separator) return html`<div class="my-1.5 border-t border-neutral-800"></div>`;
+		const parent = index !== null && !!item.submenu;
+		return html`
+			<button
+				class="mx-1.5 flex w-[calc(100%-12px)] items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-sm text-neutral-200 hover:bg-neutral-800 focus:bg-neutral-800 focus:outline-none disabled:opacity-40 ${parent && this.sub?.index === index ? "bg-neutral-800" : ""}"
+				?disabled=${item.disabled}
+				data-index=${index ?? nothing}
+				aria-haspopup=${parent ? "menu" : nothing}
+				aria-expanded=${parent ? String(this.sub?.index === index) : nothing}
+				aria-checked=${item.checked === undefined ? nothing : String(item.checked)}
+				role=${item.checked === undefined ? "menuitem" : "menuitemcheckbox"}
+				@mouseenter=${(e: MouseEvent) => {
+					// Only the top menu's rows open or close flyouts.
+					if (index === null) return;
+					if (parent) this.openSub(index, e.currentTarget as HTMLElement);
+					else this.sub = null;
+				}}
+				@click=${(e: MouseEvent) => {
+					if (parent && index !== null) {
+						this.openSub(index, e.currentTarget as HTMLElement, true);
+						return;
+					}
+					this.remove();
+					item.run?.();
+				}}
+			>
+				<span class="w-3 shrink-0 text-accent" aria-hidden="true">${item.checked ? "✓" : ""}</span>
+				${item.icon ? html`<span class="text-neutral-400">${item.icon}</span>` : nothing}
+				<span class="min-w-0 flex-1 truncate">${item.label}</span>
+				${parent ? html`<span class="text-neutral-500" aria-hidden="true">›</span>` : nothing}
+			</button>
+		`;
+	}
+
 	protected override render() {
+		const flyout = this.sub ? this.items[this.sub.index]?.submenu : undefined;
 		return html`
 			<div
 				class="fixed left-0 top-0 z-50 max-h-[calc(100vh-16px)] min-w-52 overflow-y-auto rounded-xl border border-neutral-700 bg-neutral-900/95 py-1.5 shadow-2xl backdrop-blur"
@@ -170,27 +255,67 @@ export class GoraniMenu extends LitElement {
 				role="menu"
 				tabindex="-1"
 			>
-				${this.items.map((item) =>
-					item.separator
-						? html`<div class="my-1.5 border-t border-neutral-800"></div>`
-						: html`
-								<button
-									class="mx-1.5 flex w-[calc(100%-12px)] items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-sm text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
-									?disabled=${item.disabled}
-									@click=${() => {
-										this.remove();
-										item.run?.();
-									}}
-									role="menuitem"
-								>
-									${item.icon ? html`<span class="text-neutral-400">${item.icon}</span>` : nothing}
-									${item.label}
-								</button>
-							`,
-				)}
+				${this.items.map((item, i) => this.row(item, i))}
 			</div>
+			${flyout && this.sub
+				? html`<div
+						data-flyout
+						class="fixed left-0 top-0 z-50 max-h-[calc(100vh-16px)] min-w-48 overflow-y-auto rounded-xl border border-neutral-700 bg-neutral-900/95 py-1.5 shadow-2xl backdrop-blur"
+						${cssom({ left: `${this.sub.x}px`, top: `${this.sub.y}px` })}
+						role="menu"
+						tabindex="-1"
+					>
+						${flyout.length ? flyout.map((item) => this.row(item, null)) : html`<p class="px-4 py-1.5 text-xs text-neutral-500">Nowhere to go</p>`}
+					</div>`
+				: nothing}
 		`;
 	}
+}
+
+/** A folder as the menus need it: its id, its parent, its name. */
+interface TreeFolder {
+	id: string;
+	parent?: string | null;
+	name: string;
+}
+
+/** "Holiday › 2026 › Beach": a folder's whole path, so a Move to list with
+ * two folders called "2026" says which is which. */
+export function folderPath(tree: TreeFolder[], id: string): string {
+	const names: string[] = [];
+	for (let cur: string | null = id; cur && names.length < 64; cur = tree.find((f) => f.id === cur)?.parent ?? null) {
+		names.unshift(tree.find((f) => f.id === cur)?.name ?? "…");
+	}
+	return names.join(" › ");
+}
+
+/**
+ * Where a selection can move: the top, and every folder that is neither
+ * moving nor inside a moving folder (the server refuses a folder into its
+ * own subtree; the menu does not offer it). Each is the whole path. The
+ * folder the items are already in is shown, greyed — as Explorer does.
+ */
+export function moveTargets(tree: TreeFolder[], moving: { kind: string; id: string }[], here: string | null, homeLabel: string, run: (folderId: string | null) => void): MenuItem[] {
+	const movingFolders = new Set(moving.filter((m) => m.kind === "folder").map((m) => m.id));
+	const inside = (id: string): boolean => {
+		for (let cur: string | null = id; cur; cur = tree.find((f) => f.id === cur)?.parent ?? null) if (movingFolders.has(cur)) return true;
+		return false;
+	};
+	const targets = tree
+		.filter((f) => !inside(f.id))
+		.map((f) => ({ id: f.id, label: folderPath(tree, f.id) }))
+		.sort((a, b) => a.label.localeCompare(b.label));
+	return [
+		{ label: homeLabel, run: () => run(null), disabled: here === null },
+		...targets.map((t) => ({ label: t.label, run: () => run(t.id), disabled: t.id === here })),
+	];
+}
+
+/** Put a fixed box at (x, y), moved in so it stays inside the window. */
+function clampInto(box: HTMLElement, x: number, y: number): void {
+	const { width, height } = box.getBoundingClientRect();
+	box.style.setProperty("left", `${Math.max(8, Math.min(x, innerWidth - width - 8))}px`);
+	box.style.setProperty("top", `${Math.max(8, Math.min(y, innerHeight - height - 8))}px`);
 }
 
 /** Open a context menu at the pointer (both platforms call this). */

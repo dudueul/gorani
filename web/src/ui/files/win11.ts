@@ -18,16 +18,16 @@
  * | F2 rename, Enter open, Delete → Trash | model.rename / setFolder / trash |
  * | Backspace = up one folder | model.setFolder(parent) |
  * | Status bar | counts + selection size |
- * | Context menu | Open / Download / Rename / Move to… / Delete |
+ * | Context menus (39m) | an item: Open / Download / Cut / Copy / Paste into / Move to › / Rename / Delete; empty space: View › / Sort by › / Refresh / Paste / New / Upload / Select all; the tree, Home and Trash rows; search and recent results; the menu key and Shift+F10 |
  * | Drop onto a folder | model.move; drop from the desktop | model.upload (sealed client-side) |
  * | Preview pane | model.preview — decrypted in the browser, nothing sent |
  */
 
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import type { FilesModel, Selection } from "./model.ts";
+import type { FilesModel, FolderRow, Selection, SortState } from "./model.ts";
 import { icon, type FileKind } from "./icons.ts";
-import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, type MenuItem } from "./shared.ts";
+import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, moveTargets, type MenuItem } from "./shared.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { renderMime } from "../viewer/mode.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -172,10 +172,20 @@ export class GoraniWin11 extends LitElement {
 	}
 
 	private async deleteSelection(): Promise<void> {
-		const first = this.firstSel();
-		if (!first) return;
 		const sel = this.selection();
-		await this.model.trash(first.kind, sel.map((x) => x.id));
+		if (!sel.length) return;
+		await this.model.trashItems(sel);
+	}
+
+	/** A menu's action: its failure becomes a toast, in the server's words
+	 * (an evidence case refusing a deletion, say), instead of vanishing as
+	 * an unhandled rejection. */
+	private attempt(p: Promise<unknown>): void {
+		p.catch((e) => this.model.api.toast(e instanceof Error ? e.message : String(e)));
+	}
+
+	private pick(selector: string): void {
+		this.querySelector<HTMLInputElement>(selector)?.click();
 	}
 
 	private async renameSelection(): Promise<void> {
@@ -190,66 +200,233 @@ export class GoraniWin11 extends LitElement {
 		});
 	}
 
-	private async newFolder(): Promise<void> {
+	private async newFolder(parent: string | null = this.s().folderId): Promise<void> {
 		const name = await promptName("New folder", "New folder");
-		if (name) await this.model.newFolder(this.s().folderId, name);
+		if (name) await this.model.newFolder(parent, name);
 	}
 
-	private moveMenu(folderId: string | null, x: number, y: number): void {
-		const s = this.s();
-		const items: MenuItem[] = [
-			{ label: "Home", run: () => { const f = this.firstSel(); if (!f) return; void this.model.move(f.kind, this.selection().map((x) => x.id), null); } },
-			...(s.tree
-				.filter((f) => !this.selection().some((x) => x.id === f.id))
-				.map((f) => ({ label: f.name, run: () => { const it = this.firstSel(); if (!it) return; void this.model.move(it.kind, this.selection().map((x) => x.id), f.id); } }))),
-			{ separator: true, label: "" },
-			{ label: folderId === null ? "(you are here)" : "Cancel", run: () => {} },
-		];
-		void folderId;
-		showMenu(items, x, y);
+	/** Rename a folder from the tree: open the folder it is in, select it,
+	 * and rename it there — the one place names are edited. */
+	private async renameFolderInPlace(id: string): Promise<void> {
+		await this.go(this.s().tree.find((f) => f.id === id)?.parent ?? null);
+		this.model.select({ kind: "folder", id });
+		await this.renameSelection();
 	}
+
+	private toggleExpanded(id: string): void {
+		const next = new Set(this.expanded);
+		next.has(id) ? next.delete(id) : next.add(id);
+		this.expanded = next;
+	}
+
+	// ── context menus (commit 39m: everywhere a real Explorer has one) ──
 
 	private contextMenu(e: MouseEvent, kind: "file" | "folder", id: string, name: string): void {
 		e.preventDefault();
 		e.stopPropagation();
+		this.itemMenu(kind, id, name, e.clientX, e.clientY);
+	}
+
+	/** An item's menu — for the selection it belongs to (right-clicking an
+	 * unselected item selects it first, as Explorer does). */
+	private itemMenu(kind: "file" | "folder", id: string, name: string, x: number, y: number): void {
 		if (!this.isSelected(kind, id)) this.model.select({ kind, id });
-		const many = this.selection().length > 1;
+		const sel = this.selection();
+		const many = sel.length > 1;
 		const s = this.s();
 		const sample = s.files.find((f) => f.id === id)?.sample === true;
-		const items: MenuItem[] = s.trashMode
-			? [
-					{ label: "Restore", run: () => void this.model.restore(this.selection().filter((x) => x.kind === "file").map((x) => x.id), this.selection().filter((x) => x.kind === "folder").map((x) => x.id)) },
-				]
-			: [
-					{ label: "Open", run: () => void this.openEntry(kind, id, name), disabled: many },
-					{ label: "Download", run: () => void this.downloadSelection(), disabled: kind === "folder" || many },
-					{ label: "Verify signature", run: () => void this.model.verifyAndReport(id), disabled: kind === "folder" || many },
-					{ label: "Custody…", run: () => void custodyAction(this.model, id, name), disabled: kind === "folder" || many || this.model.areaKind() !== "evidence" },
+		if (s.trashMode) {
+			showMenu(
+				[
+					{ label: "Restore", run: () => this.attempt(this.model.restore(sel.filter((x) => x.kind === "file").map((x) => x.id), sel.filter((x) => x.kind === "folder").map((x) => x.id))) },
 					{ separator: true, label: "" },
-					{ label: "Cut", run: () => this.model.cut() },
-					{ label: "Copy", run: () => this.model.copy() },
-					{ separator: true, label: "" },
-					{ label: "Share…", run: () => this.openShare(id, name), disabled: kind === "folder" || many || sample },
-					{ label: "Request files into this folder…", run: () => this.openRequests("links", id, name), disabled: kind !== "folder" || many },
-					{ label: "Mark as malware sample…", run: () => void markSample(this.model, id, name), disabled: kind === "folder" || many || sample },
-					{ label: "Rename", run: () => void this.renameSelection(), disabled: many },
-					{ label: "Move to…", run: () => void 0, disabled: many },
-					{ label: "Delete", run: () => void this.deleteSelection() },
-					{ separator: true, label: "" },
-					{ label: "Paste", run: () => void this.model.paste(), disabled: !this.s().selection.length },
-					{ label: "Properties", run: () => void this.previewId(id), disabled: many },
-				];
-		// "Move to…" needs the pointer position — splice it with a flyout-less
-		// submenu stand-in: a second menu listing destinations.
-		if (!s.trashMode) {
-			const moveItem = items.findIndex((x) => x.label === "Move to…");
-			items[moveItem] = {
-				label: "Move to…",
-				run: () => this.moveMenu(this.s().folderId, e.clientX + 10, e.clientY),
-				disabled: many || kind === undefined,
-			};
+					{ label: "Select all", run: () => this.model.selectAll() },
+				],
+				x,
+				y,
+			);
+			return;
 		}
-		showMenu(items, e.clientX, e.clientY);
+		const intoFolder = kind === "folder" && !many;
+		const items: MenuItem[] = [
+			{ label: "Open", run: () => void this.openEntry(kind, id, name), disabled: many },
+			{ label: "Download", run: () => this.attempt(this.downloadSelection()), disabled: !sel.some((x) => x.kind === "file") },
+			{ label: "Verify signature", run: () => this.attempt(this.model.verifyAndReport(id)), disabled: kind === "folder" || many },
+			{ label: "Custody…", run: () => this.attempt(custodyAction(this.model, id, name)), disabled: kind === "folder" || many || this.model.areaKind() !== "evidence" },
+			{ separator: true, label: "" },
+			{ label: "Cut", run: () => this.model.cut() },
+			{ label: "Copy", run: () => this.model.copy() },
+			// On a folder, Paste goes INTO it (as Explorer); on a file, here.
+			{ label: intoFolder ? "Paste into folder" : "Paste", run: () => this.attempt(this.model.paste(intoFolder ? id : undefined)), disabled: !this.model.canPaste },
+			{ separator: true, label: "" },
+			{ label: "Share…", run: () => this.openShare(id, name), disabled: kind === "folder" || many || sample },
+			{ label: "Request files into this folder…", run: () => this.openRequests("links", id, name), disabled: kind !== "folder" || many },
+			{ label: "Mark as malware sample…", run: () => this.attempt(markSample(this.model, id, name)), disabled: kind === "folder" || many || sample },
+			{ separator: true, label: "" },
+			{ label: "Rename", run: () => void this.renameSelection(), disabled: many },
+			{ label: "Move to", submenu: moveTargets(s.tree, sel, s.folderId, this.memberName, (to) => this.attempt(this.model.moveItems(sel, to))) },
+			{ label: "Delete", run: () => this.attempt(this.deleteSelection()) },
+			{ separator: true, label: "" },
+			{ label: "Properties", run: () => void this.previewId(id), disabled: many || kind === "folder" },
+		];
+		showMenu(items, x, y);
+	}
+
+	/** Empty space in the folder: what the folder itself can do. */
+	private backgroundMenu(e: MouseEvent): void {
+		if ((e.target as HTMLElement).closest("[data-item]")) return;
+		e.preventDefault();
+		this.openBackgroundMenu(e.clientX, e.clientY);
+	}
+
+	private openBackgroundMenu(x: number, y: number): void {
+		const s = this.s();
+		if (this.recentsMode) {
+			showMenu([{ label: "Refresh", run: () => void this.showRecents() }], x, y);
+			return;
+		}
+		if (s.trashMode) {
+			const any = s.trashFiles.length + s.trashFolders.length > 0;
+			showMenu(
+				[
+					{ label: "Restore all", run: () => this.attempt(this.model.restore(s.trashFiles.map((f) => f.id), s.trashFolders.map((f) => f.id))), disabled: !any },
+					{ label: "Select all", run: () => this.model.selectAll(), disabled: !any },
+					{ separator: true, label: "" },
+					{ label: "Refresh", run: () => this.attempt(this.model.refresh()) },
+				],
+				x,
+				y,
+			);
+			return;
+		}
+		// Right-clicking empty space leaves the selection, as Explorer does.
+		this.model.clearSelection();
+		showMenu(
+			[
+				{ label: "View", submenu: this.viewMenuItems() },
+				{ label: "Sort by", submenu: this.sortMenuItems() },
+				{ label: "Refresh", run: () => this.attempt(this.model.refresh()) },
+				{ separator: true, label: "" },
+				{ label: "Paste", run: () => this.attempt(this.model.paste()), disabled: !this.model.canPaste },
+				{ separator: true, label: "" },
+				{ label: "New folder", icon: icon("folder"), run: () => this.attempt(this.newFolder()) },
+				{ label: "Upload files…", icon: icon("file"), run: () => this.pick("[data-upload]") },
+				{ label: "Upload malware samples…", icon: icon("sample"), run: () => this.pick("[data-upload-sample]") },
+				{ label: "Request files into this folder…", run: () => this.openRequests("links", s.folderId) },
+				{ separator: true, label: "" },
+				{ label: "Select all", run: () => this.model.selectAll(), disabled: !(s.folders.length + s.files.length) },
+				{ label: this.showPreview ? "Hide the preview pane" : "Show the preview pane", run: () => (this.showPreview = !this.showPreview) },
+			],
+			x,
+			y,
+		);
+	}
+
+	/** A folder in the navigation pane's tree. */
+	private treeMenu(e: MouseEvent, f: FolderRow): void {
+		e.preventDefault();
+		e.stopPropagation();
+		const tree = this.s().tree;
+		const target = [{ kind: "folder" as const, id: f.id }];
+		showMenu(
+			[
+				{ label: "Open", run: () => void this.go(f.id) },
+				{ label: this.expanded.has(f.id) ? "Collapse" : "Expand", run: () => this.toggleExpanded(f.id), disabled: !tree.some((c) => c.parent === f.id) },
+				{ separator: true, label: "" },
+				{ label: "New folder inside", icon: icon("folder"), run: () => this.attempt(this.newFolder(f.id)) },
+				{ label: "Paste into folder", run: () => this.attempt(this.model.paste(f.id)), disabled: !this.model.canPaste },
+				{ label: "Request files into this folder…", run: () => this.openRequests("links", f.id, f.name) },
+				{ separator: true, label: "" },
+				{ label: "Rename", run: () => this.attempt(this.renameFolderInPlace(f.id)) },
+				{ label: "Move to", submenu: moveTargets(tree, target, f.parent ?? null, this.memberName, (to) => this.attempt(this.model.moveItems(target, to))) },
+				{ label: "Delete", run: () => this.attempt(this.model.trashItems(target)) },
+			],
+			e.clientX,
+			e.clientY,
+		);
+	}
+
+	/** Home: the area's top folder. */
+	private homeMenu(e: MouseEvent): void {
+		e.preventDefault();
+		showMenu(
+			[
+				{ label: "Open", run: () => void this.go(null) },
+				{ separator: true, label: "" },
+				{ label: "New folder", icon: icon("folder"), run: () => this.attempt(this.newFolder(null)) },
+				{ label: "Paste", run: () => this.attempt(this.model.paste(null)), disabled: !this.model.canPaste },
+				{ label: "Request files into the top folder…", run: () => this.openRequests("links", null) },
+			],
+			e.clientX,
+			e.clientY,
+		);
+	}
+
+	/** The Trash. (Nothing deletes for good from here: the Trash empties
+	 * itself after 30 days — housekeeping — and an evidence case never does.) */
+	private trashNavMenu(e: MouseEvent): void {
+		e.preventDefault();
+		showMenu(
+			[
+				{ label: "Open", run: () => this.attempt(this.openTrashView()) },
+				{
+					label: "Restore all",
+					run: () =>
+						this.attempt(
+							(async () => {
+								await this.openTrashView();
+								const s = this.s();
+								if (s.trashFiles.length + s.trashFolders.length) await this.model.restore(s.trashFiles.map((f) => f.id), s.trashFolders.map((f) => f.id));
+							})(),
+						),
+				},
+			],
+			e.clientX,
+			e.clientY,
+		);
+	}
+
+	private openTrashView(): Promise<void> {
+		this.recentsMode = false;
+		this.searchHits = null;
+		return this.model.openTrash();
+	}
+
+	/** A search hit or a recent file: open it, or open where it lives. */
+	private hitMenu(e: MouseEvent, hit: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; size?: number }): void {
+		e.preventDefault();
+		e.stopPropagation();
+		showMenu(
+			[
+				{
+					label: "Open",
+					run: () =>
+						this.attempt(
+							(async () => {
+								await this.jumpTo(hit);
+								if (hit.kind === "file") await this.openEntry("file", hit.id, hit.name);
+							})(),
+						),
+				},
+				{ label: "Open file location", run: () => this.attempt(this.jumpTo(hit)) },
+			],
+			e.clientX,
+			e.clientY,
+		);
+	}
+
+	/** The menu key, or Shift+F10: the selection's menu at the item, or the
+	 * folder's when nothing is selected. */
+	private keyboardMenu(): void {
+		const first = this.firstSel();
+		const el = first ? this.querySelector<HTMLElement>(`[data-item="${first.kind}:${first.id}"]`) : null;
+		if (first && el) {
+			const r = el.getBoundingClientRect();
+			this.itemMenu(first.kind, first.id, this.model.names.get(first.id) ?? "", r.left + 24, r.bottom - 4);
+			return;
+		}
+		const body = this.querySelector<HTMLElement>("[data-body]")?.getBoundingClientRect();
+		this.openBackgroundMenu((body?.left ?? 0) + 24, (body?.top ?? 0) + 24);
 	}
 
 	// ── keyboard (the Explorer grammar) ─────────────────────────────────
@@ -343,6 +520,16 @@ export class GoraniWin11 extends LitElement {
 			case "Escape":
 				this.model.clearSelection();
 				return;
+			case "ContextMenu":
+				this.keyboardMenu();
+				e.preventDefault();
+				return;
+			case "F10":
+				if (e.shiftKey) {
+					this.keyboardMenu();
+					e.preventDefault();
+				}
+				return;
 			case "a":
 			case "A":
 				if (e[modKey()]) {
@@ -412,7 +599,7 @@ export class GoraniWin11 extends LitElement {
 					hits.push({ kind: kindStr === "folder" ? "folder" : "file", id: idStr ?? "" });
 				}
 			});
-			for (const h of hits) this.model.select({ kind: h.kind, id: h.id }, { add: true });
+			this.model.selectOnly(hits);
 		};
 		const up = () => {
 			this.marquee?.el.remove();
@@ -430,9 +617,9 @@ export class GoraniWin11 extends LitElement {
 		e.preventDefault();
 		e.stopPropagation();
 		const ids = dragIds(e.dataTransfer!);
-		const firstId = ids?.[0];
-		if (ids?.length && firstId) {
-			void this.model.move(firstId.kind as "file" | "folder", ids.map((x) => x.id), folderId);
+		if (ids?.length) {
+			// Files and folders together, each by its own kind (moveItems).
+			this.attempt(this.model.moveItems(ids.map((x) => ({ kind: x.kind === "folder" ? "folder" : "file", id: x.id })), folderId));
 			return;
 		}
 		if (e.dataTransfer?.files?.length) {
@@ -453,7 +640,7 @@ export class GoraniWin11 extends LitElement {
 				<div class="flex min-h-0 flex-1">
 					${this.navPane()}
 					<div class="flex min-w-0 flex-1 flex-col">
-						<div data-body class="relative min-h-0 flex-1 overflow-auto outline-none" @pointerdown=${(e: PointerEvent) => this.onBodyPointerDown(e)}>
+						<div data-body class="relative min-h-0 flex-1 overflow-auto outline-none" @pointerdown=${(e: PointerEvent) => this.onBodyPointerDown(e)} @contextmenu=${(e: MouseEvent) => this.backgroundMenu(e)}>
 							${this.recentsMode ? this.recentsBody() : this.view === "details" ? this.detailsBody(folders, files) : this.iconsBody(folders, files)}
 						</div>
 						${this.statusBar(folders.length, files.length)}
@@ -505,18 +692,20 @@ export class GoraniWin11 extends LitElement {
 
 	private sortMenuItems(): MenuItem[] {
 		const cur = this.s().sort;
-		const item = (by: "name" | "modified" | "type" | "size", label: string): MenuItem => ({
-			label: `${cur.by === by ? (cur.dir === "asc" ? "↑ " : "↓ ") : ""}${label}`,
-			run: () => this.model.sortBy(by),
-		});
-		return [item("name", "Name"), item("modified", "Date modified"), item("type", "Type"), item("size", "Size")];
+		const item = (by: SortState["by"], label: string): MenuItem => ({ label, checked: cur.by === by, run: () => cur.by !== by && this.model.sortBy(by) });
+		return [
+			item("name", "Name"),
+			item("modified", "Date modified"),
+			item("type", "Type"),
+			item("size", "Size"),
+			{ separator: true, label: "" },
+			{ label: "Ascending", checked: cur.dir === "asc", run: () => this.model.sortDirection("asc") },
+			{ label: "Descending", checked: cur.dir === "desc", run: () => this.model.sortDirection("desc") },
+		];
 	}
 
 	private viewMenuItems(): MenuItem[] {
-		const item = (mode: ViewMode, label: string): MenuItem => ({
-			label: `${this.view === mode ? "✓ " : ""}${label}`,
-			run: () => (this.view = mode),
-		});
+		const item = (mode: ViewMode, label: string): MenuItem => ({ label, checked: this.view === mode, run: () => (this.view = mode) });
 		return [item("details", "Details"), item("list", "List"), item("small", "Small icons"), item("large", "Large icons")];
 	}
 
@@ -539,7 +728,7 @@ export class GoraniWin11 extends LitElement {
 						? html`<div class="absolute right-0 top-9 z-40 max-h-96 w-96 overflow-y-auto rounded-xl border border-neutral-700 bg-neutral-900/95 p-1.5 shadow-2xl backdrop-blur">
 								${this.searchHits.map(
 									(h) => html`
-										<button class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm hover:bg-neutral-800" @click=${() => void this.jumpTo(h)}>
+										<button class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm hover:bg-neutral-800" data-hit="${h.id}" @click=${() => void this.jumpTo(h)} @contextmenu=${(e: MouseEvent) => this.hitMenu(e, h)}>
 											${icon(h.kind === "folder" ? "folder" : "file", "h-4 w-4 shrink-0 text-neutral-400")}
 											<span class="min-w-0 flex-1 truncate text-neutral-100">${h.name}</span>
 											<span class="shrink-0 text-xs text-neutral-500">${h.kind === "folder" ? "Folder" : fmtSize(h.size ?? 0)}</span>
@@ -559,7 +748,7 @@ export class GoraniWin11 extends LitElement {
 		return html`
 			<aside class="w-60 shrink-0 overflow-y-auto border-r border-neutral-800 px-2 py-3 text-sm">
 				<p class="px-2 pb-1 text-xs uppercase tracking-wide text-neutral-500">Quick access</p>
-				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.folderId === null && !s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.go(null)}>
+				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.folderId === null && !s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" data-nav="home" @click=${() => void this.go(null)} @contextmenu=${(e: MouseEvent) => this.homeMenu(e)}>
 					${icon("folder")} Home
 				</button>
 				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${this.recentsMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => void this.showRecents()}>
@@ -568,7 +757,7 @@ export class GoraniWin11 extends LitElement {
 				<p class="px-2 pt-3 pb-1 text-xs uppercase tracking-wide text-neutral-500">${this.memberName}'s folders</p>
 				${this.treeRows(null, 0)}
 				<p class="px-2 pt-3 pb-1 text-xs uppercase tracking-wide text-neutral-500"></p>
-				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" @click=${() => { this.recentsMode = false; this.searchHits = null; void this.model.openTrash(); }}>
+				<button class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 ${s.trashMode ? "bg-neutral-800" : "hover:bg-neutral-800"}" data-nav="trash" @click=${() => void this.openTrashView()} @contextmenu=${(e: MouseEvent) => this.trashNavMenu(e)}>
 					🗑 Trash
 				</button>
 			</aside>
@@ -585,15 +774,15 @@ export class GoraniWin11 extends LitElement {
 						<button
 							class="flex w-full items-center gap-1.5 rounded-lg py-1.5 pr-2.5 hover:bg-neutral-800 ${s.folderId === f.id && !s.trashMode ? "bg-neutral-800" : ""}"
 							${cssom({ "padding-left": `${8 + depth * 14}px` })}
+							data-tree="${f.id}"
 							@click=${() => void this.go(f.id)}
+							@contextmenu=${(e: MouseEvent) => this.treeMenu(e, f)}
 							@drop=${(e: DragEvent) => this.onDropIntoFolder(e, f.id)}
 							@dragover=${(e: DragEvent) => e.preventDefault()}
 						>
 							<span class="w-4 text-neutral-500 hover:text-neutral-200" @click=${(e: Event) => {
 								e.stopPropagation();
-								const next = new Set(this.expanded);
-								next.has(f.id) ? next.delete(f.id) : next.add(f.id);
-								this.expanded = next;
+								this.toggleExpanded(f.id);
 							}}>${this.expanded.has(f.id) ? "▾" : "▸"}</span>
 							${icon("folder")} <span class="truncate">${f.name}</span>
 						</button>
@@ -674,7 +863,7 @@ export class GoraniWin11 extends LitElement {
 				<p class="px-2 pb-2 text-xs uppercase tracking-wide text-neutral-500">Recently touched on this device — opened from the local index</p>
 				${rows.map(
 					(r) => html`
-						<button class="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-neutral-800/60" @click=${() => void this.jumpTo(r)}>
+						<button class="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-neutral-800/60" data-recent="${r.id}" @click=${() => void this.jumpTo(r)} @contextmenu=${(e: MouseEvent) => this.hitMenu(e, r)}>
 							${icon(r.kind === "folder" ? "folder" : "file")}<span class="min-w-0 flex-1 truncate">${r.name}</span>
 							${r.size !== undefined ? html`<span class="text-xs text-neutral-400">${fmtSize(r.size)}</span>` : nothing}
 							<span class="text-xs text-neutral-500">${fmtDate(new Date(r.updatedAt).toISOString())}</span>
@@ -694,7 +883,7 @@ export class GoraniWin11 extends LitElement {
 				<span>${folderCount + fileCount} item${folderCount + fileCount === 1 ? "" : "s"}</span>
 				${sel.length ? html`<span>${sel.length} selected${bytes ? ` · ${fmtSize(bytes)}` : ""}</span>` : nothing}
 				<span class="flex-1"></span>
-				${this.s().trashMode ? html`<span class="text-amber-400">Trash — restore or delete forever</span>` : html`<span>sealed · end to end</span>`}
+				${this.s().trashMode ? html`<span class="text-amber-400">Trash — restore what you need; the rest is purged after 30 days</span>` : html`<span>sealed · end to end</span>`}
 			</footer>
 		`;
 	}

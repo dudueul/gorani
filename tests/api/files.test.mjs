@@ -83,6 +83,17 @@ try {
 	const other = await generateHybridKey();
 	const clash = await api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { ...settings, keyId: other.keyId } } });
 	assert.equal(clash.status, 409);
+	// …and so is a save that would leave no way in (commit 39l, member.rs ›
+	// methods_refusal): the panel never removes the last method, and the
+	// server does not take the panel's word for it.
+	const save = (patch) => api(dev.base, "PUT", "/api/v1/members/jinu/vault", { email: "jinu@family.test", body: { settings: { ...settings, ...patch } } });
+	assert.equal((await save({ methods: [] })).status, 400, "an enabled vault keeps at least one unlock method");
+	assert.equal((await save({ methods: [{ kind: "password" }] })).status, 400, "a method carries its wrap and salt");
+	const pw = { ...settings.methods[0], kind: "password", kdf: "argon2id" };
+	assert.equal((await save({ methods: [...settings.methods, pw, pw, pw, pw, pw] })).status, 400, "no more passwords than the unlock screen tries");
+	assert.deepEqual((await api(dev.base, "GET", "/api/v1/members/jinu/vault", { email: "jinu@family.test" })).json.methods, settings.methods, "none of those was saved");
+	const trail = (await api(dev.base, "GET", "/api/v1/members/jinu/audit", { email: "jinu@family.test" })).json.filter((l) => l.action === "vault.save");
+	assert.ok(trail.some((l) => /^methods:/.test(l.details ?? "")), "each save names its ways in, in the trail");
 
 	// ── 1. A whole upload, sealed under a fresh content key ────────────
 	// Since commit 25 (GV04): the CLIENT picks the file id, and the name,

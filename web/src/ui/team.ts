@@ -24,6 +24,8 @@ import { fingerprint, pin, certify, buildTrust, type RegistryIdentity } from "..
 import { newCase, openCaseKey, openCaseTitle, rotateCase, sealCaseGrant, type CaseKind, type CasePermission, type CaseRow, type MemberRoot } from "../vault/cases.ts";
 import { approveCeremony, combineCeremony, newCeremony, recoverCaseGrant, recoverMemberStore, setupRecovery, type Ceremony, type RecoveryRecord } from "../vault/recovery.ts";
 import type { TeamCall, TeamContext } from "../vault/team.ts";
+import { updateSettings } from "../vault/settings-store.ts";
+import "./methods.ts";
 import { approveRequest, requestApproval, verifyApproval, type Approval, type ApprovalCheck, type TwoPersonAction } from "../vault/approvals.ts";
 import { buildExport, reverifyCase, type ExportSource } from "../vault/export.ts";
 import { certifyTsa, trustedTsas, tsaIdentityOf, type TrustedTsas, type TsaCert, type TsaIdentity } from "../vault/timestamp.ts";
@@ -35,7 +37,7 @@ import { devIdentityHeaders } from "../lib/api.ts";
 import { controllingMediaWorker, pipeToDownload } from "../lib/media-worker.ts";
 import { blobURL, revokeBlobURL } from "../lib/blob-urls.ts";
 
-type Tab = "people" | "cases" | "recovery" | "devices" | "collectors";
+type Tab = "people" | "cases" | "recovery" | "devices" | "unlock" | "collectors";
 
 /** One of the member's computers, as `GET /api/v1/members/<id>/devices` lists it. */
 interface DeviceRow {
@@ -192,8 +194,10 @@ export class GoraniTeam extends LitElement {
 	private root = (id: string) => this.call<MemberRoot>("GET", `/api/v1/members/${id}/root`);
 
 	private async saveRecord(record: NonNullable<TeamContext["settings"]["identity"]>): Promise<void> {
-		const settings = { ...this.team.settings, identity: record };
-		await this.call("PUT", `/api/v1/members/${this.team.memberId}/vault`, { settings });
+		// Only the identity changes (settings-store.ts): saving this panel's
+		// whole copy would put back the unlock methods as they were when the
+		// panel opened — undoing a passkey added in Team › Unlock meanwhile.
+		const settings = await updateSettings(this.call, this.team.memberId, this.session.rootKeyId, (s) => ({ ...s, identity: record }));
 		this.team = { ...this.team, settings };
 		// (The session's own settings object is the shell's; the next unlock
 		// reads the saved one.)
@@ -203,7 +207,7 @@ export class GoraniTeam extends LitElement {
 	// ── render ────────────────────────────────────────────────────────
 
 	protected override render() {
-		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"], ...(this.member.role === "external" ? [] : ([["collectors", "Collectors"]] as [Tab, string][]))];
+		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"], ["unlock", "Unlock"], ...(this.member.role === "external" ? [] : ([["collectors", "Collectors"]] as [Tab, string][]))];
 		return html`
 			<div class="mx-auto flex h-full max-w-4xl flex-col gap-3 overflow-y-auto p-4 text-sm" data-test="team">
 				<nav class="flex gap-1">
@@ -212,7 +216,17 @@ export class GoraniTeam extends LitElement {
 				</nav>
 				${this.error ? html`<p class="rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-red-300" data-test="team-error">${this.error}</p>` : nothing}
 				${this.status ? html`<p class="text-xs text-neutral-400" data-test="team-status">${this.status}</p>` : nothing}
-				${this.tab === "people" ? this.renderPeople() : this.tab === "cases" ? this.renderCases() : this.tab === "devices" ? this.renderDevices() : this.tab === "collectors" ? this.renderCollectors() : this.renderRecovery()}
+				${this.tab === "people"
+					? this.renderPeople()
+					: this.tab === "cases"
+						? this.renderCases()
+						: this.tab === "devices"
+							? this.renderDevices()
+							: this.tab === "unlock"
+								? html`<gorani-methods .session=${this.session} .memberName=${this.member.name} .call=${this.call}></gorani-methods>`
+								: this.tab === "collectors"
+									? this.renderCollectors()
+									: this.renderRecovery()}
 			</div>
 		`;
 	}

@@ -949,6 +949,88 @@ try {
 		await ctx.close();
 	}
 
+	// ── Team › Unlock (39l): a passkey from setup, a password changed, a
+	// new recovery code, a passkey removed — every change confirmed with a
+	// method already held, and a wrong confirmation opens nothing. ────────
+	// On localhost: a passkey's relying party is the page's hostname, and
+	// WebAuthn refuses an IP address as one. Chromium's virtual
+	// authenticator, with the PRF extension, stands in for Touch ID or
+	// Windows Hello and answers by itself.
+	{
+		assert.equal((await api(dev.base, "POST", "/api/v1/family/members", { email: "mom@family.test", body: { id: "pat", name: "Pat", role: "analyst", emails: ["pat@family.test"] } })).status, 200);
+		const base = dev.base.replace("127.0.0.1", "localhost");
+		const ctx = await guardedContext(browser, "pat@family.test");
+		const page = await ctx.newPage();
+		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
+		const cdp = await ctx.newCDPSession(page);
+		await cdp.send("WebAuthn.enable");
+		await cdp.send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true, hasPrf: true } });
+		const stored = async () => (await api(dev.base, "GET", "/api/v1/members/pat/vault", { email: "pat@family.test" })).json.methods;
+		const kinds = async () => (await stored()).map((m) => m.kind).sort();
+		await page.goto(base);
+		await page.getByRole("button", { name: "Create the vault" }).waitFor({ timeout: 30_000 });
+		await page.getByPlaceholder("Password (12+ chars)").fill("pat's first long password");
+		await page.getByPlaceholder("Repeat it").fill("pat's first long password");
+		await page.getByRole("button", { name: "Create the vault" }).click();
+		await page.locator('[data-test="setup-passkey"]').click();
+		await page.locator('[data-test="setup-passkey-note"]', { hasText: "A passkey was added" }).waitFor({ timeout: 60_000 });
+		assert.deepEqual(await kinds(), ["passkey", "password", "recovery"], "setup offers a passkey, and saves it beside the password and the code");
+		await page.getByRole("button", { name: "I wrote it down" }).click();
+		// The unlock screen tries the passkey by itself: nothing typed.
+		const teamButton = page.locator('[data-test="team-button"]:not([disabled])');
+		await teamButton.waitFor({ timeout: 60_000 });
+		await teamButton.click();
+		await page.getByRole("button", { name: "Unlock", exact: true }).click();
+		await page.locator('[data-test="methods"]').waitFor({ timeout: 30_000 });
+		const form = page.locator('[data-test="method-change"]');
+		// A new password, confirmed with the passkey (the default when one is enrolled).
+		const pw1 = (await stored()).find((m) => m.kind === "password");
+		await page.locator(`[data-test="method-change-${pw1.id}"]`).click();
+		await form.locator('input[name="new-password"]').fill("pat's second long password");
+		await form.locator('input[name="new-password-again"]').fill("pat's second long password");
+		await form.locator('[data-test="method-apply"]').click();
+		await page.locator('[data-test="methods-status"]', { hasText: "Your password was changed" }).waitFor({ timeout: 60_000 });
+		assert.ok(!(await stored()).some((m) => m.id === pw1.id), "the old password's method is gone, not kept beside the new one");
+		// A wrong confirmation opens nothing and changes nothing.
+		const before = JSON.stringify(await stored());
+		await page.locator('[data-test="method-new-recovery"]').click();
+		await form.locator('select[name="confirm-kind"]').selectOption("password");
+		await form.locator('input[name="confirm-secret"]').fill("pat's first long password");
+		await form.locator('[data-test="method-apply"]').click();
+		await page.locator('[data-test="methods-error"]', { hasText: "does not open this vault" }).waitFor({ timeout: 60_000 });
+		assert.equal(JSON.stringify(await stored()), before, "nothing was saved");
+		// The right one: a new recovery code, shown once, replacing the old.
+		await form.locator('input[name="confirm-secret"]').fill("pat's second long password");
+		await form.locator('[data-test="method-apply"]').click();
+		const codeBox = page.locator('[data-test="method-code"]');
+		await codeBox.waitFor({ timeout: 60_000 });
+		const newCode = ((await codeBox.locator("code").textContent()) ?? "").trim();
+		assert.equal((await stored()).filter((m) => m.kind === "recovery").length, 1, "one recovery code: the new one replaced the old");
+		await codeBox.getByRole("button", { name: "I wrote it down" }).click();
+		// The passkey removed, confirmed with that new code.
+		const pk = (await stored()).find((m) => m.kind === "passkey");
+		await page.locator(`[data-test="method-remove-${pk.id}"]`).click();
+		await form.locator('select[name="confirm-kind"]').selectOption("recovery");
+		await form.locator('input[name="confirm-secret"]').fill(newCode);
+		await form.locator('[data-test="method-apply"]').click();
+		await page.locator('[data-test="methods-status"]', { hasText: "The method was removed" }).waitFor({ timeout: 60_000 });
+		assert.deepEqual(await kinds(), ["password", "recovery"]);
+		const trail = (await api(dev.base, "GET", "/api/v1/members/pat/audit", { email: "pat@family.test" })).json.filter((l) => l.action === "vault.save").map((l) => l.details);
+		assert.ok(trail.includes("methods:password,recovery,passkey") && trail.includes("methods:password,recovery"), `each save's ways in, in the trail: ${JSON.stringify(trail)}`);
+		await assertNoViolations(page, "Team › Unlock");
+		// Lock: the old password is refused, the new one opens.
+		await page.getByRole("button", { name: "Lock", exact: true }).dispatchEvent("click");
+		const pw = page.locator('input[type="password"]');
+		await pw.waitFor({ timeout: 30_000 });
+		await pw.fill("pat's first long password");
+		await page.getByRole("button", { name: "Unlock" }).click();
+		await page.locator("text=/try again|wrong|incorrect|does not open/i").first().waitFor({ timeout: 30_000 });
+		await pw.fill("pat's second long password");
+		await page.getByRole("button", { name: "Unlock" }).click();
+		await page.locator("gorani-win11 [data-upload]").first().waitFor({ state: "attached", timeout: 30_000 });
+		await ctx.close();
+	}
+
 	await browser.close();
 	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {

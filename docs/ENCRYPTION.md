@@ -191,6 +191,39 @@ machine-generated, never chosen** (`generateRecoveryCode`, 40 characters of
 a 30-character alphabet). If a user-chosen code is ever supported, it must
 move behind Argon2id.
 
+#### Managing them: Team › Unlock (commit 39l)
+
+Setup makes a password and a recovery code, and offers a passkey while the
+new root is still in hand. Afterwards Team › Unlock adds a passkey or a
+password, changes a password, issues a new recovery code (it replaces the
+old: the paper code stops working; shown once), and removes a method.
+
+**Every change is confirmed with a method you already have.** The session's
+root is non-extractable — it cannot hand out the bytes a new method must
+wrap — so the panel opens the root again from the method you confirm with
+(`methods.ts › confirmKeyBytes`), wraps the copy it needs, and wipes the
+bytes. Someone at an unlocked, unattended screen therefore cannot add their
+own way in (they would need a secret first), nor quietly remove yours.
+
+The server checks what it can without holding a secret
+(`member.rs › methods_refusal`, on `PUT members/<id>/vault`): an enabled
+vault keeps at least one method; each method has a known kind, its wrap
+and its salt; at most four passwords (the unlock screen tries no more —
+O8). Each `vault.save` line in the member's trail names the kinds the vault
+has after it (`methods:password,recovery,passkey`), so adding or removing
+one is on the record.
+
+A save changes only the field it is about (`settings-store.ts ›
+updateSettings`: read the stored settings, change that field, write them
+back; a vault whose root changed meanwhile is refused). Before 39l the
+identity, pinned-store and settings saves each wrote back a whole copy, and
+the copies drifted — a pin saved after a passkey was added would have put
+the methods back as they were.
+
+A passkey's relying party is the page's hostname (O15): moving the app to
+another host means adding passkeys again; passwords and recovery codes are
+unaffected.
+
 ### GC01 — chunked files (docs/VIDEO.md rides on this)
 
 ```text

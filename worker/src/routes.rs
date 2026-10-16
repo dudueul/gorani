@@ -614,6 +614,11 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		("PUT", ["members", id, "vault"]) => match vault_ctx(&env, &identity, id).await {
 			Ok(actor) => {
 				let body = req.json::<serde_json::Value>().await?;
+				// A person's own vault keeps a way in (member.rs ›
+				// methods_refusal, commit 39l): refused here, before the save.
+				if let Some(why) = crate::member::methods_refusal(body.get("settings").unwrap_or(&serde_json::Value::Null)) {
+					return json_error(400, why);
+				}
 				forward_member(&env, id, "PUT", "vault", Some(body), actor.email).await
 			}
 			Err(resp) => Ok(resp),

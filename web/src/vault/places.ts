@@ -24,6 +24,9 @@
  * | `file.key` | member | file id | n | version n's content key |
  * | `file.type` | member | file id | n | version n's MIME type |
  * | `file.music` | member | file id | n | version n's tag summary |
+ * | `file.video` | member | file id | n | version n's video sidecar (video-meta.ts, 39p) |
+ * | `file.poster` | member | file id | n | version n's poster frame (39o) |
+ * | `file.position` | member | file id/member id | — | where that member left off in it (39o) |
  * | `file.hash` | member | file id | n | version n's signed content hash (content-hash.ts) |
  * | `file.intake` | member | file id | — | an evidence file's signed intake record (intake.ts) |
  * | `custody.reason` | member | file id | n | custody link n's reason (custody.ts) |
@@ -65,6 +68,12 @@ export const places = {
 	fileKey: (store: string, file: string, version: number) => place("file.key", store, file, version),
 	fileType: (store: string, file: string, version: number) => place("file.type", store, file, version),
 	fileMusic: (store: string, file: string, version: number) => place("file.music", store, file, version),
+	/** Version n's video sidecar (commit 39p, video-meta.ts): where its moov is, duration, codecs, size. */
+	fileVideo: (store: string, file: string, version: number) => place("file.video", store, file, version),
+	/** Version n's poster frame (commit 39o): a small image made from the plaintext by the browser. */
+	filePoster: (store: string, file: string, version: number) => place("file.poster", store, file, version),
+	/** Where a member left off in a video (commit 39o): bound to the file and the member. */
+	filePosition: (store: string, file: string, member: string) => place("file.position", store, `${file}/${member}`),
 	fileHash: (store: string, file: string, version: number) => place("file.hash", store, file, version),
 	fileIntake: (store: string, file: string) => place("file.intake", store, file),
 	custodyReason: (store: string, file: string, seq: number) => place("custody.reason", store, file, seq),

@@ -33,6 +33,7 @@ import type { ViewerTarget } from "./viewer/viewer.ts";
 import "./files/win11.ts";
 import "./files/finder.ts";
 import "./files/music.ts";
+import "./files/movies.ts";
 import { registerMediaWorker, forgetMedia } from "../lib/media-worker.ts";
 import { carriesFiles } from "./files/dropped.ts";
 import "./team.ts";
@@ -248,6 +249,7 @@ export class GoraniShell extends LitElement {
 			// asked here once per batch.
 			areaKind: () => (own ? "own" : (this.grantedCases.find((c) => c.id === caseId)?.kind ?? null)),
 			intake: (files) => askIntake(files, this.member.id),
+			selfId: () => this.member.id,
 		}, openKey), area, own ? (this.index ?? undefined) : undefined);
 		this.area = area;
 		this.areaTitle = title;
@@ -333,6 +335,7 @@ export class GoraniShell extends LitElement {
 							<button class="px-2.5 py-1.5 ${this.mode === "win11" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="Windows 11 File Explorer" @click=${() => this.switchMode("win11")}>Windows</button>
 							<button class="px-2.5 py-1.5 ${this.mode === "macos" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="macOS Finder" @click=${() => this.switchMode("macos")}>Finder</button>
 							<button class="px-2.5 py-1.5 ${this.mode === "music" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="Music library" @click=${() => this.switchMode("music")}>Music</button>
+							<button class="px-2.5 py-1.5 ${this.mode === "movies" ? "bg-neutral-700 text-white" : "text-neutral-400 hover:bg-neutral-800"}" title="Movies — the area's videos by folder" data-test="mode-movies" @click=${() => this.switchMode("movies")}>Movies</button>
 						</div>
 						<button class="rounded-lg border border-neutral-700 px-3 py-1.5 hover:border-accent" @click=${() => void this.session.lock()}>
 							Lock
@@ -355,7 +358,9 @@ export class GoraniShell extends LitElement {
 								? html`<gorani-win11 .model=${this.model} .memberName=${this.areaTitle} .memberRole=${this.member.role}></gorani-win11>`
 								: this.mode === "music"
 									? html`<gorani-music .model=${this.model} .memberName=${this.areaTitle}></gorani-music>`
-									: html`<gorani-finder .model=${this.model} .memberName=${this.areaTitle}></gorani-finder>`
+									: this.mode === "movies"
+										? html`<gorani-movies .model=${this.model} .memberName=${this.areaTitle}></gorani-movies>`
+										: html`<gorani-finder .model=${this.model} .memberName=${this.areaTitle}></gorani-finder>`
 							: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
 				${this.viewer ? html`<gorani-viewer .model=${this.model} .target=${this.viewer} @closed=${() => (this.viewer = null)}></gorani-viewer>` : nothing}

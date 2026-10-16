@@ -5,7 +5,7 @@
 #   worker/          the Cloudflare Worker (compiles to wasm32-unknown-unknown)
 #   crates/formats/  the GV*/GC1/GB1 sealed formats — the reference implementation
 #                    (joins at commit ②; used by the Worker and the native clients)
-#   crates/media/    mp4-hls-core vendored for the video sidecar (commit ⑩)
+#   crates/media/    the MP4 engine of the video sidecar (mp4-hls-core, vendored — 39p)
 #   clients/         the native Rust clients: core + Windows + Linux + macOS
 #                    (commits ⑬–⑭)
 #
@@ -13,7 +13,7 @@
 # commit still builds with a plain `cargo check --workspace`.
 [workspace]
 resolver = "2"
-members = ["worker", "crates/formats", "crates/s3", "clients/core", "clients/linux", "clients/windows", "clients/macos"]
+members = ["worker", "crates/formats", "crates/s3", "crates/media", "crates/media-wasm", "clients/core", "clients/linux", "clients/windows", "clients/macos"]
 
 [workspace.package]
 version = "0.1.0"

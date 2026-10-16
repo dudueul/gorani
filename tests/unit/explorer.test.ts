@@ -22,7 +22,7 @@
 import assert from "node:assert/strict";
 import { generateHybridKey, importVaultKey, openWith, unwrapPlacedKey, isPlacedText } from "../../web/src/vault/vault-crypto.ts";
 import { openChunk, chunkFor, frameCount, sealedSize } from "../../web/src/vault/chunked-file.ts";
-import { FilesModel, UNVERIFIED, WHOLE_LIMIT, type FilesBridge } from "../../web/src/ui/files/model.ts";
+import { FilesModel, UNVERIFIED, WHOLE_LIMIT, toWebVtt, type FilesBridge } from "../../web/src/ui/files/model.ts";
 import { walkEntries, fromRelativePaths, plainFiles, isLitter, MAX_DROPPED_FILES, type EntryLike, type FileEntryLike, type DirEntryLike } from "../../web/src/ui/files/dropped.ts";
 import { memoryJournal } from "../../web/src/lib/upload-journal.ts";
 import { places } from "../../web/src/vault/places.ts";
@@ -576,9 +576,21 @@ assert.equal(await model.preview(plainRow.id), null);
 	assert.match(toasts.at(-1)!, /^Nothing to upload — left out 1 system file/);
 }
 
+// ── Subtitles beside a video (commit 39o) ────────────────────────────
+{
+	await model.open(null);
+	await model.upload([new File(["video bytes"], "Holiday.mp4", { type: "video/mp4" }), new File(["1\n00:00:01,000 --> 00:00:02,500\n안녕\n"], "Holiday.ko.srt"), new File(["WEBVTT\n\n00:01.000 --> 00:02.000\nhi\n"], "Holiday.vtt"), new File(["1\n"], "Other.srt"), new File(["x"], "Holiday.mp4.txt")]);
+	const video = model.state.get().files.find((f) => f.name === "Holiday.mp4")!;
+	const subs = await model.subtitlesFor(video.id, video.name, null);
+	assert.deepEqual(subs.map((x) => [x.name, x.lang]), [["Holiday.vtt", null], ["Holiday.ko.srt", "ko"]], "the video's own base name, with and without a language — not another video's, not a .txt");
+	const ko = await model.subtitleText(subs[1]!.id);
+	assert.equal(ko, "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.500\n안녕\n", "SRT becomes WebVTT: a header, and dots before the milliseconds");
+	assert.equal(toWebVtt("WEBVTT\r\n\r\n00:01.000 --> 00:02.000\r\nhi"), "WEBVTT\n\n00:01.000 --> 00:02.000\nhi", "a VTT file passes through, line ends made plain");
+}
+
 model.dispose(); // stops the change-feed poll so the test process can exit
 
-console.log("ok  explorer model: sealed listings, uploads+duplicates, downloads, trash, copies, feed, folder uploads (the walk past 100, litter, merge, into a folder, Stop)");
+console.log("ok  explorer model: sealed listings, uploads+duplicates, downloads, trash, copies, feed, folder uploads (the walk past 100, litter, merge, into a folder, Stop), subtitles beside a video (SRT → WebVTT)");
 
 function concatAll(parts: Uint8Array[]): Uint8Array {
 	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));

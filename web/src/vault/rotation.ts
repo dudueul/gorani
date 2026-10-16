@@ -40,7 +40,7 @@ import { areaPath } from "../lib/area.ts";
 // (`intake`, `custody`: evidence's intake records and custody reasons — 29g.)
 // (`collection`, `reject`: an accepted inbox item's record, a rejection's reason — 37c.)
 // (`inboxkey`, `requestlabel`: a member's own inbox keys and upload-link labels — 38.)
-export const SEALED_KINDS = ["version", "file", "folder", "music", "share", "secrets", "hash", "intake", "custody", "collection", "reject", "inboxkey", "requestlabel"] as const;
+export const SEALED_KINDS = ["version", "file", "folder", "music", "video", "position", "share", "secrets", "hash", "intake", "custody", "collection", "reject", "inboxkey", "requestlabel"] as const;
 export type SealedKind = (typeof SEALED_KINDS)[number];
 
 /** A JSON call against the API (the browser's bridge, or a test's helper). */
@@ -77,6 +77,12 @@ function placesOf(memberId: string, kind: SealedKind, it: SealedItem): [Uint8Arr
 			return [places.folderName(memberId, id), null];
 		case "music":
 			return [places.fileMusic(memberId, id, version), null];
+		case "video":
+			// (The poster is the second value — absent for most rows.)
+			return [places.fileVideo(memberId, id, version), places.filePoster(memberId, id, version)];
+		case "position":
+			// (b is the member whose position it is, not a version.)
+			return [places.filePosition(memberId, id, it.b ?? ""), null];
 		case "share":
 			return [places.shareName(memberId, id), null];
 		case "secrets":

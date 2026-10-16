@@ -37,7 +37,8 @@ export function r2Twin() {
  * (tests/api/s3-live.test.mjs) uses it. The credentials go only into the
  * gitignored .dev.vars, exactly where `wrangler dev` reads secrets from.
  */
-/** Is web/dist missing, or older than a file under web/src, web/public or a page? */
+/** Is web/dist missing, or older than a file under web/src, web/public, a
+ * page, or the video engine's crates (built into the app as WASM, 39p)? */
 function webBuildStale() {
 	const built = path.join(ROOT, "web/dist/index.html");
 	if (!fs.existsSync(built)) return true;
@@ -47,7 +48,7 @@ function webBuildStale() {
 		if (st.isDirectory()) return fs.readdirSync(p).some((f) => newer(path.join(p, f)));
 		return st.mtimeMs > at;
 	};
-	return ["web/src", "web/public", "web/index.html", "web/s.html", "web/r.html"].some((p) => fs.existsSync(path.join(ROOT, p)) && newer(path.join(ROOT, p)));
+	return ["web/src", "web/public", "web/index.html", "web/s.html", "web/r.html", "crates/media/src", "crates/media-wasm/src"].some((p) => fs.existsSync(path.join(ROOT, p)) && newer(path.join(ROOT, p)));
 }
 
 export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), config, persist = "persist", s3, keepState = false, vars = {} } = {}) {

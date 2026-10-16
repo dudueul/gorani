@@ -460,6 +460,9 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		("POST", ["requests"]) | ("DELETE", ["requests", _]) => Some(Need::Manage),
 		// The wrapped keys of named files: a read, although it is a POST.
 		("POST", ["files", "keys"]) => Some(Need::Read),
+		// Where a member left off in a video (39o) is theirs, not the
+		// file's: a read-only grantee saves it too.
+		("PUT", ["files", _, "position"]) => Some(Need::Read),
 		// Custody (commit 29g) is a record of responsibility, not access:
 		// anyone on the case may hold an item — a read-only analyst too, and
 		// after the case closed. custody.rs decides WHO, link by link.
@@ -736,6 +739,34 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		// Find duplicates (commit 39n): every live file that shares its size
 		// and keyed tag with another — files_store.rs › files_duplicates.
 		("GET", ["members", id, "files", "duplicates"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/duplicates", None, actor)).await,
+		// The video sidecars (commit 39p, files_store.rs › video_*): the
+		// feed, one version's, and a client writing one it made. (In a case,
+		// case_need classifies the GETs as reads and the PUT as a write.)
+		("GET", ["members", id, "files", "videos"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/videos", None, actor)).await,
+		("GET", ["members", id, "files", file, "video"]) => {
+			let path = format!("files-video/{file}");
+			member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", &path, &req, actor)).await
+		}
+		// Where the caller left off (commit 39o): the member is the caller's
+		// own id, put in by the Worker — never one a client names.
+		("GET", ["members", id, "files", "positions"]) => match member_ctx(&env, &identity, id).await {
+			Ok(actor) => forward_member(&env, id, "GET", format!("files/positions?member={}", urlencode(&actor.id)), None, actor.email).await,
+			Err(resp) => Ok(resp),
+		},
+		("PUT", ["members", id, "files", file, "position"]) => {
+			let actor = match member_ctx(&env, &identity, id).await {
+				Ok(a) => a,
+				Err(resp) => return Ok(resp),
+			};
+			let body = req.json::<serde_json::Value>().await?;
+			let body = serde_json::json!({ "position": body.get("position"), "member": actor.id });
+			forward_member(&env, id, "PUT", format!("files-position/{file}"), Some(body), actor.email).await
+		}
+		("PUT", ["members", id, "files", file, "video"]) => {
+			let body = req.json::<serde_json::Value>().await?;
+			let path = format!("files-video/{file}");
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "PUT", path, Some(body), actor)).await
+		}
 		("GET", ["members", id, "files", "meta"]) => member_call(&env, &identity, id, |actor| forward_member_qs(&env, id, "GET", "files/meta", &req, actor)).await,
 		("GET", ["members", id, "files", "secrets"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/secrets", None, actor)).await,
 		("GET", ["members", id, "files", "trash"]) => member_call(&env, &identity, id, |actor| forward_member(&env, id, "GET", "files/trash", None, actor)).await,

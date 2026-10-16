@@ -11,61 +11,73 @@ which box holds which sample, where the keyframes are, what the track
 durations are. That structure is what the `.hlsmeta` sidecar carries, and
 it is produced by the same engine that powers the stream-worker project.
 
-## The sidecar (one small sealed file per video version)
+## The sidecar (one sealed summary per video version, commit 39p)
 
 ```text
-<object>.hlsmeta   (sealed with the version's content key, like .thumb and text)
+video_meta (file_id, version) — sealed under the files key into place
+file.video(area, file, version), like the music tags (docs/MUSIC.md)
   {
-    v: 1,
-    kind: "mp4",
-    duration: seconds,
-    tracks: [{ id, type: "video"|"audio", codec, timescale, duration }],
-    keyframes: [{ time, chunk, offset }],   // time → GC01 frame + inner offset
-    fragments: [{ time, chunk, offset, duration, sampleCount }],
-    size: plaintext bytes
+    v: 1, container: "mp4",
+    layout: "regular" | "fragmented",
+    moov: [offset, size],          where the moov box is, in plaintext bytes
+    durationMs, codecs,            "avc1.64001f,mp4a.40.2" — what MSE is asked
+    width, height,
+    tracks: [{ type, codec }]
   }
 ```
 
-The `keyframes`/`fragments` tables are exactly what `mp4-hls-core`'s index
-builder produces for stream-worker (Case B assembly: regular MP4 assembled
-into fMP4 fragments on the fly). In stream-worker that index lives next to
-the file in the bucket and the *server* assembles segments; in gorani the
-server must never decrypt — so the same index is sealed and shipped to the
-client, and the assembly runs **in the browser**:
+It holds where the `moov` is, not the whole index. A two-hour film's
+sample tables are megabytes, and a store row is not the place for
+megabytes. The moov is in the file already: knowing its place turns "walk
+the boxes, frame by frame, to find it" into one read, and the engine
+indexes it in WebAssembly in milliseconds. The duration, picture size and
+codecs are there so the Movie tab (39o) can list videos without opening any.
+
+- **Written at upload** from the local file (its moov is a slice away), or
+  **on first play** by the first member who may write there.
+  `PUT members/<id>/files/<file>/video { version, meta }`. The server checks
+  only what it can see: a live version, sealed text, sane sizes, not a
+  malware sample (nothing ever decodes one).
+- **Read** by the player, which trusts the moov place only as far as the box
+  found there is a moov of that size (`lib/video-index.ts`). A stale or
+  wrong sidecar is corrected by walking the boxes, and written back.
+- **Resealed** with every store rotation (kind `video`), purged with its
+  version, and in no backup: any client holding the plaintext can make it
+  again.
+
+## Playing it in the page (39p)
 
 ```text
-player wants time T
-  → keyframe table: T lands in fragment F (chunk i, inner offset o)
-  → fetch Range [i*frame, …] over the GC01 object (the server relays verbatim)
-  → decrypt those frames (WebCrypto, the session's content key)
-  → mp4-hls-core (WASM) builds the fMP4 init + media segment in memory
-  → MSE SourceBuffer.appendBuffer
+the <video> wants time T
+  → the index's segment table: T is in segment n (cut on keyframes, ~4 s)
+  → its planned plaintext blocks, read through lib/frame-reader.ts —
+    one ciphertext range per run of missing GC01 frames, opened here,
+    the last few kept
+  → gorani-media (WebAssembly) builds segment n as fMP4 (moof + mdat)
+  → SourceBuffer.appendBuffer (ui/viewer/mse-player.ts)
 ```
 
-No DRM, per the family's decision: the bytes were decrypted by the family's
-own device; MSE plays them the same as any local file. The sealed storage is
-the protection.
-
-## Why WASM, and why it is safe here
-
-`mp4-hls-core` parses boxes and builds segments — it never touches a key.
-Rust-in-WASM for key *handling* would give up WebCrypto's non-extractable
-keys (docs/COURSE.md, Lesson 2); for key-free media parsing it buys speed
-and one shared implementation with the native clients, which also build
-`.hlsmeta` at upload. The vendored crate is `crates/media/` with a
-wasm-pack build (scripts/build-media-wasm.mjs) and the license/notices as
-in NOTICE.
-
-## What each part does at upload
-
-1. The browser (or desktop client) reads the MP4's *metadata boxes only*
-   (never `mdat`) while sealing — mp4-hls-core's indexer was built for
-   exactly this (any file size, O(box index)).
-2. The resulting tables are sealed with the version's content key and
-   uploaded as the `.hlsmeta` sidecar (`PUT …/files/:id/versions/:n/extras`
-   — the sidecar route arrives with the streaming commit).
-3. Devices without the indexer backfill on first open, the way text
-   sidecars backfill.
+- **The engine** is the stream-worker's MP4 core, vendored as
+  `crates/media` (gorani-media) and built to WebAssembly by
+  `crates/media-wasm` (`scripts/build-media-wasm.mjs`, run before every web
+  build). The C ABI has no wasm-bindgen and imports nothing (`gm_*` exports,
+  a result slot, indexes behind handles). It never sees a key: the page
+  decrypts and hands it plaintext.
+- **It buffers ahead, not everything.** 30 s past the playhead, 20 s behind.
+  A full buffer lets go more and tries once again. A seek is just a new
+  playhead: the next segment is always the first one from the playhead
+  that the buffer does not hold.
+- **Safari**: ManagedMediaSource (iOS 17.1+) where plain MediaSource is
+  missing.
+- **Which files**:
+  - A regular MP4 (moov at either end) whose codecs this browser's MSE
+    plays.
+  - Everything else plays the older way: through the media service worker
+    below. That covers fragmented MP4s, other containers, codecs MSE
+    refuses, and any failure of the engine or the decoder.
+- **CSP**: compiling WebAssembly needs `'wasm-unsafe-eval'`, which the app
+  has carried since the Argon2id vault. It allows compiling wasm and
+  nothing else.
 
 ## Status
 
@@ -97,7 +109,6 @@ in NOTICE.
   and always `video/mp4`. `e2e:app` now plays the path: a 9 MiB video, a
   Range fetched through the worker, exact bytes and headers, and a 404
   once the viewer closes.
-- ⑩b-next: the `.hlsmeta` sidecar (mp4-hls-core → WASM) as an
-  *optimization* on top — keyframe-accurate prefetch and instant seek
-  hints; the streaming path above works without it, because the browser
-  parses the MP4 itself.
+- **39p**: the sidecar and the in-page player above. A regular MP4 now plays
+  through MSE, with keyframe-accurate seeks and no service worker in the
+  way. The streaming path above remains for everything else.

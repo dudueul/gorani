@@ -652,6 +652,113 @@ try {
 		assert.equal(await page.evaluate(async () => (await fetch("/api/healthz")).status), 200);
 		await assertNoViolations(page, "streamed media");
 
+		// ── The in-page player (39p): sealed MP4s played through MSE ───
+		// The engine (gorani-media in WebAssembly) builds fMP4 segments from
+		// plaintext this page decrypted; the browser decodes. VP9 + Opus:
+		// the Chromium Playwright drives has no H.264/AAC decoder (unit:video
+		// covers those through the same engine).
+		{
+			const W = "gorani-win11";
+			const { videoFixture } = await import("../lib/video-fixtures.mjs");
+			const { readFileSync } = await import("node:fs");
+			const row = (name) => page.locator(`${W} [data-body] [data-item^="file:"]`, { hasText: name }).first();
+			const sidecarOf = async (id) => (await api(dev.base, "GET", `/api/v1/members/jinu/files/${id}/video`, { email: "jinu@family.test" })).status;
+			/** Open a video, play it, seek to `to`, and say what the player saw. */
+			const playAndSeek = async (name, to) => {
+				await row(name).dblclick();
+				const video = page.locator("gorani-viewer video[data-engine=mse]");
+				await video.waitFor({ state: "attached", timeout: 30_000 });
+				const seen = await page.evaluate(async (target) => {
+					const v = document.querySelector("gorani-viewer video[data-engine=mse]");
+					const until = (f, ms) => new Promise((ok, no) => { const t0 = Date.now(); const tick = () => (f() ? ok(true) : Date.now() - t0 > ms ? no(new Error(`timed out: t=${v.currentTime} rs=${v.readyState} err=${v.error?.message}`)) : setTimeout(tick, 50)); tick(); });
+					v.muted = true;
+					await until(() => v.readyState >= 2, 20_000);
+					await v.play();
+					await until(() => v.currentTime > 0.5, 20_000);
+					const width = v.videoWidth;
+					v.currentTime = target;
+					await until(() => !v.seeking && v.currentTime >= target && v.readyState >= 3, 20_000);
+					const at = v.currentTime;
+					await until(() => v.currentTime > at + 0.3, 20_000); // and it plays on from there
+					return { src: v.src, width, at: v.currentTime, duration: v.duration };
+				}, to);
+				await page.keyboard.press("Escape");
+				return seen;
+			};
+			// 1. A small video (sealed whole), uploaded in the explorer: its
+			// sidecar is written at upload, from the local file.
+			const small = videoFixture("vp9-opus.mp4", { seconds: 6 });
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "family-video.mp4", mimeType: "video/mp4", buffer: readFileSync(small) });
+			await row("family-video.mp4").waitFor({ timeout: 60_000 });
+			const smallId = (await row("family-video.mp4").getAttribute("data-item")).slice("file:".length);
+			await page.waitForFunction(() => !document.querySelector('[data-test="upload-progress"]'), null, { timeout: 60_000 });
+			assert.equal(await sidecarOf(smallId), 200, "the video sidecar was written at upload");
+			const one = await playAndSeek("family-video.mp4", 4);
+			assert.match(one.src, /^blob:/, "a MediaSource, not a file URL");
+			assert.equal(one.width, 320, "the browser decoded the picture");
+			assert.ok(one.at >= 4 && Math.abs(one.duration - 6) < 0.5, `played, sought to 4 s and on (${JSON.stringify(one)})`);
+
+			// 2. A bigger one in GC01 frames (two 5 MiB frames), uploaded
+			// through the API without a sidecar: the player walks the boxes,
+			// writes the sidecar, and seeks across the frame boundary.
+			const bigBytes = readFileSync(videoFixture("vp9-opus-noisy.mp4", { seconds: 12, size: "640x360" }));
+			const chunk = 5 * 1024 * 1024;
+			assert.ok(bigBytes.length > chunk, `the noisy fixture spans frames (${bigBytes.length} bytes)`);
+			const sealer = await storeSealer(filesStore.bundle, "jinu");
+			const ck = newContentKey();
+			const file = await sealer.newFile("holiday-big.mp4", "video/mp4", ck);
+			const sealed = await sealChunked(await importContentKey(ck), new Uint8Array(bigBytes), chunk);
+			const who = { "x-gorani-dev-email": "jinu@family.test" };
+			const start = (await api(dev.base, "POST", "/api/v1/members/jinu/files/uploads", { email: "jinu@family.test", body: { size: bigBytes.length, chunk, newFileId: file.id } })).json;
+			const parts = [];
+			for (let p = 1; p <= start.parts; p++) {
+				const r = await fetch(`${dev.base}/api/v1/members/jinu/files/uploads/${start.uploadId}/${p}?key=${encodeURIComponent(start.key)}`, { method: "PUT", headers: who, body: sealed.subarray((p - 1) * (chunk + 28), p * (chunk + 28)) });
+				parts.push({ partNumber: p, etag: (await r.json()).etag });
+			}
+			const done = new FormData();
+			for (const [k, v] of Object.entries({ key: start.key, size: String(bigBytes.length), chunk: String(chunk), ck: file.fields.ck, name: file.fields.name, type: file.fields.type, parts: JSON.stringify(parts) })) done.append(k, v);
+			assert.equal((await fetch(`${dev.base}/api/v1/members/jinu/files/uploads/${start.uploadId}/complete`, { method: "POST", headers: who, body: done })).status, 200);
+			assert.equal(await sidecarOf(file.id), 404, "no sidecar yet: the API upload made none");
+			// (The explorer follows the change feed: the API's upload shows up by itself.)
+			await row("holiday-big.mp4").waitFor({ timeout: 60_000 });
+			const two = await playAndSeek("holiday-big.mp4", 9);
+			assert.ok(two.at >= 9, `sought into the second frame and played on (${JSON.stringify(two)})`);
+			assert.equal(two.width, 640);
+			await page.waitForFunction(async ({ id }) => (await fetch(`/api/v1/members/jinu/files/${id}/video`, { headers: { "x-gorani-dev-email": "jinu@family.test" } })).status === 200, { id: file.id }, { timeout: 15_000 });
+			await assertNoViolations(page, "in-page video player");
+
+			// ── The Movie tab (39o): collections by folder, the card's
+			// poster and length from sealed sidecars, resume where this
+			// member left off, subtitles found beside the video. ─────
+			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "family-video.en.srt", mimeType: "application/x-subrip", buffer: Buffer.from("1\n00:00:00,500 --> 00:00:59,000\nHello from the subtitles\n") });
+			await row("family-video.en.srt").waitFor({ timeout: 60_000 });
+			await page.locator('[data-test="mode-movies"]').click();
+			const card = page.locator('[data-test="movie-card"]', { hasText: "family-video" });
+			await card.waitFor({ timeout: 30_000 });
+			assert.equal((await card.locator('[data-test="movie-length"]').innerText()).trim(), "0:06", "the length, from the sealed sidecar");
+			await card.locator('[data-test="movie-poster"]').waitFor({ timeout: 30_000 }); // made at upload, from the local file
+			assert.ok((await page.locator('[data-test="movie-collection"]').count()) >= 1, "collections by folder");
+			await card.click();
+			await page.locator("gorani-viewer video[data-engine=mse]").waitFor({ state: "attached", timeout: 30_000 });
+			const resumed = page.locator('[data-test="viewer-resumed"]');
+			await resumed.waitFor({ timeout: 30_000 });
+			assert.match(await resumed.innerText(), /Resumed at 0:0[4-6]/, "where this member left off, saved when the viewer closed");
+			const cue = await page.evaluate(async () => {
+				const v = document.querySelector("gorani-viewer video[data-engine=mse]");
+				const until = (f, ms) => new Promise((ok, no) => { const t0 = Date.now(); const tick = () => (f() ? ok(true) : Date.now() - t0 > ms ? no(new Error("no cues")) : setTimeout(tick, 50)); tick(); });
+				await until(() => v.textTracks.length > 0, 15_000);
+				const track = v.textTracks[0];
+				track.mode = "showing";
+				await until(() => track.cues && track.cues.length > 0, 15_000);
+				return { lang: track.language, text: track.cues[0].text };
+			});
+			assert.deepEqual(cue, { lang: "en", text: "Hello from the subtitles" }, "the .en.srt beside it, as an English WebVTT track");
+			await page.keyboard.press("Escape");
+			await page.locator('button[title="Windows 11 File Explorer"]').click();
+			await page.locator(`${W} [data-body]`).waitFor({ timeout: 15_000 });
+			await assertNoViolations(page, "movie tab");
+		}
+
 		// ── A download streamed through the media worker (D12, 31c) ────
 		// The app hands a chunked file this big to the worker only above
 		// 256 MiB; the worker's half is driven here directly, with a small
@@ -1253,7 +1360,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
 } finally {
 	await dev.close();
 }

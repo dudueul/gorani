@@ -29,7 +29,9 @@ if (wantKind("rust")) {
 	// dev` (the API suites), but its pure helpers also build on the host —
 	// `--lib` runs their unit tests (schema.rs's forgivable-error rule).
 	const { cmd: cargo, env } = cargoCommand();
-	let r = spawnSync(cargo, ["test", "-p", "gorani-formats", "-p", "gorani-s3", "-p", "gorani-client-core"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+	// (gorani-media and gorani-media-wasm since 39p: the video engine and its
+	// boundary — the same code the browser runs as WebAssembly.)
+	let r = spawnSync(cargo, ["test", "-p", "gorani-formats", "-p", "gorani-s3", "-p", "gorani-client-core", "-p", "gorani-media", "-p", "gorani-media-wasm"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 	if (r.status === 0) r = spawnSync(cargo, ["test", "-p", "gorani-worker", "--lib"], { cwd: ROOT, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 	// Build the native CLI too: api:client-live drives target/debug/gorani-sync,
 	// and a binary left over from an older checkout would test old code while
@@ -40,7 +42,7 @@ if (wantKind("rust")) {
 	const ok = r.status === 0;
 	if (!ok) failures.push("rust");
 	const out = `${String(r.stdout ?? "")}${String(r.stderr ?? "")}`;
-	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats -p gorani-s3 -p gorani-client-core -p gorani-worker; build gorani-sync, gorani-mount${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
+	console.log(`${ok ? "ok  " : "FAIL"} rust: cargo test -p gorani-formats -p gorani-s3 -p gorani-client-core -p gorani-media -p gorani-media-wasm -p gorani-worker; build gorani-sync, gorani-mount${ok ? "" : `\n${out.split("\n").filter((l) => /error|FAILED|panicked/.test(l)).slice(0, 12).join("\n")}`}`);
 }
 
 if (wantKind("unit")) {

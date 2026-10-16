@@ -20,3 +20,5 @@ wrangler.r2.jsonc
 *.local
 # Test outputs (generated per run)
 tests/output/
+# The video engine, built for the browser (scripts/build-media-wasm.mjs)
+web/public/gorani-media.wasm

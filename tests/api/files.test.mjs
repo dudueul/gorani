@@ -347,6 +347,33 @@ try {
 	assert.equal((await api(dev.base, "DELETE", `/api/v1/members/jinu/files/${twins[1]}`, { email: "jinu@family.test" })).status, 200);
 	assert.equal((await api(dev.base, "GET", "/api/v1/members/jinu/files/duplicates", { email: "jinu@family.test" })).json.files.length, 0, "a copy in the Trash is no longer a duplicate");
 
+	// ── 8d. Video sidecars (commit 39p, docs/VIDEO.md) ─────────────────
+	// One sealed summary per version: where the moov is, duration, codecs.
+	// The server checks what it can see — a live version, sealed text, a
+	// sane size, not a sample — and can read none of it.
+	const vBytes = enc.encode("pretend these are an MP4's bytes");
+	const ckV = newContentKey();
+	const vf = await store.newFile("home-video.mp4", "video/mp4", ckV);
+	assert.equal((await upload(dev.base, "jinu@family.test", "jinu", "/files", { ...vf.fields, size: String(vBytes.length) }, await sealWith(await importContentKey(ckV), vBytes))).status, 200);
+	const sidecar = { v: 1, container: "mp4", layout: "regular", moov: [24, 4000], durationMs: 61_000, codecs: "avc1.64001f,mp4a.40.2", width: 1920, height: 1080, tracks: [{ type: "video", codec: "avc1.64001f" }, { type: "audio", codec: "mp4a.40.2" }] };
+	const vPath = `/api/v1/members/jinu/files/${vf.id}/video`;
+	const asJinu = { email: "jinu@family.test" };
+	assert.equal((await api(dev.base, "GET", vPath, asJinu)).status, 404, "none yet: the client makes it");
+	assert.equal((await api(dev.base, "PUT", vPath, { ...asJinu, body: { version: 1, meta: JSON.stringify(sidecar) } })).status, 400, "an unsealed sidecar is refused");
+	assert.equal((await api(dev.base, "PUT", vPath, { ...asJinu, body: { version: 2, meta: await store.fileVideo(vf.id, 2, sidecar) } })).status, 404, "a version that does not exist is refused");
+	assert.equal((await api(dev.base, "PUT", vPath, { ...asJinu, body: { version: 1, meta: "GV04:" + "x".repeat(17_000) } })).status, 413, "a sidecar is small");
+	assert.equal((await api(dev.base, "PUT", vPath, { ...asJinu, body: { version: 1, meta: await store.fileVideo(vf.id, 1, sidecar) } })).status, 200);
+	const vGot = await api(dev.base, "GET", vPath, asJinu);
+	assert.equal(vGot.json.version, 1);
+	assert.deepEqual(JSON.parse(await store.openFileVideo(vf.id, 1, vGot.json.meta)), sidecar, "stored as sealed, opened here");
+	const vFeed = (await api(dev.base, "GET", "/api/v1/members/jinu/files/videos", asJinu)).json.videos;
+	assert.ok(vFeed.some((v) => v.id === vf.id && v.version === 1 && v.hasPoster === false && /^GV04:/.test(v.meta)), "one feed of sealed sidecars, for the Movie tab");
+	assert.equal((await api(dev.base, "GET", vPath, { email: "mom@family.test" })).status, 403, "only the area's own");
+	assert.equal((await api(dev.base, "PUT", vPath, { email: "mom@family.test", body: { version: 1, meta: await store.fileVideo(vf.id, 1, sidecar) } })).status, 403);
+	assert.equal((await api(dev.base, "DELETE", `/api/v1/members/jinu/files/${vf.id}`, asJinu)).status, 200);
+	assert.ok(!(await api(dev.base, "GET", "/api/v1/members/jinu/files/videos", asJinu)).json.videos.some((v) => v.id === vf.id), "a file in the Trash leaves the feed");
+	assert.equal((await api(dev.base, "PUT", vPath, { ...asJinu, body: { version: 1, meta: await store.fileVideo(vf.id, 1, sidecar) } })).status, 404, "…and takes no sidecar");
+
 	// ── 9. Secrets, stored sealed ──────────────────────────────────────
 	const secrets = await store.secrets(JSON.stringify({ fp: "x".repeat(43), idx: "y".repeat(43) }));
 	const putS = await api(dev.base, "PUT", "/api/v1/members/jinu/files/secrets", { email: "jinu@family.test", body: { sealed: secrets } });
@@ -367,7 +394,7 @@ try {
 	const bad = await upload(dev.base, "jinu@family.test", "jinu", "/files", { file_id: store.newId(), ck: ckSealed, name, type: typeSealed, size: String(plain.length) }, enc.encode("plaintext bytes!!"));
 	assert.equal(bad.status, 400);
 
-	console.log("ok  api:files — upload/list/keys/download/folders/changes/versions/chunked+range/trash/duplicates/secrets/refusals/family");
+	console.log("ok  api:files — upload/list/keys/download/folders/changes/versions/chunked+range/trash/duplicates/video sidecars/secrets/refusals/family");
 } finally {
 	await dev.close();
 }

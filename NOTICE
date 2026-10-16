@@ -21,10 +21,14 @@ portions are marked, their original notices are retained in place.
    of its original code those parts still carry: each derived file says so
    in its header, beside the Gorani copyright.
 
-2. mp4-hls-core (from the stream-worker project)
-   The ISO-BMFF parser, keyframe index builder and fMP4 segment assembly
-   engine, vendored under crates/media/ in a later commit, with the license
-   and notices as marked in that repository.
+2. mp4-hls-core, from Seongwoo Hong's stream-worker project
+   His own code, not a third party's: the ISO-BMFF parser, the keyframe
+   index builder and the fMP4 segment assembly, vendored under crates/media/
+   as gorani-media (commit 39p) and built to WebAssembly by
+   crates/media-wasm for the in-page video player (docs/VIDEO.md). The
+   server-side parts of stream-worker (request handling, DASH output, its
+   DRM test material) stayed behind. The S3 transport in worker/src/s3.rs
+   follows the adapter he wrote for the same project.
 
 3. Vendored file (served as-is, not built): web/public/vendor/argon2.umd.min.js
    is hash-wasm 4.12.0's dist/argon2.umd.min.js (MIT, (c) Dani Biro),

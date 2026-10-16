@@ -18,7 +18,7 @@
  * | F2 rename, Enter open, Delete → Trash; Shift+Delete, and Delete in the Trash → Delete forever (39v: a lead's, or the owner's) | model.rename / setFolder / trash / purge |
  * | Backspace = up one folder | model.setFolder(parent) |
  * | Status bar | counts + selection size |
- * | Context menus (39m) | an item: Open / Download / Cut / Copy / Paste into / Move to › / Rename / Delete; empty space: View › / Sort by › / Refresh / Paste / New / Upload / Select all; the tree, Home and Trash rows; search and recent results; the menu key and Shift+F10 |
+ * | Context menus (39m) | an item: Open / Download / Cut / Copy / Paste into / Move to › / Rename / Delete / Delete forever… (39v); the Trash: Restore / Delete forever… / Empty Trash…; empty space: View › / Sort by › / Refresh / Paste / New / Upload / Select all; the tree, Home and Trash rows; search and recent results; the menu key and Shift+F10 |
  * | Drop onto a folder | model.move; drop from the desktop | model.upload (sealed client-side) |
  * | Preview pane | model.preview — decrypted in the browser, nothing sent |
  */
@@ -202,8 +202,8 @@ export class GoraniWin11 extends LitElement {
 	}
 
 	/** "Delete forever…" — in a menu where the person may, else nothing. */
-	private purgeItem(target: { kind: "file" | "folder"; id: string }[], label = "Delete forever…"): MenuItem[] {
-		return this.model.canPurge() ? [{ label, run: () => this.attempt(deleteForever(this.model, target)) }] : [];
+	private purgeItem(target: { kind: "file" | "folder"; id: string }[]): MenuItem[] {
+		return this.model.canPurge() ? [{ label: "Delete forever…", run: () => this.attempt(deleteForever(this.model, target)) }] : [];
 	}
 
 	private emptyTrashItem(): MenuItem[] {

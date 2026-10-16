@@ -16,7 +16,7 @@
  * | ⌘C/⌘X/⌘V, ⌘A, ⌘Delete → Trash; ⌥⌘Delete, and ⌘Delete in the Trash → Delete Forever (39v: a lead's, or the owner's) | model clipboard + trash / purge |
  * | Path bar at the bottom | breadcrumbs |
  * | Drag to move, drop on sidebar folder | model.moveItems; desktop drop → upload |
- * | Context menus (39m) | an item: Open / Get Info / Rename / Duplicate / Move to › / Move to Trash / Copy / Paste Item; empty space: New Folder / Upload / Paste Item / Select All / View as › / Sort By ›; sidebar rows; search and recent results; the menu key and Shift+F10 |
+ * | Context menus (39m) | an item: Open / Get Info / Rename / Duplicate / Move to › / Move to Trash / Delete Forever… (39v) / Copy / Paste Item; the Trash: Put Back / Delete Forever… / Empty Trash…; empty space: New Folder / Upload / Paste Item / Select All / View as › / Sort By ›; sidebar rows; search and recent results; the menu key and Shift+F10 |
  * | List view columns sortable | same sort state as the Windows skin |
  *
  * The point of shipping both skins: the same sealed operations, two platform

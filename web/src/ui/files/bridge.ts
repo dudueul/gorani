@@ -29,6 +29,8 @@ export interface FilesHooks {
 	/** The area's kind, and the intake form evidence uploads need (commit 29g). */
 	areaKind?(): "evidence" | "working" | "own" | null;
 	intake?(files: File[]): Promise<IntakeFields | null>;
+	/** The signed-in member's own id — in a case, not the area's (39o: where they left off in a video is theirs). */
+	selfId?(): string;
 }
 
 /**
@@ -134,6 +136,7 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 		identity: () => hooks.identity?.() ?? null,
 		areaKind: () => hooks.areaKind?.() ?? null,
 		intake: (files) => hooks.intake?.(files) ?? Promise.resolve(null),
+		selfId: () => hooks.selfId?.() ?? "",
 	};
 }
 

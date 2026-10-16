@@ -27,7 +27,8 @@ build order is the lesson plan — see [docs/COURSE.md](docs/COURSE.md), the
 architecture map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (duplicate
 detection: [docs/DUPLICATES.md](docs/DUPLICATES.md); uploads, folders and
 where a drop goes: [docs/UPLOADS.md](docs/UPLOADS.md); records that point at
-nothing: [docs/ORPHANS.md](docs/ORPHANS.md)), and
+nothing: [docs/ORPHANS.md](docs/ORPHANS.md); video in the page and the Movie
+tab: [docs/VIDEO.md](docs/VIDEO.md), [docs/MOVIES.md](docs/MOVIES.md)), and
 NOTICE lists the Apache-2.0-derived portions.
 
 **The app:** https://gorani.at.day (behind Cloudflare Access). **Desktop

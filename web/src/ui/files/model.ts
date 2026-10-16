@@ -40,6 +40,11 @@ import { signIntake, type IntakeFields } from "../../vault/intake.ts";
 import { acceptCustody, offerCustody, verifyChain, type CustodyCall, type CustodyChain } from "../../vault/custody.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
 import type { PickedTree } from "./dropped.ts";
+import { FrameReader, WholeReader } from "../../lib/frame-reader.ts";
+import { mediaEngine, type MediaIndex } from "../../lib/media-engine.ts";
+import { indexVideo } from "../../lib/video-index.ts";
+import { parseVideoMeta, type ReadAt, type VideoMeta } from "../../vault/video-meta.ts";
+import { imageType, posterFromUrl, posterTime } from "../viewer/poster.ts";
 
 /** What a name that does not open in its place is shown as (O6). */
 export const UNVERIFIED = "⚠ unverified — not sealed here";
@@ -150,6 +155,8 @@ export interface FilesBridge {
 	 * how many files are still to come; the answer may stand for the rest. */
 	confirmDuplicate(question: DuplicateQuestion): Promise<DuplicateAnswer>;
 	toast(message: string): void;
+	/** The signed-in member's own id (39o) — in a case area, not the area's. */
+	selfId?(): string;
 	/** The member's identity (commit 29d, docs/CUSTODY.md › stage 4): the
 	 * signer that vouches for what they upload, and the trust that checks
 	 * what others did. Null until the team context is open — the member's
@@ -835,6 +842,12 @@ export class FilesModel {
 				const sealed = await sealWith(key, new Uint8Array(await file.arrayBuffer()));
 				await this.bridge.putWhole(this.memberId, { file_id: id, ck: ckSealed, name: nameSealed, type: typeSealed, size: String(file.size), tag, ...extra }, sealed);
 			}
+			// The video sidecar (39p), made now from the local file — its moov
+			// is a slice away — so the first play needs no walk of the boxes,
+			// and the Movie tab knows the duration without opening anything.
+			// (Never for a sample: a parser is attack surface. Best effort: a
+			// file the engine cannot index uploads all the same.)
+			if (!sample && isMp4(file.name, file.type)) await this.sidecarFromLocal(file, id, 1);
 		} catch (e) {
 			if (!hash && /signed content hash/.test(String(e))) throw new Error("this evidence case takes only signed uploads, and your identity is not open yet — wait for the team to open (or see Team › People), then try again");
 			throw e;
@@ -917,6 +930,146 @@ export class FilesModel {
 			}
 		}
 		return out.sort((x, y) => (x.artist ?? "").localeCompare(y.artist ?? "") || (x.album ?? "").localeCompare(y.album ?? "") || (x.title ?? "").localeCompare(y.title ?? ""));
+	}
+
+	// ── the Movie tab (commit 39o, docs/MOVIES.md) ──────────────────────
+
+	/**
+	 * The area's videos, in collections — one per folder, by its path — each
+	 * with what its sealed sidecar says (duration, picture size; 39p) and
+	 * where the caller left off. Nothing here decrypts a video: names open
+	 * with the store key, durations come from one feed of sidecars, and a
+	 * poster is fetched only when a card is shown (`posterOf`).
+	 */
+	async movieLibrary(): Promise<MovieCollection[]> {
+		const priv = await this.bridge.storePrivate();
+		const files: FileRowJson[] = [];
+		let folderRows: FolderJson[] = [];
+		for (let offset = 0; ; offset += 1000) {
+			const page = await this.bridge.apiGet<{ files: FileRowJson[]; folders: FolderJson[]; total: number }>(`${areaPath(this.memberId)}/files/list?folder=all&offset=${offset}&limit=1000`);
+			files.push(...page.files);
+			folderRows = page.folders;
+			if (!page.files.length || files.length >= page.total) break;
+		}
+		const tree = await this.decryptFolders(folderRows);
+		const feed = await this.bridge.apiGet<{ videos: { id: string; version: number; meta: string; hasPoster: boolean }[] }>(`${areaPath(this.memberId)}/files/videos`);
+		const sidecars = new Map<string, { meta: VideoMeta | null; hasPoster: boolean; version: number }>();
+		for (const v of feed.videos) {
+			let meta: VideoMeta | null = null;
+			try {
+				meta = parseVideoMeta(await openPlacedText(priv, places.fileVideo(this.memberId, v.id, v.version), v.meta));
+			} catch {
+				// sealed with a key this member no longer holds, or not in this place
+			}
+			sidecars.set(v.id, { meta, hasPoster: v.hasPoster, version: v.version });
+		}
+		const positions = await this.positions().catch(() => new Map<string, WatchPosition>());
+		const byFolder = new Map<string | null, MovieCollection>();
+		for (const f of files) {
+			if (f.sample) continue; // never offered for playing (commit 29e)
+			const name = await this.openName(priv, places.fileName(this.memberId, f.id), f.id, f.name);
+			if (kindOf(name) !== "video") continue;
+			const side = sidecars.get(f.id);
+			const meta = side && side.version === f.version ? side.meta : null;
+			const movie: Movie = {
+				id: f.id,
+				name,
+				folderId: f.folder,
+				size: Number(f.size),
+				version: f.version,
+				updatedAt: f.updatedAt,
+				durationMs: meta?.durationMs ?? null,
+				width: meta?.width ?? 0,
+				height: meta?.height ?? 0,
+				hasPoster: Boolean(side?.hasPoster && side.version === f.version),
+				position: positions.get(f.id) ?? null,
+			};
+			const key = f.folder ?? null;
+			const c = byFolder.get(key) ?? { folderId: key, path: key ? folderPath(tree, key) : "", movies: [] };
+			c.movies.push(movie);
+			byFolder.set(key, c);
+		}
+		for (const c of byFolder.values()) c.movies.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+		return [...byFolder.values()].sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
+	}
+
+	/** A video's poster frame, opened here — as a blob: URL (revoked on
+	 * Lock with every other), or null when it has none yet. */
+	async posterOf(id: string, version: number): Promise<string | null> {
+		let got: { poster: string | null } | null = null;
+		try {
+			got = await this.bridge.apiGet<{ poster: string | null }>(`${areaPath(this.memberId)}/files/${id}/video?version=${version}`);
+		} catch {
+			return null;
+		}
+		if (!got?.poster) return null;
+		try {
+			const b64 = await openPlacedText(await this.bridge.storePrivate(), places.filePoster(this.memberId, id, version), got.poster);
+			const bytes = fromBase64(b64);
+			return blobURL(new Blob([bytes as BlobPart], { type: imageType(bytes) }));
+		} catch {
+			return null;
+		}
+	}
+
+	/** Store a poster (a small WebP, 39o) beside the version's sidecar. */
+	async savePoster(id: string, version: number, meta: VideoMeta, webp: Uint8Array): Promise<void> {
+		const priv = await this.bridge.storePrivate();
+		const [sealedMeta, sealedPoster] = await Promise.all([sealPlacedText(priv, places.fileVideo(this.memberId, id, version), JSON.stringify(meta)), sealPlacedText(priv, places.filePoster(this.memberId, id, version), toBase64(webp))]);
+		await this.bridge.apiSend("PUT", `${areaPath(this.memberId)}/files/${id}/video`, { version, meta: sealedMeta, poster: sealedPoster });
+	}
+
+	/** Where the caller left off, per file (39o), opened here. */
+	async positions(): Promise<Map<string, WatchPosition>> {
+		const me = this.bridge.selfId?.() ?? "";
+		const got = await this.bridge.apiGet<{ positions: { file: string; position: string; updatedAt: string }[] }>(`${areaPath(this.memberId)}/files/positions`);
+		const priv = await this.bridge.storePrivate();
+		const out = new Map<string, WatchPosition>();
+		for (const p of got.positions) {
+			try {
+				const v = JSON.parse(await openPlacedText(priv, places.filePosition(this.memberId, p.file, me), p.position)) as { at?: unknown; of?: unknown };
+				if (typeof v.at === "number" && typeof v.of === "number" && Number.isFinite(v.at) && Number.isFinite(v.of)) out.set(p.file, { at: v.at, of: v.of, updatedAt: p.updatedAt });
+			} catch {
+				// not this member's place, or another key's
+			}
+		}
+		return out;
+	}
+
+	/** Save where the caller is in a video (seconds into how many). */
+	async savePosition(id: string, at: number, of: number): Promise<void> {
+		const me = this.bridge.selfId?.() ?? "";
+		if (!me) return;
+		const sealed = await sealPlacedText(await this.bridge.storePrivate(), places.filePosition(this.memberId, id, me), JSON.stringify({ at: Math.round(at * 10) / 10, of: Math.round(of * 10) / 10 }));
+		await this.bridge.apiSend("PUT", `${areaPath(this.memberId)}/files/${id}/position`, { position: sealed });
+	}
+
+	/**
+	 * The subtitles beside a video (39o): `.vtt` and `.srt` files in the same
+	 * folder whose name starts with the video's base name — "Holiday.mp4"
+	 * takes "Holiday.vtt", "Holiday.ko.srt", "Holiday.en.vtt". The language
+	 * is the part between, when there is one.
+	 */
+	async subtitlesFor(id: string, name: string, folderId: string | null): Promise<{ id: string; name: string; lang: string | null }[]> {
+		const base = name.replace(/\.[^.]+$/, "");
+		const priv = await this.bridge.storePrivate();
+		const page = await this.bridge.apiGet<{ files: FileRowJson[] }>(`${areaPath(this.memberId)}/files/list?folder=${folderId ?? "root"}&limit=1000`);
+		const out: { id: string; name: string; lang: string | null }[] = [];
+		for (const f of page.files) {
+			if (f.id === id || f.sample) continue;
+			const n = await this.openName(priv, places.fileName(this.memberId, f.id), f.id, f.name);
+			const m = /^(.*?)(?:\.([A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?))?\.(vtt|srt)$/i.exec(n);
+			if (m && m[1] === base) out.push({ id: f.id, name: n, lang: m[2]?.toLowerCase() ?? null });
+		}
+		return out.sort((a, b) => (a.lang ?? "").localeCompare(b.lang ?? ""));
+	}
+
+	/** A subtitle file as WebVTT text (SRT converted), decrypted here. */
+	async subtitleText(id: string): Promise<string> {
+		const parts: Uint8Array[] = [];
+		await this.openBytes(id, undefined, (plain) => void parts.push(plain));
+		const text = new TextDecoder().decode(concatBytes(parts)).replace(/^\uFEFF/, "");
+		return toWebVtt(text);
 	}
 
 	/** The duplicate tag: HMAC(fp, SHA-256(plaintext)) — keyed, so the server
@@ -1255,6 +1408,95 @@ export class FilesModel {
 		return { bytes: plain.subarray(0, maxBytes), name: row.name, mime };
 	}
 
+	// ── the in-page video player (commit 39p, docs/VIDEO.md) ────────────
+
+	/**
+	 * What the MSE player needs for a video: a plaintext reader over the
+	 * file's frames, the engine's index of its moov, and its sidecar (whose
+	 * `codecs` the viewer asks MSE about). Null when the file is not a
+	 * regular MP4, or is a sample — the viewer then plays it the older way
+	 * (the media service worker). The sidecar is read when there is one and
+	 * written back when it had to be made (best effort: a read-only grant
+	 * simply goes without).
+	 */
+	async videoPlayback(id: string): Promise<{ index: MediaIndex; source: { read: ReadAt; clear(): void }; meta: VideoMeta; version: number; hasPoster: boolean } | null> {
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number; type: string | null; sample?: boolean; size?: number }> }>(id);
+		const k = keys.keys[id];
+		if (!k) return null;
+		if ((await this.policyOf(k, id, null)) !== "normal") return null; // never decoded (commit 29e)
+		const s = this.state.get();
+		const size = s.files.find((f) => f.id === id)?.size ?? k.size ?? 0;
+		if (!size) return null;
+		const { version } = k;
+		const priv = await this.bridge.storePrivate();
+		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, version), k.key);
+		const source =
+			k.chunk && k.chunk > 0
+				? new FrameReader({ size, chunk: k.chunk, fetchCipher: async (a, b) => (await this.bridge.fetchObject(this.memberId, id, version, [a, b])).body, open: (frame, i, final) => openChunk(key, frame, i, final) })
+				: new WholeReader(size, async () => openWith(key, (await this.bridge.fetchObject(this.memberId, id, version)).body));
+		const read: ReadAt = (o, l) => source.read(o, l);
+		const record = await this.videoRecord(id, version).catch(() => null);
+		const found = await indexVideo(read, size, record?.meta ?? null, await mediaEngine());
+		if (!found) return null;
+		if (found.changed) void this.saveVideoMeta(id, version, found.meta).catch(() => {});
+		if (!found.index) return null; // fragmented: the media worker plays it
+		return { index: found.index, source, meta: found.meta, version, hasPoster: Boolean(record?.hasPoster) };
+	}
+
+	/** A version's sidecar, opened in its place — or null (none yet, or one
+	 * that does not open there: it is then made again). */
+	async videoMeta(id: string, version: number): Promise<VideoMeta | null> {
+		return (await this.videoRecord(id, version))?.meta ?? null;
+	}
+
+	private async videoRecord(id: string, version: number): Promise<{ meta: VideoMeta | null; hasPoster: boolean } | null> {
+		let got: { meta: string; poster: string | null } | null = null;
+		try {
+			got = await this.bridge.apiGet<{ meta: string; poster: string | null }>(`${areaPath(this.memberId)}/files/${id}/video?version=${version}`);
+		} catch {
+			return null; // 404: none written yet
+		}
+		let meta: VideoMeta | null = null;
+		try {
+			meta = parseVideoMeta(await openPlacedText(await this.bridge.storePrivate(), places.fileVideo(this.memberId, id, version), got.meta));
+		} catch {
+			// does not open in its place: made again
+		}
+		return { meta, hasPoster: Boolean(got.poster) };
+	}
+
+	/** Seal a sidecar into its place and store it. */
+	async saveVideoMeta(id: string, version: number, meta: VideoMeta): Promise<void> {
+		const sealed = await sealPlacedText(await this.bridge.storePrivate(), places.fileVideo(this.memberId, id, version), JSON.stringify(meta));
+		await this.bridge.apiSend("PUT", `${areaPath(this.memberId)}/files/${id}/video`, { version, meta: sealed });
+	}
+
+	/** The sidecar of a file being uploaded, from the local bytes. */
+	private async sidecarFromLocal(file: File, id: string, version: number): Promise<void> {
+		try {
+			const read: ReadAt = async (o, l) => new Uint8Array(await file.slice(o, o + l).arrayBuffer());
+			const found = await indexVideo(read, file.size, null, await mediaEngine());
+			found?.index?.drop();
+			if (!found) return;
+			await this.saveVideoMeta(id, version, found.meta);
+			// The poster (39o): a frame of the local file, where this browser
+			// decodes its codec. (A file it cannot decode gets one when it is
+			// first played somewhere that can.)
+			if (typeof document !== "undefined" && found.meta.tracks.some((t) => t.type === "video")) {
+				const url = URL.createObjectURL(file);
+				try {
+					const webp = await posterFromUrl(url, posterTime(found.meta.durationMs));
+					if (webp) await this.savePoster(id, version, found.meta, webp);
+				} finally {
+					URL.revokeObjectURL(url);
+				}
+			}
+		} catch {
+			// No engine here (an old deployment, a test without the build), or
+			// a file it cannot read: the first play makes the sidecar instead.
+		}
+	}
+
 	// ── streaming playback (the media service worker) ───────────────────
 
 	/** A playable URL for a video/audio file: the scoped media service
@@ -1428,6 +1670,53 @@ export class FilesModel {
 	}
 }
 
+/** One video in the Movie tab (39o). */
+export interface Movie {
+	id: string;
+	name: string;
+	folderId: string | null;
+	size: number;
+	version: number;
+	updatedAt: string;
+	durationMs: number | null;
+	width: number;
+	height: number;
+	hasPoster: boolean;
+	position: WatchPosition | null;
+}
+
+/** A folder's videos — the Movie tab's collections are folders. */
+export interface MovieCollection {
+	folderId: string | null;
+	path: string;
+	movies: Movie[];
+}
+
+export interface WatchPosition {
+	at: number;
+	of: number;
+	updatedAt: string;
+}
+
+/** SRT → WebVTT (39o): the header, and a comma before the milliseconds
+ * becomes a dot; a VTT file passes through. Cue numbers are kept — WebVTT
+ * reads them as cue identifiers. */
+export function toWebVtt(text: string): string {
+	const t = text.replace(/\r\n?/g, "\n");
+	if (/^WEBVTT/.test(t)) return t;
+	return `WEBVTT\n\n${t.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}`;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+	let at = 0;
+	for (const p of parts) {
+		out.set(p, at);
+		at += p.length;
+	}
+	return out;
+}
+
 interface FileRowJson {
 	id: string;
 	folder: string | null;
@@ -1474,6 +1763,11 @@ export const STREAM_DOWNLOAD_AT = 256 * 1024 * 1024;
 const IN_TAB_LIMIT = 2 * 1024 ** 3;
 /** Files up to this size go up whole, in one request; larger ones as GC01 frames. */
 export const WHOLE_LIMIT = 48 * 1024 * 1024;
+
+/** A file the video sidecar describes: the MP4 family, by type or name. */
+export function isMp4(name: string, mime: string | null): boolean {
+	return /^(video|audio)\/(mp4|quicktime|x-m4v)$/.test(mime ?? "") || /\.(mp4|m4v|mov)$/i.test(name);
+}
 /** Audio tags are parsed from the whole file — up to this size (the parser needs it in memory). */
 const TAG_PARSE_LIMIT = 512 * 1024 * 1024;
 /** The hashing pass reads this much at a time. */

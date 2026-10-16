@@ -367,6 +367,31 @@ pub const MIGRATIONS: &[&str] = &[
 		created_by TEXT NOT NULL,
 		created_at TEXT NOT NULL
 	)",
+	// Migration v19 (commit 39p, docs/VIDEO.md): the video sidecar — one
+	// sealed summary per file version (where the moov box is, duration,
+	// codecs, the picture's size), sealed under the files key into place
+	// file.video(area, file, version) as the music tags are; and its poster
+	// frame (39o, place file.poster). Derived data: any client holding the
+	// plaintext can make it again, so it rides in no backup and is checked
+	// by nothing but its seal.
+	"CREATE TABLE IF NOT EXISTS video_meta (
+		file_id TEXT NOT NULL, version INTEGER NOT NULL,
+		meta_sealed TEXT NOT NULL,
+		poster_sealed TEXT,
+		written_by TEXT NOT NULL,
+		PRIMARY KEY (file_id, version)
+	)",
+	// Migration v20 (commit 39o, docs/MOVIES.md): where each member left
+	// off in a video — sealed under the files key into place
+	// file.position(area, file, member), so no other area can be shown it
+	// and the server reads none of it. One row per (file, member): a later
+	// save replaces it.
+	"CREATE TABLE IF NOT EXISTS watch_positions (
+		file_id TEXT NOT NULL, member TEXT NOT NULL,
+		position_sealed TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (file_id, member)
+	)",
 ];
 
 /// The internal DO API (called only by the Worker, which authenticates first
@@ -835,6 +860,24 @@ impl GoraniMemberDO {
 				let body = req.json::<serde_json::Value>().await?;
 				self.file_lost(&actor, &id["files-lost/".len()..], body).await
 			}
+			// The video sidecars (commit 39p, files_store.rs › video_*).
+			("GET", "files/videos") => self.videos_feed().await,
+			("GET", id) if id.starts_with("files-video/") => {
+				let q = req.url()?.query().map(urlquery).unwrap_or_default();
+				let version = q.get("version").and_then(|x| x.parse::<i64>().ok());
+				self.video_get(&id["files-video/".len()..], version).await
+			}
+			("PUT", id) if id.starts_with("files-video/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.video_put(&actor, &id["files-video/".len()..], body).await
+			}
+			// Where each member left off (commit 39o). The Worker names the
+			// member (the caller's own id, never one the client sends).
+			("GET", "files/positions") => self.positions_get(req).await,
+			("PUT", id) if id.starts_with("files-position/") => {
+				let body = req.json::<serde_json::Value>().await?;
+				self.position_put(&id["files-position/".len()..], body).await
+			}
 			("GET", "files/secrets") => self.secrets_get().await,
 			("PUT", "files/secrets") => {
 				let body = req.json::<serde_json::Value>().await?;
@@ -1066,6 +1109,10 @@ impl GoraniMemberDO {
 		// key material outliving the file it belonged to.
 		self.sql.exec("DELETE FROM file_versions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
 		self.sql.exec("DELETE FROM music_meta WHERE file_id NOT IN (SELECT id FROM files)", None)?;
+		// (A video sidecar goes with its file — and with its VERSION, which
+		// the working-file retention prunes after a year.)
+		self.sql.exec("DELETE FROM video_meta WHERE NOT EXISTS (SELECT 1 FROM file_versions v WHERE v.file_id = video_meta.file_id AND v.version = video_meta.version)", None)?;
+		self.sql.exec("DELETE FROM watch_positions WHERE file_id NOT IN (SELECT id FROM files)", None)?;
 		self.sql.exec("DELETE FROM file_contributors WHERE file_id NOT IN (SELECT id FROM files)", None)?;
 		let n_folders_purged = self
 			.sql

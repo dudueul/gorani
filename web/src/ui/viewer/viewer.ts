@@ -30,6 +30,12 @@ import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
 import { forgetMedia } from "../../lib/media-worker.ts";
 import { SAMPLE_PASSWORD } from "../../vault/samples.ts";
+import { isMp4 } from "../files/model.ts";
+import { MsePlayer, canPlayWithMse } from "./mse-player.ts";
+import { mseType } from "../../vault/video-meta.ts";
+import type { MediaIndex } from "../../lib/media-engine.ts";
+import type { VideoMeta } from "../../vault/video-meta.ts";
+import { posterFromVideo, posterTime } from "./poster.ts";
 
 export interface ViewerTarget {
 	id: string;
@@ -37,6 +43,9 @@ export interface ViewerTarget {
 	kind: FileKind;
 	size: number;
 	version?: number;
+	/** The file's folder — where its subtitles are looked for (39o). Absent:
+	 * the folder on screen. */
+	folderId?: string | null;
 }
 
 @customElement("gorani-viewer")
@@ -53,6 +62,15 @@ export class GoraniViewer extends LitElement {
 	@state() private error: string | null = null;
 	@state() private policy: "normal" | "sample" | "unverified" = "normal";
 	@state() private shownType: string | null = null;
+	/** The in-page player (commit 39p): set when this video plays through MSE. */
+	@state() private mse: { index: MediaIndex; source: { read(o: number, l: number): Promise<Uint8Array>; clear(): void }; type: string; meta: VideoMeta; version: number; hasPoster: boolean } | null = null;
+	private player: MsePlayer | null = null;
+	/** The video's subtitles (39o): WebVTT as blob: URLs, revoked on close. */
+	@state() private tracks: { url: string; lang: string | null; label: string }[] = [];
+	/** Where this member left off (39o), offered on open. */
+	@state() private resumeAt: number | null = null;
+	private lastSaved = 0;
+	private wired: HTMLVideoElement | null = null;
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -73,6 +91,14 @@ export class GoraniViewer extends LitElement {
 	/** Let go of the decrypted handle: revoke the blob URL, or tell the media
 	 * service worker to forget this file's content key (streamed media). */
 	private release(): void {
+		this.savePosition(true);
+		for (const t of this.tracks) revokeBlobURL(t.url);
+		this.tracks = [];
+		this.wired = null;
+		this.player?.destroy();
+		this.player = null;
+		this.mse?.source.clear();
+		this.mse = null;
 		if (!this.url) return;
 		if (this.streamed) {
 			const url = this.url;
@@ -104,6 +130,8 @@ export class GoraniViewer extends LitElement {
 					this.truncated = head.bytes.length >= TEXT_CAP && (info?.size ?? 0) > TEXT_CAP;
 					this.text = new TextDecoder().decode(head.bytes.subarray(0, TEXT_CAP));
 				}
+			} else if (this.mode === "video" && isMp4(this.target.name, mime) && (await this.startMse(id))) {
+				// Played in the page (39p, mse-player.ts): updated() attaches it.
 			} else if ((this.mode === "video" || this.mode === "audio") && (info?.size ?? 0) > 8 * 1024 * 1024) {
 				// Streaming path: the scoped media worker serves decrypted
 				// ranges; the browser's player seeks natively. Only for larger
@@ -138,6 +166,137 @@ export class GoraniViewer extends LitElement {
 		}
 	}
 
+	/**
+	 * The in-page player (39p): an MP4 whose codecs this browser's MSE plays
+	 * is fed segment by segment — keyframe-accurate seeks into a sealed file
+	 * of any size, with no service worker in the way. Anything else (or any
+	 * failure) plays the older way.
+	 */
+	private async startMse(id: string): Promise<boolean> {
+		try {
+			const p = await this.model.videoPlayback(id);
+			if (!p) return false;
+			// (The engine's codecs, not the stored sidecar's: an older engine
+			// may have named them otherwise.)
+			const codecs = p.index.summary.codecs;
+			const type = mseType(codecs, p.index.summary.tracks.some((t) => t.type === "video"));
+			if (!codecs || !canPlayWithMse(type)) {
+				p.index.drop();
+				p.source.clear();
+				return false;
+			}
+			this.mse = { index: p.index, source: p.source, meta: p.meta, version: p.version, hasPoster: p.hasPoster, type };
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	protected override updated(): void {
+		this.wireVideo();
+		if (!this.mse || this.player) return;
+		const video = this.querySelector<HTMLVideoElement>("video[data-engine=mse]");
+		if (!video) return;
+		const { index, source, type } = this.mse;
+		this.player = new MsePlayer(video, index, source, type, {
+			// The engine or the decoder refused a piece: play it the older way.
+			onFail: () => void this.fallBack(),
+		});
+	}
+
+	private async fallBack(): Promise<void> {
+		this.release();
+		this.busy = true;
+		const { id, kind } = this.target;
+		const info = await this.model.info(id);
+		try {
+			const handle = await this.model.mediaHandle(id, renderMime(kind, info?.mime ?? null, this.target.name));
+			if (handle) {
+				this.streamed = true;
+				this.url = handle.url;
+			} else {
+				const parts: Uint8Array[] = [];
+				await this.model.openBytes(id, this.target.version, (plain) => void parts.push(plain));
+				this.url = blobURL(new Blob([concat(parts) as BlobPart], { type: renderMime(kind, info?.mime ?? null, this.target.name) }));
+			}
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.busy = false;
+		}
+	}
+
+	// ── Resume, subtitles and posters (39o, docs/MOVIES.md) ────────────
+
+	/** Once a video element is on screen: resume, save the position as it
+	 * plays, and make a poster when the version has none. */
+	private wireVideo(): void {
+		const video = this.querySelector<HTMLVideoElement>("main video");
+		if (!video || video === this.wired) return;
+		this.wired = video;
+		void this.loadExtras();
+		video.addEventListener("loadedmetadata", () => {
+			const at = this.resumeAt;
+			if (at !== null && video.duration && at < video.duration - 5) video.currentTime = at;
+		});
+		video.addEventListener("timeupdate", () => {
+			if (Date.now() - this.lastSaved > 10_000) this.savePosition(false);
+		});
+		video.addEventListener("pause", () => this.savePosition(true));
+		video.addEventListener("playing", () => void this.backfillPoster(video), { once: true });
+	}
+
+	/** The saved position and the subtitles, fetched beside the video. */
+	private async loadExtras(): Promise<void> {
+		const { id, name } = this.target;
+		const folderId = this.target.folderId !== undefined ? this.target.folderId : this.model.state.get().folderId;
+		const [positions, subs] = await Promise.all([this.model.positions().catch(() => new Map()), this.model.subtitlesFor(id, name, folderId).catch(() => [])]);
+		const p = positions.get(id);
+		this.resumeAt = p && worthResuming(p.at, p.of) ? p.at : null;
+		const video = this.wired;
+		if (video && this.resumeAt !== null && video.readyState >= 1 && video.currentTime < 1) video.currentTime = this.resumeAt;
+		const tracks: { url: string; lang: string | null; label: string }[] = [];
+		for (const s of subs) {
+			try {
+				const text = await this.model.subtitleText(s.id);
+				tracks.push({ url: blobURL(new Blob([text], { type: "text/vtt" })), lang: s.lang, label: s.lang ? s.lang.toUpperCase() : s.name });
+			} catch {
+				// a subtitle file that does not open is left out
+			}
+		}
+		this.tracks = tracks;
+	}
+
+	private savePosition(now: boolean): void {
+		const video = this.wired;
+		if (!video || !video.duration || !Number.isFinite(video.duration) || video.currentTime < 1) return;
+		if (!now && Date.now() - this.lastSaved < 10_000) return;
+		this.lastSaved = Date.now();
+		void this.model.savePosition(this.target.id, video.currentTime, video.duration).catch(() => {});
+	}
+
+	/** A poster for a version without one (39o): the frame on screen a
+	 * moment into playing — once, and only through the in-page player,
+	 * which knows the version and its sidecar. */
+	private async backfillPoster(video: HTMLVideoElement): Promise<void> {
+		const m = this.mse;
+		if (!m || m.hasPoster) return;
+		const at = posterTime(m.meta.durationMs);
+		if (video.currentTime < at) await new Promise<void>((ok) => {
+			const tick = () => (video.currentTime >= at || !this.wired ? ok() : setTimeout(tick, 200));
+			tick();
+		});
+		if (!this.wired) return;
+		const webp = await posterFromVideo(video).catch(() => null);
+		if (webp) await this.model.savePoster(this.target.id, m.version, m.meta, webp).catch(() => {});
+		m.hasPoster = true;
+	}
+
+	private startOver(): void {
+		this.resumeAt = null;
+		if (this.wired) this.wired.currentTime = 0;
+	}
+
 	protected override render(): TemplateResult {
 		const t = this.target;
 		return html`
@@ -160,8 +319,16 @@ export class GoraniViewer extends LitElement {
 		switch (this.mode) {
 			case "image":
 				return this.url ? html`<img class="max-h-full max-w-full rounded-lg object-contain shadow-2xl" src=${this.url} alt=${this.target.name} />` : this.unknown();
-			case "video":
-				return this.url ? html`<video class="max-h-full max-w-full rounded-lg shadow-2xl" src=${this.url} controls ${this.streamed ? nothing : html`autoplay`}></video>` : this.unknown();
+			case "video": {
+				const tracks = this.tracks.map((tr) => html`<track kind="subtitles" src=${tr.url} srclang=${tr.lang ?? nothing} label=${tr.label} />`);
+				const resume = this.resumeAt !== null
+					? html`<p class="mt-2 flex items-center justify-center gap-2 text-xs text-neutral-400" data-test="viewer-resumed">Resumed at ${fmtClock(this.resumeAt)} <button class="rounded border border-neutral-700 px-2 py-0.5 hover:border-accent" @click=${() => this.startOver()}>Start over</button></p>`
+					: nothing;
+				if (this.mse) return html`<div class="flex max-h-full max-w-full flex-col items-center"><video class="max-h-[calc(100%-2rem)] max-w-full rounded-lg shadow-2xl" data-engine="mse" controls playsinline>${tracks}</video>${resume}</div>`;
+				return this.url
+					? html`<div class="flex max-h-full max-w-full flex-col items-center"><video class="max-h-[calc(100%-2rem)] max-w-full rounded-lg shadow-2xl" src=${this.url} controls ${this.streamed ? nothing : html`autoplay`}>${tracks}</video>${resume}</div>`
+					: this.unknown();
+			}
 			case "audio":
 				return this.url
 					? html`<div class="w-full max-w-xl rounded-2xl bg-neutral-900 p-8 text-center shadow-2xl">
@@ -213,6 +380,23 @@ export class GoraniViewer extends LitElement {
 		this.release();
 		this.dispatchEvent(new CustomEvent("closed", { bubbles: true, composed: true }));
 	}
+}
+
+/** Is a saved place worth offering? Not near the start or the end: within
+ * 5 % of the length, at most 5 s — a film's last credits, a 6-second clip's
+ * last third of a second. (A fixed 5 s made every clip under 10 s
+ * unresumable.) */
+export function worthResuming(at: number, of: number): boolean {
+	const margin = Math.min(5, of * 0.05);
+	return at > margin && at < of - margin;
+}
+
+/** Seconds as h:mm:ss or m:ss. */
+function fmtClock(sec: number): string {
+	const s = Math.floor(sec % 60);
+	const m = Math.floor(sec / 60) % 60;
+	const h = Math.floor(sec / 3600);
+	return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
 }
 
 function concat(parts: Uint8Array[]): Uint8Array {

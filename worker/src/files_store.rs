@@ -380,6 +380,147 @@ impl GoraniMemberDO {
 			.collect::<Vec<_>>() }))?)
 	}
 
+	// ── The video sidecar (commit 39p, docs/VIDEO.md) ───────────────────
+
+	/// `PUT files-video/<file> { version, meta, poster? }`: a version's video
+	/// sidecar, written by a client that held the plaintext (at upload, or
+	/// the first time someone opened the video). The server can check only
+	/// what it can see: the file and version exist and are live, the values
+	/// are placed sealed text of a sane size, and the file is not a malware
+	/// sample (nothing ever decodes one — a sidecar would mean someone did).
+	/// What the blob says it cannot read; its place (file.video of THIS
+	/// file and version) keeps it from being moved to another file.
+	///
+	/// A later write for the same version replaces the earlier one — the
+	/// poster arrives after the sidecar (39o) — but a write with no poster
+	/// keeps the poster that is there.
+	pub(crate) async fn video_put(&self, actor: &str, file: &str, body: serde_json::Value) -> Result<Response> {
+		/// A sidecar is a few hundred bytes; the cap only stops abuse of the row.
+		const META_CAP: usize = 16 * 1024;
+		/// A poster is a small WebP, sealed and base64'd (39o makes ~40 KB).
+		const POSTER_CAP: usize = 512 * 1024;
+		let Some(version) = body.get("version").and_then(|v| v.as_i64()) else { return json_error(400, "version required") };
+		let Some(meta) = body.get("meta").and_then(|v| v.as_str()) else { return json_error(400, "meta required: the sealed sidecar") };
+		let poster = body.get("poster").and_then(|v| v.as_str());
+		if !gorani_formats::placed::is_placed_text(meta) || poster.is_some_and(|p| !gorani_formats::placed::is_placed_text(p)) {
+			return json_error(400, "a video sidecar and its poster arrive sealed (GV04)");
+		}
+		if meta.len() > META_CAP || poster.is_some_and(|p| p.len() > POSTER_CAP) {
+			return json_error(413, "a video sidecar is at most 16 KiB, a poster at most 512 KiB");
+		}
+		#[derive(serde::Deserialize)]
+		struct Live {
+			sample: i64,
+		}
+		let live: Vec<Live> = self
+			.sql
+			.exec("SELECT f.sample AS sample FROM files f JOIN file_versions v ON v.file_id = f.id WHERE f.id = ?1 AND v.version = ?2 AND f.deleted_at IS NULL", Some(vec![file.into(), version.into()]))?
+			.to_array()?;
+		let Some(row) = live.into_iter().next() else { return json_error(404, "no such live file version") };
+		if row.sample != 0 {
+			return json_error(400, "a malware sample is never decoded — it has no video sidecar");
+		}
+		self.sql.exec(
+			"INSERT INTO video_meta (file_id, version, meta_sealed, poster_sealed, written_by) VALUES (?1, ?2, ?3, ?4, ?5)
+			 ON CONFLICT (file_id, version) DO UPDATE SET meta_sealed = excluded.meta_sealed, poster_sealed = COALESCE(excluded.poster_sealed, video_meta.poster_sealed), written_by = excluded.written_by",
+			Some(vec![file.into(), version.into(), meta.into(), bind(poster.map(str::to_string)), actor.into()]),
+		)?;
+		Response::from_json(&serde_json::json!({ "ok": true }))
+	}
+
+	/// `GET files-video/<file>[?version=n]`: the sidecar (and poster) of
+	/// version n, or of the living version; 404 when none was written yet —
+	/// the client then makes one from the file itself.
+	pub(crate) async fn video_get(&self, file: &str, version: Option<i64>) -> Result<Response> {
+		#[derive(serde::Deserialize)]
+		struct Row {
+			version: i64,
+			meta_sealed: String,
+			poster_sealed: Option<String>,
+		}
+		let rows: Vec<Row> = match version {
+			Some(v) => self.sql.exec("SELECT version, meta_sealed, poster_sealed FROM video_meta WHERE file_id = ?1 AND version = ?2", Some(vec![file.into(), v.into()]))?.to_array()?,
+			None => self
+				.sql
+				.exec("SELECT m.version AS version, m.meta_sealed AS meta_sealed, m.poster_sealed AS poster_sealed FROM video_meta m JOIN files f ON f.id = m.file_id AND f.version = m.version WHERE m.file_id = ?1 AND f.deleted_at IS NULL", Some(vec![file.into()]))?
+				.to_array()?,
+		};
+		match rows.into_iter().next() {
+			Some(r) => Response::from_json(&serde_json::json!({ "version": r.version, "meta": r.meta_sealed, "poster": r.poster_sealed })),
+			None => json_error(404, "no video sidecar for this version yet"),
+		}
+	}
+
+	/// `GET files/videos`: every living version's sidecar in one feed — the
+	/// Movie tab (39o) opens them with the store key and never reads a
+	/// video for its duration. Posters are not in it (a few hundred of them
+	/// would be megabytes): `hasPoster` says whether `files-video/<id>` has one.
+	pub(crate) async fn videos_feed(&self) -> Result<Response> {
+		#[derive(serde::Deserialize)]
+		struct Row {
+			file_id: String,
+			version: i64,
+			meta_sealed: String,
+			has_poster: i64,
+			size: i64,
+		}
+		let rows: Vec<Row> = self
+			.sql
+			.exec(
+				"SELECT m.file_id AS file_id, m.version AS version, m.meta_sealed AS meta_sealed, m.poster_sealed IS NOT NULL AS has_poster, f.size AS size FROM video_meta m JOIN files f ON f.id = m.file_id AND f.version = m.version WHERE f.deleted_at IS NULL ORDER BY f.created_at, f.id",
+				None,
+			)?
+			.to_array()?;
+		Response::from_json(&serde_json::json!({ "videos": rows
+			.into_iter()
+			.map(|r| serde_json::json!({ "id": r.file_id, "version": r.version, "meta": r.meta_sealed, "hasPoster": r.has_poster != 0, "size": r.size }))
+			.collect::<Vec<_>>() }))
+	}
+
+	// ── Where each member left off (commit 39o, docs/MOVIES.md) ────────
+
+	/// `GET files/positions?member=<id>` — this member's saved positions in
+	/// this area, sealed (`{ file: sealed }`), for the files that still live.
+	/// The member is the Worker's (the caller's own id).
+	pub(crate) async fn positions_get(&self, req: Request) -> Result<Response> {
+		let member = urlquery(req.url()?.query().unwrap_or("")).get("member").cloned().unwrap_or_default();
+		#[derive(serde::Deserialize)]
+		struct Row {
+			file_id: String,
+			position_sealed: String,
+			updated_at: String,
+		}
+		let rows: Vec<Row> = self
+			.sql
+			.exec("SELECT p.file_id AS file_id, p.position_sealed AS position_sealed, p.updated_at AS updated_at FROM watch_positions p JOIN files f ON f.id = p.file_id WHERE p.member = ?1 AND f.deleted_at IS NULL", Some(vec![member.into()]))?
+			.to_array()?;
+		Response::from_json(&serde_json::json!({ "positions": rows.into_iter().map(|r| serde_json::json!({ "file": r.file_id, "position": r.position_sealed, "updatedAt": r.updated_at })).collect::<Vec<_>>() }))
+	}
+
+	/// `PUT files-position/<file> { member, position }` — sealed text, small,
+	/// for a live file. A read-only grantee may save theirs (case_need):
+	/// where someone paused is theirs, not the file's.
+	pub(crate) async fn position_put(&self, file: &str, body: serde_json::Value) -> Result<Response> {
+		let member = body.get("member").and_then(|v| v.as_str()).unwrap_or_default();
+		let Some(position) = body.get("position").and_then(|v| v.as_str()) else { return json_error(400, "position required: sealed") };
+		if member.is_empty() {
+			return json_error(400, "the Worker names the member");
+		}
+		if !gorani_formats::placed::is_placed_text(position) || position.len() > 2048 {
+			return json_error(400, "a position arrives sealed (GV04), and small");
+		}
+		let live: Option<ExistsRow> = self.sql.exec("SELECT 1 AS one FROM files WHERE id = ?1 AND deleted_at IS NULL", Some(vec![file.into()]))?.to_array::<ExistsRow>().ok().and_then(|mut r| r.pop());
+		if live.is_none() {
+			return json_error(404, "no such file");
+		}
+		self.sql.exec(
+			"INSERT INTO watch_positions (file_id, member, position_sealed, updated_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			 ON CONFLICT (file_id, member) DO UPDATE SET position_sealed = excluded.position_sealed, updated_at = excluded.updated_at",
+			Some(vec![file.into(), member.into(), position.into()]),
+		)?;
+		Response::from_json(&serde_json::json!({ "ok": true }))
+	}
+
 	/// The contributors trail: one row per (file, member) — readable
 	/// structure, resolved to display names by the UI via the registry.
 	pub(crate) async fn contributor_add(&self, file_id: &str, actor_email: &str) -> Result<()> {
@@ -1283,6 +1424,8 @@ impl GoraniMemberDO {
 	/// | `file` | files | name |
 	/// | `folder` | file_folders | name |
 	/// | `music` | music_meta | tag blob |
+	/// | `video` | video_meta | the video sidecar, and its poster when there is one (39p) |
+	/// | `position` | watch_positions | where a member left off in a video (39o) |
 	/// | `share` | shares | the owner's copy of the name |
 	/// | `secrets` | files_secrets | fingerprint + index keys |
 	/// | `hash` | file_versions | the uploader's signed content hash (29d) |
@@ -1308,6 +1451,8 @@ impl GoraniMemberDO {
 			"file" => "SELECT rowid AS row, id AS a, NULL AS b, name_sealed AS v1, NULL AS v2 FROM files WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"folder" => "SELECT rowid AS row, id AS a, NULL AS b, name_sealed AS v1, NULL AS v2 FROM file_folders WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"music" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, blob_sealed AS v1, NULL AS v2 FROM music_meta WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"video" => "SELECT rowid AS row, file_id AS a, CAST(version AS TEXT) AS b, meta_sealed AS v1, poster_sealed AS v2 FROM video_meta WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+			"position" => "SELECT rowid AS row, file_id AS a, member AS b, position_sealed AS v1, NULL AS v2 FROM watch_positions WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"share" => "SELECT rowid AS row, id AS a, NULL AS b, name_sealed AS v1, NULL AS v2 FROM shares WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"secrets" => "SELECT rowid AS row, NULL AS a, NULL AS b, v AS v1, NULL AS v2 FROM files_secrets WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			// (Its own kind, not a third value of `version`: most versions
@@ -1319,7 +1464,7 @@ impl GoraniMemberDO {
 			"reject" => "SELECT rowid AS row, id AS a, NULL AS b, reject_reason AS v1, NULL AS v2 FROM inbox_items WHERE rowid > ?1 AND reject_reason IS NOT NULL ORDER BY rowid LIMIT ?2",
 			"inboxkey" => "SELECT rowid AS row, key_id AS a, NULL AS b, private_sealed AS v1, NULL AS v2 FROM area_inbox_keys WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
 			"requestlabel" => "SELECT rowid AS row, id AS a, NULL AS b, label_sealed AS v1, NULL AS v2 FROM upload_requests WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
-			_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
+			_ => return json_error(400, "kind: version | file | folder | music | video | position | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
 		};
 		// `&file=<id>` narrows `version` to one file's versions (commit 29e:
 		// marking a sample re-seals each of ITS versions' types — a walk of
@@ -1372,6 +1517,9 @@ impl GoraniMemberDO {
 				"file" => "UPDATE files SET name_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"folder" => "UPDATE file_folders SET name_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"music" => "UPDATE music_meta SET blob_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
+				// (A poster is resealed only where there is one: a reseal never adds a value.)
+				"video" => "UPDATE video_meta SET meta_sealed = ?1, poster_sealed = CASE WHEN poster_sealed IS NULL THEN NULL ELSE COALESCE(?2, poster_sealed) END WHERE rowid = ?3",
+				"position" => "UPDATE watch_positions SET position_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"share" => "UPDATE shares SET name_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"secrets" => "UPDATE files_secrets SET v = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				// (Only a row that HAS a hash: a reseal never adds a claim.)
@@ -1382,7 +1530,7 @@ impl GoraniMemberDO {
 				"reject" => "UPDATE inbox_items SET reject_reason = ?1 WHERE rowid = ?3 AND ?2 IS NULL AND reject_reason IS NOT NULL",
 				"inboxkey" => "UPDATE area_inbox_keys SET private_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
 				"requestlabel" => "UPDATE upload_requests SET label_sealed = ?1 WHERE rowid = ?3 AND ?2 IS NULL",
-				_ => return json_error(400, "kind: version | file | folder | music | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
+				_ => return json_error(400, "kind: version | file | folder | music | video | position | share | secrets | hash | intake | custody | collection | reject | inboxkey | requestlabel"),
 			};
 			plan.push((sql, row, v1, v2));
 		}

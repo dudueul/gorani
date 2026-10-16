@@ -34,6 +34,13 @@ export async function storeSealer(bundle, member) {
 		/** A version's content-hash record, sealed into its place (unsigned
 		 * here — tests/lib/team.mjs › signedHash makes the real, signed one). */
 		fileHash: (id, version, json) => sealPlacedText(priv, places.fileHash(member, id, version), typeof json === "string" ? json : JSON.stringify(json)),
+		/** A version's video sidecar (39p, video-meta.ts), sealed into its place. */
+		fileVideo: (id, version, json) => sealPlacedText(priv, places.fileVideo(member, id, version), typeof json === "string" ? json : JSON.stringify(json)),
+		openFileVideo: (id, version, sealed) => openPlacedText(priv, places.fileVideo(member, id, version), sealed),
+		/** Where `who` left off in a file (39o). */
+		filePosition: (id, who, json) => sealPlacedText(priv, places.filePosition(member, id, who), typeof json === "string" ? json : JSON.stringify(json)),
+		/** A version's poster frame (39o), sealed into its place. */
+		filePoster: (id, version, text) => sealPlacedText(priv, places.filePoster(member, id, version), text),
 		folderName: (id, text) => sealPlacedText(priv, places.folderName(member, id), text),
 		shareName: (id, text) => sealPlacedText(priv, places.shareName(member, id), text),
 		secrets: (text) => sealPlacedText(priv, places.storeSecrets(member), text),

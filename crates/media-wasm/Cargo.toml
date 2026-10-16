@@ -1,0 +1,25 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+
+# The browser's door into crates/media (commit 39p): a cdylib for
+# wasm32-unknown-unknown with a plain C ABI — no wasm-bindgen, no generated
+# glue; web/src/lib/media-engine.ts loads it with zero imports. Also an rlib,
+# so `cargo test` runs the same entry points natively.
+#
+#   cargo build -p gorani-media-wasm --target wasm32-unknown-unknown --release
+#   (npm run build:web does this — scripts/build-media-wasm.mjs)
+
+[package]
+name = "gorani-media-wasm"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gorani-media = { path = "../media" }
+serde_json = "1"
+
+[dev-dependencies]
+gorani-media = { path = "../media", features = ["fixtures"] }

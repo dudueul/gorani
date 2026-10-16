@@ -202,18 +202,32 @@ Found at the first production upload: the browser said "internal error"
 and the Worker's log said `S3 put files/…: HTTP 403` and nothing else.
 Since 39s, the log, the member and a lead each see more:
 
-- **Team › People › Check storage** (leads only). The Worker writes a
+- **Team › Status › Test connection** (any member since 39u; it was
+  Team › People › Check storage, leads only, in 39s). The Worker writes a
   16-byte probe object under `probe/`, then reads its size, reads it back
   and deletes it. Each step shows the status, the `Server` that answered,
-  and S3's own error code with what it usually means. Below that are the
-  five settings as the Worker holds them: endpoint, region, bucket, the
-  access key id's last four characters, and the secret's **length** (never
-  its value). A value stored with spaces or a line end around it is
-  flagged. `config()` trims such values now, but set the secret again
-  cleanly anyway. Two mistakes are named before any request is sent: a
-  region in the endpoint's host that is not `S3_REGION`, and an endpoint
-  whose host starts with the bucket's name (gorani addresses buckets by
-  path).
+  how long it took, and S3's own error code with what it usually means.
+  The button is rate limited per member, since each press writes and
+  deletes an object.
+
+  A **lead** also sees the five settings as the Worker holds them:
+  endpoint, region, bucket, the access key id's last four characters, and
+  the secret's **length** (never its value). A value stored with spaces or
+  a line end around it is flagged. `config()` trims such values now, but
+  set the secret again cleanly anyway. Two mistakes are named before any
+  request is sent: a region in the endpoint's host that is not
+  `S3_REGION`, and an endpoint whose host starts with the bucket's name
+  (gorani addresses buckets by path). Everyone else sees the steps and
+  their reasons, not the settings.
+- **The rest of Team › Status** (39u) needs no button. For any member, an
+  external included, `GET /api/v1/status` reports four things, each timed
+  by the Worker; the page adds its own round trip:
+  - the app answered, and which version;
+  - the team registry's database answered;
+  - the member's own files database answered (externals have none);
+  - whether storage and a timestamp authority are configured.
+
+  It writes nothing, so it runs whenever the tab opens.
 - **The member** whose upload was refused gets a 502 with the status and
   the code: "the storage refused this (HTTP 403 AccessDenied)". The object
   key and the endpoint stay in the log. The public share pages still say

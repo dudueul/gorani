@@ -96,7 +96,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 					// and where a lead finds the rest. Only to signed-in callers:
 					// /api/v1 is behind Access, the public share pages are not.
 					match crate::s3::public_reason(&message).filter(|_| req_is_api) {
-						Some(reason) => harden(Response::from_json(&serde_json::json!({ "error": format!("the storage refused this ({reason}) — a lead can run Team › People › Check storage") }))?.with_status(502)),
+						Some(reason) => harden(Response::from_json(&serde_json::json!({ "error": format!("the storage refused this ({reason}) — anyone can run Team › Status › Test connection") }))?.with_status(502)),
 						None => harden(Response::from_json(&serde_json::json!({ "error": "internal error" }))?.with_status(500)),
 					}
 				}

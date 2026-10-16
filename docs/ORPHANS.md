@@ -47,8 +47,8 @@ object was deleted behind the Worker's back, or lost by the storage.
    has NONE of them is not this deployment's bucket — a wrong `S3_BUCKET` or
    endpoint would make every file look lost, and trashing them all is the
    one answer that turns a configuration mistake into data loss. So
-   nothing is changed, and the reader is pointed at Team › People › Check
-   storage. An area with no other file cannot tell the two apart either,
+   nothing is changed, and the reader is pointed at Team › Status › Test
+   connection. An area with no other file cannot tell the two apart either,
    and nothing is changed there.
 3. Only then does the store act (`files_store.rs › file_lost`):
    - a **working** file whose living version is gone goes to the **Trash** —

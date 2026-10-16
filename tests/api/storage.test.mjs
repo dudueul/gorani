@@ -1,7 +1,8 @@
 // Copyright 2026- Seongwoo Hong. All rights reserved.
 
 /**
- * api:storage — a storage refusal says why (commit 39s).
+ * api:storage — a storage refusal says why (commit 39s), and every member
+ * can ask whether the system works (Team › Status, commit 39u).
  *
  * Found in production: the first upload to gorani.at.day failed with
  * "internal error", and the Worker's log said "S3 put …: HTTP 403" and
@@ -13,15 +14,19 @@
  * body's <Code>; the Worker threw it away. Its own server, so the stub's
  * faults and the settings below are this suite's alone:
  *
- *   1. a lead's Check storage: write, size, read and delete of a probe
- *      object, all passing — and the settings shown without the secret
- *      (its length only) and with only the access key id's last four;
+ *   1. a lead's storage check: write, size, read and delete of a probe
+ *      object, all passing and timed — and the settings shown without the
+ *      secret (its length only) and with only the access key id's last four;
  *   2. the same check against a refusing storage: the step that failed,
  *      S3's code, the hint — for SignatureDoesNotMatch, AccessDenied, and a
  *      code-less 403 from Cloudflare (named as not S3's answer at all);
  *   3. an upload the storage refuses: the member hears 502 with the code,
  *      never the object key;
- *   4. only a lead may run the check.
+ *   4. Team › Status (39u): any member — an analyst, an external — reads
+ *      the cheap checks (the registry, their own files database, whether
+ *      storage and a TSA are configured) and runs Test connection; they get
+ *      the steps and the reasons, and only a lead gets the settings. The
+ *      lead-only route stays lead-only.
  */
 
 import assert from "node:assert/strict";
@@ -49,6 +54,7 @@ try {
 	assert.equal(ok.json.backend, "s3");
 	assert.equal(ok.json.ok, true, ok.text);
 	assert.deepEqual(ok.json.steps.map((s) => [s.step, s.ok]), [["write", true], ["size", true], ["read", true], ["delete", true]]);
+	assert.ok(ok.json.steps.every((s) => Number.isInteger(s.ms) && s.ms >= 0), "each step is timed");
 	assert.ok(!ok.text.includes(SECRET), "the secret is never in the answer");
 	assert.ok(!ok.text.includes(KEY_ID), "nor the whole access key id");
 	const shown = Object.fromEntries(ok.json.settings.map((v) => [v.name, v]));
@@ -88,14 +94,44 @@ try {
 	const r = await fetch(`${dev.base}/api/v1/members/bo/files`, { method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}`, "x-gorani-dev-email": bo.email }, body: new Uint8Array([...head, ...sealed, ...enc.encode(`\r\n--${boundary}--\r\n`)]) });
 	const body = await r.text();
 	assert.equal(r.status, 502, body);
-	assert.match(JSON.parse(body).error, /the storage refused this \(HTTP 403 AccessDenied\) — a lead can run Team › People › Check storage/);
+	assert.match(JSON.parse(body).error, /the storage refused this \(HTTP 403 AccessDenied\) — anyone can run Team › Status › Test connection/);
 	assert.ok(!body.includes("files/bo/"), `the object key stays in the operator's log: ${body}`);
 
-	// ── 4. Only a lead ────────────────────────────────────────────────
+	// ── 4. Team › Status, for everyone ────────────────────────────────
 	const not = await check(bo);
-	assert.equal(not.status, 403);
+	assert.equal(not.status, 403, "the settings route stays a lead's");
+	assert.match(not.json.error, /Team › Status › Test connection/, "…and points at the one that is not");
+	const eve = await member(dev, "eve", "external", { by: ana, extra: { expiresAt: new Date(Date.now() + 86_400_000).toISOString() } });
+	for (const [who, files] of [[ana, true], [bo, true], [eve, false]]) {
+		const st = await api(dev.base, "GET", "/api/v1/status", { email: who.email });
+		assert.equal(st.status, 200, st.text);
+		assert.equal(st.json.app.ok, true);
+		assert.equal(st.json.registry.ok, true);
+		assert.ok(Number.isInteger(st.json.registry.ms));
+		if (files) assert.equal(st.json.files?.ok, true, `${who.id}: their files database answers`);
+		else assert.equal(st.json.files, null, "an external has no own area");
+		assert.deepEqual(st.json.storage, { backend: "s3", configured: true });
+		assert.equal(st.json.timestamps.configured, false);
+		assert.equal(st.json.lead, who === ana);
+		assert.ok(!st.text.includes(SECRET) && !st.text.includes(KEY_ID), "no credential in the status");
+	}
+	const test = async (who) => api(dev.base, "POST", "/api/v1/status/storage", { email: who.email });
+	const byBo = await test(bo);
+	assert.equal(byBo.status, 200, byBo.text);
+	assert.equal(byBo.json.ok, true);
+	assert.deepEqual(byBo.json.steps.map((s) => s.step), ["write", "size", "read", "delete"]);
+	assert.equal(byBo.json.settings, undefined, "an analyst sees the steps, not the settings");
+	assert.equal(byBo.json.warnings, undefined);
+	assert.ok(!byBo.text.includes(KEY_ID.slice(-4)) && !byBo.text.includes(`${SECRET.length} characters`), "not even their shape");
+	await refuse("probe/", 403, "AccessDenied");
+	const refused = await test(eve);
+	assert.equal(refused.json.ok, false);
+	assert.match(refused.json.steps[0].reason, /AccessDenied/, "an external hears why too");
+	const byLead = await test(ana);
+	assert.ok(Array.isArray(byLead.json.settings), "a lead's Test connection shows the settings");
+	assert.equal((await api(dev.base, "GET", "/api/v1/status", { email: "stranger@else.test" })).status, 403, "not for strangers");
 
-	console.log("ok  api:storage — Check storage: write/size/read/delete pass with no secret shown (its length, the key id's last four); SignatureDoesNotMatch, AccessDenied and Cloudflare's code-less 403 each explained at the step that failed; a refused upload tells the member the code, not the key; leads only");
+	console.log("ok  api:storage — the storage check: write/size/read/delete pass, timed, with no secret shown (its length, the key id's last four); SignatureDoesNotMatch, AccessDenied and Cloudflare's code-less 403 each explained at the step that failed; a refused upload tells the member the code, not the key; Team › Status for every member (registry, own files, storage, TSA), Test connection for all with the settings for leads only");
 } finally {
 	await dev.close();
 }

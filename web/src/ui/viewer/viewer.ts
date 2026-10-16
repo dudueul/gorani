@@ -30,7 +30,8 @@ import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
 import { forgetMedia } from "../../lib/media-worker.ts";
 import { SAMPLE_PASSWORD } from "../../vault/samples.ts";
-import { isMp4 } from "../files/model.ts";
+import { isMp4, readyCopy, type DrmState } from "../files/model.ts";
+import { fairPlaySupported, playProtected, type FairPlayRoutes } from "./fairplay.ts";
 import { MsePlayer, canPlayWithMse } from "./mse-player.ts";
 import { mseType } from "../../vault/video-meta.ts";
 import type { MediaIndex } from "../../lib/media-engine.ts";
@@ -71,6 +72,15 @@ export class GoraniViewer extends LitElement {
 	@state() private resumeAt: number | null = null;
 	private lastSaved = 0;
 	private wired: HTMLVideoElement | null = null;
+	/** Protection (commit 40c, docs/DRM.md): the file's state, as this
+	 * member sees it. */
+	@state() private drm: DrmState | null = null;
+	/** A protected copy playing through FairPlay — or, where it cannot, why. */
+	@state() private protectedPlay: FairPlayRoutes | null = null;
+	@state() private protectedNote: string | null = null;
+	/** A lead packaging the copy: how far. */
+	@state() private protecting: { done: number; total: number } | null = null;
+	private stopProtected: (() => void) | null = null;
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -79,8 +89,16 @@ export class GoraniViewer extends LitElement {
 	protected override async firstUpdated(): Promise<void> {
 		// Focus the overlay so its "Close (esc)" works at once — the key
 		// handler sits on this element, which nothing focused before.
-		this.querySelector<HTMLElement>("[data-viewer-root]")?.focus();
+		this.refocus();
 		await this.load();
+	}
+
+	/** Give the overlay the focus back. Protect and Remove protection swap
+	 * the button that held it for a badge (or back), and a focus whose
+	 * element is gone falls to the page's body — out of reach of the
+	 * overlay's Escape handler. */
+	private refocus(): void {
+		this.querySelector<HTMLElement>("[data-viewer-root]")?.focus();
 	}
 
 	override disconnectedCallback(): void {
@@ -97,6 +115,8 @@ export class GoraniViewer extends LitElement {
 		this.wired = null;
 		this.player?.destroy();
 		this.player = null;
+		this.stopProtected?.();
+		this.stopProtected = null;
 		this.mse?.source.clear();
 		this.mse = null;
 		if (!this.url) return;
@@ -130,6 +150,9 @@ export class GoraniViewer extends LitElement {
 					this.truncated = head.bytes.length >= TEXT_CAP && (info?.size ?? 0) > TEXT_CAP;
 					this.text = new TextDecoder().decode(head.bytes.subarray(0, TEXT_CAP));
 				}
+			} else if (this.mode === "video" && (await this.startProtected(id))) {
+				// A protected video this member gets only as its copy (40c):
+				// FairPlay plays it, or the viewer says where it plays.
 			} else if (this.mode === "video" && isMp4(this.target.name, mime) && (await this.startMse(id))) {
 				// Played in the page (39p, mse-player.ts): updated() attaches it.
 			} else if ((this.mode === "video" || this.mode === "audio") && (info?.size ?? 0) > 8 * 1024 * 1024) {
@@ -192,8 +215,85 @@ export class GoraniViewer extends LitElement {
 		}
 	}
 
+	/**
+	 * A protected video (40c): its state first — for everyone, so a lead's
+	 * header can offer Protect. A member who does not get the original plays
+	 * the copy through FairPlay where this browser has it, and is told where
+	 * it plays where it does not (or that the copy is still being made).
+	 * Answers true when the viewer is handled here.
+	 */
+	private async startProtected(id: string): Promise<boolean> {
+		this.drm = await this.model.drmState(id);
+		const d = this.drm;
+		if (!d?.protected || d.original) return false;
+		const copy = readyCopy(d);
+		if (!copy) {
+			this.protectedNote = "This video is protected, and its protected copy is still being made — a lead's browser makes it. Try again later.";
+		} else if (!d.playable) {
+			this.protectedNote = "This video is protected, and this deployment cannot play protected copies yet (FairPlay is not set up — it waits on Apple).";
+		} else if (!(await fairPlaySupported())) {
+			this.protectedNote = "This video is protected. It plays in Safari on a Mac, iPhone or iPad — not in this browser.";
+		} else {
+			this.protectedPlay = this.model.drmRoutes(id, copy.version);
+		}
+		return true;
+	}
+
+	/** A lead's Protect (40c): confirm, then package — with its progress. */
+	private async protect(): Promise<void> {
+		const ok = confirm(
+			"Protect this video?\n\n" +
+				"Everyone but leads will then get only a protected copy that plays in Safari (FairPlay) and cannot be saved. " +
+				"The copy's key is held by the server — it is not end-to-end encrypted, unlike the original. " +
+				"The copy takes about as much space as the video. Copies already downloaded or shared are not taken back.",
+		);
+		if (!ok) return;
+		this.protecting = { done: 0, total: 1 };
+		try {
+			await this.model.protectVideo(this.target.id, (done, total) => (this.protecting = { done, total }));
+			this.drm = await this.model.drmState(this.target.id);
+			this.model.notify("Protected: everyone but leads now gets the protected copy.");
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.protecting = null;
+			await this.updateComplete;
+			this.refocus();
+		}
+	}
+
+	private async unprotect(): Promise<void> {
+		if (!confirm("Remove protection? The protected copies and their keys are deleted, and everyone who may read this video gets the original again.")) return;
+		try {
+			await this.model.unprotectVideo(this.target.id);
+			this.drm = await this.model.drmState(this.target.id);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+		await this.updateComplete;
+		this.refocus();
+	}
+
+	/** The header's protection controls: a lead's Protect / Remove, and the
+	 * badge that says what others get. */
+	private protectionControls(): TemplateResult | typeof nothing {
+		const d = this.drm;
+		if (!d || this.mode !== "video") return nothing;
+		if (this.protecting) return html`<span class="text-xs text-amber-300" data-test="viewer-protecting">Protecting… ${this.protecting.done}/${this.protecting.total}</span>`;
+		if (d.protected) {
+			const stale = !readyCopy(d);
+			return html`
+				<span class="rounded-full border border-amber-600/60 px-2 py-0.5 text-[11px] text-amber-300" data-test="viewer-protected-badge" title="Others get the protected copy only">🔒 Protected${stale && d.original ? " — copy not made for this version" : ""}</span>
+				${d.canProtect && stale ? html`<button class="rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" data-test="viewer-protect" @click=${() => void this.protect()}>Make protected copy</button>` : nothing}
+				${d.canProtect ? html`<button class="rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" data-test="viewer-unprotect" @click=${() => void this.unprotect()}>Remove protection</button>` : nothing}
+			`;
+		}
+		return d.canProtect && isMp4(this.target.name, null) ? html`<button class="rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" data-test="viewer-protect" title="Others get a protected copy that plays in Safari and cannot be saved" @click=${() => void this.protect()}>🔒 Protect…</button>` : nothing;
+	}
+
 	protected override updated(): void {
 		this.wireVideo();
+		this.attachProtected();
 		if (!this.mse || this.player) return;
 		const video = this.querySelector<HTMLVideoElement>("video[data-engine=mse]");
 		if (!video) return;
@@ -202,6 +302,20 @@ export class GoraniViewer extends LitElement {
 			// The engine or the decoder refused a piece: play it the older way.
 			onFail: () => void this.fallBack(),
 		});
+	}
+
+	/** Once the protected copy's `<video>` is on screen: FairPlay. */
+	private attachProtected(): void {
+		if (!this.protectedPlay || this.stopProtected) return;
+		const video = this.querySelector<HTMLVideoElement>("video[data-engine=fairplay]");
+		if (!video) return;
+		this.stopProtected = () => {};
+		void playProtected(video, this.protectedPlay, (message) => (this.error = message))
+			.then((stop) => (this.stopProtected = stop))
+			.catch((e: unknown) => {
+				this.stopProtected = null;
+				this.error = e instanceof Error ? e.message : String(e);
+			});
 	}
 
 	private async fallBack(): Promise<void> {
@@ -304,8 +418,9 @@ export class GoraniViewer extends LitElement {
 				<header class="flex items-center gap-3 border-b border-neutral-800 bg-neutral-900/95 px-4 py-2.5 text-sm">
 					${icon(t.kind, "h-5 w-5 text-neutral-400")}
 					<span class="min-w-0 flex-1 truncate text-neutral-100">${t.name}</span>
-					<span class="shrink-0 text-xs text-neutral-500">${fmtSize(t.size)} · v${t.version ?? 1} · decrypted here, sealed everywhere else</span>
-					<button class="rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.model.download(t.id, t.name)}>Download</button>
+					<span class="shrink-0 text-xs text-neutral-500">${fmtSize(t.size)} · v${t.version ?? 1} · ${this.drm?.protected && !this.drm.original ? "a protected copy, decrypted only inside Safari's DRM" : "decrypted here, sealed everywhere else"}</span>
+					${this.protectionControls()}
+					${this.drm?.protected && !this.drm.original ? nothing : html`<button class="rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.model.download(t.id, t.name)}>Download</button>`}
 					<button class="rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" @click=${() => this.close()}>Close (esc)</button>
 				</header>
 				<main class="flex min-h-0 flex-1 items-center justify-center overflow-auto p-6">${this.content()}</main>
@@ -324,6 +439,8 @@ export class GoraniViewer extends LitElement {
 				const resume = this.resumeAt !== null
 					? html`<p class="mt-2 flex items-center justify-center gap-2 text-xs text-neutral-400" data-test="viewer-resumed">Resumed at ${fmtClock(this.resumeAt)} <button class="rounded border border-neutral-700 px-2 py-0.5 hover:border-accent" @click=${() => this.startOver()}>Start over</button></p>`
 					: nothing;
+				if (this.protectedNote) return this.protectedNotice();
+				if (this.protectedPlay) return html`<div class="flex max-h-full max-w-full flex-col items-center"><video class="max-h-[calc(100%-2rem)] max-w-full rounded-lg shadow-2xl" data-engine="fairplay" controls playsinline></video><p class="mt-2 text-xs text-neutral-500">Protected copy · an external display needs HDCP</p></div>`;
 				if (this.mse) return html`<div class="flex max-h-full max-w-full flex-col items-center"><video class="max-h-[calc(100%-2rem)] max-w-full rounded-lg shadow-2xl" data-engine="mse" controls playsinline>${tracks}</video>${resume}</div>`;
 				return this.url
 					? html`<div class="flex max-h-full max-w-full flex-col items-center"><video class="max-h-[calc(100%-2rem)] max-w-full rounded-lg shadow-2xl" src=${this.url} controls ${this.streamed ? nothing : html`autoplay`}>${tracks}</video>${resume}</div>`
@@ -349,6 +466,18 @@ export class GoraniViewer extends LitElement {
 			default:
 				return this.unknown();
 		}
+	}
+
+	/** A protected video this browser cannot play, or whose copy is not
+	 * ready (40c) — said plainly, with no way around it. */
+	private protectedNotice(): TemplateResult {
+		return html`
+			<div class="max-w-md rounded-2xl border border-amber-700/60 bg-neutral-900 p-8 text-center" data-test="viewer-protected">
+				<p class="text-4xl">🔒</p>
+				<p class="mt-3 text-sm text-neutral-200">${this.protectedNote}</p>
+				<p class="mt-2 text-xs text-neutral-500">Protected videos play as a copy that cannot be saved; only a lead downloads the original.</p>
+			</div>
+		`;
 	}
 
 	/** A sample is never rendered here (commit 29e). Download zips it. */

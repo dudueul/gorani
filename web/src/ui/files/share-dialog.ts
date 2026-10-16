@@ -17,16 +17,23 @@
  * downloads here (the server allows 100). The server refuses a link
  * without the password's parameters or past a week — this dialog only
  * never asks it to. A partner who needs more gets a guest account.
+ *
+ * A protected video (commit 40c, docs/DRM.md) can also be shared VIEW-ONLY:
+ * no copy is sealed for the link at all — the recipient's page plays the
+ * protected copy in Safari, through FairPlay, and has nothing to save. The
+ * same secret and password guard it: the page derives a claim proof from
+ * both, and the server, holding only the proof's hash, starts a viewing
+ * session for nothing less.
  */
 
 import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta } from "../../vault/share-crypto.ts";
+import { newShareId, newShareSecret, newShareKdf, shareKeys, sealShareMeta, claimHashOf } from "../../vault/share-crypto.ts";
 import { sealChunked, DEFAULT_CHUNK } from "../../vault/chunked-file.ts";
 import { devIdentityHeaders } from "../../lib/api.ts";
 import { areaPath } from "../../lib/area.ts";
 import { sealText } from "../../vault/vault-crypto.ts";
-import type { FilesModel } from "./model.ts";
+import { readyCopy, type FilesModel } from "./model.ts";
 
 export interface ShareTarget {
 	id: string;
@@ -59,6 +66,11 @@ export class GoraniShare extends LitElement {
 	@state() private busy = false;
 	@state() private error: string | null = null;
 	@state() private link: string | null = null;
+	/** A protected video with a ready copy (40c): the link may be view-only —
+	 * and is, unless the owner chooses to hand out the original. */
+	@state() private canViewOnly = false;
+	@state() private viewOnly = false;
+	private copyVersion: number | null = null;
 
 	protected override createRenderRoot(): HTMLElement {
 		return this;
@@ -71,6 +83,14 @@ export class GoraniShare extends LitElement {
 	override connectedCallback(): void {
 		super.connectedCallback();
 		document.addEventListener("keydown", this.onKey);
+		void this.model.drmState(this.target.id).then((d) => {
+			const copy = readyCopy(d);
+			if (d?.protected && copy) {
+				this.canViewOnly = true;
+				this.viewOnly = true;
+				this.copyVersion = copy.version;
+			}
+		});
 	}
 	override disconnectedCallback(): void {
 		document.removeEventListener("keydown", this.onKey);
@@ -95,6 +115,13 @@ export class GoraniShare extends LitElement {
 				e.preventDefault();
 				void this.create();
 			}}>
+				${this.canViewOnly
+					? html`<fieldset class="mb-3 rounded-xl border border-amber-700/50 p-3 text-xs" data-test="share-kind">
+							<legend class="px-1 text-amber-300">🔒 This video is protected</legend>
+							<label class="flex gap-2"><input type="radio" name="kind" .checked=${this.viewOnly} @change=${() => (this.viewOnly = true)} data-test="share-view-only" /><span><b class="text-neutral-200">View-only</b> — plays in Safari as the protected copy; nothing to save</span></label>
+							<label class="mt-1.5 flex gap-2"><input type="radio" name="kind" .checked=${!this.viewOnly} @change=${() => (this.viewOnly = false)} /><span><b class="text-neutral-200">Download</b> — the original, sealed for the link: whoever opens it can keep it</span></label>
+						</fieldset>`
+					: nothing}
 				<label class="block text-neutral-400">
 					Expires after
 					<select class="mt-1 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 outline-none focus:border-[var(--color-accent)]" .value=${String(this.expiry)} @change=${(e: Event) => (this.expiry = Number((e.target as HTMLSelectElement).value))}>
@@ -104,7 +131,7 @@ export class GoraniShare extends LitElement {
 					</select>
 				</label>
 				<label class="mt-3 block text-neutral-400">
-					Downloads allowed
+					${this.viewOnly ? "Viewings allowed" : "Downloads allowed"}
 					<select class="mt-1 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 outline-none focus:border-[var(--color-accent)]" .value=${String(this.downloads)} @change=${(e: Event) => (this.downloads = Number((e.target as HTMLSelectElement).value))}>
 						<option value="1">1</option>
 						<option value="5">5</option>
@@ -154,6 +181,26 @@ export class GoraniShare extends LitElement {
 			if (this.password.length < 8) throw new Error("a link's password is at least 8 characters");
 			const kdf = newShareKdf();
 			const keys = await shareKeys(id, secret, this.password, kdf);
+			const expiresAt = new Date(Date.now() + this.expiry * 86_400_000).toISOString();
+			if (this.viewOnly && this.copyVersion !== null) {
+				// View-only (40c): no copy for the link — only its sealed name,
+				// and the hash of the claim proof its page will derive.
+				const metaSealed = await sealShareMeta(keys.meta, id, { name: this.target.name, type: null, size: this.target.size, modified: null });
+				await this.model.api.apiSend("POST", `${areaPath(this.model.memberId)}/files/shares`, {
+					id,
+					fileId: this.target.id,
+					version: this.copyVersion,
+					nameSealed: await this.model.sealShareName(id, this.target.name),
+					metaSealed,
+					expiresAt,
+					downloadsLeft: this.downloads,
+					kdf,
+					drm: true,
+					claimHash: await claimHashOf(keys.claim),
+				});
+				this.link = `${location.origin}/s/f/${id}#${secret}`;
+				return;
+			}
 			// The copy: the plaintext opened in this tab, re-sealed under a
 			// fresh content key… no — under the LINK's data key (GS01): a copy
 			// that exists for this link alone, openable without the vault.
@@ -164,7 +211,6 @@ export class GoraniShare extends LitElement {
 			const metaSealed = await sealShareMeta(keys.meta, id, { name: this.target.name, type: null, size: plain.length, modified: null });
 			// The owner's list keeps the link's name sealed into the share's place.
 			const nameSealed = await this.model.sealShareName(id, this.target.name);
-			const expiresAt = new Date(Date.now() + this.expiry * 86_400_000).toISOString();
 
 			const start = await this.model.api.apiSend<{ parts: number }>("POST", `${areaPath(this.model.memberId)}/files/shares`, {
 				id,

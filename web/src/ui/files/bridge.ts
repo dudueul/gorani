@@ -119,6 +119,14 @@ export function sessionBridge(session: VaultSession, hooks: FilesHooks, openKey:
 		multipartStart: (memberId, plan) => fetchJson<{ uploadId: string; key: string; parts: number }>("POST", `${areaPath(memberId)}/files/uploads`, plan),
 		// One part; what the network lost is sent again, a refusal is not.
 		multipartPart: (memberId, uploadId, key, n, frame) => sendPart(`${areaPath(memberId)}/files/uploads/${uploadId}/${n}?key=${encodeURIComponent(key)}`, frame, n),
+		// Protected copies (40c): a copy's part goes up like an upload part;
+		// a license is bytes in (the SPC) and bytes out (the CKC).
+		putPart: (path, bytes, n) => sendPart(path, bytes, n),
+		async postBytes(path, bytes) {
+			const res = await fetch(path, { method: "POST", headers: { ...devIdentityHeaders(), "content-type": "application/octet-stream" }, body: bytes as unknown as BodyInit });
+			if (!res.ok) await throwIfError(res);
+			return new Uint8Array(await res.arrayBuffer());
+		},
 		async multipartComplete(memberId, uploadId, fields) {
 			const form = formBody(fields, null);
 			const res = await fetch(`${areaPath(memberId)}/files/uploads/${uploadId}/complete`, {

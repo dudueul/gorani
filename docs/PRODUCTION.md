@@ -620,6 +620,53 @@ button, not a pipeline. The scanner that looks at the BYTES is local:
 `gorani-sync accept --scan "clamscan --no-summary"` on the accepting
 member's machine (docs/REQUESTS.md › Scanning).
 
+### Protected videos: FairPlay (commit 40, docs/DRM.md)
+
+Protected copies need two kinds of secret. Without either, nothing else
+changes: Protect is not offered, and Team › Status says which is missing.
+
+**1. The custody key**, `DRM_KEY_SECRET`. Every protected copy's content
+key is sealed under it:
+
+```sh
+openssl rand -hex 32 | npx wrangler secret put DRM_KEY_SECRET
+```
+
+- **Keep a copy offline**, as you would a backup key. If it is lost,
+  every protected copy is unplayable; a lead fixes that by protecting each
+  video again, from the original.
+- **Replacing it** has the same effect. There is no automatic re-seal yet.
+- **Nobody needs to see it.** It never reaches a browser, the database or
+  the logs.
+
+With this secret set, leads can protect videos even before Apple answers:
+the copies are made and wait to be played.
+
+**2. FairPlay**, from Apple's FPS Deployment Package. Your Apple
+Developer account's Account Holder requests it at
+developer.apple.com/streaming/fps, and Apple reviews each request. It
+holds three things, each set as a secret:
+
+```sh
+# the FPS certificate (the .cer Apple issues: DER) — base64, one line
+base64 -w0 fairplay.cer | npx wrangler secret put FAIRPLAY_CERT
+# the RSA private key you made the certificate request with (PEM, unencrypted)
+npx wrangler secret put FAIRPLAY_PRIVATE_KEY < fairplay-private-key.pem
+# the Application Secret Key: 32 hex characters
+npx wrangler secret put FAIRPLAY_ASK
+```
+
+- **The certificate** is public: Safari seals each license request to it.
+  The Worker serves it at `GET /api/v1/drm/fairplay/certificate`.
+- **The private key and the ASK** are the deployment's most sensitive
+  secrets after the custody key. They are kept nowhere but here.
+- **Check.** Team › Status › Protected videos then reads "copies can be
+  made and play in Safari". The first real play, on a Mac, iPhone or iPad,
+  is the end-to-end test no CI can run.
+- **No new Access rule.** View-only links ride the `/s/*` Access bypass
+  that share links already use (§ 2). Their playlist, media and license
+  routes live under it.
+
 ### The desktop installers (commit 39f, docs/DESKTOP.md › 39f)
 
 `.github/workflows/package.yml` builds the installers and publishes them

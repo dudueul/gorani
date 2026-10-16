@@ -56,7 +56,10 @@ if (!chromium) {
 	process.exit(0);
 }
 
-const dev = await startDev();
+// DRM_KEY_SECRET (commit 40c): the protected-video block packages a copy
+// in the browser. No FairPlay credentials: Chromium has no FairPlay, and
+// api:drm plays the license with a player of its own.
+const dev = await startDev({ vars: { DRM_KEY_SECRET: (await import("node:crypto")).randomBytes(32).toString("hex") } });
 try {
 	const browser = await chromium.launch({ headless: true });
 
@@ -1196,6 +1199,36 @@ try {
 		await page.locator("text=all 2 versions re-hashed and verified").first().waitFor({ timeout: 60_000 });
 		const rv = await api(dev.base, "GET", "/api/v1/cases/ir-e2e/reverify", { email: "mom@family.test" });
 		assert.deepEqual([rv.json.overdue, rv.json.last?.checked, rv.json.last?.failed], [false, 2, 0], "the store recorded it");
+		// Protected videos (40c, docs/DRM.md): mom, a lead, protects a video
+		// of the case from the viewer — HER browser packages the FairPlay
+		// copy from the plaintext it decrypts (the engine's cbcs packager,
+		// in WebAssembly) and uploads it in parts — and keeps the original;
+		// everyone else on the case would get the copy only (api:drm).
+		{
+			const { videoFixture } = await import("../lib/video-fixtures.mjs");
+			const { readFileSync } = await import("node:fs");
+			await teamButton.click(); // back to the case's files
+			await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "briefing.mp4", mimeType: "video/mp4", buffer: readFileSync(videoFixture("h264-high.mp4")) });
+			await fillIntake("body camera, unit 7", "copied from the camera's card");
+			const briefing = page.locator('[data-body] [data-item^="file:"]', { hasText: "briefing.mp4" }).first();
+			await briefing.waitFor({ timeout: 60_000 });
+			await page.waitForFunction(() => !document.querySelector('[data-test="upload-progress"]'), null, { timeout: 60_000 });
+			const briefingId = (await briefing.getAttribute("data-item")).slice("file:".length);
+			await briefing.dblclick();
+			page.once("dialog", (d) => void d.accept()); // Protect's plain confirmation
+			await page.locator('gorani-viewer [data-test="viewer-protect"]').click();
+			await page.locator('gorani-viewer [data-test="viewer-protected-badge"]').waitFor({ timeout: 120_000 });
+			const drm = (await api(dev.base, "GET", `/api/v1/cases/ir-e2e/files/${briefingId}/drm`, { email: "mom@family.test" })).json;
+			assert.equal(drm.copies?.[0]?.state, "ready", `the browser packaged and uploaded the copy (${JSON.stringify(drm)})`);
+			assert.ok(drm.copies[0].segments > 0, "with its layout");
+			assert.equal(drm.original, true, "the lead still gets the original");
+			// Esc still closes the viewer: the badge took the Protect button's
+			// place, and the focus that button held went back to the overlay.
+			await page.keyboard.press("Escape");
+			await page.locator("gorani-viewer [data-viewer-root]").waitFor({ state: "detached", timeout: 10_000 });
+			await teamButton.click();
+			await page.getByRole("button", { name: "Cases" }).click();
+		}
 		// The case's inbox key (commit 37b): mom, its manager, makes it here —
 		// signed by her browser, the private half sealed under the case key.
 		await page.locator('[data-test="inbox-ir-e2e"]').filter({ hasText: "no key" }).waitFor({ timeout: 30_000 });
@@ -1261,6 +1294,73 @@ try {
 		assert.equal(rejectedRow.status, "rejected");
 		assert.match(rejectedRow.rejected.reason, /^GV04:/, "the reason went sealed");
 		await assertNoViolations(page, "team panel, case open, upload and preview");
+		await ctx.close();
+	}
+
+	// ── 5b. A view-only link's page (40c, docs/DRM.md) ────────────────
+	// A second lead's video, protected the way api:drm protects one (this
+	// process plays the lead's browser), shared VIEW-ONLY: no copy is sealed
+	// for the link. Its page, opened signed out, unlocks with the password —
+	// which also derives the claim proof — and in Chromium, which has no
+	// FairPlay, says where it plays instead of playing anything.
+	{
+		const { videoFixture, mediaWasm } = await import("../lib/video-fixtures.mjs");
+		const { readFileSync } = await import("node:fs");
+		const { mediaEngine } = await import("../../web/src/lib/media-engine.ts");
+		const { indexVideo } = await import("../../web/src/lib/video-index.ts");
+		const { claimHashOf } = await import("../../web/src/vault/share-crypto.ts");
+		const lena = await member(dev, "lena", "lead", { by: { email: "mom@family.test" } });
+		const clip = new Uint8Array(readFileSync(videoFixture("h264-high.mp4")));
+		const ck = newContentKey();
+		const f = await lena.sealer.newFile("briefing.mp4", "video/mp4", ck);
+		const boundary = `drm${Date.now()}`;
+		const head = new TextEncoder().encode(Object.entries({ ...f.fields, size: String(clip.length) }).map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`).join("") + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s"\r\n\r\n`);
+		const up = await fetch(`${dev.base}/api/v1/members/lena/files`, { method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}`, "x-gorani-dev-email": lena.email }, body: new Uint8Array([...head, ...(await sealWith(await importContentKey(ck), clip)), ...new TextEncoder().encode(`\r\n--${boundary}--\r\n`)]) });
+		assert.equal(up.status, 200, await up.clone().text());
+		const fileId = f.id;
+		const base = `/api/v1/members/lena/files/${fileId}/drm`;
+		const started = await api(dev.base, "POST", base, { email: lena.email, body: { version: 1 } });
+		assert.equal(started.status, 200, started.text);
+		const engine = await mediaEngine(mediaWasm());
+		const found = await indexVideo(async (o, l) => clip.slice(o, Math.min(o + l, clip.length)), clip.length, null, engine);
+		const p = found.index.protect(new Uint8Array(Buffer.from(started.json.material, "base64")));
+		const parts = [p.init()];
+		const layout = { init: [0, parts[0].length], segments: [] };
+		let at = parts[0].length;
+		for (let n = 0; n < found.index.segments.length; n++) {
+			const seg = p.segment(n, Buffer.concat(p.plan(n).map(([o, l]) => clip.subarray(o, o + l))));
+			layout.segments.push([at, seg.length, found.index.segments[n][1]]);
+			at += seg.length;
+			parts.push(seg);
+		}
+		p.drop();
+		found.index.drop();
+		const copy = Buffer.concat(parts);
+		const put = await fetch(`${dev.base}${base}/1/parts/1`, { method: "PUT", headers: { "x-gorani-dev-email": lena.email, "content-length": String(copy.length) }, body: copy });
+		const etag = (await put.json()).etag;
+		assert.equal((await api(dev.base, "POST", `${base}/1/complete`, { email: lena.email, body: { parts: [{ partNumber: 1, etag }], layout } })).status, 200);
+		const id = newShareId();
+		const secret = newShareSecret();
+		const kdf = newShareKdf();
+		const keys = await shareKeys(id, secret, "view-only-passphrase", kdf);
+		const made = await api(dev.base, "POST", "/api/v1/members/lena/files/shares", {
+			email: lena.email,
+			body: { id, fileId, version: 1, drm: true, claimHash: await claimHashOf(keys.claim), nameSealed: await lena.sealer.shareName(id, "briefing.mp4"), metaSealed: await sealShareMeta(keys.meta, id, { name: "briefing.mp4", type: null, size: clip.length, modified: null }), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), downloadsLeft: 2, kdf },
+		});
+		assert.equal(made.status, 200, made.text);
+		const ctx = await guardedContext(browser, null);
+		const page = await ctx.newPage();
+		page.on("pageerror", (e) => console.error("PAGEERROR:", String(e).slice(0, 250)));
+		const res = await page.goto(`${dev.base}/s/f/${id}#${secret}`);
+		assert.match(res.headers()["content-security-policy"] ?? "", /media-src 'self'/, "the share page may play same-origin media");
+		await page.getByPlaceholder("Password").fill("view-only-passphrase");
+		await page.getByRole("button", { name: "Unlock" }).click();
+		await page.locator("#name", { hasText: "briefing.mp4" }).waitFor({ timeout: 60_000 });
+		await page.locator("#meta", { hasText: "viewings left" }).waitFor();
+		await page.getByRole("button", { name: "Play" }).click();
+		await page.locator("#drmnote", { hasText: "Safari" }).waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator("#player").isVisible(), false, "nothing plays where FairPlay is not");
+		await assertNoViolations(page, "a view-only link's page in a browser without FairPlay");
 		await ctx.close();
 	}
 
@@ -1366,7 +1466,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
 } finally {
 	await dev.close();
 }

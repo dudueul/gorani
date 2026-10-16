@@ -42,6 +42,13 @@ const meta = { name: "가족사진.jpg", type: "image/jpeg", size: 123456, modif
 	const sealedByTs = await ts.sealShareMeta(tsKeys.meta, id, meta);
 	const libKeys = await lib.shareKeys(id, secret, "FamilyPhotos2026", kdf);
 	assert.deepEqual(await lib.openShareMeta(libKeys.meta, id, sealedByTs), meta, "password derivation agrees");
+	// A view-only link's claim proof (40c): the same 32 bytes from both, and
+	// a different one for another password or another link.
+	assert.equal(libKeys.claim, tsKeys.claim, "the claim proof agrees");
+	assert.match(tsKeys.claim, /^[A-Za-z0-9_-]{43}$/);
+	assert.notEqual((await ts.shareKeys(id, secret, "FamilyPhotos2027", kdf)).claim, tsKeys.claim, "another password, another proof");
+	assert.notEqual((await ts.shareKeys(ts.newShareId(), secret, "FamilyPhotos2026", kdf)).claim, tsKeys.claim, "another link, another proof");
+	assert.match(await ts.claimHashOf(tsKeys.claim), /^[A-Za-z0-9_-]{43}$/, "what the server keeps: 43 base64url characters");
 	await assert.rejects(() => lib.openShareMeta(libKeys.meta, id, sealedByTs).then(() => lib.shareKeys(id, secret, "wrong-password", kdf)).then((k) => lib.openShareMeta(k.meta, id, sealedByTs)), /Wrong password/);
 	await assert.rejects(() => lib.shareKeys(id, secret, null, kdf), /needs its password/);
 

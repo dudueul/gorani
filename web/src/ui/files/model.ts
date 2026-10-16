@@ -41,7 +41,7 @@ import { acceptCustody, offerCustody, verifyChain, type CustodyCall, type Custod
 import type { IndexEntry } from "../../vault/index-engine.ts";
 import type { PickedTree } from "./dropped.ts";
 import { FrameReader, WholeReader } from "../../lib/frame-reader.ts";
-import { mediaEngine, type MediaIndex } from "../../lib/media-engine.ts";
+import { mediaEngine, type MediaIndex, type Protector } from "../../lib/media-engine.ts";
 import { indexVideo } from "../../lib/video-index.ts";
 import { parseVideoMeta, type ReadAt, type VideoMeta } from "../../vault/video-meta.ts";
 import { imageType, posterFromUrl, posterTime } from "../viewer/poster.ts";
@@ -157,6 +157,12 @@ export interface FilesBridge {
 	toast(message: string): void;
 	/** The signed-in member's own id (39o) — in a case area, not the area's. */
 	selfId?(): string;
+	/** Protected copies (commit 40c, docs/DRM.md): one part of a copy, sent
+	 * as an upload part is (retried what the network lost); and raw bytes
+	 * in, raw bytes out — a license's SPC and CKC. Optional: a test bridge
+	 * that never protects leaves them out. */
+	putPart?(path: string, bytes: Uint8Array, n: number): Promise<{ partNumber: number; etag: string }>;
+	postBytes?(path: string, bytes: Uint8Array): Promise<Uint8Array>;
 	/** The member's identity (commit 29d, docs/CUSTODY.md › stage 4): the
 	 * signer that vouches for what they upload, and the trust that checks
 	 * what others did. Null until the team context is open — the member's
@@ -1471,6 +1477,105 @@ export class FilesModel {
 		await this.bridge.apiSend("PUT", `${areaPath(this.memberId)}/files/${id}/video`, { version, meta: sealed });
 	}
 
+	// ── Protected copies (commit 40c, docs/DRM.md) ──────────────────────
+
+	/** A file's protection: whether it is protected, its copies, and what
+	 * THIS member gets (the original, or the protected copy). Null when the
+	 * deployment answers nothing (an older Worker). */
+	async drmState(id: string): Promise<DrmState | null> {
+		try {
+			return await this.bridge.apiGet<DrmState>(`${areaPath(this.memberId)}/files/${id}/drm`);
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Protect a video (a lead's act): the Worker makes the key and hands it
+	 * to this browser once; the engine packages the copy from the plaintext
+	 * this browser reads anyway (the same reader the in-page player uses);
+	 * the copy goes up in parts of at least 8 MiB, and its layout — the
+	 * playlist's byte ranges — completes it. The key material is zeroed as
+	 * soon as the packager holds it.
+	 */
+	async protectVideo(id: string, onProgress?: (done: number, total: number) => void): Promise<void> {
+		const putPart = this.bridge.putPart;
+		if (!putPart) throw new Error("this app cannot upload a protected copy");
+		const p = await this.videoPlayback(id);
+		if (!p) throw new Error("only an MP4 the video engine can read can be protected");
+		const base = `${areaPath(this.memberId)}/files/${id}/drm`;
+		let protector: Protector | null = null;
+		try {
+			const started = await this.bridge.apiSend<{ version: number; kid: string; material: string }>("POST", base, { version: p.version });
+			const material = fromBase64(started.material);
+			try {
+				protector = p.index.protect(material);
+			} finally {
+				material.fill(0);
+			}
+			const PART = 8 * 1024 * 1024;
+			const parts: { partNumber: number; etag: string }[] = [];
+			let pending: Uint8Array[] = [];
+			let pendingLength = 0;
+			let offset = 0;
+			const flush = async () => {
+				const n = parts.length + 1;
+				parts.push(await putPart(`${base}/${started.version}/parts/${n}`, concatBytes(pending), n));
+				pending = [];
+				pendingLength = 0;
+			};
+			const append = async (bytes: Uint8Array) => {
+				pending.push(bytes);
+				pendingLength += bytes.length;
+				offset += bytes.length;
+				if (pendingLength >= PART) await flush();
+			};
+			const init = protector.init();
+			const layout: { init: [number, number]; segments: [number, number, number][] } = { init: [0, init.length], segments: [] };
+			await append(init);
+			const total = p.index.segments.length;
+			for (let n = 0; n < total; n++) {
+				const blocks: Uint8Array[] = [];
+				for (const [o, l] of protector.plan(n)) blocks.push(await p.source.read(o, l));
+				const segment = protector.segment(n, concatBytes(blocks));
+				layout.segments.push([offset, segment.length, p.index.segments[n]![1]]);
+				await append(segment);
+				onProgress?.(n + 1, total);
+			}
+			if (pendingLength) await flush();
+			await this.bridge.apiSend("POST", `${base}/${started.version}/complete`, { parts, layout });
+		} finally {
+			protector?.drop();
+			p.index.drop();
+			p.source.clear();
+		}
+	}
+
+	/** A message for the person, as the explorers show them. */
+	notify(message: string): void {
+		this.bridge.toast(message);
+	}
+
+	/** Protection off (a lead's act): the copies and their keys are gone. */
+	async unprotectVideo(id: string): Promise<void> {
+		await this.bridge.apiSend("DELETE", `${areaPath(this.memberId)}/files/${id}/drm`);
+	}
+
+	/** Where a member's player finds a copy: its playlist, its license
+	 * route, and the FairPlay certificate. */
+	drmRoutes(id: string, version: number): { playlist: string; certificate: string; license: (spc: Uint8Array) => Promise<Uint8Array> } {
+		const base = `${areaPath(this.memberId)}/files/${id}/drm/${version}`;
+		const post = this.bridge.postBytes;
+		return {
+			playlist: `${base}/playlist`,
+			certificate: "/api/v1/drm/fairplay/certificate",
+			license: async (spc) => {
+				if (!post) throw new Error("this app cannot ask for a license");
+				return post(`${base}/license`, spc);
+			},
+		};
+	}
+
 	/** The sidecar of a file being uploaded, from the local bytes. */
 	private async sidecarFromLocal(file: File, id: string, version: number): Promise<void> {
 		try {
@@ -1788,3 +1893,25 @@ async function digestOf(file: Blob): Promise<Uint8Array> {
 function hexOf(bytes: Uint8Array): string {
 	return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+/** `GET files/<id>/drm` (commit 40c, worker/src/drm.rs › state). */
+export interface DrmState {
+	protected: boolean;
+	protectedBy: string | null;
+	current: number | null;
+	copies: { version: number; state: "packaging" | "ready"; size: number | null; kid: string; segments: number | null }[];
+	/** Does THIS member get the original (a lead, an own area's owner)? */
+	original: boolean;
+	/** May THIS member protect (a lead, on a deployment with DRM_KEY_SECRET)? */
+	canProtect: boolean;
+	/** Is FairPlay configured, so a copy can play at all? */
+	playable: boolean;
+}
+
+/** The ready copy of the current version, if there is one. */
+export function readyCopy(s: DrmState | null): { version: number } | null {
+	if (!s?.current) return null;
+	const c = s.copies.find((x) => x.version === s.current && x.state === "ready");
+	return c ? { version: c.version } : null;
+}
+

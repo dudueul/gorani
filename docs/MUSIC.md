@@ -23,6 +23,20 @@ library view     ──▶ GET /api/v1/members/<id>/files/music  (ONE feed of se
 play             ──▶ the viewer streams the file (the only moment audio plaintext exists)
 ```
 
+**How a track plays (39w).** It always streams, and decrypts only what is
+being played:
+
+- **An M4A or M4B** (AAC or ALAC in MP4) goes through the in-page player
+  that plays films (docs/VIDEO.md). Its moov is indexed in WebAssembly and
+  the track is cut into ~4-second fMP4 segments. Each segment is fetched,
+  decrypted and appended to an `<audio>` element through MediaSource when
+  the playhead needs it. Its sidecar is written at upload, as a video's is.
+- **MP3, FLAC, Ogg and WAV** are not MP4, and the engine does not cut them.
+  They stream through the media worker: the browser's own player asks for
+  byte ranges, and the worker answers with decrypted bytes. This happens
+  from the first byte at any size. Until 39w a track under 8 MiB was
+  decrypted whole before it started.
+
 - **One blob per version** (`PRIMARY KEY (file_id, version)`): a remaster
   carries new tags; the feed joins on the file's LIVING version, so old
   blobs stop appearing the moment the pointer moves. The trigger-fed

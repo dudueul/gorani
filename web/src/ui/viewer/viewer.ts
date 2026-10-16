@@ -24,7 +24,7 @@
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel } from "../files/model.ts";
-import { pickViewerMode, renderMime, TEXT_CAP, type ViewerMode } from "./mode.ts";
+import { pickViewerMode, renderMime, TEXT_CAP, MAX_INLINE, type ViewerMode } from "./mode.ts";
 import { icon, type FileKind } from "../files/icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
@@ -136,7 +136,7 @@ export class GoraniViewer extends LitElement {
 		this.mode = pickViewerMode(kind, mime, size, info?.policy ?? "unverified");
 		this.policy = info?.policy ?? "unverified";
 		this.shownType = info?.shownType ?? null;
-		if (this.mode === "unsupported" || this.mode === "refused") {
+		if (this.mode === "unsupported" || this.mode === "too-large" || this.mode === "refused") {
 			this.busy = false;
 			return;
 		}
@@ -153,29 +153,25 @@ export class GoraniViewer extends LitElement {
 			} else if (this.mode === "video" && (await this.startProtected(id))) {
 				// A protected video this member gets only as its copy (40c):
 				// FairPlay plays it, or the viewer says where it plays.
-			} else if (this.mode === "video" && isMp4(this.target.name, mime) && (await this.startMse(id))) {
-				// Played in the page (39p, mse-player.ts): updated() attaches it.
-			} else if ((this.mode === "video" || this.mode === "audio") && (info?.size ?? 0) > 8 * 1024 * 1024) {
+			} else if ((this.mode === "video" || this.mode === "audio") && isMp4(this.target.name, mime) && (await this.startMse(id))) {
+				// Played in the page (39p, mse-player.ts) — films, and since
+				// 39w music in MP4 (M4A): updated() attaches it.
+			} else if (this.mode === "audio" || (this.mode === "video" && (info?.size ?? 0) > 8 * 1024 * 1024)) {
 				// Streaming path: the scoped media worker serves decrypted
-				// ranges; the browser's player seeks natively. Only for larger
-				// media — small ones are simpler as blobs.
+				// ranges; the browser's player seeks natively — what plays
+				// MP3, FLAC, Ogg and WAV, which the MP4 engine does not cut.
+				// Music streams at any size (39w): a track starts at once
+				// instead of after its whole download. A small video is
+				// simpler as a blob.
 				const handle = await this.model.mediaHandle(id, renderMime(kind, mime, this.target.name));
 				if (handle) {
 					this.streamed = true;
 					this.url = handle.url;
 					return;
 				}
-				const parts: Uint8Array[] = [];
-				await this.model.openBytes(id, this.target.version, (plain) => { parts.push(plain); });
-				this.url = blobURL(new Blob([concat(parts) as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
+				await this.readWhole(mime);
 			} else {
-				const parts: Uint8Array[] = [];
-				await this.model.openBytes(id, this.target.version, (plain) => {
-					parts.push(plain);
-					return Promise.resolve();
-				});
-				const whole = concat(parts);
-				this.url = blobURL(new Blob([whole as BlobPart], { type: renderMime(kind, mime, this.target.name) }));
+				await this.readWhole(mime);
 			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
@@ -295,7 +291,7 @@ export class GoraniViewer extends LitElement {
 		this.wireVideo();
 		this.attachProtected();
 		if (!this.mse || this.player) return;
-		const video = this.querySelector<HTMLVideoElement>("video[data-engine=mse]");
+		const video = this.querySelector<HTMLMediaElement>("main [data-engine=mse]");
 		if (!video) return;
 		const { index, source, type } = this.mse;
 		this.player = new MsePlayer(video, index, source, type, {
@@ -329,9 +325,7 @@ export class GoraniViewer extends LitElement {
 				this.streamed = true;
 				this.url = handle.url;
 			} else {
-				const parts: Uint8Array[] = [];
-				await this.model.openBytes(id, this.target.version, (plain) => void parts.push(plain));
-				this.url = blobURL(new Blob([concat(parts) as BlobPart], { type: renderMime(kind, info?.mime ?? null, this.target.name) }));
+				await this.readWhole(info?.mime ?? null);
 			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
@@ -358,6 +352,22 @@ export class GoraniViewer extends LitElement {
 		});
 		video.addEventListener("pause", () => this.savePosition(true));
 		video.addEventListener("playing", () => void this.backfillPoster(video), { once: true });
+	}
+
+	/**
+	 * The whole file, decrypted into a blob — what an image always is, and
+	 * media only when neither streaming path is there. Above MAX_INLINE it
+	 * is not read at all: the viewer offers the Download (39w — the cap used
+	 * to stop every kind before streaming was even tried).
+	 */
+	private async readWhole(mime: string | null): Promise<void> {
+		if (this.target.size > MAX_INLINE) {
+			this.mode = "too-large";
+			return;
+		}
+		const parts: Uint8Array[] = [];
+		await this.model.openBytes(this.target.id, this.target.version, (plain) => void parts.push(plain));
+		this.url = blobURL(new Blob([concat(parts) as BlobPart], { type: renderMime(this.target.kind, mime, this.target.name) }));
 	}
 
 	/** The saved position and the subtitles, fetched beside the video. */
@@ -447,11 +457,13 @@ export class GoraniViewer extends LitElement {
 					: this.unknown();
 			}
 			case "audio":
-				return this.url
+				// Music in MP4 through the in-page engine (39w), the rest
+				// through the media worker (or, when it is missing, a blob).
+				return this.mse || this.url
 					? html`<div class="w-full max-w-xl rounded-2xl bg-neutral-900 p-8 text-center shadow-2xl">
 							${icon("audio", "h-16 w-16 text-neutral-600 mx-auto")}
 							<p class="mt-2 truncate text-sm text-neutral-200">${this.target.name}</p>
-							<audio class="mt-4 w-full" src=${this.url} controls></audio>
+							${this.mse ? html`<audio class="mt-4 w-full" data-engine="mse" controls></audio>` : html`<audio class="mt-4 w-full" src=${this.url!} controls></audio>`}
 						</div>`
 					: this.unknown();
 			case "text":
@@ -494,12 +506,17 @@ export class GoraniViewer extends LitElement {
 		`;
 	}
 
+	/** Nothing to show here: a format the viewer has no reader for, or
+	 * something only shown by reading it whole that is too big for that. */
 	private unknown(): TemplateResult {
+		const large = this.mode === "too-large";
 		return html`
-			<div class="max-w-md rounded-2xl border border-neutral-800 bg-neutral-900 p-8 text-center">
+			<div class="max-w-md rounded-2xl border border-neutral-800 bg-neutral-900 p-8 text-center" data-test=${large ? "viewer-too-large" : "viewer-no-preview"}>
 				${icon(this.target.kind, "h-16 w-16 text-neutral-600 mx-auto")}
-				<p class="mt-3 text-sm text-neutral-300">No inline preview yet for this format.</p>
-				<p class="mt-1 text-xs text-neutral-500">The document readers, PDF and the sealed video streamer land with the next commit. Download works today.</p>
+				<p class="mt-3 text-sm text-neutral-300">${large ? "Too large to open in the page." : "No preview for this format."}</p>
+				<p class="mt-1 text-xs text-neutral-500">${large
+					? `Shown only by reading it whole, and ${fmtSize(this.target.size)} is more than a tab should hold (${fmtSize(MAX_INLINE)}). Download it to open it.`
+					: "Video and music stream here, images and text open here; documents, PDFs and archives do not yet. Download opens it on this computer."}</p>
 				<button class="mt-4 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" @click=${() => void this.model.download(this.target.id, this.target.name)}>Download</button>
 			</div>
 		`;

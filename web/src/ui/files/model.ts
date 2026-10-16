@@ -1912,8 +1912,11 @@ const IN_TAB_LIMIT = 2 * 1024 ** 3;
 export const WHOLE_LIMIT = 48 * 1024 * 1024;
 
 /** A file the video sidecar describes: the MP4 family, by type or name. */
+/** An MP4-family file — what the in-page engine (39p) indexes and the
+ * upload writes a sidecar for: video, and since 39w music in MP4 (M4A:
+ * AAC or ALAC; M4B audiobooks). */
 export function isMp4(name: string, mime: string | null): boolean {
-	return /^(video|audio)\/(mp4|quicktime|x-m4v)$/.test(mime ?? "") || /\.(mp4|m4v|mov)$/i.test(name);
+	return /^(video|audio)\/(mp4|quicktime|x-m4v|x-m4a)$/.test(mime ?? "") || /\.(mp4|m4v|mov|m4a|m4b)$/i.test(name);
 }
 /** Audio tags are parsed from the whole file — up to this size (the parser needs it in memory). */
 const TAG_PARSE_LIMIT = 512 * 1024 * 1024;

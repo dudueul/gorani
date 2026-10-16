@@ -28,8 +28,15 @@ assert.equal(pickViewerMode("text", null, 10), "text");
 assert.equal(pickViewerMode("code", null, 10), "text");
 assert.equal(pickViewerMode("file", "text/markdown", 10), "text");
 
-// The size cap: oversized anything falls back to Download.
-assert.equal(pickViewerMode("video", null, MAX_INLINE + 1), "unsupported");
+// The size cap is for what is read WHOLE to be shown: an image. Video and
+// audio stream at any size, and text opens only its head (39w — the cap
+// used to come first, so a film over 256 MB had "no preview" at all).
+assert.equal(pickViewerMode("image", "image/png", MAX_INLINE + 1), "too-large");
+assert.equal(pickViewerMode("image", "image/png", MAX_INLINE), "image", "at the cap, still shown");
+assert.equal(pickViewerMode("video", null, 20 * 1024 ** 3), "video", "a 20 GB film streams");
+assert.equal(pickViewerMode("audio", "audio/flac", MAX_INLINE + 1), "audio", "so does a long recording");
+assert.equal(pickViewerMode("text", "text/plain", MAX_INLINE + 1), "text", "a big log opens its first part");
+assert.equal(pickViewerMode("pdf", "application/pdf", MAX_INLINE + 1), "unsupported", "no reader is no reader, at any size");
 
 // Structured formats are honest about not being ready (the styled readers
 // and pdf.js land with ⑩b) — except a text/plain mime, which still shows.
@@ -53,4 +60,4 @@ assert.equal(renderMime("image", null, "pic.jpg"), "image/jpeg");
 assert.equal(renderMime("video", null, "v.mkv"), "video/mp4");
 assert.equal(renderMime("text", "text/plain", "n"), "text/plain");
 
-console.log("ok  viewer modes: caps, mimes, escape-by-construction, samples refused");
+console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused");

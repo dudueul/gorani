@@ -62,6 +62,13 @@ const RECIPES = {
 	// HEVC without WPP: no entry points, and deblocking/SAO left at the
 	// PPS's word (no override in the slice header).
 	"hevc-nowpp.mp4": ["-c:v", "libx265", "-preset", "fast", "-tag:v", "hvc1", "-x265-params", "log-level=error:keyint=30:wpp=0:sao=0:bframes=2", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k"],
+
+	// Music (39w): the tone alone (`-vn` drops the picture). AAC in MP4 is
+	// what an M4A is; Opus in MP4 is what Playwright's Chromium decodes;
+	// an MP3 is what the MP4 engine does not cut — the media worker plays it.
+	"aac.m4a": ["-vn", "-c:a", "aac", "-b:a", "128k"],
+	"opus.m4a": ["-vn", "-c:a", "libopus", "-b:a", "64k"],
+	"tone.mp3": ["-vn", "-c:a", "libmp3lame", "-b:a", "128k"],
 };
 
 /** A fixture's path, made on first use: `seconds` of test picture and tone. */
@@ -71,15 +78,18 @@ export function videoFixture(name, { seconds = 6, size = "320x180" } = {}) {
 	const out = path.join(DIR, `${seconds}s-${size}-${name}`);
 	if (fs.existsSync(out) && fs.statSync(out).size > 0) return out;
 	fs.mkdirSync(DIR, { recursive: true });
+	// (The container follows the extension ffmpeg sees: MP4 for the MP4
+	// family, M4A included — its own muxer refuses Opus — MP3 for an MP3.)
+	const part = `${out}.part${name.endsWith(".mp3") ? ".mp3" : ".mp4"}`;
 	const probe = spawnSync("ffmpeg", ["-version"], { encoding: "utf8" });
 	if (probe.status !== 0) throw new Error("the video tests need ffmpeg (docs/TESTS.md › Prerequisites) — it was not found on PATH");
 	const r = spawnSync(
 		"ffmpeg",
-		["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", `testsrc2=size=${size}:rate=30:duration=${seconds}`, "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=48000:duration=${seconds}`, "-shortest", ...recipe, `${out}.part.mp4`],
+		["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", `testsrc2=size=${size}:rate=30:duration=${seconds}`, "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=48000:duration=${seconds}`, "-shortest", ...recipe, part],
 		{ encoding: "utf8" },
 	);
 	if (r.status !== 0) throw new Error(`ffmpeg could not make ${name}: ${r.stderr}`);
-	fs.renameSync(`${out}.part.mp4`, out);
+	fs.renameSync(part, out);
 	return out;
 }
 

@@ -12,6 +12,9 @@
 //   clients/windows/packaging/Assets/*.png                   the package's logos (MSIX), on a tile
 //   clients/windows/packaging/gorani.ico                     Explorer's navigation pane (16–256 px)
 //   clients/macos/App/Assets.xcassets/AppIcon.appiconset/    the Mac app's icon, on Apple's grid
+//   web/public/icons/                                        Add to Home Screen (41b): the manifest's
+//                                                            192/512 tiles, Android's maskable one,
+//                                                            and iOS's apple-touch-icon
 import { chromium } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
@@ -37,6 +40,9 @@ function compose({ plate, scale }) {
 	if (plate === "tile") back = `<rect x="0" y="0" width="512" height="512" rx="96" fill="url(#plate)"/>`;
 	// Apple's grid: the shape is 824 of 1024 units, corners about 22% of it.
 	if (plate === "mac") back = `<rect x="44" y="44" width="424" height="424" rx="94" fill="url(#plate)"/>`;
+	// Full bleed, square: the phone cuts the shape itself (Android's mask,
+	// iOS's rounded square), so a corner drawn here would show as a seam.
+	if (plate === "full") back = `<rect x="0" y="0" width="512" height="512" fill="url(#plate)"/>`;
 	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs>${gradient}</defs>${back}${deerAt}</svg>`;
 }
 
@@ -82,6 +88,15 @@ for (const base of [16, 32, 128, 256, 512]) {
 }
 write("clients/macos/App/Assets.xcassets/AppIcon.appiconset/Contents.json", JSON.stringify({ images, info: { author: "tools/icons/render.mjs", version: 1 } }, null, 2) + "\n");
 write("clients/macos/App/Assets.xcassets/Contents.json", JSON.stringify({ info: { author: "tools/icons/render.mjs", version: 1 } }, null, 2) + "\n");
+
+// The web app on a phone's home screen (41b, docs/PHONE.md). "any" icons
+// are drawn as they are; a "maskable" one must keep the deer inside the
+// middle 80 % circle Android may crop to; iOS takes one 180 px square.
+const tileWeb = compose({ plate: "tile", scale: 0.9 });
+write("web/public/icons/icon-192.png", await png(tileWeb, 192));
+write("web/public/icons/icon-512.png", await png(tileWeb, 512));
+write("web/public/icons/maskable-512.png", await png(compose({ plate: "full", scale: 0.62 }), 512));
+write("web/public/icons/apple-touch-icon.png", await png(compose({ plate: "full", scale: 0.8 }), 180));
 
 await browser.close();
 

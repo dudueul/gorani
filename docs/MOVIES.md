@@ -74,6 +74,33 @@ revoked when the viewer closes. The browser's own controls switch them.
   Chromium build without it, for instance. The card keeps its icon until a
   browser that can plays it.
 
+## Playing a film from any folder (39z)
+
+The tab lists videos from every folder, and the explorer may be showing
+any one of them, or none. So the viewer decides what it may play from the
+film's own keys entry, which holds the server's sample flag and the
+sealed type. It opens that type in its place, as for every file
+(`model.ts › renderInfo`). It never looks at the open folder's rows.
+
+Until 39z it did look at them. A film in a folder the explorer was not
+showing found no row. The viewer, failing closed, then showed it as a
+malware sample ("this file's type does not verify in its place", under
+the sample's icon), though nothing was wrong with it. Failing closed is
+still the rule:
+
+- no keys entry at all, so nothing can be opened: refused;
+- a type that does not open in its place: refused;
+- a sample's mark, either one: refused, wherever the explorer is.
+
+The same slip was in four more places, each fixed the same way:
+
+- **Streaming:** a track or film the media worker plays, sized from the
+  row (`mediaHandle`);
+- **Previews:** the first bytes a preview opens (`preview`);
+- **Downloads:** the streamed download of a big file (`streamDownload`);
+- **Paste:** Paste in another folder, which lost the copy's date and type
+  (`paste`). The date is now taken at Copy.
+
 ## Tests
 
 | Suite | What it checks |
@@ -81,4 +108,5 @@ revoked when the viewer closes. The browser's own controls switch them.
 | `unit:explorer` | Subtitles found by the video's base name, with and without a language, not another video's; SRT converted to WebVTT, VTT passed through |
 | `api:files` 8d | The sidecar routes the tab reads |
 | `api:rotation` | Sidecars, posters and positions resealed with every other value |
-| `e2e:app` | The card's length from the sidecar and its poster made at upload; opening it resumes where the previous play stopped; an `.en.srt` beside it becomes an English track with its cue |
+| `e2e:app` | The card's length from the sidecar and its poster made at upload; opening it, with the explorer in another folder, plays it (39z: no refusal) and resumes where the previous play stopped; an `.en.srt` beside it becomes an English track with its cue |
+| `unit:explorer` 5e, 13 | (39z) A film in a folder the explorer is not showing opens as itself and previews; Get Info alone still needs its row; Paste elsewhere keeps the date and type; a sample there, with the server's flag cleared, is still refused |

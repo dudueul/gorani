@@ -426,6 +426,32 @@ assert.equal((await model.verify(row.id)).status, "verified");
 	assert.equal(shownModified(byName("new-letter.txt")), byName("new-letter.txt").updatedAt, "…the file shows when it reached the server, as one without a date does");
 }
 
+// 5e. A file the explorer is not listing (39z). The Movie and Music tabs
+// open the viewer on videos and tracks from every folder, so what may be
+// rendered comes from the file's own keys entry, never from the open
+// folder's rows. Until 39z a film in another folder came back "unverified"
+// and the viewer showed it as a malware sample. Copy in one folder and
+// Paste in another keeps the date and the type.
+{
+	await model.setFolder(folderId);
+	const filmBytes = new Uint8Array(4096).fill(7);
+	await model.upload([new File([filmBytes], "holiday.webm", { type: "video/webm", lastModified: Date.parse("2012-07-14T10:00:00.000Z") })]);
+	const film = model.state.get().files.find((f) => f.name === "holiday.webm")!;
+	model.select({ kind: "file", id: film.id });
+	model.copy();
+	await model.setFolder(null);
+	assert.ok(!model.state.get().files.some((f) => f.id === film.id), "the explorer is at the top; the film is in Photos");
+	const shown = await model.renderInfo(film.id);
+	assert.deepEqual({ policy: shown?.policy, mime: shown?.mime, size: shown?.size }, { policy: "normal", mime: "video/webm", size: 4096 }, "a film in another folder opens as itself, not as a sample");
+	assert.equal((await model.preview(film.id))?.bytes.length, 4096, "…and its first bytes open for the viewer");
+	assert.equal(await model.info(film.id), null, "Get Info shows a listed item, so it alone still needs the row");
+	await model.paste();
+	const pasted = model.state.get().files.find((f) => f.name.startsWith("holiday") && f.id !== film.id)!;
+	assert.equal(pasted.modified, "2012-07-14T10:00:00.000Z", "pasted in another folder, the copy keeps the original's date");
+	assert.equal(await openPlacedText(storePrivate, places.fileType("jinu", pasted.id, 1), versions.get(pasted.id)!.type!), "video/webm", "…and its type (until 39z a copy was sealed as application/octet-stream)");
+	await model.trash("file", [pasted.id]);
+}
+
 // 6. Rename re-seals; the server's stored name changes shape but stays sealed.
 await model.rename("file", row.id, "sunset.png");
 assert.ok(isPlacedText(rows.get(row.id)!.name));
@@ -512,6 +538,13 @@ rows.get(dropper.id)!.sample = false;
 await model.refresh();
 assert.equal(await model.preview(dropper.id), null, "the flag cleared by the server — still refused");
 assert.equal(await model.renderPolicy(dropper.id), "sample");
+// …and from a folder the explorer is not showing (the viewer opened from the
+// Movie tab, 39z): no row to read, and the sealed mark still refuses it.
+await model.setFolder(folderId);
+assert.equal((await model.renderInfo(dropper.id))?.policy, "sample", "not listed, flag cleared: still a sample");
+assert.equal((await model.renderInfo(dropper.id))?.mime, null, "…with no mime to render with");
+assert.equal(await model.preview(dropper.id), null, "…and no bytes decrypted for a preview");
+await model.setFolder(null);
 // The download is a zip under "infected", opened here by an independent reader.
 await model.download(dropper.id, "dropper.png");
 assert.equal(model.lastSaved?.name, "dropper.png.zip");

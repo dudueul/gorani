@@ -236,7 +236,10 @@ export class FilesModel {
 	/** Each listing's number: one that lands after a newer one was asked for
 	 * is dropped (two quick double-clicks; a change-feed refresh mid-walk). */
 	private listSeq = 0;
-	private clipboard: { mode: "copy" | "cut"; files: string[]; folders: string[] } | null = null;
+	/** `dates`: each copied file's shown modified date, taken when it was
+	 * copied, while its row was on screen. Paste usually happens in another
+	 * folder, where the source's row is no longer listed (39z). */
+	private clipboard: { mode: "copy" | "cut"; files: string[]; folders: string[]; dates?: Map<string, number> } | null = null;
 	private pollTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly listeners = new Set<() => void>();
 
@@ -1217,25 +1220,30 @@ export class FilesModel {
 	 * too large for the tab with no worker is refused rather than tried.
 	 */
 	private async streamDownload(id: string, name: string): Promise<boolean> {
-		const row = this.state.get().files.find((f) => f.id === id);
-		if (!row || row.size <= STREAM_DOWNLOAD_AT) return false;
-		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number; type: string | null; sample?: boolean; hash?: string | null }> }>(id);
+		// The size is the file's own (its keys entry), not its row's: a
+		// download from the viewer opened in the Movie tab names a file the
+		// explorer may not be listing (39z).
+		const row = this.rowOf(id);
+		if (row && row.size <= STREAM_DOWNLOAD_AT) return false;
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number; type: string | null; size: number; sample?: boolean; hash?: string | null }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta?.chunk) return false;
+		const size = Number(meta.size);
+		if (size <= STREAM_DOWNLOAD_AT) return false;
 		if ((await this.policyOf(meta, id, null)) !== "normal") {
 			// A sample leaves only zipped under "infected" — in this tab (31d streams the export's).
-			if (row.size > IN_TAB_LIMIT) throw new Error(`“${name}” is a sample of ${(row.size / 1024 ** 3).toFixed(1)} GiB — too large to zip in the browser; export the case instead`);
+			if (size > IN_TAB_LIMIT) throw new Error(`“${name}” is a sample of ${(size / 1024 ** 3).toFixed(1)} GiB — too large to zip in the browser; export the case instead`);
 			return false;
 		}
 		const worker = await controllingMediaWorker(2000);
 		if (!worker) {
-			if (row.size > IN_TAB_LIMIT) throw new Error(`“${name}” is ${(row.size / 1024 ** 3).toFixed(1)} GiB: it downloads through the media worker, which is not running — reload the page and try again`);
+			if (size > IN_TAB_LIMIT) throw new Error(`“${name}” is ${(size / 1024 ** 3).toFixed(1)} GiB: it downloads through the media worker, which is not running — reload the page and try again`);
 			return false;
 		}
 		const priv = await this.bridge.storePrivate();
 		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, meta.version), meta.key);
 		const url = `/media/dl/${toBase64(crypto.getRandomValues(new Uint8Array(18))).replace(/\+/g, "-").replace(/\//g, "_")}`;
-		const { done } = await registerDownload(worker, { url, memberId: this.memberId, fileId: id, version: meta.version, key, chunk: meta.chunk, size: row.size, name, headers: this.bridge.identityHeaders() });
+		const { done } = await registerDownload(worker, { url, memberId: this.memberId, fileId: id, version: meta.version, key, chunk: meta.chunk, size, name, headers: this.bridge.identityHeaders() });
 		if (typeof document !== "undefined") {
 			// A NAVIGATION to the worker's URL, not <a download>: Chromium sends a
 			// download-attribute request straight to the network, past the
@@ -1245,7 +1253,7 @@ export class FilesModel {
 			a.href = url;
 			a.click();
 		}
-		this.bridge.toast(`Downloading “${name}” (${(row.size / 1024 ** 3).toFixed(1)} GiB) — it is checked against its signature when it finishes`);
+		this.bridge.toast(`Downloading “${name}” (${(size / 1024 ** 3).toFixed(1)} GiB) — it is checked against its signature when it finishes`);
 		void done.then(async (r) => {
 			if (!r.ok || !r.sha256) return this.bridge.toast(`⚠ “${name}” did not finish downloading: ${r.error ?? "stopped"} — the file on disk is incomplete`);
 			const check = await this.checkHash(id, { version: meta.version, hash: meta.hash ?? null }, { sha256: r.sha256, size: r.size ?? 0 });
@@ -1452,9 +1460,8 @@ export class FilesModel {
 
 	/** A decrypted slice for previews (first bytes only; nothing stored). */
 	async preview(id: string, maxBytes = 128 * 1024): Promise<{ bytes: Uint8Array; name: string; mime: string } | null> {
-		const s = this.state.get();
-		const row = s.files.find((f) => f.id === id) ?? s.trashFiles.find((f) => f.id === id);
-		if (!row) return null;
+		// (Not tied to the open folder's listing, 39z: the viewer opens files
+		// from the Movie and Music tabs too. The keys entry is what counts.)
 		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; type: string | null; version: number; sample?: boolean }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
@@ -1474,7 +1481,7 @@ export class FilesModel {
 			const { body } = await this.bridge.fetchObject(this.memberId, id, meta.version);
 			plain = await openWith(key, body);
 		}
-		return { bytes: plain.subarray(0, maxBytes), name: row.name, mime };
+		return { bytes: plain.subarray(0, maxBytes), name: this.rowOf(id)?.name ?? this.names.get(id) ?? id, mime };
 	}
 
 	// ── the in-page video player (commit 39p, docs/VIDEO.md) ────────────
@@ -1675,13 +1682,14 @@ export class FilesModel {
 	async mediaHandle(id: string, mime: string | null = null): Promise<{ url: string } | null> {
 		const worker = await controllingMediaWorker();
 		if (!worker) return null;
-		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number; type: string | null; sample?: boolean }> }>(id);
+		const keys = await this.keysFor<{ keys: Record<string, { key: string; chunk: number | null; version: number; type: string | null; size: number; sample?: boolean }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		if ((await this.policyOf(meta, id, null)) !== "normal") return null; // never played (commit 29e)
-		const s = this.state.get();
-		const row = s.files.find((f) => f.id === id);
-		if (!row) return null;
+		// The size is the version's own, from its keys entry. Until 39z it was
+		// the listed row's, so a track opened from the Music tab, from a
+		// folder the explorer was not showing, never streamed.
+		const size = Number(meta.size);
 		const priv = await this.bridge.storePrivate();
 		const key = await unwrapPlacedKey(priv, places.fileKey(this.memberId, id, meta.version), meta.key);
 		const url = `/media/${id}`;
@@ -1690,7 +1698,7 @@ export class FilesModel {
 		// (`headers`: the dev server's identity header — a service worker cannot
 		// read the page's localStorage. Empty in production, where Access's
 		// cookie rides every same-origin fetch, the worker's included.)
-		await registerMedia(worker, { url, memberId: this.memberId, fileId: id, version: meta.version, key, chunk: meta.chunk, size: row.size, mime, headers: this.bridge.identityHeaders() });
+		await registerMedia(worker, { url, memberId: this.memberId, fileId: id, version: meta.version, key, chunk: meta.chunk, size, mime, headers: this.bridge.identityHeaders() });
 		return { url };
 	}
 
@@ -1698,7 +1706,14 @@ export class FilesModel {
 
 	copy(): void {
 		const sel = this.state.get().selection;
-		this.clipboard = { mode: "copy", files: sel.filter((s) => s.kind === "file").map((s) => s.id), folders: sel.filter((s) => s.kind === "folder").map((s) => s.id) };
+		const files = sel.filter((s) => s.kind === "file").map((s) => s.id);
+		const dates = new Map<string, number>();
+		for (const id of files) {
+			const row = this.rowOf(id);
+			const at = row ? Date.parse(shownModified(row)) : NaN;
+			if (Number.isFinite(at)) dates.set(id, at);
+		}
+		this.clipboard = { mode: "copy", files, folders: sel.filter((s) => s.kind === "folder").map((s) => s.id), dates };
 		if (this.clipboard.files.length + this.clipboard.folders.length) this.bridge.toast("Copied");
 	}
 
@@ -1752,16 +1767,21 @@ export class FilesModel {
 			if (check.status === "mismatch" || check.status === "invalid") throw new Error(`not copying “${name}”: ${describeHashCheck(check)}`);
 			// A copy of a sample is a sample (commit 29e) — copying must never
 			// be the way a sample loses its mark. (An unverifiable type copies
-			// as a sample too: the careful side.)
-			const sample = (await this.renderPolicy(id)) !== "normal";
-			const original = sample ? (await this.info(id))?.shownType ?? "" : "";
+			// as a sample too: the careful side.) The copy keeps the source's
+			// type either way. (Until 39z a normal file's copy was sealed as
+			// application/octet-stream, and a sample's lost its original type
+			// when pasted into another folder: both read the listing.)
+			const shown = await this.renderInfo(id);
+			const sample = (shown?.policy ?? "unverified") !== "normal";
+			const original = shown?.shownType ?? "";
 			// A copy inside an evidence case is a new item: its intake says
 			// exactly what it is — this case's own copy, checked first.
 			const me = this.bridge.identity?.() ?? null;
 			const intake: IntakeFields | null = this.bridge.areaKind?.() === "evidence" ? { source: `a copy of “${name}” (${id}) in this case`, collector: me?.signer.member ?? "", method: "duplicated in gorani from the case's own copy, after its signature was checked", collectedAt: new Date().toISOString(), notes: "" } : null;
-			// The copy keeps its original's date, as a file manager's copy does (39y).
+			// The copy keeps its original's date, as a file manager's copy does
+			// (39y): the date taken at Copy, or the row's if it is still listed.
 			const source = this.rowOf(id);
-			const lastModified = source ? Date.parse(shownModified(source)) : Date.now();
+			const lastModified = clip.dates?.get(id) ?? (source ? Date.parse(shownModified(source)) : Date.now());
 			await this.uploadOne(new File([plain as BlobPart], copyName(name), { type: original, lastModified }), await this.fingerprint(digest), folderId, hexOf(digest), sample, intake);
 		}
 		await this.refresh();
@@ -1816,18 +1836,40 @@ export class FilesModel {
 		return this.bridge.apiSend<T>("POST", `${areaPath(this.memberId)}/files/keys`, { ids: [id] });
 	}
 
-	/** Info for the Get Info / details pane: everything readable, opened. */
-	/** `mime` is what may be rendered: null unless `policy` is "normal" (commit
-	 * 29e). `shownType` is for display only — a sample's original type. */
-	async info(id: string): Promise<{ name: string; kind: FileKind; size: number; version: number; createdAt: string; updatedAt: string; modified: string | null; mime: string | null; policy: "normal" | "sample" | "unverified"; shownType: string | null } | null> {
+	/**
+	 * What the viewer needs to decide how to show a file (commit 29e): its
+	 * size and version, the `mime` it may be rendered with (null unless
+	 * `policy` is "normal"), and `shownType`, for display only (a sample's
+	 * original type).
+	 *
+	 * Built from the file's OWN keys entry: the server's flag and the
+	 * sealed type, opened in its place. It never looks at the explorer's
+	 * listing. Until 39z this was `info()`, which needed the file's row in
+	 * the open folder. So a video opened from the Movie or Music tab, from
+	 * a folder the explorer was not showing, came back as nothing, and the
+	 * viewer, failing closed, said "this file's type does not verify" over
+	 * a sample's icon, for a perfectly good film. Fail closed is still the
+	 * rule: no keys entry at all → null → refused.
+	 */
+	async renderInfo(id: string): Promise<{ size: number; version: number; mime: string | null; policy: "normal" | "sample" | "unverified"; shownType: string | null } | null> {
 		const keys = await this.keysFor<{ keys: Record<string, { key: string; version: number; type: string | null; size: number; sample?: boolean }> }>(id);
 		const meta = keys.keys[id];
 		if (!meta) return null;
 		const opened = await this.openType(meta, id);
 		const policy = await this.policyOf(meta, id, opened);
-		const row = this.rowOf(id);
 		const shownType = opened.mime && isSampleType(opened.mime) ? originalType(opened.mime) : opened.mime;
-		return row ? { name: row.name, kind: row.kind, size: row.size, version: meta.version, createdAt: row.createdAt, updatedAt: row.updatedAt, modified: row.modified, mime: policy === "normal" ? opened.mime : null, policy, shownType } : null;
+		return { size: Number(meta.size), version: meta.version, mime: policy === "normal" ? opened.mime : null, policy, shownType };
+	}
+
+	/** Info for the Get Info / details pane: everything readable, opened.
+	 * The pane shows a listed item, so this one does need its row (name,
+	 * dates); what may be rendered is `renderInfo`'s. */
+	async info(id: string): Promise<{ name: string; kind: FileKind; size: number; version: number; createdAt: string; updatedAt: string; modified: string | null; mime: string | null; policy: "normal" | "sample" | "unverified"; shownType: string | null } | null> {
+		const row = this.rowOf(id);
+		if (!row) return null;
+		const r = await this.renderInfo(id);
+		if (!r) return null;
+		return { name: row.name, kind: row.kind, size: row.size, version: r.version, createdAt: row.createdAt, updatedAt: row.updatedAt, modified: row.modified, mime: r.mime, policy: r.policy, shownType: r.shownType };
 	}
 
 	async refresh(): Promise<void> {

@@ -862,6 +862,13 @@ try {
 			// member left off, subtitles found beside the video. ─────
 			await page.locator(`${W} [data-upload]`).first().setInputFiles({ name: "family-video.en.srt", mimeType: "application/x-subrip", buffer: Buffer.from("1\n00:00:00,500 --> 00:00:59,000\nHello from the subtitles\n") });
 			await row("family-video.en.srt").waitFor({ timeout: 60_000 });
+			// The explorer is left in ANOTHER folder (Trip, from the folder
+			// uploads): the Movie tab plays films from every folder, and the
+			// viewer must decide from the film's own sealed type, not from the
+			// open folder's rows. Until 39z this film opened as "this file's
+			// type does not verify", under a malware sample's icon.
+			await page.locator(`${W} [data-body] [data-item^="folder:"]`, { hasText: "Trip" }).first().dblclick();
+			await page.locator(`${W} [data-body] [data-item^="file:"]`, { hasText: "notes.txt" }).first().waitFor({ timeout: 15_000 });
 			await page.locator('[data-test="mode-movies"]').click();
 			const card = page.locator('[data-test="movie-card"]', { hasText: "family-video" });
 			await card.waitFor({ timeout: 30_000 });
@@ -870,6 +877,7 @@ try {
 			assert.ok((await page.locator('[data-test="movie-collection"]').count()) >= 1, "collections by folder");
 			await card.click();
 			await page.locator("gorani-viewer video[data-engine=mse]").waitFor({ state: "attached", timeout: 30_000 });
+			assert.equal(await page.locator('gorani-viewer [data-test="viewer-refused"]').count(), 0, "a film in a folder the explorer is not showing plays; it is not refused as a sample");
 			const resumed = page.locator('[data-test="viewer-resumed"]');
 			await resumed.waitFor({ timeout: 30_000 });
 			assert.match(await resumed.innerText(), /Resumed at 0:0[4-6]/, "where this member left off, saved when the viewer closed");
@@ -886,6 +894,8 @@ try {
 			await page.keyboard.press("Escape");
 			await page.locator('button[title="Windows 11 File Explorer"]').click();
 			await page.locator(`${W} [data-body]`).waitFor({ timeout: 15_000 });
+			await page.locator(`${W} nav button`).first().click(); // back to the top, from Trip
+			await row("family-video.mp4").waitFor({ timeout: 15_000 });
 			await assertNoViolations(page, "movie tab");
 		}
 
@@ -1593,7 +1603,7 @@ try {
 	}
 
 	await browser.close();
-	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), a chunked upload counting its parts in the status bar, a file keeping its own modified date, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), music (an M4A through the same engine, an MP3 streamed by the media worker), the Movie tab (length and poster from sealed sidecars, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
+	console.log("ok  e2e:app — CSP + Trusted Types delivered and violation-free; setup, recovery + password unlock, sealed upload, open, Delete forever from the menus (asked first: No keeps it; from the Trash too), a chunked upload counting its parts in the status bar, a file keeping its own modified date, duplicates (the prompt names the twin, “for the rest”, Find duplicates), folder uploads (picked whole, dropped onto a folder, on the list, on a crumb, a stray drop refused), sealed MP4s played in the page through MSE (whole and in GC01 frames, seeks, the sidecar), music (an M4A through the same engine, an MP3 streamed by the media worker), the Movie tab (length and poster from sealed sidecars, a film played while the explorer shows another folder, resume, subtitles), Lock revokes plaintext handles, 15-minute idle lock, refusal, password share page, an upload link (made in the explorer, sent through by a signed-out browser, checked and accepted as a sample), team panel (with Devices: protection shown, a lost laptop revoked; Collectors: registered through the form, approved by a second lead, its verdict this member's own) + case upload, a sample refused by the viewer, intake records, a legal hold and a two-person request, re-verification, a video protected in the viewer (packaged in the browser) and a view-only link's page, re-enrol");
 } finally {
 	await dev.close();
 }

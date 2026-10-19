@@ -131,7 +131,7 @@ export class GoraniViewer extends LitElement {
 
 	private async load(): Promise<void> {
 		const { id, kind, size } = this.target;
-		const info = await this.model.info(id);
+		const info = await this.model.renderInfo(id);
 		const mime = info?.mime ?? null;
 		this.mode = pickViewerMode(kind, mime, size, info?.policy ?? "unverified");
 		this.policy = info?.policy ?? "unverified";
@@ -318,7 +318,7 @@ export class GoraniViewer extends LitElement {
 		this.release();
 		this.busy = true;
 		const { id, kind } = this.target;
-		const info = await this.model.info(id);
+		const info = await this.model.renderInfo(id);
 		try {
 			const handle = await this.model.mediaHandle(id, renderMime(kind, info?.mime ?? null, this.target.name));
 			if (handle) {

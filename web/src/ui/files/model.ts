@@ -1923,6 +1923,12 @@ export class FilesModel {
 		if (this.clipboard.files.length + this.clipboard.folders.length) this.bridge.toast("Cut");
 	}
 
+	/** Forget what was copied or cut (41b: the phone's Paste bar has a ✕). */
+	clearClipboard(): void {
+		this.clipboard = null;
+		this.set({});
+	}
+
 	/** Whether Paste has anything to paste (the menus grey it out otherwise —
 	 * until 39m they asked whether something was SELECTED instead). */
 	get canPaste(): boolean {

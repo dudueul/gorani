@@ -23,7 +23,7 @@
  * | Preview pane | model.preview — decrypted in the browser, nothing sent |
  */
 
-import { LitElement, html, nothing, type TemplateResult } from "lit";
+import { LitElement, html, nothing, type PropertyValues, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel, FolderRow, Selection, SortState } from "./model.ts";
 import { shownModified } from "./model.ts";
@@ -65,12 +65,29 @@ export class GoraniWin11 extends LitElement {
 		return this;
 	}
 
-	protected override firstUpdated(): void {
-		void this.model.subscribe(() => {
+	/** The model's ticks re-render this view — the model's of the moment:
+	 * switching areas hands this same element a NEW model (shell.ts ›
+	 * openArea). Until 41b the first model's subscription was the only
+	 * one, so after a switch the new area's listing landed unseen. */
+	private unsubscribe: (() => void) | null = null;
+
+	protected override willUpdate(changed: PropertyValues<this>): void {
+		if (!changed.has("model")) return;
+		this.unsubscribe?.();
+		this.unsubscribe = this.model?.subscribe(() => {
 			this.v++;
 			void this.requestUpdate();
-		});
+		}) ?? null;
+	}
+
+	protected override firstUpdated(): void {
 		this.tabIndex = 0;
+	}
+
+	override disconnectedCallback(): void {
+		super.disconnectedCallback();
+		this.unsubscribe?.();
+		this.unsubscribe = null;
 	}
 
 	private s = () => this.model.state.get();
@@ -140,7 +157,10 @@ export class GoraniWin11 extends LitElement {
 		}
 		const row = this.s().files.find((f) => f.id === id);
 		if (!row) return;
-		this.dispatchEvent(new CustomEvent("open-viewer", { detail: { id, name: row.name, kind: row.kind, size: row.size, version: row.version } as ViewerTarget, bubbles: true, composed: true }));
+		// With the folder's other files, in the order shown (41b): ← and → in the viewer.
+		const target = (f: typeof row): ViewerTarget => ({ id: f.id, name: f.name, kind: f.kind, size: f.size, version: f.version });
+		const siblings = this.s().trashMode ? undefined : this.visible().files.map(target);
+		this.dispatchEvent(new CustomEvent("open-viewer", { detail: { ...target(row), siblings } as ViewerTarget, bubbles: true, composed: true }));
 	}
 
 	@state() private previewFile: { id: string; name: string; url?: string; text?: string; kind: FileKind } | null = null;

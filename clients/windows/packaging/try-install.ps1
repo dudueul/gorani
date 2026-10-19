@@ -23,9 +23,10 @@ if (-not $p) { throw "$Path did not install" }
 Write-Output "installed $($p.PackageFullName)"
 try {
 	$apps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
-	foreach ($cmd in 'gorani-cloud', 'gorani-sync') {
-		# (Each says how to use it, and exits non-zero: its words are checked.)
-		$said = & (Join-Path $apps "$cmd.exe") 2>&1 | Out-String
+	foreach ($cmd in 'gorani', 'gorani-cloud', 'gorani-sync') {
+		# (Each says how to use it: its words are checked. The app, a window
+		# program, answers --version on the pipe and opens no window.)
+		$said = & (Join-Path $apps "$cmd.exe") $(if ($cmd -eq 'gorani') { '--version' }) 2>&1 | Out-String
 		if ($said -notmatch "usage: $cmd") { throw "the installed $cmd did not answer: $said" }
 		Write-Output "$cmd answers from the package's alias"
 	}

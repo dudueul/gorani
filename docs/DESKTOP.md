@@ -789,6 +789,76 @@ device name.
 
 `accept` uses the saved scanner when `--scan` names none.
 
+### 40b as built: the Windows app (clients/windows/src/app/)
+
+`gorani.exe` is a window program: the Start menu's **Gorani**. It holds
+the tray icon, the Settings window, and the sync itself: the Cloud Files
+folder that `gorani-cloud` serves, run here on a thread of its own. It is
+written with the `windows` crate alone, with no other UI code.
+
+| Part | What it does |
+|---|---|
+| The tray icon | The water deer, its tooltip saying where the sync stands. Its menu: Open the Gorani folder, Open Gorani in the browser, Pause/Resume syncing, Settings…, Quit. A double-click opens the folder. |
+| Settings › Account | Server; Sign in with Cloudflare Access (runs `cloudflared access login`; also signs in again when the session ran out); "Signed in as … — member …". Not enrolled: this computer's name, its protection (the menu of `protection_choices`), the vault password, Enrol. Enrolled: where and how, Change server…, Sign out…. |
+| Settings › Sync | The folder (Browse…); Show: My files, or a case (Refresh opens the titles with each case's key); start at sign-in; keep downloaded files; Pause; Save. |
+| Settings › This computer & devices | Its protection, and Change it to (`session::protect`); your computers, Refresh, Revoke selected…. |
+| Settings › Advanced | The sign-in command; an Access service token; accept unverified files; the scanner `gorani-sync accept` uses. |
+
+**What it does on its own:**
+- **At start:** a computer that is not enrolled, or has no folder,
+  opens its Settings. An enrolled one with a folder starts syncing and
+  says so once. It says nothing when Windows started it at sign-in.
+- **One instance:** starting it again opens the running one's Settings.
+- **Enrolling** proposes `%USERPROFILE%\Gorani` and starts syncing there.
+
+**Folders.** Gorani takes only a new or empty folder, or the one it has
+already (`appmodel::folder_ok`). Signing out removes what it put in its
+folder: the placeholders and the folders they leave empty. A folder that
+already held someone's files would lose them. Each area has a folder of
+its own, so changing the area asks for a new folder (one is suggested).
+Otherwise the old area's placeholders would look like new files to the
+other area. A folder given up for another is unregistered and emptied
+the same way.
+
+**Signing out** stops the sync, sending what is left; unregisters the
+folder and removes its placeholders; then runs `settings::sign_out`.
+Whole files, which are copies kept by "Keep downloaded files", stay,
+and the person is told how many.
+
+**Start at sign-in.** From the package (MSIX), the manifest declares a
+startup task, off at install. Settings turns it on through Windows, and
+Task Manager › Startup apps can always turn it off again: Windows does
+not let an app overrule that, and Settings says so. From the ZIP, it is
+the per-user Run key (`"…\gorani.exe" --background`).
+
+**How it is built:**
+- **Threads.** The window thread draws and decides. The sync thread owns
+  the running folder and posts what happened as messages. Each job that
+  waits on the network or a person (sign-in, enrolment, the device list,
+  the cases' titles, a protection change) gets a thread of its own, so the
+  window never waits. The window's state is a thread-local, borrowed for
+  a moment and never across a message box, a menu or the folder picker:
+  those run a message loop that can re-enter the window procedure.
+- **The vault password** is read once, out of its box (which is
+  emptied), and wiped with the enrolment.
+- **The manifest** (`src/app/gorani.exe.manifest`) is embedded by
+  link.exe itself (build.rs): Common Controls 6 and per-monitor DPI
+  awareness. The window lays itself out again when it moves to a screen
+  of another DPI.
+
+**What is checked:**
+- **Words and rules** (status lines, the tooltip's 127-character limit,
+  folder names for cases, the icon chosen from gorani.ico, `folder_ok`)
+  live in `appmodel.rs`, with no Win32 in them, and are tested on every
+  system.
+- **In CI, `gorani --self-test`** makes the real Settings window without
+  showing it: every control must exist, every tab arrange, the protection
+  menu fill, the layout survive 144 dpi, and the window go cleanly.
+- **The package check** runs `gorani --version` through its alias.
+
+What CI cannot do is look at the window, or enrol against a real Access
+deployment. The first run on a real PC is that check.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

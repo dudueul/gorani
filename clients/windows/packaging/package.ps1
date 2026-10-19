@@ -23,7 +23,7 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $layout = Join-Path ([IO.Path]::GetTempPath()) "gorani-msix-$([guid]::NewGuid())"
 New-Item -ItemType Directory (Join-Path $layout 'Assets') | Out-Null
 try {
-	foreach ($exe in 'gorani-cloud.exe', 'gorani-sync.exe') {
+	foreach ($exe in 'gorani.exe', 'gorani-cloud.exe', 'gorani-sync.exe') {
 		Copy-Item (Join-Path $repo "target\release\$exe") $layout
 	}
 	Copy-Item (Join-Path $PSScriptRoot 'Assets\*.png') (Join-Path $layout 'Assets')

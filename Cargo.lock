@@ -545,6 +545,7 @@ dependencies = [
  "serde_json",
  "windows",
  "windows-collections",
+ "zeroize",
 ]
 
 [[package]]

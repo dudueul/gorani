@@ -102,12 +102,28 @@ installs programs for every user):
 ```powershell
 Get-ChildItem $HOME\Downloads\gorani-v1.2.3 | Unblock-File      # once verified
 Add-AppxPackage -Path $HOME\Downloads\gorani-v1.2.3\gorani-windows-x64-unsigned.msix -AllowUnsigned
-gorani-sync setup …        # then: gorani-cloud <folder>
 ```
 
-**Windows, the ZIP**: verify, `Unblock-File`, unpack, run `gorani-sync.exe`
-and `gorani-cloud.exe` from that folder (without `Unblock-File`, SmartScreen
-asks about an "unknown publisher" — after verifying, that is expected).
+Then open **Gorani** from the Start menu. Its Settings window opens on
+Account:
+
+1. **Sign in with Cloudflare Access.** The browser opens at the team's
+   sign-in. It needs `cloudflared`: `winget install Cloudflare.cloudflared`.
+2. **Enrol.** Name the computer, keep "Automatic" protection, and type
+   your vault password or recovery code.
+
+It syncs into `%USERPROFILE%\Gorani` at once. The water deer in the
+notification area has the rest: the folder, Pause, Settings (change the
+folder, show a case instead, start at sign-in), Quit.
+
+The commands are still there: `gorani-sync setup …`, then
+`gorani-cloud <folder>` (DESKTOP.md › 40b). Use one or the other for a
+folder, not both.
+
+**Windows, the ZIP**: verify, `Unblock-File`, unpack, and run `gorani.exe`
+(the app, as above) or `gorani-sync.exe` and `gorani-cloud.exe` from that
+folder. Without `Unblock-File`, SmartScreen asks about an "unknown
+publisher"; after verifying, that is expected.
 
 **macOS, the CLI**: verify, then
 

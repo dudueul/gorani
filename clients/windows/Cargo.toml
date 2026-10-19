@@ -7,10 +7,15 @@ license-file.workspace = true
 [dependencies]
 gorani-client-core = { path = "../core" }
 serde_json = "1"
+# (The app wipes the vault password it read from its box — 40b.)
+zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
 # (Storage_Provider and friends: Explorer's registration, 39e — shell.rs.)
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_CorrelationVector", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Registry", "Foundation", "Security_Cryptography", "Storage", "Storage_Provider", "Storage_Search", "Storage_Streams"] }
+# (40b, the app's window and tray: WindowsAndMessaging, Controls, Shell,
+# Gdi, HiDpi, Com and KeyboardAndMouse; its start at sign-in: Packaging_Appx
+# and ApplicationModel. No other UI code: decided 2026-10-19.)
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_CorrelationVector", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_Storage_Packaging_Appx", "Foundation", "ApplicationModel", "ApplicationModel_Activation", "Security_Cryptography", "Storage", "Storage_Provider", "Storage_Search", "Storage_Streams"] }
 # The WinRT collection the shell takes a file's states in (the windows
 # crate's own companion — already in the build, now named directly).
 windows-collections = "0.2"
@@ -19,3 +24,9 @@ windows-collections = "0.2"
 [[bin]]
 name = "gorani-cloud"
 path = "src/main.rs"
+
+# The app (commit 40b): the tray icon and Settings. A window program, so it
+# never opens a console; `gorani --version` still answers on a pipe.
+[[bin]]
+name = "gorani"
+path = "src/bin/gorani.rs"

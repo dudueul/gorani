@@ -239,9 +239,11 @@ export class GoraniTeam extends LitElement {
 	protected override render() {
 		const tabs: [Tab, string][] = [["people", "People"], ["cases", "Cases"], ...(this.member.role === "external" ? [] : ([["recovery", "Recovery"]] as [Tab, string][])), ["devices", "Devices"], ["unlock", "Unlock"], ...(this.member.role === "external" ? [] : ([["collectors", "Collectors"]] as [Tab, string][])), ["status", "Status"]];
 		return html`
-			<div class="mx-auto flex h-full max-w-4xl flex-col gap-3 overflow-y-auto p-4 text-sm" data-test="team">
-				<nav class="flex gap-1">
-					${tabs.map(([t, label]) => html`<button class="${button} ${this.tab === t ? "border-accent text-white" : "text-neutral-400"}" data-test="team-tab-${t}" @click=${() => {
+			<!-- On a phone (41b): one column, and the tabs a row that scrolls
+			     sideways instead of seven buttons squeezed into 360 pixels. -->
+			<div class="mx-auto flex h-full max-w-4xl flex-col gap-3 overflow-y-auto p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] text-sm sm:p-4" data-test="team">
+				<nav class="-mx-3 flex shrink-0 gap-1 overflow-x-auto px-3 pb-1 sm:mx-0 sm:px-0 sm:pb-0">
+					${tabs.map(([t, label]) => html`<button class="${button} shrink-0 ${this.tab === t ? "border-accent text-white" : "text-neutral-400"}" data-test="team-tab-${t}" @click=${() => {
 						this.tab = t;
 						if (t === "status" && !this.systemStatus) void this.checkStatus();
 					}}>${label}</button>`)}
@@ -446,7 +448,7 @@ export class GoraniTeam extends LitElement {
 				</select>
 			</label>
 			<label class="text-xs text-neutral-400">Sign-in addresses
-				<input class="${input} mt-1 block w-64" name="${prefix}-emails" placeholder="name@example.org" .value=${d.emails} @input=${(e: Event) => set({ emails: (e.target as HTMLInputElement).value })} />
+				<input class="${input} mt-1 block w-64 max-w-full" name="${prefix}-emails" placeholder="name@example.org" .value=${d.emails} @input=${(e: Event) => set({ emails: (e.target as HTMLInputElement).value })} />
 			</label>
 			${d.role === "external"
 				? html`<label class="text-xs text-neutral-400">Access ends after
@@ -611,8 +613,8 @@ export class GoraniTeam extends LitElement {
 		const stepOf = (name: string) => c?.steps.find((x) => x.step === name);
 		const row = (test: string, label: string, ok: boolean | null, detail: string) => html`<li class="flex items-baseline gap-2 py-1.5" data-test=${test} data-ok=${ok === null ? "unknown" : String(ok)}>
 			<span class="w-4 ${ok === null ? "text-neutral-500" : ok ? "text-emerald-400" : "text-red-400"}">${ok === null ? "–" : ok ? "✓" : "✗"}</span>
-			<span class="w-40 text-neutral-200">${label}</span>
-			<span class="text-xs text-neutral-400">${detail}</span>
+			<span class="w-28 shrink-0 text-neutral-200 sm:w-40">${label}</span>
+			<span class="min-w-0 break-words text-xs text-neutral-400">${detail}</span>
 		</li>`;
 		const st = s?.status;
 		const backend = st?.storage.backend === "r2" ? "Cloudflare R2" : "S3-compatible storage";
@@ -682,7 +684,7 @@ export class GoraniTeam extends LitElement {
 							</ul>
 							${c.warnings?.length ? html`<ul class="mt-2 space-y-1 text-xs text-amber-300" data-test="storage-warnings">${c.warnings.map((w) => html`<li>⚠ ${w}</li>`)}</ul>` : nothing}
 							${c.settings
-								? html`<table class="mt-2 text-xs" data-test="storage-settings">
+								? html`<table class="mt-2 block max-w-full overflow-x-auto text-xs" data-test="storage-settings">
 										${c.settings.map((v) => html`<tr>
 											<td class="pr-3 font-mono text-neutral-400">${v.name}</td>
 											<td class=${v.set ? "text-neutral-200" : "text-red-300"}>${v.set ? v.shown : "not set"}${v.padded ? html` <span class="text-amber-300">— stored with spaces or a line end around it; set it again without</span>` : nothing}</td>
@@ -716,7 +718,7 @@ export class GoraniTeam extends LitElement {
 					${[...bySpki].map(([spki, certs]) => {
 						const counts = this.tsaTrusted.has(spki);
 						return html`<li class="flex flex-wrap items-center gap-2 py-2 text-xs" data-test="tsa-${spki.slice(0, 16)}">
-							<span class="w-48 truncate">${certs[0]!.name}</span>
+							<span class="w-full truncate sm:w-48">${certs[0]!.name}</span>
 							<code class="font-mono text-neutral-400">key ${spki.slice(0, 16)}…</code>
 							<span class=${counts ? "text-emerald-400" : "text-amber-400"}>certified by ${certs.map((c) => this.nameOf(c.by)).join(", ")}${counts ? "" : " — none of them someone you verified"}</span>
 							${this.isLead ? html`<button class="${button} ml-auto" ?disabled=${this.busy} @click=${() => this.act("Withdrawing the authority", async () => {

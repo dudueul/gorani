@@ -77,9 +77,9 @@ export class GoraniUnlock extends LitElement {
 				<section class="w-full max-w-sm rounded-2xl border border-accent/40 bg-neutral-900 p-6 shadow-xl" data-test="reenrolled">
 					<h2 class="text-lg font-medium">Re-enrolled — waiting for the leads</h2>
 					<p class="mt-2 text-sm text-neutral-400">Read this fingerprint to the lead who coordinates your recovery. They type it before your area is sealed to your new key:</p>
-					<code class="mt-3 block select-all rounded-xl bg-neutral-950 p-3 text-center font-mono text-sm text-accent" data-test="reenrol-fingerprint">${r.done.fingerprint}</code>
+					<code class="mt-3 block select-all break-all rounded-xl bg-neutral-950 p-3 text-center font-mono text-sm text-accent" data-test="reenrol-fingerprint">${r.done.fingerprint}</code>
 					<p class="mt-3 text-sm text-neutral-400">Your new recovery code — write it down, it is shown once:</p>
-					<code class="mt-2 block select-all rounded-xl bg-neutral-950 p-3 text-center text-sm tracking-widest">${r.done.code}</code>
+					<code class="mt-2 block select-all break-all rounded-xl bg-neutral-950 p-3 text-center text-sm tracking-widest">${r.done.code}</code>
 					<p class="mt-3 text-xs text-neutral-500">When the ceremony completes, unlock with your new password.</p>
 				</section>
 			`;
@@ -170,6 +170,9 @@ export class GoraniUnlock extends LitElement {
 									.value=${this.secret}
 									@input=${(e: InputEvent) => (this.secret = (e.target as HTMLInputElement).value)}
 									autocomplete="off"
+									autocapitalize="off"
+									spellcheck="false"
+									enterkeyhint="go"
 									autofocus
 								/>
 							`}

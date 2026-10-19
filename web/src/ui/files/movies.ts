@@ -113,7 +113,7 @@ export class GoraniMovies extends LitElement {
 			</div>`;
 		const total = all.reduce((n, m) => n + (m.durationMs ?? 0), 0);
 		return html`
-			<div class="h-full overflow-auto p-6" data-test="movies">
+			<div class="h-full overflow-auto p-3 sm:p-6" data-test="movies">
 				<h2 class="text-lg font-medium text-neutral-200">Movies</h2>
 				<p class="mt-1 text-xs text-neutral-500">${all.length} video${all.length === 1 ? "" : "s"}${total ? ` · ${fmtLength(total)} in all` : ""} · in ${this.collections.length} collection${this.collections.length === 1 ? "" : "s"}</p>
 				${this.collections.map((c) => this.collection(c))}
@@ -125,7 +125,8 @@ export class GoraniMovies extends LitElement {
 		return html`
 			<section class="mt-6" data-test="movie-collection" data-path=${c.path}>
 				<h3 class="flex items-center gap-2 text-sm font-medium text-neutral-300">${icon("folder", "h-4 w-4 text-neutral-500")} ${c.path || "Top folder"} <span class="text-xs font-normal text-neutral-500">${c.movies.length}</span></h3>
-				<div class="mt-3 grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] gap-4">${c.movies.map((m) => this.card(m))}</div>
+				<!-- One poster per row on a phone (41b): a full-width picture, not two thumbnails. -->
+				<div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-[repeat(auto-fill,minmax(11rem,1fr))]" data-test="movie-grid">${c.movies.map((m) => this.card(m))}</div>
 			</section>
 		`;
 	}

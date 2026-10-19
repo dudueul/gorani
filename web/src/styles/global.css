@@ -25,3 +25,21 @@ body {
 body {
 	overscroll-behavior: none;
 }
+
+/* Phones (commit 41b, docs/PHONE.md). iOS Safari zooms the page into any
+   field whose text is smaller than 16 px — and stays zoomed after — so on
+   a phone every field is 16 px. (Unlayered, so it wins over the `text-sm`
+   utilities, which Tailwind v4 keeps in a layer.) */
+@media (max-width: 639.98px) {
+	input,
+	select,
+	textarea {
+		font-size: 16px;
+	}
+}
+
+/* A tap shows the app's own pressed state (the `active:` classes), not
+   the browser's grey flash over the whole row. */
+html {
+	-webkit-tap-highlight-color: transparent;
+}

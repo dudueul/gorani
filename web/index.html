@@ -4,7 +4,9 @@
 <html lang="en" class="h-full">
 	<head>
 		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<!-- viewport-fit=cover: on a phone with a notch the app reaches the
+		     edges, and pads itself with env(safe-area-inset-*) (41b). -->
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<!-- The strict Content-Security-Policy (default-src 'none'; self only;
 		     Trusted Types) arrives as a HEADER from public/_headers — static
 		     assets are served by the platform, not the Worker, so a header the
@@ -17,6 +19,17 @@
 		<title>Gorani</title>
 		<!-- The water deer (docs/assets/gorani.svg, via tools/icons/render.mjs). -->
 		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<!-- Add to Home Screen (41b, docs/PHONE.md): the app opens standalone,
+		     with no browser bar. use-credentials: the manifest is fetched
+		     with the Access cookie — without it, Cloudflare Access answers a
+		     manifest request with its sign-in page, and the phone sees none. -->
+		<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+		<meta name="theme-color" content="#0a0a0a" />
+		<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+		<meta name="apple-mobile-web-app-title" content="Gorani" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black" />
 	</head>
 	<body class="h-full bg-neutral-950 text-neutral-100 antialiased">
 		<!-- The whole app is one custom element tree. Nothing renders before

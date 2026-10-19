@@ -47,7 +47,14 @@ export interface ViewerTarget {
 	/** The file's folder — where its subtitles are looked for (39o). Absent:
 	 * the folder on screen. */
 	folderId?: string | null;
+	/** The files around it, in the order the explorer showed them (41b): a
+	 * swipe, or ← and →, opens the next one. Absent: this file alone. */
+	siblings?: ViewerTarget[];
 }
+
+/** How far a finger must travel sideways for a swipe, and how little up or down. */
+const SWIPE_MIN = 60;
+const SWIPE_SLANT = 0.6;
 
 @customElement("gorani-viewer")
 export class GoraniViewer extends LitElement {
@@ -423,17 +430,24 @@ export class GoraniViewer extends LitElement {
 
 	protected override render(): TemplateResult {
 		const t = this.target;
+		const pos = this.place();
+		const details = `${fmtSize(t.size)} · v${t.version ?? 1} · ${this.drm?.protected && !this.drm.original ? "a protected copy, decrypted only inside Safari's DRM" : "decrypted here, sealed everywhere else"}`;
 		return html`
-			<div class="fixed inset-0 z-50 flex flex-col bg-black/80 outline-none" tabindex="-1" data-viewer-root @keydown=${(e: KeyboardEvent) => e.key === "Escape" && this.close()}>
-				<header class="flex items-center gap-3 border-b border-neutral-800 bg-neutral-900/95 px-4 py-2.5 text-sm">
-					${icon(t.kind, "h-5 w-5 text-neutral-400")}
-					<span class="min-w-0 flex-1 truncate text-neutral-100">${t.name}</span>
-					<span class="shrink-0 text-xs text-neutral-500">${fmtSize(t.size)} · v${t.version ?? 1} · ${this.drm?.protected && !this.drm.original ? "a protected copy, decrypted only inside Safari's DRM" : "decrypted here, sealed everywhere else"}</span>
+			<div class="fixed inset-0 z-50 flex flex-col bg-black/80 outline-none max-sm:bg-black" tabindex="-1" data-viewer-root @keydown=${(e: KeyboardEvent) => this.onKey(e)}>
+				<!-- On a phone (41b) the header is one short row: the name, Download
+				     and ✕; the details line moves under the picture. -->
+				<header class="flex items-center gap-2 border-b border-neutral-800 bg-neutral-900/95 px-2 py-2 pt-[max(0.5rem,env(safe-area-inset-top))] text-sm sm:gap-3 sm:px-4 sm:py-2.5">
+					${icon(t.kind, "hidden h-5 w-5 text-neutral-400 sm:block")}
+					<span class="min-w-0 flex-1 truncate pl-1 text-neutral-100 sm:pl-0">${t.name}</span>
+					${pos ? html`<span class="shrink-0 tabular-nums text-xs text-neutral-500" data-test="viewer-position">${pos.at + 1} / ${pos.of}</span>` : nothing}
+					${pos ? html`<span class="hidden shrink-0 sm:flex"><button class="rounded-l-lg border border-neutral-700 px-2 py-1 text-xs hover:border-accent disabled:opacity-30" title="Previous (←)" ?disabled=${pos.at === 0} @click=${() => this.step(-1)}>‹</button><button class="rounded-r-lg border border-l-0 border-neutral-700 px-2 py-1 text-xs hover:border-accent disabled:opacity-30" title="Next (→)" ?disabled=${pos.at === pos.of - 1} @click=${() => this.step(1)}>›</button></span>` : nothing}
+					<span class="hidden shrink-0 text-xs text-neutral-500 sm:inline">${details}</span>
 					${this.protectionControls()}
-					${this.drm?.protected && !this.drm.original ? nothing : html`<button class="rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.model.download(t.id, t.name)}>Download</button>`}
-					<button class="rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" @click=${() => this.close()}>Close (esc)</button>
+					${this.drm?.protected && !this.drm.original ? nothing : html`<button class="shrink-0 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.model.download(t.id, t.name)}>Download</button>`}
+					<button class="shrink-0 rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" aria-label="Close" data-test="viewer-close" @click=${() => this.close()}><span class="sm:hidden" aria-hidden="true">✕</span><span class="hidden sm:inline">Close (esc)</span></button>
 				</header>
-				<main class="flex min-h-0 flex-1 items-center justify-center overflow-auto p-6">${this.content()}</main>
+				<main class="flex min-h-0 flex-1 touch-pan-y items-center justify-center overflow-auto p-1 sm:p-6" @touchstart=${{ handleEvent: (e: TouchEvent) => this.onTouchStart(e), passive: true }} @touchend=${{ handleEvent: (e: TouchEvent) => this.onTouchEnd(e), passive: true }}>${this.content()}</main>
+				<p class="truncate border-t border-neutral-900 px-3 py-1.5 pb-[max(0.375rem,env(safe-area-inset-bottom))] text-center text-[11px] text-neutral-500 sm:hidden">${details}${pos ? " · swipe for the next" : ""}</p>
 			</div>
 		`;
 	}
@@ -525,6 +539,57 @@ export class GoraniViewer extends LitElement {
 	close(): void {
 		this.release();
 		this.dispatchEvent(new CustomEvent("closed", { bubbles: true, composed: true }));
+	}
+
+	// ── the next file (41b): a swipe on a phone, ← and → on a keyboard ──
+
+	/** Where this file sits among its siblings, or null when it has none. */
+	private place(): { at: number; of: number } | null {
+		const list = this.target.siblings;
+		if (!list || list.length < 2) return null;
+		const at = list.findIndex((t) => t.id === this.target.id);
+		return at < 0 ? null : { at, of: list.length };
+	}
+
+	/** Open the file `delta` places away. The shell mounts a fresh viewer
+	 * for it (keyed by id), so nothing of this file's — its blob URL, its
+	 * player, its key in the media worker — carries over: release() runs as
+	 * this element leaves. */
+	private step(delta: number): void {
+		const p = this.place();
+		const next = p ? this.target.siblings![p.at + delta] : undefined;
+		if (!next) return;
+		this.dispatchEvent(new CustomEvent("navigate", { detail: { ...next, siblings: this.target.siblings } as ViewerTarget, bubbles: true, composed: true }));
+	}
+
+	private touch: { x: number; y: number; ignore: boolean } | null = null;
+
+	private onTouchStart(e: TouchEvent): void {
+		const t = e.touches[0];
+		// Not a swipe: two fingers (a pinch), a finger on a player's controls
+		// (scrubbing), or a page the person has zoomed into (panning).
+		const onMedia = (e.target as HTMLElement | null)?.closest?.("video, audio");
+		const zoomed = (globalThis.visualViewport?.scale ?? 1) > 1.01;
+		this.touch = t ? { x: t.clientX, y: t.clientY, ignore: e.touches.length > 1 || Boolean(onMedia) || zoomed } : null;
+	}
+
+	private onTouchEnd(e: TouchEvent): void {
+		const start = this.touch;
+		this.touch = null;
+		const t = e.changedTouches[0];
+		if (!start || start.ignore || !t) return;
+		const dx = t.clientX - start.x;
+		const dy = t.clientY - start.y;
+		if (Math.abs(dx) < SWIPE_MIN || Math.abs(dy) > Math.abs(dx) * SWIPE_SLANT) return;
+		this.step(dx < 0 ? 1 : -1); // finger to the left: the next file, as a photo roll
+	}
+
+	private onKey(e: KeyboardEvent): void {
+		if (e.key === "Escape") return this.close();
+		// ← → belong to a player that has the focus (it seeks with them).
+		if ((e.target as HTMLElement | null)?.closest?.("video, audio, input, textarea")) return;
+		if (e.key === "ArrowRight") this.step(1);
+		if (e.key === "ArrowLeft") this.step(-1);
 	}
 }
 

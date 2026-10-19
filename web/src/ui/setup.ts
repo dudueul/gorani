@@ -60,7 +60,7 @@ export class GoraniSetup extends LitElement {
 					<p class="mt-2 text-sm text-neutral-400">
 						The recovery code is the only other way in if the password is forgotten. It is shown once; gorani cannot show it again.
 					</p>
-					<code class="mt-3 block select-all rounded-xl bg-neutral-950 p-3 text-center text-sm tracking-widest text-accent">${this.recoveryCode}</code>
+					<code class="mt-3 block select-all break-all rounded-xl bg-neutral-950 p-3 text-center text-sm tracking-widest text-accent">${this.recoveryCode}</code>
 					${this.rootBundle
 						? html`<button class="mt-4 w-full rounded-xl border border-neutral-700 px-4 py-2.5 text-sm hover:border-accent disabled:opacity-50" ?disabled=${this.busy} data-test="setup-passkey" @click=${() => void this.addPasskey()}>
 								Also unlock with a passkey on this device

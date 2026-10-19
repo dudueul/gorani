@@ -52,17 +52,18 @@ export class GoraniMusic extends LitElement {
 				<p class="mt-2">Audio files uploaded in the explorer carry their tags here — parsed and sealed in the browser, the server never sees them.</p>
 			</div>`;
 		return html`
-			<div class="h-full overflow-auto p-6">
+			<div class="h-full overflow-auto p-3 sm:p-6" data-test="music">
 				<h2 class="text-lg font-medium text-neutral-200">Music</h2>
 				<p class="mt-1 text-xs text-neutral-500">${this.tracks.length} track${this.tracks.length === 1 ? "" : "s"} · metadata sealed per version, opened from one feed</p>
 				<table class="mt-4 w-full text-left text-sm">
 					<thead class="text-xs uppercase tracking-wide text-neutral-500">
 						<tr>
-							<th class="py-2 pr-4">#</th>
+							<!-- On a phone (41b) one column: artist and album fold under the title. -->
+							<th class="hidden py-2 pr-4 sm:table-cell">#</th>
 							<th class="py-2 pr-4">Title</th>
-							<th class="py-2 pr-4">Artist</th>
-							<th class="py-2 pr-4">Album</th>
-							<th class="py-2 pr-4 text-right">Length</th>
+							<th class="hidden py-2 pr-4 sm:table-cell">Artist</th>
+							<th class="hidden py-2 pr-4 sm:table-cell">Album</th>
+							<th class="py-2 text-right sm:pr-4">Length</th>
 						</tr>
 					</thead>
 					<tbody>
@@ -76,11 +77,14 @@ export class GoraniMusic extends LitElement {
 											new CustomEvent("open-viewer", { detail: { id: t.id, name: t.title ?? `${t.artist ?? "Unknown"} — track`, kind: "audio", size: t.size, version: t.version } as ViewerTarget, bubbles: true, composed: true }),
 										)}
 								>
-									<td class="py-2 pr-4 text-neutral-500">${t.track ?? i + 1}</td>
-									<td class="py-2 pr-4 text-neutral-200">${t.title ?? "Unknown title"}</td>
-									<td class="py-2 pr-4 text-neutral-400">${t.artist ?? "Unknown artist"}</td>
-									<td class="py-2 pr-4 text-neutral-400">${t.album ?? "Unknown album"}</td>
-									<td class="py-2 pr-4 text-right text-neutral-500">${t.durationSec ? fmtTime(t.durationSec) : "—"}</td>
+									<td class="hidden py-2 pr-4 text-neutral-500 sm:table-cell">${t.track ?? i + 1}</td>
+									<td class="py-3 pr-4 text-neutral-200 sm:py-2" data-test="track">
+										${t.title ?? "Unknown title"}
+										<span class="block truncate text-xs text-neutral-500 sm:hidden">${t.artist ?? "Unknown artist"} · ${t.album ?? "Unknown album"}</span>
+									</td>
+									<td class="hidden py-2 pr-4 text-neutral-400 sm:table-cell">${t.artist ?? "Unknown artist"}</td>
+									<td class="hidden py-2 pr-4 text-neutral-400 sm:table-cell">${t.album ?? "Unknown album"}</td>
+									<td class="py-3 text-right text-neutral-500 sm:py-2 sm:pr-4">${t.durationSec ? fmtTime(t.durationSec) : "—"}</td>
 								</tr>
 							`,
 						)}

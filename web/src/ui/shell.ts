@@ -13,10 +13,17 @@
  * explorer between AREAS — "My files" or a case the member is granted, the
  * same explorer over `case:<id>` with the case key (signature checked
  * before the first byte is opened) — and the Team panel (ui/team.ts).
+ *
+ * On a phone (41b, docs/PHONE.md: narrower than 640 px, lib/phone.ts) the
+ * frame changes, not the app: one short header — Files · Music · Movies ·
+ * Team, and ☰ for the areas and Lock — and the touch explorer
+ * (files/phone.ts) in place of the Windows or Finder look. Turn the phone
+ * sideways, or open the app on a tablet, and the desktop frame is back.
  */
 
 import { LitElement, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
+import { keyed } from "lit/directives/keyed.js";
 import { api, type Member } from "../lib/api.ts";
 import { watchAutoLock, AUTO_LOCK, type VaultSession } from "../vault/session.ts";
 import { revokeAllBlobURLs } from "../lib/blob-urls.ts";
@@ -24,7 +31,10 @@ import { FilesModel } from "./files/model.ts";
 import { sessionBridge } from "./files/bridge.ts";
 import { askIntake } from "./files/intake-dialog.ts";
 import { askDuplicate } from "./files/duplicate-dialog.ts";
-import { loadMode, saveMode, type PlatformMode } from "./files/shared.ts";
+import { loadMode, loadSkin, saveMode, type PlatformMode } from "./files/shared.ts";
+import { isPhone, watchPhone } from "../lib/phone.ts";
+import { showSheet } from "./files/sheet.ts";
+import "./files/phone.ts";
 import { readPlace } from "./files/place.ts";
 import { updateSettings } from "../vault/settings-store.ts";
 import { LocalIndex } from "../vault/index.ts";
@@ -51,6 +61,9 @@ export class GoraniShell extends LitElement {
 	@property({ type: Boolean }) stay = false;
 
 	@state() private mode: PlatformMode = loadMode();
+	/** Phone-narrow now (41b) — it changes as the window or the phone turns. */
+	@state() private phone = isPhone();
+	private stopPhone: (() => void) | null = null;
 	private model: FilesModel | null = null;
 	private index: import("../vault/index.ts").LocalIndex | null = null;
 	@state() private viewer: ViewerTarget | null = null;
@@ -110,6 +123,7 @@ export class GoraniShell extends LitElement {
 		addEventListener("popstate", this.onPopState);
 		addEventListener("dragover", this.onStrayDragOver);
 		addEventListener("drop", this.onStrayDrop);
+		this.stopPhone = watchPhone((phone) => (this.phone = phone));
 	}
 
 	/**
@@ -129,6 +143,8 @@ export class GoraniShell extends LitElement {
 		removeEventListener("popstate", this.onPopState);
 		removeEventListener("dragover", this.onStrayDragOver);
 		removeEventListener("drop", this.onStrayDrop);
+		this.stopPhone?.();
+		this.stopPhone = null;
 		this.stopAutoLock?.();
 		this.stopOnLock?.();
 		this.stopAutoLock = this.stopOnLock = null;
@@ -310,22 +326,59 @@ export class GoraniShell extends LitElement {
 		void this.requestUpdate();
 	}
 
+	/** The area menu, shared by the desktop select and the phone's ☰. */
+	private chooseArea(v: string): void {
+		const c = this.grantedCases.find((x) => `case:${x.id}` === v);
+		this.view = "files";
+		this.openArea(v, c ? c.id : this.member.name);
+	}
+
+	/** The phone's header (41b): the four places, and ☰. */
+	private phoneHeader() {
+		const explorer = this.mode === "win11" || this.mode === "macos";
+		const tab = (label: string, active: boolean, run: () => void, test: string, disabled = false) =>
+			html`<button class="min-h-10 min-w-0 flex-1 rounded-lg text-[13px] disabled:opacity-40 ${active ? "bg-neutral-700 text-white" : "text-neutral-400"}" aria-current=${active ? "page" : "false"} ?disabled=${disabled} data-test=${test} @click=${run}>${label}</button>`;
+		const toFiles = (mode: PlatformMode) => () => {
+			if (this.view === "team") void this.loadCases();
+			this.view = "files";
+			this.switchMode(mode);
+		};
+		return html`<header class="flex items-center gap-1.5 border-b border-neutral-800 px-2 pb-1.5 pt-[max(0.375rem,env(safe-area-inset-top))]" data-test="phone-header">
+			<nav class="flex min-w-0 flex-1 gap-0.5 rounded-xl bg-neutral-900 p-0.5" aria-label="Places">
+				${tab("Files", this.view === "files" && explorer, toFiles(explorer ? this.mode : loadSkin()), "phone-tab-files")}
+				${tab("Music", this.view === "files" && this.mode === "music", toFiles("music"), "phone-tab-music")}
+				${tab("Movies", this.view === "files" && this.mode === "movies", toFiles("movies"), "phone-tab-movies")}
+				${tab("Team", this.view === "team", () => (this.view = "team"), "phone-tab-team", !this.team)}
+			</nav>
+			<button class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-lg text-neutral-300 active:bg-neutral-800" aria-label="Areas and Lock" data-test="phone-account" @click=${() => this.accountSheet()}>☰</button>
+		</header>`;
+	}
+
+	/** ☰: who is signed in, the areas to switch to, and Lock. */
+	private accountSheet(): void {
+		showSheet(
+			[
+				...(this.member.role === "external" ? [] : [{ label: "My files", checked: this.area === this.member.id, run: () => this.chooseArea(this.member.id) }]),
+				...this.grantedCases.map((c) => ({ label: `Case ${c.id}`, checked: this.area === `case:${c.id}`, run: () => this.chooseArea(`case:${c.id}`) })),
+				{ separator: true, label: "" },
+				{ label: "Lock", run: () => void this.session.lock() },
+			],
+			`${this.member.name} · ${this.member.role} · sealed`,
+		);
+	}
+
 	protected override render() {
+		const explorer = this.mode === "win11" || this.mode === "macos";
 		return html`
 			<div class="flex h-full flex-col">
-				<header class="flex items-center justify-between border-b border-neutral-800 px-4 py-2">
+				${this.phone ? this.phoneHeader() : html`<header class="flex items-center justify-between border-b border-neutral-800 px-4 py-2">
 					<div class="flex items-center gap-2">
 						<span class="font-semibold text-accent">Gorani</span>
 						<span class="text-sm text-neutral-400">${this.member.name}</span>
 						<span class="rounded-full bg-neutral-800 px-2 py-0.5 text-[10px] uppercase tracking-wide text-neutral-400">${this.member.role} · sealed</span>
 					</div>
 					<div class="flex items-center gap-2 text-xs">
-						<select class="rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5" title="Area" data-test="area" .value=${this.area} @change=${(e: Event) => {
-							const v = (e.target as HTMLSelectElement).value;
-							const c = this.grantedCases.find((x) => `case:${x.id}` === v);
-							this.view = "files";
-							this.openArea(v, c ? c.id : this.member.name);
-						}}>
+						<select class="rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5" title="Area" data-test="area" .value=${this.area} @change=${(e: Event) => this.chooseArea((e.target as HTMLSelectElement).value)}>
 							${this.member.role === "external" ? nothing : html`<option value=${this.member.id}>My files</option>`}
 							${this.grantedCases.map((c) => html`<option value=${`case:${c.id}`}>Case ${c.id}</option>`)}
 						</select>
@@ -343,7 +396,7 @@ export class GoraniShell extends LitElement {
 							Lock
 						</button>
 					</div>
-				</header>
+				</header>`}
 				<main class="relative min-h-0 flex-1" @open-viewer=${(e: CustomEvent) => {
 					this.viewer = e.detail as ViewerTarget;
 					void this.requestUpdate();
@@ -356,7 +409,9 @@ export class GoraniShell extends LitElement {
 								});
 							}}></gorani-team>`
 						: this.model
-							? this.mode === "win11"
+							? this.phone && explorer
+								? html`<gorani-phone .model=${this.model} .memberName=${this.areaTitle} .memberRole=${this.member.role}></gorani-phone>`
+								: this.mode === "win11"
 								? html`<gorani-win11 .model=${this.model} .memberName=${this.areaTitle} .memberRole=${this.member.role}></gorani-win11>`
 								: this.mode === "music"
 									? html`<gorani-music .model=${this.model} .memberName=${this.areaTitle}></gorani-music>`
@@ -365,9 +420,18 @@ export class GoraniShell extends LitElement {
 										: html`<gorani-finder .model=${this.model} .memberName=${this.areaTitle}></gorani-finder>`
 							: html`<div class="flex h-full items-center justify-center text-sm text-neutral-500">Opening the vault…</div>`}
 				</main>
-				${this.viewer ? html`<gorani-viewer .model=${this.model} .target=${this.viewer} @closed=${() => (this.viewer = null)}></gorani-viewer>` : nothing}
-				<div class="pointer-events-none fixed bottom-4 left-1/2 z-50 -translate-x-1/2 space-y-2">
-					${this.toasts.map((t) => html`<div class="rounded-xl border border-neutral-700 bg-neutral-900/95 px-4 py-2 text-sm text-neutral-200 shadow-xl">${t.text}</div>`)}
+				${this.viewer
+					? // Keyed by file (41b): the next file a swipe opens gets a fresh
+						// viewer, and this one releases its decrypted handle on the way out.
+						keyed(this.viewer.id, html`<gorani-viewer .model=${this.model} .target=${this.viewer} @navigate=${(e: CustomEvent<ViewerTarget>) => (this.viewer = e.detail)} @closed=${() => (this.viewer = null)}></gorani-viewer>`)
+					: nothing}
+				<!-- Toasts: over the viewer, under a sheet (z 55: the viewer is 50,
+				     a sheet 60), so a message never hides the choices on screen.
+				     On a phone (41b): above the bottom bar, never wider than the
+				     screen, and the newest two only — a burst of five covered half
+				     of it. -->
+				<div class="pointer-events-none fixed bottom-4 left-1/2 z-[55] w-max max-w-[calc(100vw-1.5rem)] -translate-x-1/2 space-y-2 max-sm:bottom-[calc(4.5rem+env(safe-area-inset-bottom))]" data-test="toasts">
+					${(this.phone ? this.toasts.slice(-2) : this.toasts).map((t) => html`<div class="break-words rounded-xl border border-neutral-700 bg-neutral-900/95 px-4 py-2 text-sm text-neutral-200 shadow-xl">${t.text}</div>`)}
 				</div>
 			</div>
 		`;

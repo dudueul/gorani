@@ -86,6 +86,17 @@ export function loadMode(): PlatformMode {
 
 export function saveMode(mode: PlatformMode): void {
 	localStorage.setItem(MODE_KEY, mode);
+	if (mode === "win11" || mode === "macos") localStorage.setItem(SKIN_KEY, mode);
+}
+
+/** The explorer skin last chosen (41b): the phone's Files tab goes back to
+ * it after Music or Movies, so the desktop opens in the look it had. */
+const SKIN_KEY = "gorani-explorer-skin";
+
+export function loadSkin(): "win11" | "macos" {
+	const mode = localStorage.getItem(MODE_KEY);
+	if (mode === "win11" || mode === "macos") return mode;
+	return localStorage.getItem(SKIN_KEY) === "macos" ? "macos" : "win11";
 }
 
 // ── drag payloads (HTML5 dnd; ids travel, bytes never do) ───────────
@@ -396,13 +407,15 @@ export function startRename(container: HTMLElement, selector: string, current: s
 	input.addEventListener("blur", () => finish(true));
 }
 
-/** Prompt (styled) for a new folder name — a tiny promise-based dialog. */
-export function promptName(title: string, placeholder: string): Promise<string | null> {
+/** Prompt (styled) for a name — a new folder's, or (41b, the phone's
+ * Rename…) a new one for an item, starting from `value`. A tiny
+ * promise-based dialog. */
+export function promptName(title: string, placeholder: string, { value = "", action = "Create" }: { value?: string; action?: string } = {}): Promise<string | null> {
 	return new Promise((resolve) => {
 		const wrap = document.createElement("div");
 		wrap.className = "fixed inset-0 z-50 flex items-center justify-center bg-black/50";
 		const card = document.createElement("div");
-		card.className = "w-80 rounded-2xl border border-neutral-700 bg-neutral-900 p-5 shadow-2xl";
+		card.className = "w-80 max-w-[calc(100vw-2rem)] rounded-2xl border border-neutral-700 bg-neutral-900 p-5 shadow-2xl";
 		// Built node by node, not with `card.innerHTML = …` (commit 24): under
 		// the app's Trusted Types CSP an innerHTML assignment throws — there is
 		// deliberately no policy that turns strings into HTML. The markup was
@@ -417,8 +430,10 @@ export function promptName(title: string, placeholder: string): Promise<string |
 		const heading = el("h3", "text-sm font-medium text-neutral-200", title);
 		const input = el("input", "mt-3 w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-[var(--color-accent)]");
 		input.placeholder = placeholder;
+		input.value = value;
+		input.enterKeyHint = "done";
 		const no = el("button", "rounded-lg px-3 py-1.5 text-sm text-neutral-300 hover:bg-neutral-800", "Cancel");
-		const yes = el("button", "rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-neutral-950 hover:opacity-90", "Create");
+		const yes = el("button", "rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-neutral-950 hover:opacity-90", action);
 		const row = el("div", "mt-4 flex justify-end gap-2");
 		row.append(no, yes);
 		card.append(heading, input, row);
@@ -435,6 +450,9 @@ export function promptName(title: string, placeholder: string): Promise<string |
 		wrap.append(card);
 		document.body.append(wrap);
 		input.focus();
+		// A rename starts with the name up to its extension selected, as both
+		// desktops do: typing replaces "report", not ".pdf".
+		if (value) input.setSelectionRange(0, value.lastIndexOf(".") > 0 ? value.lastIndexOf(".") : value.length);
 	});
 }
 

@@ -21,7 +21,7 @@
 import { store, type Store } from "../../lib/store.ts";
 import { newContentKey, importContentKey, sealWith, openWith, sealPlacedText, openPlacedText, wrapPlacedKey, unwrapPlacedKey, type VaultPrivateKey } from "../../vault/vault-crypto.ts";
 import { places, newItemId } from "../../vault/places.ts";
-import { controllingMediaWorker, registerDownload, registerMedia } from "../../lib/media-worker.ts";
+import { controllingMediaWorker, pipeToDownload, registerDownload, registerMedia } from "../../lib/media-worker.ts";
 import { openChunk, sealChunk, chunkFor, frameCount, MAX_FILE } from "../../vault/chunked-file.ts";
 import type { UploadJournal, UploadRecord } from "../../lib/upload-journal.ts";
 import { parseAudioMeta, type AudioMeta } from "../../vault/music-meta.ts";
@@ -40,6 +40,8 @@ import { signIntake, type IntakeFields } from "../../vault/intake.ts";
 import { acceptCustody, offerCustody, verifyChain, type CustodyCall, type CustodyChain } from "../../vault/custody.ts";
 import type { IndexEntry } from "../../vault/index-engine.ts";
 import type { PickedTree } from "./dropped.ts";
+import { ZipStream } from "../../vault/zip.ts";
+import { REPORT_NAME, ZipNames, checkReport, flagged, safeSegment, verdictOf, type LeftOut, type ZipLine } from "./zip-download.ts";
 import { FrameReader, WholeReader } from "../../lib/frame-reader.ts";
 import { mediaEngine, type MediaIndex, type Protector } from "../../lib/media-engine.ts";
 import { indexVideo } from "../../lib/video-index.ts";
@@ -1278,6 +1280,204 @@ export class FilesModel {
 		setTimeout(() => revokeBlobURL(url), 5000);
 	}
 
+	// ── download as zip (commit 41a, docs/DOWNLOADS.md) ─────────────────
+
+	/**
+	 * Download a selection — files, and folders with everything under them —
+	 * as ONE zip. The bytes take the same road a single download does:
+	 * fetched, decrypted and SHA-256-hashed here, frame by frame, then
+	 * written straight into the zip (zip.ts › ZipStream: stored entries,
+	 * ZIP64 where sizes need it). Nothing is held whole: above
+	 * STREAM_DOWNLOAD_AT the zip goes to disk through the media worker as it
+	 * is made, the way a case export does (31d).
+	 *
+	 * Three rules, from docs/DOWNLOADS.md:
+	 *   1. Malware samples (and files whose type does not verify, which are
+	 *      treated as samples) are LEFT OUT. A sample leaves the vault only
+	 *      zipped under "infected" (commit 29e). A plain zip holding one
+	 *      would put it raw on disk the moment it is unpacked.
+	 *   2. Every file is checked against its uploader's signed hash, and the
+	 *      verdicts travel inside the zip as `gorani-check.txt` (written
+	 *      last, when they are all known). A file that does not match is
+	 *      still included, so the person can examine it, but flagged.
+	 *   3. Folder paths are kept, with every name made safe and unique
+	 *      (zip-download.ts). An empty folder is kept as an entry.
+	 */
+	async downloadZip(items: Selection[] = this.state.get().selection): Promise<ZipDownloadResult> {
+		const s = this.state.get();
+		if (s.trashMode) throw new Error("restore files from the Trash before downloading them");
+		if (!items.length) throw new Error("select files or folders to download");
+		const files = items.flatMap((it) => (it.kind === "file" ? s.files.filter((f) => f.id === it.id) : []));
+		const folders = items.flatMap((it) => (it.kind === "folder" ? [...s.tree, ...s.folders].filter((f) => f.id === it.id).slice(0, 1) : []));
+		const only = items.length === 1 && folders.length === 1 ? folders[0] : undefined;
+		const name = only && only.name !== UNVERIFIED ? `${safeSegment(only.name)}.zip` : `gorani-${new Date().toISOString().slice(0, 10)}.zip`;
+		return this.zipDownload(files, folders, name);
+	}
+
+	/** One whole folder as a zip; null is the area's top — every folder and
+	 * file in the area (`name` then names the zip: the area's own name). */
+	async downloadFolderZip(folderId: string | null, name?: string): Promise<ZipDownloadResult> {
+		const s = this.state.get();
+		if (folderId) {
+			// From the tree, not the open folder's listing: the navigation
+			// pane offers this while the Trash is open, too.
+			const folder = s.tree.find((f) => f.id === folderId);
+			if (!folder) throw new Error("that folder is not in this area any more — refresh and try again");
+			return this.zipDownload([], [folder], folder.name === UNVERIFIED ? `gorani-${new Date().toISOString().slice(0, 10)}.zip` : `${safeSegment(folder.name)}.zip`);
+		}
+		const tops = s.tree.filter((f) => (f.parent ?? null) === null);
+		return this.zipDownload(await this.filesIn(null), tops, `${safeSegment(name ?? "gorani")}.zip`);
+	}
+
+	private async zipDownload(topFiles: FileRow[], topFolders: FolderRow[], zipName: string): Promise<ZipDownloadResult> {
+		const s = this.state.get();
+
+		// ── 1. the plan: which file goes where ──────────────────────────
+		const names = new ZipNames();
+		names.reserve(REPORT_NAME);
+		const dirs: { path: string; modified: Date }[] = [];
+		const plan: { row: FileRow; path: string }[] = [];
+		const children = new Map<string | null, FolderRow[]>();
+		for (const f of s.tree) {
+			const list = children.get(f.parent ?? null) ?? [];
+			list.push(f);
+			children.set(f.parent ?? null, list);
+		}
+		const cmp = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+		// A server could send a tree with a loop (a folder its own ancestor):
+		// each folder is walked once, whatever the tree says.
+		const seen = new Set<string>();
+		const walk = async (folder: FolderRow, dir: string): Promise<void> => {
+			if (seen.has(folder.id)) return;
+			seen.add(folder.id);
+			const path = names.claim(dir, folder.name === UNVERIFIED ? `unverified-name-${folder.id}` : folder.name);
+			dirs.push({ path, modified: dateOr(folder.updatedAt) });
+			for (const f of (await this.filesIn(folder.id)).sort((a, b) => cmp(a.name, b.name))) plan.push({ row: f, path: names.claim(path, zipNameOf(f)) });
+			for (const c of [...(children.get(folder.id) ?? [])].sort((a, b) => cmp(a.name, b.name))) await walk(c, path);
+		};
+		for (const row of topFiles) plan.push({ row, path: names.claim("", zipNameOf(row)) });
+		for (const folder of topFolders) await walk(folder, "");
+
+		// ── 2. which of them may go in (rule 1) ─────────────────────────
+		const keys = await this.keysOf(plan.map((p) => p.row.id));
+		const leftOut: LeftOut[] = [];
+		const going: { row: FileRow; path: string; meta: KeyMeta }[] = [];
+		for (const p of plan) {
+			const meta = keys[p.row.id];
+			if (!meta) {
+				leftOut.push({ path: p.path, why: "its key was not found (moved to the Trash, or the server did not answer for it)" });
+				continue;
+			}
+			const policy = p.row.sample ? "sample" : await this.policyOf(meta, p.row.id, null);
+			if (policy === "sample") leftOut.push({ path: p.path, why: `a malware sample — download it on its own: it comes zipped under “${SAMPLE_PASSWORD}”` });
+			else if (policy === "unverified") leftOut.push({ path: p.path, why: `its type does not verify, so it is treated as a sample — download it on its own (zipped under “${SAMPLE_PASSWORD}”)` });
+			else going.push({ ...p, meta });
+		}
+
+		// ── 3. where the zip goes: this tab, or the media worker ────────
+		const total = going.reduce((n, g) => n + Number(g.meta.size ?? g.row.size), 0);
+		const worker = total > STREAM_DOWNLOAD_AT ? await controllingMediaWorker(2000) : null;
+		if (!worker && total > IN_TAB_LIMIT) throw new Error(`these files come to ${(total / 1024 ** 3).toFixed(1)} GiB: a zip that large is written through the media worker, which is not running — reload the page and try again`);
+		const parts: Uint8Array[] = [];
+		let pipe: Awaited<ReturnType<typeof pipeToDownload>> | null = null;
+		if (worker) {
+			const url = `/media/dl/${toBase64(crypto.getRandomValues(new Uint8Array(18))).replace(/\+/g, "-").replace(/\//g, "_")}`;
+			pipe = await pipeToDownload(worker, { url, name: zipName, mime: "application/zip" });
+			// A navigation the worker answers (not <a download>, which Chromium sends past it).
+			const a = document.createElement("a");
+			a.href = url;
+			a.click();
+		}
+		this.bridge.toast(`Zipping ${going.length} file${going.length === 1 ? "" : "s"} (${sizeText(total)}) into “${zipName}”…`);
+
+		// ── 4. the zip itself ───────────────────────────────────────────
+		const lines: ZipLine[] = [];
+		try {
+			// An error from the SINK (the person cancelled the download) ends
+			// the whole zip. An error from one file's fetch ends only that file.
+			let sinkError: unknown = null;
+			const sink = async (bytes: Uint8Array) => {
+				try {
+					if (pipe) await pipe.write(bytes);
+					else parts.push(bytes);
+				} catch (e) {
+					sinkError = e;
+					throw e;
+				}
+			};
+			const zip = new ZipStream(sink);
+			for (const d of dirs) await zip.addFolder(d.path, { modified: d.modified });
+			for (const g of going) {
+				const h = await sha256Stream();
+				let size = 0;
+				let served: { version: number; hash: string | null } | null = null;
+				let error: string | undefined;
+				await zip.add(
+					g.path,
+					async (write) => {
+						try {
+							// The version the type was checked for, and no other.
+							served = await this.bridge.fetchObjectStream(this.memberId, g.row.id, g.meta.version, async (plain) => {
+								h.update(plain);
+								size += plain.length;
+								await write(plain);
+							});
+						} catch (e) {
+							if (sinkError) throw e;
+							// The entry closes with what arrived; the report says so.
+							error = `did not finish downloading (${e instanceof Error ? e.message : String(e)}) — the copy in this zip is incomplete (${size} of ${Number(g.meta.size ?? g.row.size)} bytes)`;
+						}
+					},
+					{ modified: dateOr(shownModified(g.row)), size: Number(g.meta.size ?? g.row.size) },
+				);
+				const sha256 = h.hex();
+				const check = served && !error ? await this.checkHash(g.row.id, served, { sha256, size }) : null;
+				lines.push({ path: g.path, size, sha256, check, ...(error ? { error } : {}), ...(g.row.name === UNVERIFIED ? { nameUnverified: true } : {}) });
+			}
+			const report = checkReport({ zipName, area: this.memberId, made: new Date(), lines, leftOut, detail: describeHashCheck });
+			await zip.addBytes(REPORT_NAME, new TextEncoder().encode(report));
+			await zip.finish();
+			if (pipe) await pipe.close();
+			else this.save(parts, zipName);
+		} catch (e) {
+			pipe?.fail(e);
+			throw e;
+		}
+
+		// ── 5. what the person is told ──────────────────────────────────
+		const bad = lines.filter(flagged);
+		const unsigned = lines.filter((l) => verdictOf(l) === "UNSIGNED").length;
+		const said = [`Downloaded “${zipName}” — ${lines.length} file${lines.length === 1 ? "" : "s"}`];
+		if (bad.length) said.push(`⚠ ${bad.length} flagged (${bad.slice(0, 3).map((l) => `${l.path}: ${verdictOf(l)}`).join("; ")}${bad.length > 3 ? "; …" : ""})`);
+		else if (lines.length) said.push(unsigned === lines.length ? "none signed by its uploader" : unsigned ? `verified against their uploaders' signatures, ${unsigned} not signed` : "all verified against their uploaders' signatures");
+		if (leftOut.length) said.push(`${leftOut.length} left out (malware samples: download them on their own)`);
+		this.bridge.toast(`${said.join(" — ")} — see ${REPORT_NAME} inside`);
+		return { name: zipName, lines, leftOut };
+	}
+
+	/** Every live file of one folder (null: the top), page by page (the listing caps a page
+	 * at 1000). Rows that claim another folder are ignored, and a page that
+	 * brings nothing new ends the walk: a server cannot keep it going. */
+	private async filesIn(folderId: string | null): Promise<FileRow[]> {
+		const out = new Map<string, FileRow>();
+		for (let offset = 0; ; offset += LIST_PAGE) {
+			const l = await this.bridge.apiGet<{ files: FileRowJson[] }>(`${areaPath(this.memberId)}/files/list?folder=${folderId ? encodeURIComponent(folderId) : "root"}&offset=${offset}&limit=${LIST_PAGE}`);
+			const before = out.size;
+			for (const f of await this.decryptFiles(l.files.filter((f) => (f.folder ?? null) === folderId))) out.set(f.id, f);
+			if (l.files.length < LIST_PAGE || out.size === before) return [...out.values()];
+		}
+	}
+
+	/** Many files' keys entries, in batches (the server answers up to 500 ids a call). */
+	private async keysOf(ids: string[]): Promise<Record<string, KeyMeta>> {
+		const out: Record<string, KeyMeta> = {};
+		for (let at = 0; at < ids.length; at += KEYS_BATCH) {
+			const got = await this.bridge.apiSend<{ keys: Record<string, KeyMeta> }>("POST", `${areaPath(this.memberId)}/files/keys`, { ids: ids.slice(at, at + KEYS_BATCH) });
+			for (const id of ids.slice(at, at + KEYS_BATCH)) if (got.keys[id]) out[id] = got.keys[id];
+		}
+		return out;
+	}
+
 	// ── malware samples (commit 29e, docs/CUSTODY.md › stage 5) ─────────
 
 	/**
@@ -1999,6 +2199,48 @@ export function concat(parts: Uint8Array[]): Uint8Array {
 export const STREAM_DOWNLOAD_AT = 256 * 1024 * 1024;
 /** Above this, a download is not even tried in the tab's memory. */
 const IN_TAB_LIMIT = 2 * 1024 ** 3;
+/** A listing page, as the server caps it (files_store.rs › files_list). */
+const LIST_PAGE = 1000;
+/** Ids per `POST files/keys` — under the server's 500. */
+const KEYS_BATCH = 200;
+
+/** What `POST files/keys` says about one file (its living version). */
+interface KeyMeta {
+	key: string;
+	chunk: number | null;
+	version: number;
+	type: string | null;
+	size?: number;
+	sample?: boolean;
+	hash?: string | null;
+}
+
+/** What a zip download did — the toast says it; a test reads it. */
+export interface ZipDownloadResult {
+	name: string;
+	lines: ZipLine[];
+	leftOut: LeftOut[];
+}
+
+/** The name a file goes into a zip under: its own, or — when it did not
+ * open in its place — its id, so nothing a server wrote names a file. */
+function zipNameOf(f: FileRow): string {
+	return f.name === UNVERIFIED ? `unverified-name-${f.id}` : f.name;
+}
+
+/** A date from ISO text, or now when the text is not one. */
+function dateOr(iso: string | null | undefined): Date {
+	const t = iso ? Date.parse(iso) : NaN;
+	return Number.isFinite(t) ? new Date(t) : new Date();
+}
+
+/** "12 KB", "3.4 GiB" — for a toast. */
+function sizeText(n: number): string {
+	if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GiB`;
+	if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MiB`;
+	if (n >= 1024) return `${Math.round(n / 1024)} KiB`;
+	return `${n} bytes`;
+}
 /** Files up to this size go up whole, in one request; larger ones as GC01 frames. */
 export const WHOLE_LIMIT = 48 * 1024 * 1024;
 

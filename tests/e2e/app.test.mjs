@@ -248,6 +248,24 @@ try {
 			const download = page.waitForEvent("download");
 			await choose("gorani-win11", "menu-b.txt", "Download");
 			assert.equal((await download).suggestedFilename(), "menu-b.txt", "Download from the menu downloads the file");
+			// Download as zip (41a): one zip, the file in it, the check report beside it.
+			{
+				const zipped = page.waitForEvent("download");
+				await choose("gorani-win11", "menu-b.txt", "Download as zip");
+				const z = await zipped;
+				assert.match(z.suggestedFilename(), /^gorani-\d{4}-\d{2}-\d{2}\.zip$/, "Download as zip from the menu downloads a zip");
+				const { spawnSync } = await import("node:child_process");
+				const read = spawnSync("python3", ["-I", "-c", "import zipfile,sys,hashlib; z=zipfile.ZipFile(sys.argv[1]); print(' '.join(z.namelist())); print(hashlib.sha256(z.read('menu-b.txt')).hexdigest()); print(z.read('gorani-check.txt').decode())", await z.path()], { encoding: "utf8" });
+				if (read.error) console.log("  (python3 not found: the zip from the menu was not opened)");
+				else {
+					assert.equal(read.status, 0, read.stderr);
+					const [names, sha, ...report] = read.stdout.split("\n");
+					assert.equal(names, "menu-b.txt gorani-check.txt", "the file, then the report");
+					assert.equal(sha, await sha256Hex(new TextEncoder().encode("a file for the menus")), "decrypted in the browser, byte for byte");
+					assert.match(report.join("\n"), new RegExp(`\\n(OK|UNSIGNED) +menu-b\\.txt\\n  SHA-256  ${sha}\\n`), "the report names it, with its hash and verdict");
+				}
+				await page.getByText(/Downloaded “gorani-.*\.zip” — 1 file — .* — see gorani-check\.txt inside/).first().waitFor({ timeout: 10_000 });
+			}
 			await choose("gorani-win11", "menu-b.txt", "Share…");
 			await page.locator("gorani-share").waitFor({ state: "attached" });
 			await page.keyboard.press("Escape");

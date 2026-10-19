@@ -346,6 +346,58 @@ export class ZipStream {
 		return this.add(name, (write) => write(data), { ...opts, size: data.length });
 	}
 
+	/**
+	 * A folder entry, `name/` with no data (41a, a Download as zip): an empty
+	 * folder keeps its place in the tree. The MS-DOS directory attribute is
+	 * set, as Explorer and Info-ZIP write folders. No data descriptor:
+	 * nothing follows the header.
+	 */
+	async addFolder(name: string, { modified = new Date() }: { modified?: Date } = {}): Promise<void> {
+		if (this.finished) throw new Error("the zip is already finished");
+		const clean = name.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+		if (!clean || clean.split("/").some((s) => s === ".." || s === "")) throw new Error(`a zip folder needs a plain relative name: “${name}”`);
+		const key = `${clean}/`;
+		if (this.names.has(key)) return;
+		this.names.add(key);
+		const nameBytes = this.enc.encode(key);
+		const { time, date } = dosTime(modified);
+		const localAt = this.offset;
+		const local = new Uint8Array(30 + nameBytes.length);
+		const lv = new DataView(local.buffer);
+		lv.setUint32(0, 0x04034b50, true);
+		lv.setUint16(4, 20, true);
+		lv.setUint16(6, 0x0800, true); // UTF-8
+		lv.setUint16(10, time, true);
+		lv.setUint16(12, date, true);
+		lv.setUint16(26, nameBytes.length, true);
+		local.set(nameBytes, 30);
+		await this.emit(local);
+		const big = this.opts.forceZip64 === true || localAt >= U32;
+		const cx = big ? new Uint8Array(12) : new Uint8Array(0);
+		if (big) {
+			const xv = new DataView(cx.buffer);
+			xv.setUint16(0, 0x0001, true);
+			xv.setUint16(2, 8, true);
+			xv.setBigUint64(4, BigInt(localAt), true);
+		}
+		const cd = new Uint8Array(46 + nameBytes.length + cx.length);
+		const cv = new DataView(cd.buffer);
+		cv.setUint32(0, 0x02014b50, true);
+		cv.setUint16(4, 45, true);
+		cv.setUint16(6, big ? 45 : 20, true);
+		cv.setUint16(8, 0x0800, true);
+		cv.setUint16(12, time, true);
+		cv.setUint16(14, date, true);
+		cv.setUint16(28, nameBytes.length, true);
+		cv.setUint16(30, cx.length, true);
+		cv.setUint32(38, 0x10, true); // external attributes: MS-DOS directory
+		cv.setUint32(42, big ? U32 : localAt, true);
+		cd.set(nameBytes, 46);
+		cd.set(cx, 46 + nameBytes.length);
+		this.central.push(cd);
+		this.count++;
+	}
+
 	/** The central directory and its end records (ZIP64 when anything overflows). */
 	async finish(): Promise<void> {
 		if (this.finished) return;

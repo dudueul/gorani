@@ -16,7 +16,11 @@
  *   → (commit 29e, D8) a sample uploaded as one, or marked later, is never
  *   previewed, downloads as a ZipCrypto zip under "infected" (opened here
  *   by Python's zipfile, an independent reader), and its copies stay
- *   samples; a server that clears its flag cannot make it renderable.
+ *   samples; a server that clears its flag cannot make it renderable →
+ *   (commit 41a) Download as zip keeps the folders (an empty one too),
+ *   makes names safe and unique without case, leaves samples out and says
+ *   so, flags a file whose signature does not verify, and writes the
+ *   verdicts into gorani-check.txt — read back by Python's zipfile.
  */
 
 import assert from "node:assert/strict";
@@ -668,9 +672,104 @@ assert.equal(await model.preview(plainRow.id), null);
 	assert.equal(toWebVtt("WEBVTT\r\n\r\n00:01.000 --> 00:02.000\r\nhi"), "WEBVTT\n\n00:01.000 --> 00:02.000\nhi", "a VTT file passes through, line ends made plain");
 }
 
+// ── Download as zip (commit 41a, docs/DOWNLOADS.md) ──────────────────
+{
+	// A folder tree with everything the zip has to get right: a subfolder,
+	// an EMPTY folder, two names that differ only in case, a malware
+	// sample, and a name Windows refuses. Read back by Python's zipfile.
+	await model.open(null);
+	const top = await model.newFolder(null, "Case 41a");
+	const sub = await model.newFolder(top, "photos");
+	await model.newFolder(top, "empty");
+	await model.upload([new File(["first notes 41a"], "notes.txt"), new File(["what? 41a"], "what?.txt")], { into: top });
+	await model.upload([new File(["lower 41a"], "a.jpg", { type: "image/jpeg" }), new File(["UPPER 41a"], "A.JPG", { type: "image/jpeg" })], { into: sub });
+	await model.upload([new File([new TextEncoder().encode("MZ\x90 41a dropper") as BlobPart], "dropper.exe")], { sample: true, into: top });
+	await model.upload([new File(["top-level 41a"], "loose.txt")], { into: null });
+	await model.open(null);
+	const loose = model.state.get().files.find((f) => f.name === "loose.txt")!;
+
+	// A server that moves another file's signed record onto notes.txt:
+	// the copy goes in, flagged — the person may need to examine it.
+	const notesId = [...rows.values()].find((r) => r.folder === top && versions.get(r.id) && rows.get(r.id)!.size === "first notes 41a".length)!.id;
+	const notesHash = versions.get(notesId)!.hash;
+	versions.get(notesId)!.hash = versions.get(loose.id)!.hash;
+
+	const result = await model.downloadZip([{ kind: "folder", id: top }, { kind: "file", id: loose.id }]);
+	versions.get(notesId)!.hash = notesHash;
+	assert.match(result.name, /^gorani-\d{4}-\d{2}-\d{2}\.zip$/, "a mixed selection is named by the day");
+	assert.equal(model.lastSaved?.name, result.name, "small: built in this tab and saved once");
+	assert.deepEqual(result.leftOut.map((l) => l.path), ["Case 41a/dropper.exe"], "the sample is left out…");
+	assert.match(result.leftOut[0]!.why, /malware sample — download it on its own: it comes zipped under “infected”/, "…and says how to get it");
+	const byPath = new Map(result.lines.map((l) => [l.path, l]));
+	assert.deepEqual([...byPath.keys()].sort(), ["Case 41a/notes.txt", "Case 41a/photos/A (2).JPG", "Case 41a/photos/a.jpg", "Case 41a/what_.txt", "loose.txt"].sort(), "paths kept, names made safe and unique without case");
+	assert.equal(byPath.get("Case 41a/notes.txt")?.check?.status, "invalid", "a record moved from another file does not verify here");
+	assert.equal(byPath.get("loose.txt")?.check?.status, "verified");
+	assert.match(toasts.at(-1)!, /^Downloaded “gorani-.*\.zip” — 5 files — ⚠ 1 flagged \(Case 41a\/notes\.txt: INVALID\) — 1 left out \(malware samples: download them on their own\) — see gorani-check\.txt inside$/, toasts.at(-1));
+
+	const dir = mkdtempSync(join(tmpdir(), "gorani-zipdl-"));
+	try {
+		writeFileSync(join(dir, "d.zip"), concatAll(model.lastSaved!.parts));
+		const py = spawnSync("python3", ["-I", "-c", ["import zipfile,sys,hashlib,json", "z=zipfile.ZipFile(sys.argv[1])", "z.testzip() is None or sys.exit('a CRC is wrong')", "print(json.dumps({i.filename: (None if i.is_dir() else hashlib.sha256(z.read(i)).hexdigest()) for i in z.infolist()}))", "print(z.read('gorani-check.txt').decode())"].join("\n"), join(dir, "d.zip")], { encoding: "utf8" });
+		if (py.error) console.log("  (python3 not found: the downloaded zip was not cross-checked by an independent reader)");
+		else {
+			assert.equal(py.status, 0, py.stderr);
+			const [json, ...rest] = py.stdout.split("\n");
+			const entries = JSON.parse(json!) as Record<string, string | null>;
+			const report = rest.join("\n");
+			assert.deepEqual(Object.keys(entries).filter((k) => k.endsWith("/")).sort(), ["Case 41a/", "Case 41a/empty/", "Case 41a/photos/"], "every folder an entry — the empty one kept");
+			assert.ok(!Object.keys(entries).some((k) => k.includes("dropper")), "no sample in the zip, under any name");
+			assert.equal(Object.keys(entries).at(-1), "gorani-check.txt", "the report is written last, when every verdict is known");
+			const { createHash } = await import("node:crypto");
+			const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+			assert.equal(entries["Case 41a/photos/a.jpg"], sha("lower 41a"), "decrypted byte for byte");
+			assert.equal(entries["Case 41a/photos/A (2).JPG"], sha("UPPER 41a"));
+			for (const l of result.lines) assert.equal(entries[l.path], l.sha256, `the report's hash of ${l.path} is the hash of what is in the zip`);
+			assert.match(report, /Files: 5 in this zip, 1 left out\n       4 OK · 1 INVALID\n/);
+			assert.match(report, new RegExp(`\\nINVALID    Case 41a/notes\\.txt\\n  SHA-256  ${sha("first notes 41a")}\\n`));
+			assert.match(report, /\nCase 41a\/dropper\.exe — a malware sample/);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+
+	// One folder alone: the zip takes its name.
+	assert.equal((await model.downloadFolderZip(sub)).name, "photos.zip");
+	// The area's top: every folder and file, named as the caller says.
+	const all = await model.downloadFolderZip(null, "Jinu");
+	assert.equal(all.name, "Jinu.zip");
+	assert.ok(all.lines.some((l) => l.path === "loose.txt") && all.lines.some((l) => l.path === "Case 41a/photos/a.jpg"), "the top's files and everything under its folders");
+
+	// A connection that drops part-way through one file: the rest still go
+	// in, and that one is marked FAILED, never passed off as complete.
+	const real = bridge.fetchObjectStream;
+	bridge.fetchObjectStream = async (member, id, version, sink) => {
+		if (id === loose.id) {
+			await sink(new TextEncoder().encode("top-"));
+			throw new Error("the network went away");
+		}
+		return real(member, id, version, sink);
+	};
+	try {
+		const cut = await model.downloadZip([{ kind: "folder", id: sub }, { kind: "file", id: loose.id }]);
+		const line = cut.lines.find((l) => l.path === "loose.txt")!;
+		assert.equal(line.check, null);
+		assert.match(line.error!, /did not finish downloading \(the network went away\) — the copy in this zip is incomplete \(4 of 13 bytes\)/);
+		assert.equal(cut.lines.filter((l) => l.check?.status === "verified").length, 2, "the other files went in whole and verified");
+		assert.match(toasts.at(-1)!, /⚠ 1 flagged \(loose\.txt: FAILED\)/);
+	} finally {
+		bridge.fetchObjectStream = real;
+	}
+
+	// Not from the Trash, and not nothing.
+	await assert.rejects(model.downloadZip([]), /select files or folders/);
+	await model.openTrash();
+	await assert.rejects(model.downloadZip([{ kind: "file", id: loose.id }]), /restore files from the Trash/);
+	await model.closeTrash();
+}
+
 model.dispose(); // stops the change-feed poll so the test process can exit
 
-console.log("ok  explorer model: sealed listings, uploads+duplicates, downloads, trash, copies, feed, folder uploads (the walk past 100, litter, merge, into a folder, Stop), subtitles beside a video (SRT → WebVTT)");
+console.log("ok  explorer model: sealed listings, uploads+duplicates, downloads, trash, copies, feed, folder uploads (the walk past 100, litter, merge, into a folder, Stop), subtitles beside a video (SRT → WebVTT), download as zip (folders kept, samples left out, checks inside, a dropped file marked FAILED)");
 
 function concatAll(parts: Uint8Array[]): Uint8Array {
 	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));

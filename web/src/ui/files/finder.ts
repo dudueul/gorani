@@ -16,7 +16,7 @@
  * | ⌘C/⌘X/⌘V, ⌘A, ⌘Delete → Trash; ⌥⌘Delete, and ⌘Delete in the Trash → Delete Forever (39v: a lead's, or the owner's) | model clipboard + trash / purge |
  * | Path bar at the bottom | breadcrumbs |
  * | Drag to move, drop on sidebar folder | model.moveItems; desktop drop → upload |
- * | Context menus (39m) | an item: Open / Get Info / Rename / Duplicate / Move to › / Move to Trash / Delete Forever… (39v) / Copy / Paste Item; the Trash: Put Back / Delete Forever… / Empty Trash…; empty space: New Folder / Upload / Paste Item / Select All / View as › / Sort By ›; sidebar rows; search and recent results; the menu key and Shift+F10 |
+ * | Context menus (39m) | an item: Open / Get Info / Rename / Duplicate / Move to › / Move to Trash / Delete Forever… (39v) / Copy / Paste Item / Download as Zip (41a); the Trash: Put Back / Delete Forever… / Empty Trash…; empty space: New Folder / Upload / Download Folder as Zip / Paste Item / Select All / View as › / Sort By ›; sidebar rows; search and recent results; the menu key and Shift+F10 |
  * | List view columns sortable | same sort state as the Windows skin |
  *
  * The point of shipping both skins: the same sealed operations, two platform
@@ -276,6 +276,8 @@ export class GoraniFinder extends LitElement {
 			{ label: "Request Files into Folder…", run: () => this.openRequests("links", id, name), disabled: kind !== "folder" || many },
 			{ label: "Mark as Malware Sample…", run: () => this.attempt(markSample(this.model, id, name)), disabled: kind === "folder" || many || sample },
 			{ label: "Download", run: () => this.attempt(this.downloadSelection()), disabled: !sel.some((x) => x.kind === "file") },
+			// (41a) Files and folders, one zip; samples left out, checks inside.
+			{ label: "Download as Zip", run: () => this.attempt(this.model.downloadZip(sel)) },
 			{ label: "Verify Signature", run: () => this.attempt(this.model.verifyAndReport(id)), disabled: kind === "folder" || many },
 			{ label: "Custody…", run: () => this.attempt(custodyAction(this.model, id, name)), disabled: kind === "folder" || many || this.model.areaKind() !== "evidence" },
 		];
@@ -336,6 +338,7 @@ export class GoraniFinder extends LitElement {
 				{ label: "Upload Folder…", icon: icon("folder"), run: () => this.pick("[data-upload-folder]") },
 				{ label: "Upload Malware Samples…", icon: icon("sample"), run: () => this.pick("[data-upload-sample]") },
 				{ label: "Request Files into Folder…", run: () => this.openRequests("links", s.folderId) },
+				{ label: "Download Folder as Zip", run: () => this.attempt(this.model.downloadFolderZip(s.folderId, this.memberName || "Home")), disabled: !(s.folders.length + s.files.length) },
 				{ separator: true, label: "" },
 				{ label: "Paste Item", run: () => this.attempt(this.model.paste()), disabled: !this.model.canPaste },
 				{ label: "Select All", run: () => this.model.selectAll(), disabled: !(s.folders.length + s.files.length) },
@@ -374,6 +377,7 @@ export class GoraniFinder extends LitElement {
 				{ label: "New Folder", icon: icon("folder"), run: () => this.attempt(this.newFolder(id)) },
 				{ label: id ? "Paste Item into Folder" : "Paste Item", run: () => this.attempt(this.model.paste(id)), disabled: !this.model.canPaste },
 				{ label: "Request Files into Folder…", run: () => this.openRequests("links", id, name) },
+				{ label: id ? "Download as Zip" : "Download All as Zip", run: () => this.attempt(this.model.downloadFolderZip(id, this.memberName || "Home")) },
 				...(id
 					? ([
 							{ separator: true, label: "" },

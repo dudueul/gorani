@@ -12,7 +12,9 @@
  *      refuses a wrong password;
  *   3. a zip written INTO another zip's entry (a sample inside an export)
  *      is itself a valid zip;
- *   4. the ZIP64 end records (forced) are what a reader expects.
+ *   4. the ZIP64 end records (forced) are what a reader expects;
+ *   5. (41a) a folder entry — "name/", no data — reads back as a folder,
+ *      and an EMPTY folder survives extraction.
  *
  * Without python3 on the PATH it says so and checks the structure only.
  */
@@ -85,12 +87,45 @@ for (const forceZip64 of [false, true]) {
 	}
 }
 
+// 5. Folder entries (41a, Download as zip): an empty folder keeps its place.
+for (const forceZip64 of [false, true]) {
+	const out: Uint8Array[] = [];
+	const zip = new ZipStream(async (b) => void out.push(b.slice()), { forceZip64 });
+	await zip.addFolder("Case 41a");
+	await zip.addFolder("Case 41a/empty", { modified: new Date("2026-10-14T09:30:00Z") });
+	await zip.addFolder("Case 41a/empty/"); // the same folder again: ignored, not doubled
+	await zip.addBytes("Case 41a/notes.txt", notes);
+	await zip.finish();
+	const mode = forceZip64 ? "ZIP64" : "plain";
+	const dir = mkdtempSync(join(tmpdir(), "gorani-zipfolders-"));
+	try {
+		writeFileSync(join(dir, "f.zip"), Buffer.concat(out));
+		const r = py(["import zipfile,sys,os", "z=zipfile.ZipFile(sys.argv[1])", "print('\\n'.join('|'.join([i.filename, str(i.is_dir()), str(i.file_size), '-'.join(map(str, i.date_time[:3]))]) for i in z.infolist()))", "d=os.path.join(os.path.dirname(sys.argv[1]),'out')", "z.extractall(d)", "print(os.path.isdir(os.path.join(d,'Case 41a','empty')))"], join(dir, "f.zip"));
+		if (r.error) {
+			console.log("  (python3 not found: folder entries were not cross-checked)");
+			break;
+		}
+		assert.equal(r.status, 0, r.stderr);
+		const lines = r.stdout.trim().split("\n");
+		const rows = lines.slice(0, -1).map((l) => l.split("|"));
+		assert.deepEqual(rows.map((x) => x[0]), ["Case 41a/", "Case 41a/empty/", "Case 41a/notes.txt"], `${mode}: folders end in "/", once each`);
+		assert.deepEqual(rows.map((x) => x[1]), ["True", "True", "False"], `${mode}: a reader sees folders as folders`);
+		assert.deepEqual(rows[1]!.slice(2), ["0", "2026-10-14"], `${mode}: no data, and the folder's own date`);
+		assert.equal(lines.at(-1), "True", `${mode}: the empty folder survives extraction`);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 // Misuse is refused, not written.
 const zip = new ZipStream(async () => {});
 await zip.addBytes("a.txt", notes);
 await assert.rejects(zip.addBytes("a.txt", notes), /two zip entries/);
 await assert.rejects(zip.addBytes("../escape", notes), /plain relative name/);
+await assert.rejects(zip.addFolder("../up"), /plain relative name/);
+await assert.rejects(zip.addFolder(""), /plain relative name/);
 await zip.finish();
 await assert.rejects(zip.addBytes("late.txt", notes), /already finished/);
+await assert.rejects(zip.addFolder("late"), /already finished/);
 
-console.log("ok  zipstream: streamed stored entries, a ZipCrypto entry with a data descriptor, a zip inside a zip — plain and ZIP64 — read back by Python's zipfile");
+console.log("ok  zipstream: streamed stored entries, a ZipCrypto entry with a data descriptor, a zip inside a zip, folder entries (empty ones kept) — plain and ZIP64 — read back by Python's zipfile");

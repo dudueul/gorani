@@ -26,7 +26,8 @@ storage path, the nightly cron, the music library, and a browser e2e. The
 build order is the lesson plan — see [docs/COURSE.md](docs/COURSE.md), the
 architecture map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (duplicate
 detection: [docs/DUPLICATES.md](docs/DUPLICATES.md); uploads, folders and
-where a drop goes: [docs/UPLOADS.md](docs/UPLOADS.md); records that point at
+where a drop goes: [docs/UPLOADS.md](docs/UPLOADS.md); downloads, and a zip
+that carries its own check report: [docs/DOWNLOADS.md](docs/DOWNLOADS.md); records that point at
 nothing: [docs/ORPHANS.md](docs/ORPHANS.md); video in the page and the Movie
 tab: [docs/VIDEO.md](docs/VIDEO.md), [docs/MOVIES.md](docs/MOVIES.md);
 protected copies of videos, played through FairPlay:

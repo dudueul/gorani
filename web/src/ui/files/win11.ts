@@ -18,7 +18,7 @@
  * | F2 rename, Enter open, Delete → Trash; Shift+Delete, and Delete in the Trash → Delete forever (39v: a lead's, or the owner's) | model.rename / setFolder / trash / purge |
  * | Backspace = up one folder | model.setFolder(parent) |
  * | Status bar | counts + selection size |
- * | Context menus (39m) | an item: Open / Download / Cut / Copy / Paste into / Move to › / Rename / Delete / Delete forever… (39v); the Trash: Restore / Delete forever… / Empty Trash…; empty space: View › / Sort by › / Refresh / Paste / New / Upload / Select all; the tree, Home and Trash rows; search and recent results; the menu key and Shift+F10 |
+ * | Context menus (39m) | an item: Open / Download / Download as zip (41a) / Cut / Copy / Paste into / Move to › / Rename / Delete / Delete forever… (39v); the Trash: Restore / Delete forever… / Empty Trash…; empty space: View › / Sort by › / Refresh / Paste / New / Upload / Download this folder as zip / Select all; the tree, Home and Trash rows; search and recent results; the menu key and Shift+F10 |
  * | Drop onto a folder | model.move; drop from the desktop | model.upload (sealed client-side) |
  * | Preview pane | model.preview — decrypted in the browser, nothing sent |
  */
@@ -286,6 +286,8 @@ export class GoraniWin11 extends LitElement {
 		const items: MenuItem[] = [
 			{ label: "Open", run: () => void this.openEntry(kind, id, name), disabled: many },
 			{ label: "Download", run: () => this.attempt(this.downloadSelection()), disabled: !sel.some((x) => x.kind === "file") },
+			// (41a) Files and folders, one zip; samples left out, checks inside.
+			{ label: "Download as zip", run: () => this.attempt(this.model.downloadZip(sel)) },
 			{ label: "Verify signature", run: () => this.attempt(this.model.verifyAndReport(id)), disabled: kind === "folder" || many },
 			{ label: "Custody…", run: () => this.attempt(custodyAction(this.model, id, name)), disabled: kind === "folder" || many || this.model.areaKind() !== "evidence" },
 			{ separator: true, label: "" },
@@ -351,6 +353,7 @@ export class GoraniWin11 extends LitElement {
 				{ label: "Upload folder…", icon: icon("folder"), run: () => this.pickFolder() },
 				{ label: "Upload malware samples…", icon: icon("sample"), run: () => this.pick("[data-upload-sample]") },
 				{ label: "Request files into this folder…", run: () => this.openRequests("links", s.folderId) },
+				{ label: "Download this folder as zip", run: () => this.attempt(this.model.downloadFolderZip(s.folderId, this.memberName)), disabled: !(s.folders.length + s.files.length) },
 				{ separator: true, label: "" },
 				{ label: "Select all", run: () => this.model.selectAll(), disabled: !(s.folders.length + s.files.length) },
 				{ label: "Find duplicates…", run: () => this.openDuplicates() },
@@ -387,6 +390,7 @@ export class GoraniWin11 extends LitElement {
 				{ label: "New folder inside", icon: icon("folder"), run: () => this.attempt(this.newFolder(f.id)) },
 				{ label: "Paste into folder", run: () => this.attempt(this.model.paste(f.id)), disabled: !this.model.canPaste },
 				{ label: "Request files into this folder…", run: () => this.openRequests("links", f.id, f.name) },
+				{ label: "Download as zip", run: () => this.attempt(this.model.downloadFolderZip(f.id)) },
 				{ separator: true, label: "" },
 				{ label: "Rename", run: () => this.attempt(this.renameFolderInPlace(f.id)) },
 				{ label: "Move to", submenu: moveTargets(tree, target, f.parent ?? null, this.memberName, (to) => this.attempt(this.model.moveItems(target, to))) },
@@ -408,6 +412,7 @@ export class GoraniWin11 extends LitElement {
 				{ label: "New folder", icon: icon("folder"), run: () => this.attempt(this.newFolder(null)) },
 				{ label: "Paste", run: () => this.attempt(this.model.paste(null)), disabled: !this.model.canPaste },
 				{ label: "Request files into the top folder…", run: () => this.openRequests("links", null) },
+				{ label: "Download all as zip", run: () => this.attempt(this.model.downloadFolderZip(null, this.memberName)) },
 			],
 			e.clientX,
 			e.clientY,

@@ -17,4 +17,6 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 gorani-client-core = { path = "../core" }
 serde_json = "1"
+# (The app layer wipes a password and a sign-in it holds — 40d.)
+zeroize = "1"
 base64 = "0.22"

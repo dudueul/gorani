@@ -128,6 +128,20 @@ folder, not both.
 folder. Without `Unblock-File`, SmartScreen asks about an "unknown
 publisher"; after verifying, that is expected.
 
+**macOS, the app** (signed builds, from the release manager): open
+**Gorani**. It lives in the menu bar, and its Settings window opens on
+Account the first time:
+
+1. **Sign in with your browser.** Your browser opens at the team's page;
+   press **Sign in Gorani** there.
+2. **Enrol.** Name the Mac, keep "Automatic" protection (the Secure
+   Enclave and your login Keychain), and type your vault password or
+   recovery code.
+
+Gorani then appears in Finder under Locations. The menu bar has the rest:
+Open in Finder, Pause, Settings (show a case instead, start at login),
+Quit (DESKTOP.md › 40d).
+
 **macOS, the CLI**: verify, then
 
 ```sh

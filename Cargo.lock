@@ -507,6 +507,7 @@ dependencies = [
  "base64",
  "gorani-client-core",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

@@ -11,6 +11,7 @@
 //! char *gorani_call(session, request_json);         // one request, one JSON answer
 //! void gorani_free(char *);                         // every string this library returns
 //! void gorani_close(session);
+//! char *gorani_app(request_json);                   // the app's Settings and menu (40d, app.rs)
 //! ```
 //!
 //! A session is safe to call from any thread (the extension's queues): one
@@ -20,6 +21,8 @@
 //! A memory session also answers `mem.*` requests, so a test can play the
 //! server: `mem.put`, `mem.dir`, `mem.edit`, `mem.move`, `mem.remove`,
 //! `mem.sample`, `mem.readOnly`.
+
+mod app;
 
 use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
@@ -68,7 +71,13 @@ pub unsafe extern "C" fn gorani_open(profile: *const c_char, case_id: *const c_c
 		std::ptr::null_mut()
 	};
 	let Some(profile) = text(profile) else { return fail("no profile path".into()) };
-	let r = std::panic::catch_unwind(|| replica::connect(Path::new(&profile), text(case_id).as_deref(), None, text(dev_email).as_deref(), accept_unverified));
+	// What the app's Settings chose (40d) when the caller names nothing:
+	// the area, and whether unverified files are accepted. The extension
+	// passes neither, so it follows the app.
+	let chosen = gorani_client_core::session::load_profile(Path::new(&profile)).map(|p| p.app).unwrap_or_default();
+	let case = text(case_id).or(chosen.case);
+	let accept = accept_unverified || chosen.accept_unverified;
+	let r = std::panic::catch_unwind(|| replica::connect(Path::new(&profile), case.as_deref(), None, text(dev_email).as_deref(), accept));
 	match r {
 		Ok(Ok(remote)) => Box::into_raw(Box::new(GoraniSession { inner: Mutex::new(Inner::Http(remote)) })),
 		Ok(Err(e)) => fail(e.to_string()),
@@ -112,6 +121,23 @@ pub unsafe extern "C" fn gorani_call(session: *mut GoraniSession, request: *cons
 		}
 	}));
 	out(answer.unwrap_or_else(|_| json!({ "error": "the client core panicked", "code": "io" })).to_string())
+}
+
+/// One request of the Mac app's Settings and menu (commit 40d, app.rs):
+/// JSON in, JSON out (freed with `gorani_free`). Some requests block —
+/// `signin.wait` until the browser hands the sign-in over — so the app
+/// calls from a background task.
+///
+/// # Safety
+/// `request` is NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn gorani_app(request: *const c_char) -> *mut c_char {
+	let req: Value = match text(request).map(|r| serde_json::from_str(&r)) {
+		Some(Ok(v)) => v,
+		_ => return out(json!({ "error": "the request is not JSON" }).to_string()),
+	};
+	let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app::call(&req)));
+	out(answer.unwrap_or_else(|_| json!({ "error": "the client core panicked" })).to_string())
 }
 
 /// # Safety

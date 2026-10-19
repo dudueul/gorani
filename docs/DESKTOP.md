@@ -907,6 +907,57 @@ after a new one.
 else signs it in. `gorani-sync signin` signs in again, and
 `--no-browser` prints the address instead of opening it.
 
+### 40d as built: the Mac app (clients/macos/App/)
+
+The host app, which until 40d could only add Gorani to Finder or remove
+it, is now a menu-bar app (`LSUIElement`) with the same Settings as on
+Windows. Its decisions are the same core's, through one more C call:
+`gorani_app(request_json)` (clients/macos/src/app.rs), typed in Swift by
+`AppBridge` (GoraniKit).
+
+| Part | What it does |
+|---|---|
+| The menu bar | Where it stands (not set up, signed out, paused, in Finder). Open in Finder, Open Gorani in the browser, Pause/Resume, Sign in again… (when it ran out), Settings…, Quit. |
+| Settings › Account | Server; Sign in with your browser (40c; pressed again, it cancels); "Signed in as …". Before enrolment: the Mac's name, its protection (Automatic, Touch ID each time, Secure Enclave, login Keychain), the vault password, Enrol. After: where and how, Change server… (sign out, then enrol on the new one), Sign out…. |
+| Settings › Sync | Show Gorani in Finder; Show: my files or a case (Refresh opens the titles with each case key); start at login (`SMAppService`); Pause. |
+| Settings › This Mac & devices | Its protection, and changing it; your computers, Refresh, Revoke selected…. |
+| Settings › Advanced | The sign-in command; an Access service token; accept unverified files; the scanner. |
+
+**How it fits the Mac:**
+- **The files are Finder's.** The File Provider extension (39c) serves
+  them. Since 40d, `gorani_open` reads the area and "accept unverified"
+  from the profile when its caller names neither, so the extension
+  follows the Settings. A change the extension reads only when it starts
+  (the area, accepting unverified files) removes the domain and adds it
+  again. Nothing is lost: the files are the server's.
+- **Pause** disconnects the domain: the files stay listed, and nothing
+  moves.
+- **Sign out** removes the domain first, so its files leave this Mac,
+  then runs the core's sign-out.
+- **The browser's token never reaches Swift.** `signin.wait` keeps it in
+  the core, under the sign-in's id, until `whoami` or `enrol` uses it.
+  Once enrolled, it is saved straight into the profile. The vault
+  password does cross, as a string, and only for the enrolment call.
+- **Entitlements.** The host app now links the core and holds
+  `network.client` (the server) and `network.server` (the loopback
+  listener the browser posts to). It is still sandboxed, and still
+  shares only the app group with the extension.
+- **Opening Settings by itself.** The Settings window is a `Window`
+  scene, so the app can open it with `openWindow` on the first launch
+  and when the sign-in has run out. macOS 14 no longer opens SwiftUI's
+  `Settings` scene from code.
+
+**Tests:**
+- **The bridge's Rust tests** cover the app's requests: defaults, the
+  URL rules, a Mac not enrolled, an enrolment without a password
+  refused, a sign-in started and cancelled.
+- **`swift test` (AppBridgeTests)** covers the same requests through the
+  C interface, and the settings' JSON shape both ways.
+- **CI's unsigned `xcodebuild`** compiles the app with the core linked.
+
+What no CI can do here is run a File Provider domain or sign in to a
+real Access deployment. The first launch on a signed build is that check.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

@@ -4,8 +4,15 @@
 //! commands stay (scriptability, tests, power users).
 //!
 //! ```text
-//! setup [--server S]                     enrol this computer (the device's wrapped root copy);
-//!                                         S: https://gorani.at.day unless named (DEFAULT_SERVER)
+//! setup [--server S] [--member M]        enrol this computer (the device's wrapped root copy);
+//!       [--name N]                        S: https://gorani.at.day unless named (DEFAULT_SERVER);
+//!                                         M: the signed-in person's account unless named (40a)
+//! whoami [--server S]                     who the server says is signed in, and their account
+//! signout                                 this computer leaves: the server deletes its copy,
+//!                                         its key parts here are forgotten, the profile goes
+//! settings [--set key=value ...]          what the desktop apps' Settings window keeps (40a):
+//!                                         deviceName folder case startAtLogin keepLocal
+//!                                         acceptUnverified scanCommand paused (empty: unset)
 //! cases                                   the cases you are granted: kind, permission, title, state
 //! ls    [--case C]                        the change feed of your area, or of case C
 //! pull  --id F [--case C] [--out O]       a file, decrypted to disk — and, where its uploader
@@ -50,7 +57,7 @@ use std::path::{Path, PathBuf};
 
 use gorani_client_core::area::{self, open_area, open_team, Area};
 use gorani_client_core::cases::{self, CaseRow, HashCheck, IntakeFields};
-use gorani_client_core::{api, devicekey, inbox, session, transfer, DeviceProfile, Error, Session};
+use gorani_client_core::{api, devicekey, inbox, session, settings, transfer, DeviceProfile, Error, Session};
 use gorani_formats::formats::VaultPrivateKey;
 use gorani_formats::placed::{self, Place};
 
@@ -105,9 +112,16 @@ fn run(args: &[String]) -> Result<(), Error> {
 	//        --tpm-pin (a switch) --tpm-pcrs 7 (Linux's TPM part's PIN and boot state — commit 36)
 	let mut flags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 	let mut pos: Vec<String> = Vec::new();
+	// `--set key=value`, the one flag given more than once (`settings`).
+	let mut sets: Vec<String> = Vec::new();
 	let mut i = 0;
 	while i < args.len() {
 		let a = &args[i];
+		if a == "--set" {
+			sets.extend(args.get(i + 1).cloned());
+			i += 2;
+			continue;
+		}
 		if let Some(name) = a.strip_prefix("--") {
 			if SWITCHES.contains(&name) {
 				flags.insert(name.to_string(), "1".into());
@@ -135,32 +149,72 @@ fn run(args: &[String]) -> Result<(), Error> {
 
 	match pos.first().map(String::as_str) {
 		Some("setup") => {
-			let mut profile = DeviceProfile {
-				server: flag("server").unwrap_or_else(|| gorani_client_core::DEFAULT_SERVER.into()),
-				member: req_flag("member")?,
-				device_id: String::new(),
-				token: String::new(),
-				access_token_cmd: flag("access-token-cmd"),
-				access_id: flag("access-id"),
-				access_secret: flag("access-secret"),
-				device_secret: flag("device-secret"),
-				device_protectors: Vec::new(),
-				pending_protectors: Vec::new(),
-				dev_email: flag("dev-email"),
-			};
+			// The same enrolment the desktop apps' Settings window does
+			// (settings.rs, 40a): the member is the signed-in person's own
+			// account unless --member names one, and a computer already
+			// enrolled must sign out first.
+			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
 			let name = flag("name").unwrap_or_else(|| "this computer".into());
 			let secret = flag("secret").unwrap_or_else(|| read_secret("Vault password or recovery code: "));
 			// Where the device secret lives (commit 34): the TPM and/or the login
 			// keyring by default — never silently a file.
 			let want: devicekey::Want = flag("protect").as_deref().unwrap_or("auto").parse()?;
-			let sess = session::enrol(&mut profile, &name, &secret, want, &tpm_options(&flag)?)?;
-			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
-			session::save_profile(&path, &profile)?;
-			let protection = if profile.device_secret.is_some() { "file".to_string() } else { devicekey::label(&profile.device_protectors) };
-			println!("enrolled device {} for root {} (member {}) — device secret protected by: {protection}", profile.device_id, sess.settings.key_id, profile.member);
+			let profile = settings::enrol(
+				&path,
+				settings::Enrolment {
+					sign_in: sign_in_of(&flag),
+					member: flag("member"),
+					device_name: name,
+					secret: &secret,
+					protect: want,
+					tpm_options: tpm_options(&flag)?,
+					device_secret: flag("device-secret"),
+					app: Default::default(),
+				},
+			)?;
+			let protection = settings::protection(&profile);
+			println!("enrolled device {} (member {}) — device secret protected by: {protection}", profile.device_id, profile.member);
 			if protection == "file" {
 				eprintln!("warning: this computer's device secret is in {} — anyone who copies that file, with the member's sign-in, can open this computer's copy of the root. Move it: gorani-sync protect", path.display());
 			}
+		}
+		Some("whoami") => {
+			// Before enrolment: the --server (and sign-in flags) given. After:
+			// the profile's own.
+			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
+			let sign_in = match (flag("server"), session::load_profile(&path)) {
+				(None, Ok(p)) => settings::SignIn { dev_email: flag("dev-email").or(p.dev_email.clone()), ..settings::SignIn::of(&p) },
+				_ => sign_in_of(&flag),
+			};
+			let me = settings::whoami(&sign_in)?;
+			match &me.member {
+				Some(m) => println!("{} — member {} ({}, {}){}", me.email, m.id, m.name, m.role, if m.active { "" } else { " — not active" }),
+				None => println!("{} — no account on this team (a lead adds the address in Team › People)", me.email),
+			}
+		}
+		Some("signout") => {
+			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
+			let out = settings::sign_out(&path)?;
+			match &out.warning {
+				None => println!("signed out: the server deleted this computer's copy; its key parts here are forgotten and {} is gone", path.display()),
+				Some(w) => {
+					println!("signed out here: the key parts are forgotten and {} is gone", path.display());
+					eprintln!("warning: {w}");
+				}
+			}
+		}
+		Some("settings") => {
+			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
+			let mut app = session::load_profile(&path)?.app;
+			// --set key=value, as many as wanted: an empty value unsets an option.
+			for kv in &sets {
+				let (k, v) = kv.split_once('=').ok_or_else(|| Error::Config(format!("--set {kv}: key=value")))?;
+				set_option(&mut app, k, v)?;
+			}
+			if !sets.is_empty() {
+				settings::save(&path, &app)?;
+			}
+			println!("{}", serde_json::to_string_pretty(&app).map_err(|e| Error::Config(e.to_string()))?);
 		}
 		Some("protect") => {
 			// Move an enrolled computer's secret to new protectors without
@@ -326,6 +380,8 @@ fn run(args: &[String]) -> Result<(), Error> {
 		Some(cmd @ ("inbox" | "accept" | "reject")) => {
 			let (profile, sess) = unlocked(&flag)?;
 			let member = profile.member.clone();
+			// The Settings window's scanner (40a) when --scan names none.
+			let scan_command = flag("scan").or_else(|| profile.app.scan_command.clone());
 			let client = api::Client::new(profile);
 			let case = flag("case");
 			let area = open_area(&client, &sess, &member, case.as_deref())?;
@@ -404,7 +460,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			let key = gorani_formats::formats::import_content_key(&opened.content_key);
 			// --scan: the decrypted bytes in a private file for the scanner
 			// (scan.rs), written as they are hashed — one pass over the item.
-			let (sha256, size) = match flag("scan") {
+			let (sha256, size) = match scan_command.clone() {
 				Some(scanner) => {
 					let mut f = gorani_client_core::scan::PrivateFile::create(&id, opened.meta.name())?;
 					let hashed = inbox::hash_item(&client, item, &key, |plain| f.write(plain))?;
@@ -547,7 +603,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file (Windows: +dpapi +hello; macOS: enclave +keychain +presence) --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash --duplicates skip|keep|ask]");
+			eprintln!("usage: gorani-sync <setup|whoami|signout|settings|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file (Windows: +dpapi +hello; macOS: enclave +keychain +presence) --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash --duplicates skip|keep|ask]");
 			std::process::exit(2);
 		}
 	}
@@ -706,6 +762,40 @@ fn with_dev_email(mut profile: DeviceProfile, flag: &dyn Fn(&str) -> Option<Stri
 		profile.dev_email = Some(e);
 	}
 	profile
+}
+
+/// The sign-in the flags describe (setup, whoami before enrolment).
+fn sign_in_of(flag: &dyn Fn(&str) -> Option<String>) -> settings::SignIn {
+	settings::SignIn {
+		server: flag("server").unwrap_or_else(|| gorani_client_core::DEFAULT_SERVER.into()),
+		access_token_cmd: flag("access-token-cmd"),
+		access_id: flag("access-id"),
+		access_secret: flag("access-secret"),
+		dev_email: flag("dev-email"),
+	}
+}
+
+/// One `--set key=value` of `gorani-sync settings`. The keys are the
+/// profile's own names (camelCase), so the file and the command agree.
+fn set_option(app: &mut settings::AppSettings, key: &str, value: &str) -> Result<(), Error> {
+	let text = || (!value.is_empty()).then(|| value.to_string());
+	let on = || match value {
+		"true" | "on" | "yes" | "1" => Ok(true),
+		"false" | "off" | "no" | "0" | "" => Ok(false),
+		_ => Err(Error::Config(format!("{key}: true or false, not “{value}”"))),
+	};
+	match key {
+		"deviceName" => app.device_name = text(),
+		"folder" => app.folder = text(),
+		"case" => app.case = text(),
+		"scanCommand" => app.scan_command = text(),
+		"startAtLogin" => app.start_at_login = on()?,
+		"keepLocal" => app.keep_local = on()?,
+		"acceptUnverified" => app.accept_unverified = on()?,
+		"paused" => app.paused = on()?,
+		_ => return Err(Error::Config(format!("no setting “{key}” — deviceName folder case startAtLogin keepLocal acceptUnverified scanCommand paused"))),
+	}
+	Ok(())
 }
 
 fn unlocked(flag: &dyn Fn(&str) -> Option<String>) -> Result<(DeviceProfile, Session), Error> {

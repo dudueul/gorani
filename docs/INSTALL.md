@@ -40,9 +40,17 @@ another deployment), signing in through Cloudflare Access with
 [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/):
 
 ```sh
-gorani-sync setup --member <your member id> \
+cloudflared access login https://gorani.at.day
+gorani-sync whoami --access-token-cmd "cloudflared access token -app=https://gorani.at.day"
+gorani-sync setup --name "my laptop" \
   --access-token-cmd "cloudflared access token -app=https://gorani.at.day"
 ```
+
+`whoami` says which account the sign-in belongs to, and `setup` enrols
+that account; `--member` names another only where a lead set one up for
+you to use. `gorani-sync signout` undoes it: the server deletes this
+computer's copy, and its keys here are forgotten. (On Windows and macOS
+the Gorani app's Settings window does the same: DESKTOP.md › 40.)
 
 (DESKTOP.md › 33a, 34, 39d.) The browser needs only the address:
 https://gorani.at.day.

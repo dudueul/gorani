@@ -705,6 +705,90 @@ environment `release` limited to main and `v*` tags, and add
 `environment: release` to the sign job: then no other branch's workflow
 can reach the key. Rotate with `new-key.sh` when the key may have leaked.
 
+## Commit 40: settings in a window
+
+Until 40 every desktop setting was a flag typed once to `gorani-sync
+setup`, and saved in the profile. Commit 40 gives the Windows and macOS
+apps a Settings window and a tray or menu-bar icon (decided 2026-10-19:
+Windows and macOS first, native per system, no new third-party UI code).
+40a is the part both windows call, in the core, and the CLI calls it too.
+
+### 40a as built: the settings layer (clients/core/src/settings.rs)
+
+| Tab | What it does | The core's call |
+|---|---|---|
+| Account | the server URL; who is signed in; this computer's name; enrol with the vault password; sign out | `normalize_server`, `sign_in_with_cloudflared`, `whoami`, `enrol`, `sign_out` |
+| Sync | the folder (Windows); the area, your own files or a case; start at login; keep local copies; pause | `AppSettings`, `cases`, `save` |
+| This computer & devices | how this computer's key part is protected, and changing it; your other computers, and revoking them | `protection`, `protection_choices`, `session::protect`, `devices`, `revoke` |
+| Advanced | an Access service token; accept files whose signature cannot be checked; the scanner command; the sign-in command itself | `save_sign_in`, `AppSettings` |
+
+**Where it is kept.** The window's choices live in the profile, under
+`app`, beside the enrolment: the device's name, folder, case,
+startAtLogin, keepLocal, acceptUnverified, scanCommand and paused. The
+key is left out while nothing is set, so a profile from before 40 reads
+and writes unchanged.
+
+**Who you are comes from the server.** `whoami` asks `GET /api/v1/me`
+with the sign-in. It needs no member id, so `setup` no longer asks for
+one: the member is the signed-in person's own account, and the window
+shows "Signed in as …". An address with no account is told that a lead
+adds it in Team › People. `--member` still names one explicitly.
+
+**One server per computer.** A computer's wrapped copy of the root and
+its token exist on one server. A new server URL is therefore "sign out
+there, then enrol here", and the window does both, in that order.
+Enrolling over an enrolled profile is refused ("sign out first"),
+because it would leave the first copy on a server with nothing on this
+computer left to revoke it. An enrolment the server accepted but this
+computer could not save gives its copy straight back.
+
+**Signing out** (`gorani-sync signout`, Account › Sign out) runs in this
+order:
+
+1. **The server.** `POST …/devices/<id>/leave`, with this computer's own
+   token: the server deletes its wrapped copy. If the server cannot be
+   reached, the rest still happens, and the person is told to revoke the
+   computer from another one (Team › Devices).
+2. **The key parts here.** Keyring and Keychain items and CNG keys are
+   forgotten.
+3. **The files.** The profile, and its journal of unfinished uploads,
+   are deleted.
+
+The Windows app also unregisters its folder.
+
+**Signing in.** The Access token now:
+
+- **Is fetched again shortly before it expires.** Until 40a it was
+  fetched once per process, so a shell left running past the Access
+  session (a day by default) was refused until restarted. The client now
+  reads the JWT's `exp`, only to schedule the next fetch, never to trust
+  it, and fetches again two minutes before. Without a readable `exp` it
+  fetches every 15 minutes, and after a failure every minute, so signing
+  in again is picked up quickly.
+- **Can be fetched from a path with spaces.** The command is split as a
+  command line, with quotes grouping. Windows installs cloudflared under
+  `C:\Program Files (x86)`, which the old whitespace split cut in three.
+- **Is signed into by the window.** `sign_in_with_cloudflared` runs
+  `cloudflared access login <server>`, which opens the browser at the
+  team's sign-in, then proves the token command works and keeps it.
+- **Never flashes a console.** Commands run from the windows open none on
+  Windows.
+
+**Checked before saving.** The server must be `https://`; plain `http://`
+is allowed only for this machine (`wrangler dev`), since anything else
+would send both tokens in the clear. Also checked: a case id's shape,
+that the folder is a full path, that the scanner command splits, and the
+device name.
+
+**The CLI** gained:
+
+- `whoami`;
+- `signout`;
+- `settings [--set key=value …]`, which shows or changes what the window
+  keeps (an empty value unsets).
+
+`accept` uses the saved scanner when `--scan` names none.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

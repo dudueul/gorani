@@ -25,6 +25,7 @@ pub mod inbox;
 pub mod replica;
 pub mod scan;
 pub mod session;
+pub mod settings;
 pub mod transfer;
 
 // Re-export the formats module at the crate root so bins can use
@@ -131,6 +132,12 @@ pub struct DeviceProfile {
 	/// Dev-mode identity (wrangler dev only; production uses Access).
 	#[serde(default)]
 	pub dev_email: Option<String>,
+	/// What the desktop apps' Settings window keeps (commit 40a,
+	/// settings.rs): the device's name, the folder, the area, start at
+	/// login, … Left out of the file while nothing is set, so profiles
+	/// written before 40a and after it read the same.
+	#[serde(default, skip_serializing_if = "settings::AppSettings::is_default")]
+	pub app: settings::AppSettings,
 }
 
 impl std::fmt::Debug for DeviceProfile {
@@ -147,6 +154,7 @@ impl std::fmt::Debug for DeviceProfile {
 			.field("device_secret", &redact(&self.device_secret))
 			.field("device_protectors", &devicekey::label(&self.device_protectors))
 			.field("dev_email", &self.dev_email)
+			.field("app", &self.app)
 			.finish()
 	}
 }

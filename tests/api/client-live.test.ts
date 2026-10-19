@@ -67,14 +67,26 @@ try {
 	assert.equal(saved.status, 200);
 	const recoveryCode = kidVault.recoveryCode;
 
+	// ── 0a. Who is signed in (40a): what the desktop apps' Account tab
+	// shows before enrolment, from GET /api/v1/me — no member id typed.
+	const who = await sync(["whoami", "--server", dev.base, "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json")]);
+	assert.equal(who.status, 0, who.out);
+	assert.match(who.out, /jinu@family\.test — member jinu \(Jinu, analyst\)/, `whoami names the account: ${who.out}`);
+	const stranger = await sync(["whoami", "--server", dev.base, "--dev-email", "stranger@example.test", "--profile", path.join(home, "profile.json")]);
+	assert.match(stranger.out, /stranger@example\.test — no account on this team/, `…or says there is none: ${stranger.out}`);
+	const strangerSetup = await sync(["setup", "--server", dev.base, "--secret", "x", "--device-secret", "00".repeat(32), "--dev-email", "stranger@example.test", "--profile", path.join(home, "stranger.json")]);
+	assert.notEqual(strangerSetup.status, 0);
+	assert.match(strangerSetup.out, /has no account on this team — a lead adds the address in Team › People/, `setup without --member says whose account is missing: ${strangerSetup.out}`);
+	assert.ok(!fs.existsSync(path.join(home, "stranger.json")), "…and writes no profile");
+
 	// ── 1. enrol: the real binary, the real worker ──────────────────────
+	// No --member (40a): the signed-in person's own account, from /me.
 	const deviceSecret = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 	console.error("STEP setup");
 	const setup = await sync(
 		[
 			"setup",
 			"--server", dev.base,
-			"--member", "jinu",
 			"--name", "Jinu's CLI",
 			"--secret", recoveryCode,
 			"--device-secret", deviceSecret,
@@ -84,7 +96,23 @@ try {
 		{ GORANI_URL: dev.base },
 	);
 	assert.equal(setup.status, 0, `setup failed: ${setup.out}`);
-	assert.match(setup.out, /enrolled device /);
+	assert.match(setup.out, /enrolled device \S+ \(member jinu\)/, `the member found from the sign-in: ${setup.out}`);
+	// A second enrolment over the first is refused: it would leave the first
+	// copy of the root on the server with nothing here to revoke it (40a).
+	const twice = await sync(["setup", "--server", dev.base, "--secret", recoveryCode, "--device-secret", deviceSecret, "--dev-email", "jinu@family.test", "--profile", path.join(home, "profile.json")]);
+	assert.notEqual(twice.status, 0);
+	assert.match(twice.out, /already enrolled \(Jinu's CLI on .+\) — sign out first/, twice.out);
+	// What the Settings window keeps (40a), set and read back through the CLI.
+	const set = await sync(["settings", "--set", "keepLocal=true", "--set", "scanCommand=clamscan --no-summary", "--set", "case=c42", "--profile", path.join(home, "profile.json")]);
+	assert.equal(set.status, 0, set.out);
+	const shown = JSON.parse(set.out);
+	assert.deepEqual({ deviceName: shown.deviceName, keepLocal: shown.keepLocal, scanCommand: shown.scanCommand, case: shown.case }, { deviceName: "Jinu's CLI", keepLocal: true, scanCommand: "clamscan --no-summary", case: "c42" });
+	assert.equal(JSON.parse(fs.readFileSync(path.join(home, "profile.json"), "utf8")).app.keepLocal, true, "kept in the profile, beside the enrolment");
+	const unset = await sync(["settings", "--set", "case=", "--set", "keepLocal=false", "--set", "scanCommand=", "--profile", path.join(home, "profile.json")]);
+	assert.equal(JSON.parse(unset.out).case, undefined, "an empty value unsets");
+	const bogus = await sync(["settings", "--set", "colour=red", "--profile", path.join(home, "profile.json")]);
+	assert.notEqual(bogus.status, 0);
+	assert.match(bogus.out, /no setting “colour”/);
 	// The device's wrapped copy is on the server (the web app sees it).
 	const devices = await api(dev.base, "GET", "/api/v1/members/jinu/devices", { email: "jinu@family.test" });
 	assert.ok(devices.json.find((d) => d.platform === "linux"), "the enrolled device is listed");
@@ -207,7 +235,21 @@ try {
 	assert.notEqual(refused.status, 0, "push with a swapped store record is refused");
 	assert.match(refused.out, /failed authentication/, `the refusal names the reason: ${refused.out}`);
 
-	console.log("ok  live:client — enrol, push (a duplicate skipped and named, kept on --duplicates keep, listed by Find duplicates), ls, pull, round trip, a 60 MiB file in GC01 frames stopped after 3 parts and resumed from part 4, pulled streamed and byte-equal, a sample refused by pull, zero-trust, a swapped store record refused");
+	// ── 7. Sign out (40a): the server deletes this computer's copy, the
+	// profile and its journal go, and the old token opens nothing. ─────
+	const before = JSON.parse(fs.readFileSync(path.join(home, "profile.json"), "utf8"));
+	const out = await sync(["signout", "--profile", path.join(home, "profile.json")]);
+	assert.equal(out.status, 0, out.out);
+	assert.match(out.out, /signed out: the server deleted this computer's copy/, out.out);
+	assert.ok(!fs.existsSync(path.join(home, "profile.json")) && !fs.existsSync(path.join(home, "profile.uploads")), "the profile and its upload journal are gone");
+	const listed = await api(dev.base, "GET", "/api/v1/members/jinu/devices", { email: "jinu@family.test" });
+	assert.equal(listed.json.find((d) => d.id === before.deviceId)?.revoked, true, "listed as revoked in Team › Devices");
+	const reopen = await fetch(`${dev.base}/api/v1/members/jinu/devices/${before.deviceId}/unlock`, { method: "POST", headers: { "content-type": "application/json", "x-gorani-dev-email": "jinu@family.test", "x-gorani-device-token": before.token }, body: "{}" });
+	assert.ok(reopen.status >= 400 && reopen.status < 500, `the old token unlocks nothing (${reopen.status})`);
+	const again2 = await sync(["signout", "--profile", path.join(home, "profile.json")]);
+	assert.equal(again2.status, 0, "signing out twice is fine");
+
+	console.log("ok  live:client — whoami (an account, and none), setup with the member found from the sign-in and a second enrolment refused, settings set and unset, enrol, push (a duplicate skipped and named, kept on --duplicates keep, listed by Find duplicates), ls, pull, round trip, a 60 MiB file in GC01 frames stopped after 3 parts and resumed from part 4, pulled streamed and byte-equal, a sample refused by pull, zero-trust, a swapped store record refused, sign out (the server's copy deleted, the profile gone, the old token refused)");
 } finally {
 	await dev.close();
 }

@@ -26,6 +26,7 @@ pub mod replica;
 pub mod scan;
 pub mod session;
 pub mod settings;
+pub mod signin;
 pub mod transfer;
 
 // Re-export the formats module at the crate root so bins can use
@@ -91,6 +92,13 @@ pub struct DeviceProfile {
 	/// `GORANI_ACCESS_TOKEN` takes precedence (a shell that already has one).
 	#[serde(default)]
 	pub access_token_cmd: Option<String>,
+	/// The member's Access token itself, handed over by their browser
+	/// (commit 40c, signin.rs): what the desktop apps and `gorani-sync
+	/// signin` keep. It is used until it expires; then the apps ask for a
+	/// new sign-in. It sits in this file (0600) as cloudflared keeps its own
+	/// in one. The command above is still taken when this is absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub access_token: Option<String>,
 	/// A Cloudflare Access service-token pair, sent as
 	/// `CF-Access-Client-Id/Secret`. NOT enough alone: a service token's JWT
 	/// carries no email, and the Worker takes identity from the email — it
@@ -149,6 +157,7 @@ impl std::fmt::Debug for DeviceProfile {
 			.field("device_id", &self.device_id)
 			.field("token", &"[redacted]")
 			.field("access_token_cmd", &self.access_token_cmd)
+			.field("access_token", &redact(&self.access_token))
 			.field("access_id", &self.access_id)
 			.field("access_secret", &redact(&self.access_secret))
 			.field("device_secret", &redact(&self.device_secret))

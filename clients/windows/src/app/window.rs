@@ -5,7 +5,7 @@
 //! (gorani_client_core::settings) or by appmodel.rs.
 //!
 //! ```text
-//! Account     Server · Sign in with Cloudflare Access · signed in as …
+//! Account     Server · Sign in with your browser (40c) · signed in as …
 //!             not enrolled: this computer's name, its protection, the vault
 //!               password, Enrol
 //!             enrolled: where and how it is enrolled, Change server…, Sign out…
@@ -140,8 +140,11 @@ struct Win {
 	c: C,
 	/// The enrolled profile (None: not enrolled).
 	profile: Option<DeviceProfile>,
-	/// Before enrolment: the sign-in command from Sign in.
-	token_cmd: Option<String>,
+	/// Before enrolment: the sign-in the browser handed over (40c).
+	token: Option<zeroize::Zeroizing<String>>,
+	/// A browser sign-in waiting: set to cancel it (Sign in pressed
+	/// again, or the window closed).
+	signing: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 	devices: Vec<Device>,
 	/// The area menu's entries after "My files": case ids, with titles.
 	cases: Vec<(String, String)>,
@@ -310,7 +313,7 @@ fn build(hwnd: HWND, dpi: u32) -> Win {
 	add(a, Always, ui::STATIC, "Server", label, none, 0, [24, 51, 160, 20]);
 	c.server = add(a, Always, ui::EDIT, gorani_client_core::DEFAULT_SERVER, edit, edge, 0, [192, 48, 250, 24]);
 	add(a, Enrolled, ui::BUTTON, "Change server…", button, none, ID_CHANGE_SERVER, [450, 47, 102, 26]);
-	c.sign_in = add(a, Always, ui::BUTTON, "Sign in with Cloudflare Access", button, none, ID_SIGN_IN, [192, 82, 230, 28]);
+	c.sign_in = add(a, Always, ui::BUTTON, SIGN_IN, button, none, ID_SIGN_IN, [192, 82, 230, 28]);
 	c.signed_as = add(a, Always, ui::STATIC, "Not signed in yet.", label, none, 0, [192, 116, 360, 36]);
 	add(a, NotEnrolled, ui::STATIC, "This computer's name", label, none, 0, [24, 165, 160, 20]);
 	c.name = add(a, NotEnrolled, ui::EDIT, "", edit, edge, 0, [192, 162, 360, 24]);
@@ -369,7 +372,7 @@ fn build(hwnd: HWND, dpi: u32) -> Win {
 	ui::cue(c.name, "e.g. Jinu's ThinkPad");
 	ui::list_columns(c.devices, &[("Name", 170), ("System", 70), ("Protection", 130), ("Last seen", 150)], dpi);
 	let font = ui::message_font(dpi);
-	let win = Win { hwnd, dpi, font, placed, c, profile: None, token_cmd: None, devices: Vec::new(), cases: Vec::new(), next_server: None, busy: false };
+	let win = Win { hwnd, dpi, font, placed, c, profile: None, token: None, signing: None, devices: Vec::new(), cases: Vec::new(), next_server: None, busy: false };
 	relayout(&win);
 	win
 }
@@ -535,7 +538,18 @@ fn owner() -> HWND {
 
 // ── the actions ─────────────────────────────────────────────────────
 
+const SIGN_IN: &str = "Sign in with your browser";
+
+/// Sign in through the person's own browser (40c, signin.rs): the app
+/// listens on this computer, the browser opens the team's page, the page
+/// asks, and the browser hands the sign-in back. Pressed again while it
+/// waits, the button cancels.
 fn sign_in() {
+	let waiting = with_win(|w| w.signing.take()).flatten();
+	if let Some(cancel) = waiting {
+		cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+		return;
+	}
 	let Some((typed, profile)) = with_win(|w| (ui::text(w.c.server), w.profile.clone())) else { return };
 	let server = match &profile {
 		Some(p) => p.server.clone(),
@@ -544,10 +558,20 @@ fn sign_in() {
 			Err(e) => return say(&e.to_string()),
 		},
 	};
-	if !begin("Signing in — finish in the browser window that opened…") {
+	let pending = match gorani_client_core::signin::BrowserSignIn::start(&server) {
+		Ok(p) => p,
+		Err(e) => return say(&e.to_string()),
+	};
+	if !begin("Finish signing in in your browser — press the button on the page it opened.") {
 		return;
 	}
-	job(move || Done::SignedIn(settings::sign_in_with_cloudflared(&server).map_err(|e| e.to_string())));
+	let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	with_win(|w| {
+		w.signing = Some(cancel.clone());
+		ui::set_text(w.c.sign_in, "Cancel signing in");
+	});
+	ui::open(&pending.url);
+	job(move || Done::SignedIn(pending.wait(std::time::Duration::from_secs(300), Some(&cancel)).map(|t| t.to_string()).map_err(|e| e.to_string())));
 }
 
 fn enrol() {
@@ -563,14 +587,14 @@ fn enrol() {
 		Ok(s) => s,
 		Err(e) => return say(&e.to_string()),
 	};
-	let token_cmd = with_win(|w| w.token_cmd.clone()).flatten();
+	let token = with_win(|w| w.token.as_ref().map(|t| t.to_string())).flatten();
 	if !begin("Enrolling this computer…") {
 		return;
 	}
 	let path = super::profile_path();
 	let folder = appmodel::default_folder(&super::home(), None).display().to_string();
 	job(move || {
-		let sign_in = SignIn { server, access_token_cmd: token_cmd, dev_email: std::env::var("GORANI_DEV_EMAIL").ok(), ..Default::default() };
+		let sign_in = SignIn { server, access_token: token, dev_email: std::env::var("GORANI_DEV_EMAIL").ok(), ..Default::default() };
 		let e = settings::Enrolment { sign_in, member: None, device_name: name, secret: &password, protect: want, tpm_options: Default::default(), device_secret: None, app: AppSettings { folder: Some(folder), ..Default::default() } };
 		Done::Enrolled(settings::enrol(&path, e).map(Box::new).map_err(|e| e.to_string()))
 	});
@@ -743,25 +767,43 @@ pub(crate) fn done(d: Done) {
 		return;
 	}
 	match d {
-		Done::SignedIn(Ok(cmd)) => {
+		Done::SignedIn(Ok(token)) => {
 			let path = super::profile_path();
-			let enrolled = with_win(|w| w.profile.clone()).flatten();
+			let enrolled = with_win(|w| {
+				w.signing = None;
+				ui::set_text(w.c.sign_in, SIGN_IN);
+				w.profile.clone()
+			})
+			.flatten();
 			let sign_in = match enrolled {
-				Some(p) => {
-					// Signed in again: the profile keeps the (perhaps new) command.
-					if let Err(e) = settings::save_sign_in(&path, Some(cmd.clone()), p.access_id.clone(), None) {
-						return end(&e.to_string());
+				Some(_) => {
+					// Signed in again: the profile keeps it, and the sync starts
+					// over with it (a sync that stopped for want of it resumes).
+					let saved = match settings::save_access_token(&path, &token) {
+						Ok(p) => p,
+						Err(e) => return end(&e.to_string()),
+					};
+					with_win(|w| w.profile = Some(saved.clone()));
+					if !saved.app.paused {
+						super::start_sync(&path, &saved);
 					}
-					SignIn { access_token_cmd: Some(cmd), ..SignIn::of(&p) }
+					SignIn::of(&saved)
 				}
 				None => {
-					with_win(|w| w.token_cmd = Some(cmd.clone()));
+					with_win(|w| w.token = Some(zeroize::Zeroizing::new(token.clone())));
 					let server = with_win(|w| ui::text(w.c.server)).unwrap_or_default();
-					SignIn { server: settings::normalize_server(&server).unwrap_or(server), access_token_cmd: Some(cmd), dev_email: std::env::var("GORANI_DEV_EMAIL").ok(), ..Default::default() }
+					SignIn { server: settings::normalize_server(&server).unwrap_or(server), access_token: Some(token), dev_email: std::env::var("GORANI_DEV_EMAIL").ok(), ..Default::default() }
 				}
 			};
 			end("Signed in.");
 			job(move || Done::Me(settings::whoami(&sign_in).map_err(|e| e.to_string())));
+		}
+		Done::SignedIn(Err(e)) => {
+			with_win(|w| {
+				w.signing = None;
+				ui::set_text(w.c.sign_in, SIGN_IN);
+			});
+			end(&e);
 		}
 		Done::Me(Ok(me)) => {
 			let line = match &me.member {
@@ -776,7 +818,7 @@ pub(crate) fn done(d: Done) {
 		}
 		Done::Enrolled(Ok(p)) => {
 			with_win(|w| {
-				w.token_cmd = None;
+				w.token = None;
 				w.next_server = None;
 			});
 			refresh();
@@ -825,7 +867,7 @@ pub(crate) fn done(d: Done) {
 			end("");
 			status_changed(&super::status());
 		}
-		Done::SignedIn(Err(e)) | Done::Enrolled(Err(e)) | Done::SignedOut(Err(e)) | Done::Devices(Err(e)) | Done::Revoked(Err(e)) | Done::Protected(Err(e)) | Done::Cases(Err(e)) => {
+		Done::Enrolled(Err(e)) | Done::SignedOut(Err(e)) | Done::Devices(Err(e)) | Done::Revoked(Err(e)) | Done::Protected(Err(e)) | Done::Cases(Err(e)) => {
 			with_win(|w| w.next_server = None);
 			end(&e);
 		}
@@ -899,6 +941,10 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 			let gone = WIN.with(|w| w.try_borrow_mut().ok().and_then(|mut w| w.take()));
 			if let Some(w) = gone {
 				ui::drop_font(w.font);
+				// A browser sign-in still waiting stops listening.
+				if let Some(cancel) = w.signing {
+					cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+				}
 			}
 			with_app(|a| a.settings = None);
 			LRESULT(0)

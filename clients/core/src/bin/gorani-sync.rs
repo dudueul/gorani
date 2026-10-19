@@ -6,7 +6,10 @@
 //! ```text
 //! setup [--server S] [--member M]        enrol this computer (the device's wrapped root copy);
 //!       [--name N]                        S: https://gorani.at.day unless named (DEFAULT_SERVER);
-//!                                         M: the signed-in person's account unless named (40a)
+//!                                         M: the signed-in person's account unless named (40a);
+//!                                         not signed in another way: through the browser (40c)
+//! signin [--no-browser]                   sign in again through the browser (40c): the page asks,
+//!                                         the browser hands the sign-in to this computer
 //! whoami [--server S]                     who the server says is signed in, and their account
 //! signout                                 this computer leaves: the server deletes its copy,
 //!                                         its key parts here are forgotten, the profile goes
@@ -73,7 +76,7 @@ fn main() {
 const WHOLE_LIMIT: u64 = 48 * 1024 * 1024;
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["accept-unverified", "tpm-pin", "as-file", "as-sample", "check-hash"];
+const SWITCHES: &[&str] = &["accept-unverified", "tpm-pin", "as-file", "as-sample", "check-hash", "no-browser"];
 
 fn profile_path() -> PathBuf {
 	let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
@@ -159,10 +162,17 @@ fn run(args: &[String]) -> Result<(), Error> {
 			// Where the device secret lives (commit 34): the TPM and/or the login
 			// keyring by default — never silently a file.
 			let want: devicekey::Want = flag("protect").as_deref().unwrap_or("auto").parse()?;
+			// Not signed in any other way (no token, no command, not dev
+			// mode): through the browser, as the apps do (40c).
+			let mut sign_in = sign_in_of(&flag);
+			if !sign_in.signed_in() {
+				let token = settings::sign_in_with_browser(&sign_in.server, flag("no-browser").is_none(), std::time::Duration::from_secs(300))?;
+				sign_in.access_token = Some(token.to_string());
+			}
 			let profile = settings::enrol(
 				&path,
 				settings::Enrolment {
-					sign_in: sign_in_of(&flag),
+					sign_in,
 					member: flag("member"),
 					device_name: name,
 					secret: &secret,
@@ -191,6 +201,16 @@ fn run(args: &[String]) -> Result<(), Error> {
 				Some(m) => println!("{} — member {} ({}, {}){}", me.email, m.id, m.name, m.role, if m.active { "" } else { " — not active" }),
 				None => println!("{} — no account on this team (a lead adds the address in Team › People)", me.email),
 			}
+		}
+		Some("signin") => {
+			// Sign this computer in again through the browser (40c): the
+			// token is kept in the enrolled profile, and a running shell picks
+			// it up by itself. --no-browser: print the address only.
+			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
+			let profile = session::load_profile(&path).map_err(|_| Error::Config("this computer is not enrolled — run gorani-sync setup (it signs in on the way)".into()))?;
+			let token = settings::sign_in_with_browser(&profile.server, flag("no-browser").is_none(), std::time::Duration::from_secs(300))?;
+			settings::save_access_token(&path, &token)?;
+			println!("signed in: {} keeps the sign-in until it expires", path.display());
 		}
 		Some("signout") => {
 			let path = flag("profile").map(PathBuf::from).unwrap_or_else(profile_path);
@@ -603,7 +623,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 			println!("pushed: {} ({} bytes, SHA-256 {sha256}){}", row["id"].as_str().unwrap_or("?"), bytes.len(), signed_note(&area, intake.is_some()));
 		}
 		_ => {
-			eprintln!("usage: gorani-sync <setup|whoami|signout|settings|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file (Windows: +dpapi +hello; macOS: enclave +keychain +presence) --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash --duplicates skip|keep|ask]");
+			eprintln!("usage: gorani-sync <setup|signin|whoami|signout|settings|protect|devices|revoke|cases|ls|pull|push|inbox|accept|reject|replica|collector|collect> [--protect auto|tpm|keyring|tpm+keyring|file (Windows: +dpapi +hello; macOS: enclave +keychain +presence) --tpm-pin --tpm-pcrs 7] [--case C] [--server S --member M --name N --secret S --device-secret H --access-token-cmd CMD --dev-email E --file P --id I --out O --profile P --source S --collector W --method M --collected-at T --notes X --accept-unverified --item I --reason R --as-file --as-sample --scan CMD --check-hash --duplicates skip|keep|ask]");
 			std::process::exit(2);
 		}
 	}
@@ -768,6 +788,7 @@ fn with_dev_email(mut profile: DeviceProfile, flag: &dyn Fn(&str) -> Option<Stri
 fn sign_in_of(flag: &dyn Fn(&str) -> Option<String>) -> settings::SignIn {
 	settings::SignIn {
 		server: flag("server").unwrap_or_else(|| gorani_client_core::DEFAULT_SERVER.into()),
+		access_token: None,
 		access_token_cmd: flag("access-token-cmd"),
 		access_id: flag("access-id"),
 		access_secret: flag("access-secret"),

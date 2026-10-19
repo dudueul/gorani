@@ -68,6 +68,10 @@ pub struct Client {
 	/// every request until restarted. The desktop apps run for weeks at a
 	/// time, so it is fetched again shortly before its `exp`.
 	access_token: std::sync::Mutex<Option<CachedToken>>,
+	/// Where the profile lives, when the caller knows: a stored token that
+	/// is about to expire is looked for there again, so a sign-in made in
+	/// the app's window reaches a sync that has been running for days (40c).
+	profile_path: Option<std::path::PathBuf>,
 }
 
 /// A fetched token and the moment to fetch the next one.
@@ -156,7 +160,14 @@ impl Client {
 			.timeout_connect(std::time::Duration::from_secs(15))
 			.timeout(std::time::Duration::from_secs(60));
 		let area = profile.member.clone();
-		Self { profile, area, agent: b.build(), access_token: std::sync::Mutex::new(None) }
+		Self { profile, area, agent: b.build(), access_token: std::sync::Mutex::new(None), profile_path: None }
+	}
+
+	/// The same client, re-reading its stored token from `path` when it
+	/// runs out.
+	pub fn with_profile_path(mut self, path: &std::path::Path) -> Self {
+		self.profile_path = Some(path.to_path_buf());
+		self
 	}
 
 	/// The same client, its file routes addressing `area` (`case:<id>`).
@@ -197,7 +208,18 @@ impl Client {
 		if let Some(c) = cached.as_ref().filter(|c| now < c.refresh_at) {
 			return c.token.clone();
 		}
-		let (token, refresh) = match access_token_from(std::env::var("GORANI_ACCESS_TOKEN").ok(), self.profile.access_token_cmd.as_deref()) {
+		// The variable first (a shell that has one), then the token the
+		// browser handed over (40c) — the profile's, or a newer one written
+		// to the profile file since — then the command.
+		let env = std::env::var("GORANI_ACCESS_TOKEN").ok().filter(|t| !t.trim().is_empty());
+		if env.is_none() {
+			if let Some(stored) = self.stored_token(now) {
+				let at = refresh_at(Some(&stored), now);
+				*cached = Some(CachedToken { token: Some(stored.clone()), refresh_at: at });
+				return Some(stored);
+			}
+		}
+		let (token, refresh) = match access_token_from(env, self.profile.access_token_cmd.as_deref()) {
 			Ok(t) => {
 				let at = refresh_at(t.as_deref(), now);
 				(t, at)
@@ -209,6 +231,20 @@ impl Client {
 		};
 		*cached = Some(CachedToken { token: token.clone(), refresh_at: refresh });
 		token
+	}
+
+	/// The browser's token: the profile's while it lasts, else the one in
+	/// the profile file now (the app may have signed in again). An expired
+	/// one is still sent when there is nothing else: Access then refuses
+	/// it, and the refusal says "Sign in again".
+	fn stored_token(&self, now: u64) -> Option<String> {
+		let mine = self.profile.access_token.clone().filter(|t| !t.is_empty())?;
+		let fresh = |t: &str| jwt_exp(t).is_none_or(|exp| exp > now + TOKEN_MARGIN_SECS);
+		if fresh(&mine) {
+			return Some(mine);
+		}
+		let newer = self.profile_path.as_deref().and_then(|p| crate::session::load_profile(p).ok()).and_then(|p| p.access_token).filter(|t| fresh(t));
+		Some(newer.unwrap_or(mine))
 	}
 
 	fn req(&self, method: &str, url: &str) -> ureq::Request {

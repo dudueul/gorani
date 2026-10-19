@@ -223,6 +223,13 @@ fn first_steps(background: bool) {
 	let path = profile_path();
 	match session::load_profile(&path) {
 		Ok(p) if session::has_device_copy(&p) => {
+			if !gorani_client_core::settings::SignIn::of(&p).signed_in() {
+				// Enrolled, but the browser's sign-in ran out while the app was
+				// not running: Settings, to sign in again (40c).
+				set_status(Status::Failed("signed out — sign in again in Settings".into()));
+				window::open(window::Tab::Account);
+				return;
+			}
 			if p.app.paused {
 				set_status(Status::Paused);
 			} else if p.app.folder.is_none() {

@@ -717,7 +717,7 @@ Windows and macOS first, native per system, no new third-party UI code).
 
 | Tab | What it does | The core's call |
 |---|---|---|
-| Account | the server URL; who is signed in; this computer's name; enrol with the vault password; sign out | `normalize_server`, `sign_in_with_cloudflared`, `whoami`, `enrol`, `sign_out` |
+| Account | the server URL; who is signed in; this computer's name; enrol with the vault password; sign out | `normalize_server`, `signin::BrowserSignIn` (40c), `whoami`, `enrol`, `sign_out` |
 | Sync | the folder (Windows); the area, your own files or a case; start at login; keep local copies; pause | `AppSettings`, `cases`, `save` |
 | This computer & devices | how this computer's key part is protected, and changing it; your other computers, and revoking them | `protection`, `protection_choices`, `session::protect`, `devices`, `revoke` |
 | Advanced | an Access service token; accept files whose signature cannot be checked; the scanner command; the sign-in command itself | `save_sign_in`, `AppSettings` |
@@ -768,9 +768,8 @@ The Windows app also unregisters its folder.
 - **Can be fetched from a path with spaces.** The command is split as a
   command line, with quotes grouping. Windows installs cloudflared under
   `C:\Program Files (x86)`, which the old whitespace split cut in three.
-- **Is signed into by the window.** `sign_in_with_cloudflared` runs
-  `cloudflared access login <server>`, which opens the browser at the
-  team's sign-in, then proves the token command works and keeps it.
+- **Is signed into through the browser** (40c, below). cloudflared's
+  command stays for scripts and the Advanced tab.
 - **Never flashes a console.** Commands run from the windows open none on
   Windows.
 
@@ -799,7 +798,7 @@ written with the `windows` crate alone, with no other UI code.
 | Part | What it does |
 |---|---|
 | The tray icon | The water deer, its tooltip saying where the sync stands. Its menu: Open the Gorani folder, Open Gorani in the browser, Pause/Resume syncing, Settings…, Quit. A double-click opens the folder. |
-| Settings › Account | Server; Sign in with Cloudflare Access (runs `cloudflared access login`; also signs in again when the session ran out); "Signed in as … — member …". Not enrolled: this computer's name, its protection (the menu of `protection_choices`), the vault password, Enrol. Enrolled: where and how, Change server…, Sign out…. |
+| Settings › Account | Server; Sign in with your browser (40c; pressed again while it waits, it cancels; also signs in again when the session ran out, and the sync resumes); "Signed in as … — member …". Not enrolled: this computer's name, its protection (the menu of `protection_choices`), the vault password, Enrol. Enrolled: where and how, Change server…, Sign out…. |
 | Settings › Sync | The folder (Browse…); Show: My files, or a case (Refresh opens the titles with each case's key); start at sign-in; keep downloaded files; Pause; Save. |
 | Settings › This computer & devices | Its protection, and Change it to (`session::protect`); your computers, Refresh, Revoke selected…. |
 | Settings › Advanced | The sign-in command; an Access service token; accept unverified files; the scanner `gorani-sync accept` uses. |
@@ -858,6 +857,55 @@ the per-user Run key (`"…\gorani.exe" --background`).
 
 What CI cannot do is look at the window, or enrol against a real Access
 deployment. The first run on a real PC is that check.
+
+### 40c as built: signing in through the browser
+
+Asked how the apps should sign in, and to keep the one flow everywhere
+for maintenance, the choice was the person's own browser. It is the
+same on Windows, macOS and the command line.
+
+```text
+the app      listens on 127.0.0.1:<a random port>, makes a random state, and opens
+             https://<server>/api/v1/desktop/sign-in?port=…&state=…  in the browser
+Access       signs the person in, as for the web app (usually they are already)
+the page     "Sign Gorani in on this computer as jinu@…?" — one button, no script
+             (worker/src/desktop.rs)
+the button   POSTs {state, token} to http://127.0.0.1:<port>/gorani-sign-in; the
+             token is this very request's Access token, which Access and the
+             Worker just checked
+the app      takes it only from the server's Origin, with its own state; keeps it
+             in the profile (accessToken, 0600) until it expires (signin.rs)
+```
+
+**Why not the alternatives:**
+- **A sign-in sheet inside the app** is refused by identity providers
+  (Google outright). It also cannot use the browser's existing session
+  or the person's passkeys.
+- **cloudflared** is an install, and a sandboxed Mac app cannot read its
+  token file.
+
+The browser is usually signed in already, so signing in is one button.
+
+**What protects it:**
+
+| Threat | Answer |
+|---|---|
+| A website opens the page in the person's browser, hoping something listens on the port it names | Nothing is sent without the person's click on the server's own page. |
+| Someone plants their own token in the app (login CSRF) | The app takes only its own state (compared in constant time), only from the server's Origin, only as a POST. |
+| The token in a URL: the history, a synced history, a Referer | It travels in a form body, to loopback. The page is `no-store` and `no-referrer`, with no frames. |
+| The page as a script target | No script. Its CSP is `default-src 'none'`, its style by hash, and `form-action` exactly the one loopback address. Port and state are checked to their shapes. |
+| A listener left open | Loopback only. It takes one sign-in, refuses everything else without stopping, and ends at five minutes or on Cancel. |
+
+**Running out.** The token lasts as long as the Access session (a day,
+by default). A shell running for days reads the profile again when its
+token nears its end (`api.rs › stored_token`), so a sign-in made in the
+window reaches the sync without a restart. The Windows app opens its
+Settings at start when the sign-in has run out, and restarts the sync
+after a new one.
+
+**The command line:** `gorani-sync setup` signs in this way when nothing
+else signs it in. `gorani-sync signin` signs in again, and
+`--no-browser` prints the address instead of opening it.
 
 ## Testing (the pattern the port follows)
 

@@ -622,6 +622,10 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 		("GET", ["family"]) => forward_family(&env, &identity.email, "GET", "state", None).await,
 		// The signed-in person's own account (commit 39l): what the app opens.
 		("GET", ["me"]) => forward_family(&env, &identity.email, "GET", "me", None).await,
+		// A desktop app signing in through the person's own browser (commit
+		// 40c, desktop.rs): the page that asks, then hands this request's
+		// Access token to the app's loopback port.
+		("GET", ["desktop", "sign-in"]) => crate::desktop::sign_in(&req, &identity.email, env.var("GORANI_DEV").map(|v| v.to_string() == "1").unwrap_or(false)).await,
 		("POST", ["family", "members"]) => {
 			// The bootstrap proof (O18) — decided here, where the secret is;
 			// the registry applies it only while it has no members.

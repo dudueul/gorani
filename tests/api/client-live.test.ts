@@ -113,6 +113,46 @@ try {
 	const bogus = await sync(["settings", "--set", "colour=red", "--profile", path.join(home, "profile.json")]);
 	assert.notEqual(bogus.status, 0);
 	assert.match(bogus.out, /no setting “colour”/);
+
+	// ── 1b. Sign in through the browser (40c): the CLI listens on loopback
+	// and names the server's page; this test is the browser. The page asks
+	// first, and only its own origin's form, with the CLI's state, is taken.
+	{
+		const c = spawn(BIN, ["signin", "--no-browser", "--profile", path.join(home, "profile.json")], { cwd: ROOT, env: process.env });
+		let said = "";
+		c.stdout.on("data", (d) => (said += d));
+		c.stderr.on("data", (d) => (said += d));
+		const done = new Promise<number>((ok) => c.on("exit", (code) => ok(code ?? 1)));
+		const t0 = Date.now();
+		while (!/https?:\/\/\S+desktop\/sign-in\S+/.test(said) && Date.now() - t0 < 20_000) await new Promise((r) => setTimeout(r, 50));
+		const url = said.match(/(https?:\/\/\S+desktop\/sign-in\S+)/)?.[1];
+		assert.ok(url?.startsWith(`${dev.base}/api/v1/desktop/sign-in?port=`), `the CLI names the server's page: ${said}`);
+		const page = await fetch(url!, { headers: { "x-gorani-dev-email": "jinu@family.test" } });
+		assert.equal(page.status, 200);
+		const csp = page.headers.get("content-security-policy") ?? "";
+		const port = new URL(url!).searchParams.get("port");
+		assert.match(csp, new RegExp(`form-action http://127\\.0\\.0\\.1:${port}/gorani-sign-in`), csp);
+		assert.match(csp, /frame-ancestors 'none'/);
+		assert.equal(page.headers.get("cache-control"), "no-store");
+		const html = await page.text();
+		assert.match(html, /Sign Gorani in on this computer\?/);
+		assert.match(html, /jinu@family\.test/);
+		assert.ok(!/<script/i.test(html), "no script: the person presses the button");
+		const field = (name: string) => html.match(new RegExp(`name="${name}" value="([^"]*)"`))?.[1] ?? "";
+		const action = html.match(/action="([^"]+)"/)?.[1] ?? "";
+		const form = (origin: string, state = field("state")) => fetch(action, { method: "POST", headers: { origin, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ state, token: field("token") }).toString() });
+		assert.equal((await form("https://evil.example")).status, 400, "another site's form is refused…");
+		assert.equal((await form(dev.base, "x".repeat(44))).status, 400, "…and so is a state the CLI did not make");
+		assert.equal((await fetch(action.replace("/gorani-sign-in", "/elsewhere"))).status, 404);
+		const ok = await form(dev.base);
+		assert.equal(ok.status, 200);
+		assert.match(await ok.text(), /You can close this tab/);
+		assert.equal(await done, 0, said);
+		const kept = JSON.parse(fs.readFileSync(path.join(home, "profile.json"), "utf8"));
+		assert.equal(kept.accessToken, field("token"), "the sign-in kept in the profile");
+		const bad = await api(dev.base, "GET", "/api/v1/desktop/sign-in?port=80&state=short", { email: "jinu@family.test" });
+		assert.equal(bad.status, 400, "the page takes only the shape the app sends");
+	}
 	// The device's wrapped copy is on the server (the web app sees it).
 	const devices = await api(dev.base, "GET", "/api/v1/members/jinu/devices", { email: "jinu@family.test" });
 	assert.ok(devices.json.find((d) => d.platform === "linux"), "the enrolled device is listed");
@@ -249,7 +289,7 @@ try {
 	const again2 = await sync(["signout", "--profile", path.join(home, "profile.json")]);
 	assert.equal(again2.status, 0, "signing out twice is fine");
 
-	console.log("ok  live:client — whoami (an account, and none), setup with the member found from the sign-in and a second enrolment refused, settings set and unset, enrol, push (a duplicate skipped and named, kept on --duplicates keep, listed by Find duplicates), ls, pull, round trip, a 60 MiB file in GC01 frames stopped after 3 parts and resumed from part 4, pulled streamed and byte-equal, a sample refused by pull, zero-trust, a swapped store record refused, sign out (the server's copy deleted, the profile gone, the old token refused)");
+	console.log("ok  live:client — whoami (an account, and none), setup with the member found from the sign-in and a second enrolment refused, settings set and unset, sign-in through the browser (the page asks, posts only to the CLI's loopback port; another origin, a wrong state and another path refused; the token kept), enrol, push (a duplicate skipped and named, kept on --duplicates keep, listed by Find duplicates), ls, pull, round trip, a 60 MiB file in GC01 frames stopped after 3 parts and resumed from part 4, pulled streamed and byte-equal, a sample refused by pull, zero-trust, a swapped store record refused, sign out (the server's copy deleted, the profile gone, the old token refused)");
 } finally {
 	await dev.close();
 }

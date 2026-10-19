@@ -137,7 +137,20 @@ try {
 	const [h, , s] = member("ana@team.test").split(".");
 	assert.match(await refused(`${h}.${b64u(JSON.stringify({ iss: TEAM, aud: AUD, email: "mallory@team.test", exp: now() + 600 }))}.${s}`, "claims edited after signing"), /bad signature/);
 
-	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused on member routes and, unregistered, on the drop routes; missing, foreign-audience, expired, foreign-issuer, forged, not-yet-valid, unknown-key, non-RS256 (HS256, ES256) and wrong-key-type tokens each refused by name — Access's own token and JWKS shapes (aud an array)");
+	// ── 4. A desktop app's sign-in through the browser (40c) ─────────────
+	// The page hands the app the very token this request carried, which
+	// Access and the Worker just checked, inside a form for the loopback
+	// port only. Without a valid token there is no page.
+	const ana = member("ana@team.test");
+	const handoff = await fetch(`${dev.base}/api/v1/desktop/sign-in?port=54321&state=${"s".repeat(43)}`, { headers: { "CF-Access-JWT-Assertion": ana } });
+	assert.equal(handoff.status, 200);
+	const page = await handoff.text();
+	assert.ok(page.includes(`name="token" value="${ana}"`), "the person's own Access token, in the page's form");
+	assert.ok(page.includes('action="http://127.0.0.1:54321/gorani-sign-in"'));
+	assert.match(handoff.headers.get("content-security-policy") ?? "", /form-action http:\/\/127\.0\.0\.1:54321\/gorani-sign-in/);
+	assert.notEqual((await fetch(`${dev.base}/api/v1/desktop/sign-in?port=54321&state=${"s".repeat(43)}`)).status, 200, "no token, no page");
+
+	console.log("ok  api:access — dev mode off: a member's Access token is the member; a service token (no email) refused on member routes and, unregistered, on the drop routes; missing, foreign-audience, expired, foreign-issuer, forged, not-yet-valid, unknown-key, non-RS256 (HS256, ES256) and wrong-key-type tokens each refused by name — Access's own token and JWKS shapes (aud an array); the desktop sign-in page hands over the request's own verified token, for the loopback port only (40c)");
 } finally {
 	await dev.close();
 	await new Promise((r) => jwks.close(r));

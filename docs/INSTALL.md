@@ -36,21 +36,24 @@ holds, whoever carries them.)
 
 Whichever way, the computer is then enrolled once against the team's
 server, **https://gorani.at.day** (the default — `--server` only for
-another deployment), signing in through Cloudflare Access with
-[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/):
+another deployment). Signing in goes through your own browser, as on
+Windows and macOS (DESKTOP.md › 40c): nothing to install.
 
 ```sh
-cloudflared access login https://gorani.at.day
-gorani-sync whoami --access-token-cmd "cloudflared access token -app=https://gorani.at.day"
-gorani-sync setup --name "my laptop" \
-  --access-token-cmd "cloudflared access token -app=https://gorani.at.day"
+gorani-sync setup --name "my laptop"
 ```
 
-`whoami` says which account the sign-in belongs to, and `setup` enrols
-that account; `--member` names another only where a lead set one up for
-you to use. `gorani-sync signout` undoes it: the server deletes this
-computer's copy, and its keys here are forgotten. (On Windows and macOS
-the Gorani app's Settings window does the same: DESKTOP.md › 40.)
+`setup` opens the browser at the team's sign-in. There, press **Sign in
+Gorani**: the browser hands the sign-in to this computer, and `setup`
+enrols your own account with your vault password. `--member` names
+another account only where a lead set one up for you to use. When the
+sign-in runs out (a day, by default), `gorani-sync signin` signs in
+again, and a running mount or folder picks it up by itself.
+`gorani-sync signout` undoes the enrolment: the server deletes this
+computer's copy, and its keys here are forgotten.
+
+(cloudflared still works, for scripts: `--access-token-cmd "cloudflared
+access token -app=https://gorani.at.day"`.)
 
 (DESKTOP.md › 33a, 34, 39d.) The browser needs only the address:
 https://gorani.at.day.
@@ -107,8 +110,8 @@ Add-AppxPackage -Path $HOME\Downloads\gorani-v1.2.3\gorani-windows-x64-unsigned.
 Then open **Gorani** from the Start menu. Its Settings window opens on
 Account:
 
-1. **Sign in with Cloudflare Access.** The browser opens at the team's
-   sign-in. It needs `cloudflared`: `winget install Cloudflare.cloudflared`.
+1. **Sign in with your browser.** Your browser opens at the team's
+   page; press **Sign in Gorani** there.
 2. **Enrol.** Name the computer, keep "Automatic" protection, and type
    your vault password or recovery code.
 

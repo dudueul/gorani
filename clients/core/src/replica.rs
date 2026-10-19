@@ -361,7 +361,9 @@ pub fn connect(profile_path: &Path, case: Option<&str>, secret: Option<&str>, de
 	let area = crate::area::open_area(&client, &sess, &member, case)?;
 	let name = area.name.clone();
 	drop(sess);
-	let mut engine = Engine::new(crate::api::Client::new(profile).in_area(&name), area, accept_unverified);
+	// (The engine runs for as long as the shell does: it looks for a newer
+	// sign-in in the profile file when its token runs out — 40c.)
+	let mut engine = Engine::new(crate::api::Client::new(profile).with_profile_path(profile_path).in_area(&name), area, accept_unverified);
 	engine.refresh()?;
 	Ok(HttpRemote::new(engine, &member, profile_path.with_extension("uploads")))
 }

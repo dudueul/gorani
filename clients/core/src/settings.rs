@@ -137,11 +137,16 @@ pub fn normalize_server(input: &str) -> Result<String, Error> {
 
 /// How the apps reach a server before (and after) enrolment: the address
 /// and the sign-in, without any device.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SignIn {
 	pub server: String,
-	/// The command that prints the member's Access token (cloudflared).
+	/// The member's Access token, handed over by their browser (40c,
+	/// signin.rs) — how the apps sign in. Never written out by serde.
+	#[serde(skip_serializing)]
+	pub access_token: Option<String>,
+	/// The command that prints the member's Access token (cloudflared): the
+	/// older way, kept for the Advanced tab and scripts.
 	pub access_token_cmd: Option<String>,
 	/// An Access service-token pair (Advanced): only for a deployment
 	/// whose Access policy asks for one in front of the member's token.
@@ -152,10 +157,34 @@ pub struct SignIn {
 	pub dev_email: Option<String>,
 }
 
+/// By hand, as DeviceProfile's (O16): the token and the secret never print.
+impl std::fmt::Debug for SignIn {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let redact = |o: &Option<String>| if o.is_some() { "[redacted]" } else { "None" };
+		f.debug_struct("SignIn")
+			.field("server", &self.server)
+			.field("access_token", &redact(&self.access_token))
+			.field("access_token_cmd", &self.access_token_cmd)
+			.field("access_id", &self.access_id)
+			.field("access_secret", &redact(&self.access_secret))
+			.field("dev_email", &self.dev_email)
+			.finish()
+	}
+}
+
 impl SignIn {
 	/// The sign-in of an enrolled profile.
 	pub fn of(profile: &DeviceProfile) -> Self {
-		Self { server: profile.server.clone(), access_token_cmd: profile.access_token_cmd.clone(), access_id: profile.access_id.clone(), access_secret: profile.access_secret.clone(), dev_email: profile.dev_email.clone() }
+		Self { server: profile.server.clone(), access_token: profile.access_token.clone(), access_token_cmd: profile.access_token_cmd.clone(), access_id: profile.access_id.clone(), access_secret: profile.access_secret.clone(), dev_email: profile.dev_email.clone() }
+	}
+
+	/// Whether this sign-in can reach the server as a member at all: a
+	/// token (the browser's, the variable's), a command, or dev mode. The
+	/// apps offer Sign in when it cannot, or when the token has expired.
+	pub fn signed_in(&self) -> bool {
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let live = self.access_token.as_deref().is_some_and(|t| crate::api::jwt_exp(t).is_none_or(|exp| exp > now));
+		live || self.access_token_cmd.is_some() || self.dev_email.is_some() || std::env::var("GORANI_ACCESS_TOKEN").is_ok_and(|t| !t.trim().is_empty())
 	}
 
 	/// A profile with no member and no device: enough for the team routes.
@@ -165,6 +194,7 @@ impl SignIn {
 			member: String::new(),
 			device_id: String::new(),
 			token: String::new(),
+			access_token: self.access_token.clone(),
 			access_token_cmd: self.access_token_cmd.clone(),
 			access_id: self.access_id.clone(),
 			access_secret: self.access_secret.clone(),
@@ -425,6 +455,30 @@ pub fn save_sign_in(path: &Path, access_token_cmd: Option<String>, access_id: Op
 	}
 	session::save_profile(path, &profile)?;
 	Ok(profile)
+}
+
+/// Keep a sign-in the browser handed over (40c) in an enrolled profile.
+/// A shell already running picks it up when its own token runs out
+/// (api.rs › stored_token).
+pub fn save_access_token(path: &Path, token: &str) -> Result<DeviceProfile, Error> {
+	let mut profile = session::load_profile(path)?;
+	profile.access_token = Some(token.to_string());
+	session::save_profile(path, &profile)?;
+	Ok(profile)
+}
+
+/// Sign in through the browser and wait (the CLI's whole flow; the apps
+/// drive signin::BrowserSignIn themselves, to show the page's address
+/// and a Cancel). `open`: open the browser here.
+pub fn sign_in_with_browser(server: &str, open: bool, timeout: std::time::Duration) -> Result<zeroize::Zeroizing<String>, Error> {
+	let s = crate::signin::BrowserSignIn::start(server)?;
+	eprintln!("Sign in in your browser: {}", s.url);
+	if open {
+		if let Err(e) = crate::signin::open_browser(&s.url) {
+			eprintln!("{e}");
+		}
+	}
+	s.wait(timeout, None)
 }
 
 // ── this computer and the others ────────────────────────────────────

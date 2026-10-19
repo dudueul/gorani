@@ -96,7 +96,7 @@ jobs:
           key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-release-${{ runner.os }}-
       - name: Release builds
-        run: cargo build --release --locked -p gorani-windows -p gorani-client-core --bin gorani-cloud --bin gorani-sync
+        run: cargo build --release --locked -p gorani-windows -p gorani-client-core --bin gorani --bin gorani-cloud --bin gorani-sync
       - name: Package
         shell: pwsh
         run: |
@@ -110,7 +110,7 @@ jobs:
           # its publisher carries this OID (and never as the signed identity).
           ./clients/windows/packaging/package.ps1 -Version "$base.${{ github.run_number }}" -Name Gorani.Client `
             -Publisher 'CN=Gorani Unsigned, OID.2.25.311729368913984317654407730594956997722=1' -Out dist/gorani-windows-x64-unsigned.msix
-          Compress-Archive -Path target/release/gorani-cloud.exe, target/release/gorani-sync.exe, clients/windows/packaging/gorani.ico -DestinationPath dist/gorani-windows-x64.zip
+          Compress-Archive -Path target/release/gorani.exe, target/release/gorani-cloud.exe, target/release/gorani-sync.exe, clients/windows/packaging/gorani.ico -DestinationPath dist/gorani-windows-x64.zip
           if ($env:STORE_NAME -and $env:STORE_PUBLISHER) {
             ./clients/windows/packaging/package.ps1 -Version "$base.0" -Name $env:STORE_NAME -Publisher $env:STORE_PUBLISHER `
               -PublisherDisplayName ($env:STORE_PUBLISHER_NAME ? $env:STORE_PUBLISHER_NAME : 'Gorani') -Out store/gorani-store.msix
@@ -123,8 +123,8 @@ jobs:
           ./clients/windows/packaging/try-install.ps1 -Path dist/gorani-windows-x64-unsigned.msix -Name Gorani.Client -AllowUnsigned
           $z = Join-Path $env:RUNNER_TEMP 'zip'
           Expand-Archive dist/gorani-windows-x64.zip $z
-          foreach ($cmd in 'gorani-cloud', 'gorani-sync') {
-            $said = & (Join-Path $z "$cmd.exe") 2>&1 | Out-String
+          foreach ($cmd in 'gorani', 'gorani-cloud', 'gorani-sync') {
+            $said = & (Join-Path $z "$cmd.exe") $(if ($cmd -eq 'gorani') { '--version' }) 2>&1 | Out-String
             if ($said -notmatch "usage: $cmd") { throw "$cmd from the ZIP did not answer: $said" }
             Write-Output "$cmd answers from the ZIP"
           }

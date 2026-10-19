@@ -36,13 +36,24 @@ holds, whoever carries them.)
 
 Whichever way, the computer is then enrolled once against the team's
 server, **https://gorani.at.day** (the default — `--server` only for
-another deployment), signing in through Cloudflare Access with
-[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/):
+another deployment). Signing in goes through your own browser, as on
+Windows and macOS (DESKTOP.md › 40c): nothing to install.
 
 ```sh
-gorani-sync setup --member <your member id> \
-  --access-token-cmd "cloudflared access token -app=https://gorani.at.day"
+gorani-sync setup --name "my laptop"
 ```
+
+`setup` opens the browser at the team's sign-in. There, press **Sign in
+Gorani**: the browser hands the sign-in to this computer, and `setup`
+enrols your own account with your vault password. `--member` names
+another account only where a lead set one up for you to use. When the
+sign-in runs out (a day, by default), `gorani-sync signin` signs in
+again, and a running mount or folder picks it up by itself.
+`gorani-sync signout` undoes the enrolment: the server deletes this
+computer's copy, and its keys here are forgotten.
+
+(cloudflared still works, for scripts: `--access-token-cmd "cloudflared
+access token -app=https://gorani.at.day"`.)
 
 (DESKTOP.md › 33a, 34, 39d.) The browser needs only the address:
 https://gorani.at.day.
@@ -94,12 +105,42 @@ installs programs for every user):
 ```powershell
 Get-ChildItem $HOME\Downloads\gorani-v1.2.3 | Unblock-File      # once verified
 Add-AppxPackage -Path $HOME\Downloads\gorani-v1.2.3\gorani-windows-x64-unsigned.msix -AllowUnsigned
-gorani-sync setup …        # then: gorani-cloud <folder>
 ```
 
-**Windows, the ZIP**: verify, `Unblock-File`, unpack, run `gorani-sync.exe`
-and `gorani-cloud.exe` from that folder (without `Unblock-File`, SmartScreen
-asks about an "unknown publisher" — after verifying, that is expected).
+Then open **Gorani** from the Start menu. Its Settings window opens on
+Account:
+
+1. **Sign in with your browser.** Your browser opens at the team's
+   page; press **Sign in Gorani** there.
+2. **Enrol.** Name the computer, keep "Automatic" protection, and type
+   your vault password or recovery code.
+
+It syncs into `%USERPROFILE%\Gorani` at once. The water deer in the
+notification area has the rest: the folder, Pause, Settings (change the
+folder, show a case instead, start at sign-in), Quit.
+
+The commands are still there: `gorani-sync setup …`, then
+`gorani-cloud <folder>` (DESKTOP.md › 40b). Use one or the other for a
+folder, not both.
+
+**Windows, the ZIP**: verify, `Unblock-File`, unpack, and run `gorani.exe`
+(the app, as above) or `gorani-sync.exe` and `gorani-cloud.exe` from that
+folder. Without `Unblock-File`, SmartScreen asks about an "unknown
+publisher"; after verifying, that is expected.
+
+**macOS, the app** (signed builds, from the release manager): open
+**Gorani**. It lives in the menu bar, and its Settings window opens on
+Account the first time:
+
+1. **Sign in with your browser.** Your browser opens at the team's page;
+   press **Sign in Gorani** there.
+2. **Enrol.** Name the Mac, keep "Automatic" protection (the Secure
+   Enclave and your login Keychain), and type your vault password or
+   recovery code.
+
+Gorani then appears in Finder under Locations. The menu bar has the rest:
+Open in Finder, Pause, Settings (show a case instead, start at login),
+Quit (DESKTOP.md › 40d).
 
 **macOS, the CLI**: verify, then
 

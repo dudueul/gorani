@@ -77,15 +77,26 @@ jobs:
       - name: The Cloud Files shell's smoke test (Windows)
         if: runner.os == 'Windows'
         run: cargo test --locked -p gorani-windows -- --test-threads=1 --nocapture
-      - name: Build the Windows shell
+      - name: Build the Windows shell and the app
         if: runner.os == 'Windows'
-        run: cargo build --locked -p gorani-windows --bin gorani-cloud
+        run: cargo build --locked -p gorani-windows --bin gorani-cloud --bin gorani
+      # ── 40b: the app's Settings window, made (never shown) and checked ──
+      - name: The app's self-test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $said = & target/debug/gorani.exe --self-test 2>&1 | Out-String
+          Write-Output $said
+          if ($said -notmatch 'self-test ok') { throw "gorani --self-test: $said" }
+          $v = & target/debug/gorani.exe --version 2>&1 | Out-String
+          if ($v -notmatch 'usage: gorani') { throw "gorani --version: $v" }
       # (What this run built, to try on a PC: debug builds, kept a week.)
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
           name: gorani-windows-debug
           path: |
+            target/debug/gorani.exe
             target/debug/gorani-cloud.exe
             target/debug/gorani-sync.exe
           retention-days: 7

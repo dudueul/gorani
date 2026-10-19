@@ -35,6 +35,7 @@ mod backup;
 mod cache;
 mod cron;
 mod custody;
+mod desktop;
 mod devices;
 mod drm;
 mod drm_store;

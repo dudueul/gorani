@@ -25,4 +25,10 @@ char *gorani_call(GoraniSession *session, const char *request_json);
 void gorani_free(char *s);
 void gorani_close(GoraniSession *session);
 
+/* The Mac app's Settings and menu (commit 40d, clients/macos/src/app.rs):
+   one JSON request, one JSON answer (freed with gorani_free). Some block
+   (signin.wait, until the browser hands the sign-in over): call them off
+   the main thread. */
+char *gorani_app(const char *request_json);
+
 #endif

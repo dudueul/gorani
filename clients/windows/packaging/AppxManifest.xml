@@ -2,9 +2,11 @@
 <!--
   Copyright 2026- Seongwoo Hong. All rights reserved.
 
-  The Windows package (commit 39f, docs/DESKTOP.md › 39f–g): gorani-cloud
-  (the Explorer folder) and gorani-sync (the CLI), full trust, each as a
-  console command on PATH through an execution alias. package.ps1 fills
+  The Windows package (commit 39f, docs/DESKTOP.md › 39f–g): gorani (the
+  app: its tray icon and Settings, commit 40b — the Start menu's entry,
+  and a startup task the person turns on in Settings › Sync), gorani-cloud
+  (the Explorer folder) and gorani-sync (the CLI), full trust, the last
+  two as console commands on PATH through an execution alias. package.ps1 fills
   in the identity (name, publisher, its display name) and the version
   (a.b.c.d). Two identities are built (39g): the Store's, exactly as
   Partner Center assigned it (Microsoft signs that package), and the
@@ -15,9 +17,10 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap5 desktop4 rescap">
+  IgnorableNamespaces="uap uap5 desktop desktop4 rescap">
   <Identity Name="@NAME@" Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>Gorani</DisplayName>
@@ -32,6 +35,22 @@
     <Resource Language="en-us" />
   </Resources>
   <Applications>
+    <!-- The app (40b): the Start menu's Gorani. It starts at sign-in only
+         when the person asks (Settings › Sync): the task is off at install,
+         and Task Manager › Startup apps can always turn it off again. -->
+    <Application Id="App" Executable="gorani.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="Gorani" Description="Your Gorani files in Explorer, its tray icon and Settings" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <desktop:Extension Category="windows.startupTask" Executable="gorani.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="GoraniStartup" Enabled="false" DisplayName="Gorani" />
+        </desktop:Extension>
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="gorani.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias desktop4:Subsystem="windows">
+            <uap5:ExecutionAlias Alias="gorani.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
     <Application Id="Cloud" Executable="gorani-cloud.exe" EntryPoint="Windows.FullTrustApplication" desktop4:Subsystem="console" desktop4:SupportsMultipleInstances="true">
       <uap:VisualElements DisplayName="Gorani" Description="A Gorani area as a folder in Explorer" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" AppListEntry="none" />
       <Extensions>

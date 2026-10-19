@@ -705,6 +705,259 @@ environment `release` limited to main and `v*` tags, and add
 `environment: release` to the sign job: then no other branch's workflow
 can reach the key. Rotate with `new-key.sh` when the key may have leaked.
 
+## Commit 40: settings in a window
+
+Until 40 every desktop setting was a flag typed once to `gorani-sync
+setup`, and saved in the profile. Commit 40 gives the Windows and macOS
+apps a Settings window and a tray or menu-bar icon (decided 2026-10-19:
+Windows and macOS first, native per system, no new third-party UI code).
+40a is the part both windows call, in the core, and the CLI calls it too.
+
+### 40a as built: the settings layer (clients/core/src/settings.rs)
+
+| Tab | What it does | The core's call |
+|---|---|---|
+| Account | the server URL; who is signed in; this computer's name; enrol with the vault password; sign out | `normalize_server`, `signin::BrowserSignIn` (40c), `whoami`, `enrol`, `sign_out` |
+| Sync | the folder (Windows); the area, your own files or a case; start at login; keep local copies; pause | `AppSettings`, `cases`, `save` |
+| This computer & devices | how this computer's key part is protected, and changing it; your other computers, and revoking them | `protection`, `protection_choices`, `session::protect`, `devices`, `revoke` |
+| Advanced | an Access service token; accept files whose signature cannot be checked; the scanner command; the sign-in command itself | `save_sign_in`, `AppSettings` |
+
+**Where it is kept.** The window's choices live in the profile, under
+`app`, beside the enrolment: the device's name, folder, case,
+startAtLogin, keepLocal, acceptUnverified, scanCommand and paused. The
+key is left out while nothing is set, so a profile from before 40 reads
+and writes unchanged.
+
+**Who you are comes from the server.** `whoami` asks `GET /api/v1/me`
+with the sign-in. It needs no member id, so `setup` no longer asks for
+one: the member is the signed-in person's own account, and the window
+shows "Signed in as …". An address with no account is told that a lead
+adds it in Team › People. `--member` still names one explicitly.
+
+**One server per computer.** A computer's wrapped copy of the root and
+its token exist on one server. A new server URL is therefore "sign out
+there, then enrol here", and the window does both, in that order.
+Enrolling over an enrolled profile is refused ("sign out first"),
+because it would leave the first copy on a server with nothing on this
+computer left to revoke it. An enrolment the server accepted but this
+computer could not save gives its copy straight back.
+
+**Signing out** (`gorani-sync signout`, Account › Sign out) runs in this
+order:
+
+1. **The server.** `POST …/devices/<id>/leave`, with this computer's own
+   token: the server deletes its wrapped copy. If the server cannot be
+   reached, the rest still happens, and the person is told to revoke the
+   computer from another one (Team › Devices).
+2. **The key parts here.** Keyring and Keychain items and CNG keys are
+   forgotten.
+3. **The files.** The profile, and its journal of unfinished uploads,
+   are deleted.
+
+The Windows app also unregisters its folder.
+
+**Signing in.** The Access token now:
+
+- **Is fetched again shortly before it expires.** Until 40a it was
+  fetched once per process, so a shell left running past the Access
+  session (a day by default) was refused until restarted. The client now
+  reads the JWT's `exp`, only to schedule the next fetch, never to trust
+  it, and fetches again two minutes before. Without a readable `exp` it
+  fetches every 15 minutes, and after a failure every minute, so signing
+  in again is picked up quickly.
+- **Can be fetched from a path with spaces.** The command is split as a
+  command line, with quotes grouping. Windows installs cloudflared under
+  `C:\Program Files (x86)`, which the old whitespace split cut in three.
+- **Is signed into through the browser** (40c, below). cloudflared's
+  command stays for scripts and the Advanced tab.
+- **Never flashes a console.** Commands run from the windows open none on
+  Windows.
+
+**Checked before saving.** The server must be `https://`; plain `http://`
+is allowed only for this machine (`wrangler dev`), since anything else
+would send both tokens in the clear. Also checked: a case id's shape,
+that the folder is a full path, that the scanner command splits, and the
+device name.
+
+**The CLI** gained:
+
+- `whoami`;
+- `signout`;
+- `settings [--set key=value …]`, which shows or changes what the window
+  keeps (an empty value unsets).
+
+`accept` uses the saved scanner when `--scan` names none.
+
+### 40b as built: the Windows app (clients/windows/src/app/)
+
+`gorani.exe` is a window program: the Start menu's **Gorani**. It holds
+the tray icon, the Settings window, and the sync itself: the Cloud Files
+folder that `gorani-cloud` serves, run here on a thread of its own. It is
+written with the `windows` crate alone, with no other UI code.
+
+| Part | What it does |
+|---|---|
+| The tray icon | The water deer, its tooltip saying where the sync stands. Its menu: Open the Gorani folder, Open Gorani in the browser, Pause/Resume syncing, Settings…, Quit. A double-click opens the folder. |
+| Settings › Account | Server; Sign in with your browser (40c; pressed again while it waits, it cancels; also signs in again when the session ran out, and the sync resumes); "Signed in as … — member …". Not enrolled: this computer's name, its protection (the menu of `protection_choices`), the vault password, Enrol. Enrolled: where and how, Change server…, Sign out…. |
+| Settings › Sync | The folder (Browse…); Show: My files, or a case (Refresh opens the titles with each case's key); start at sign-in; keep downloaded files; Pause; Save. |
+| Settings › This computer & devices | Its protection, and Change it to (`session::protect`); your computers, Refresh, Revoke selected…. |
+| Settings › Advanced | The sign-in command; an Access service token; accept unverified files; the scanner `gorani-sync accept` uses. |
+
+**What it does on its own:**
+- **At start:** a computer that is not enrolled, or has no folder,
+  opens its Settings. An enrolled one with a folder starts syncing and
+  says so once. It says nothing when Windows started it at sign-in.
+- **One instance:** starting it again opens the running one's Settings.
+- **Enrolling** proposes `%USERPROFILE%\Gorani` and starts syncing there.
+
+**Folders.** Gorani takes only a new or empty folder, or the one it has
+already (`appmodel::folder_ok`). Signing out removes what it put in its
+folder: the placeholders and the folders they leave empty. A folder that
+already held someone's files would lose them. Each area has a folder of
+its own, so changing the area asks for a new folder (one is suggested).
+Otherwise the old area's placeholders would look like new files to the
+other area. A folder given up for another is unregistered and emptied
+the same way.
+
+**Signing out** stops the sync, sending what is left; unregisters the
+folder and removes its placeholders; then runs `settings::sign_out`.
+Whole files, which are copies kept by "Keep downloaded files", stay,
+and the person is told how many.
+
+**Start at sign-in.** From the package (MSIX), the manifest declares a
+startup task, off at install. Settings turns it on through Windows, and
+Task Manager › Startup apps can always turn it off again: Windows does
+not let an app overrule that, and Settings says so. From the ZIP, it is
+the per-user Run key (`"…\gorani.exe" --background`).
+
+**How it is built:**
+- **Threads.** The window thread draws and decides. The sync thread owns
+  the running folder and posts what happened as messages. Each job that
+  waits on the network or a person (sign-in, enrolment, the device list,
+  the cases' titles, a protection change) gets a thread of its own, so the
+  window never waits. The window's state is a thread-local, borrowed for
+  a moment and never across a message box, a menu or the folder picker:
+  those run a message loop that can re-enter the window procedure.
+- **The vault password** is read once, out of its box (which is
+  emptied), and wiped with the enrolment.
+- **The manifest** (`src/app/gorani.exe.manifest`) is embedded by
+  link.exe itself (build.rs): Common Controls 6 and per-monitor DPI
+  awareness. The window lays itself out again when it moves to a screen
+  of another DPI.
+
+**What is checked:**
+- **Words and rules** (status lines, the tooltip's 127-character limit,
+  folder names for cases, the icon chosen from gorani.ico, `folder_ok`)
+  live in `appmodel.rs`, with no Win32 in them, and are tested on every
+  system.
+- **In CI, `gorani --self-test`** makes the real Settings window without
+  showing it: every control must exist, every tab arrange, the protection
+  menu fill, the layout survive 144 dpi, and the window go cleanly.
+- **The package check** runs `gorani --version` through its alias.
+
+What CI cannot do is look at the window, or enrol against a real Access
+deployment. The first run on a real PC is that check.
+
+### 40c as built: signing in through the browser
+
+Asked how the apps should sign in, and to keep the one flow everywhere
+for maintenance, the choice was the person's own browser. It is the
+same on Windows, macOS and the command line.
+
+```text
+the app      listens on 127.0.0.1:<a random port>, makes a random state, and opens
+             https://<server>/api/v1/desktop/sign-in?port=…&state=…  in the browser
+Access       signs the person in, as for the web app (usually they are already)
+the page     "Sign Gorani in on this computer as jinu@…?" — one button, no script
+             (worker/src/desktop.rs)
+the button   POSTs {state, token} to http://127.0.0.1:<port>/gorani-sign-in; the
+             token is this very request's Access token, which Access and the
+             Worker just checked
+the app      takes it only from the server's Origin, with its own state; keeps it
+             in the profile (accessToken, 0600) until it expires (signin.rs)
+```
+
+**Why not the alternatives:**
+- **A sign-in sheet inside the app** is refused by identity providers
+  (Google outright). It also cannot use the browser's existing session
+  or the person's passkeys.
+- **cloudflared** is an install, and a sandboxed Mac app cannot read its
+  token file.
+
+The browser is usually signed in already, so signing in is one button.
+
+**What protects it:**
+
+| Threat | Answer |
+|---|---|
+| A website opens the page in the person's browser, hoping something listens on the port it names | Nothing is sent without the person's click on the server's own page. |
+| Someone plants their own token in the app (login CSRF) | The app takes only its own state (compared in constant time), only from the server's Origin, only as a POST. |
+| The token in a URL: the history, a synced history, a Referer | It travels in a form body, to loopback. The page is `no-store` and `no-referrer`, with no frames. |
+| The page as a script target | No script. Its CSP is `default-src 'none'`, its style by hash, and `form-action` exactly the one loopback address. Port and state are checked to their shapes. |
+| A listener left open | Loopback only. It takes one sign-in, refuses everything else without stopping, and ends at five minutes or on Cancel. |
+
+**Running out.** The token lasts as long as the Access session (a day,
+by default). A shell running for days reads the profile again when its
+token nears its end (`api.rs › stored_token`), so a sign-in made in the
+window reaches the sync without a restart. The Windows app opens its
+Settings at start when the sign-in has run out, and restarts the sync
+after a new one.
+
+**The command line:** `gorani-sync setup` signs in this way when nothing
+else signs it in. `gorani-sync signin` signs in again, and
+`--no-browser` prints the address instead of opening it.
+
+### 40d as built: the Mac app (clients/macos/App/)
+
+The host app, which until 40d could only add Gorani to Finder or remove
+it, is now a menu-bar app (`LSUIElement`) with the same Settings as on
+Windows. Its decisions are the same core's, through one more C call:
+`gorani_app(request_json)` (clients/macos/src/app.rs), typed in Swift by
+`AppBridge` (GoraniKit).
+
+| Part | What it does |
+|---|---|
+| The menu bar | Where it stands (not set up, signed out, paused, in Finder). Open in Finder, Open Gorani in the browser, Pause/Resume, Sign in again… (when it ran out), Settings…, Quit. |
+| Settings › Account | Server; Sign in with your browser (40c; pressed again, it cancels); "Signed in as …". Before enrolment: the Mac's name, its protection (Automatic, Touch ID each time, Secure Enclave, login Keychain), the vault password, Enrol. After: where and how, Change server… (sign out, then enrol on the new one), Sign out…. |
+| Settings › Sync | Show Gorani in Finder; Show: my files or a case (Refresh opens the titles with each case key); start at login (`SMAppService`); Pause. |
+| Settings › This Mac & devices | Its protection, and changing it; your computers, Refresh, Revoke selected…. |
+| Settings › Advanced | The sign-in command; an Access service token; accept unverified files; the scanner. |
+
+**How it fits the Mac:**
+- **The files are Finder's.** The File Provider extension (39c) serves
+  them. Since 40d, `gorani_open` reads the area and "accept unverified"
+  from the profile when its caller names neither, so the extension
+  follows the Settings. A change the extension reads only when it starts
+  (the area, accepting unverified files) removes the domain and adds it
+  again. Nothing is lost: the files are the server's.
+- **Pause** disconnects the domain: the files stay listed, and nothing
+  moves.
+- **Sign out** removes the domain first, so its files leave this Mac,
+  then runs the core's sign-out.
+- **The browser's token never reaches Swift.** `signin.wait` keeps it in
+  the core, under the sign-in's id, until `whoami` or `enrol` uses it.
+  Once enrolled, it is saved straight into the profile. The vault
+  password does cross, as a string, and only for the enrolment call.
+- **Entitlements.** The host app now links the core and holds
+  `network.client` (the server) and `network.server` (the loopback
+  listener the browser posts to). It is still sandboxed, and still
+  shares only the app group with the extension.
+- **Opening Settings by itself.** The Settings window is a `Window`
+  scene, so the app can open it with `openWindow` on the first launch
+  and when the sign-in has run out. macOS 14 no longer opens SwiftUI's
+  `Settings` scene from code.
+
+**Tests:**
+- **The bridge's Rust tests** cover the app's requests: defaults, the
+  URL rules, a Mac not enrolled, an enrolment without a password
+  refused, a sign-in started and cancelled.
+- **`swift test` (AppBridgeTests)** covers the same requests through the
+  C interface, and the settings' JSON shape both ways.
+- **CI's unsigned `xcodebuild`** compiles the app with the core linked.
+
+What no CI can do here is run a File Provider domain or sign in to a
+real Access deployment. The first launch on a signed build is that check.
+
 ## Testing (the pattern the port follows)
 
 `tests/unit/formats.test.mjs` proves Rust ⇄ TS byte equality; the client

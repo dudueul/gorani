@@ -62,8 +62,50 @@ pub struct Client {
 	/// vault and the devices are always the member's own.
 	area: String,
 	agent: ureq::Agent,
-	/// The member's Access token, fetched once per process (commit 33a).
-	access_token: std::sync::OnceLock<Option<String>>,
+	/// The member's Access token (commit 33a), with when it stops being
+	/// good. Until 40a it was fetched once per process, so a shell left
+	/// running past the Access session (a day, by default) was refused on
+	/// every request until restarted. The desktop apps run for weeks at a
+	/// time, so it is fetched again shortly before its `exp`.
+	access_token: std::sync::Mutex<Option<CachedToken>>,
+	/// Where the profile lives, when the caller knows: a stored token that
+	/// is about to expire is looked for there again, so a sign-in made in
+	/// the app's window reaches a sync that has been running for days (40c).
+	profile_path: Option<std::path::PathBuf>,
+}
+
+/// A fetched token and the moment to fetch the next one.
+struct CachedToken {
+	token: Option<String>,
+	refresh_at: u64,
+}
+
+/// Fetch again this long before a token's `exp`, and at least this often
+/// when its `exp` cannot be read (`cloudflared access token` only reads
+/// its cached file, so asking is cheap).
+const TOKEN_MARGIN_SECS: u64 = 120;
+const TOKEN_RECHECK_SECS: u64 = 15 * 60;
+
+fn now_secs() -> u64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A JWT's `exp`, read WITHOUT checking its signature. That is safe here:
+/// it is only used to decide when to fetch the next token. Access and the
+/// Worker check the token itself on every request.
+pub fn jwt_exp(token: &str) -> Option<u64> {
+	use base64::Engine;
+	let payload = token.split('.').nth(1)?;
+	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+	serde_json::from_slice::<Value>(&bytes).ok()?.get("exp")?.as_u64()
+}
+
+/// When to fetch again after getting `token` at `now`.
+fn refresh_at(token: Option<&str>, now: u64) -> u64 {
+	match token.and_then(jwt_exp) {
+		Some(exp) => exp.saturating_sub(TOKEN_MARGIN_SECS).clamp(now + 30, now + TOKEN_RECHECK_SECS),
+		None => now + TOKEN_RECHECK_SECS,
+	}
 }
 
 /// The member's Access token: `GORANI_ACCESS_TOKEN`, else the profile's
@@ -75,9 +117,15 @@ pub fn access_token_from(env_token: Option<String>, cmd: Option<&str>) -> Result
 		return Ok(Some(t));
 	}
 	let Some(cmd) = cmd.map(str::trim).filter(|c| !c.is_empty()) else { return Ok(None) };
-	let mut parts = cmd.split_whitespace();
-	let program = parts.next().unwrap_or_default();
-	let out = std::process::Command::new(program).args(parts).output().map_err(|e| Error::Config(format!("the access token command ({program}) did not run: {e}")))?;
+	// Split as a command line, quotes grouping (scan.rs, no shell): the
+	// Windows installer puts cloudflared under "C:\Program Files (x86)",
+	// which a plain whitespace split cut in three (until 40a).
+	let words = crate::scan::split_words(cmd).map_err(|_| Error::Config("the access token command has an unclosed quote".into()))?;
+	let (program, args) = words.split_first().ok_or_else(|| Error::Config("the access token command is empty".into()))?;
+	let mut command = std::process::Command::new(program);
+	command.args(args);
+	hide_console(&mut command);
+	let out = command.output().map_err(|e| Error::Config(format!("the access token command ({program}) did not run: {e}")))?;
 	if !out.status.success() {
 		return Err(Error::Config(format!("the access token command failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
 	}
@@ -86,6 +134,19 @@ pub fn access_token_from(env_token: Option<String>, cmd: Option<&str>) -> Result
 		return Err(Error::Config("the access token command printed no token (sign in first: cloudflared access login <host>)".into()));
 	}
 	Ok(Some(token))
+}
+
+/// A program run from a window (the desktop apps) must not flash a console
+/// window on Windows each time it asks for a token.
+pub fn hide_console(command: &mut std::process::Command) {
+	#[cfg(windows)]
+	{
+		use std::os::windows::process::CommandExt;
+		const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+		command.creation_flags(CREATE_NO_WINDOW);
+	}
+	#[cfg(not(windows))]
+	let _ = command;
 }
 
 impl Client {
@@ -99,7 +160,14 @@ impl Client {
 			.timeout_connect(std::time::Duration::from_secs(15))
 			.timeout(std::time::Duration::from_secs(60));
 		let area = profile.member.clone();
-		Self { profile, area, agent: b.build(), access_token: std::sync::OnceLock::new() }
+		Self { profile, area, agent: b.build(), access_token: std::sync::Mutex::new(None), profile_path: None }
+	}
+
+	/// The same client, re-reading its stored token from `path` when it
+	/// runs out.
+	pub fn with_profile_path(mut self, path: &std::path::Path) -> Self {
+		self.profile_path = Some(path.to_path_buf());
+		self
 	}
 
 	/// The same client, its file routes addressing `area` (`case:<id>`).
@@ -131,17 +199,52 @@ impl Client {
 		}
 	}
 
-	/// The member's token for this process (fetched on first use).
-	fn member_token(&self) -> Option<&str> {
-		self.access_token
-			.get_or_init(|| match access_token_from(std::env::var("GORANI_ACCESS_TOKEN").ok(), self.profile.access_token_cmd.as_deref()) {
-				Ok(t) => t,
-				Err(e) => {
-					eprintln!("gorani: {e}");
-					None
-				}
-			})
-			.as_deref()
+	/// The member's token: fetched on first use, and again shortly before
+	/// it expires (40a). A failed fetch is not cached for long, so signing
+	/// in again (`cloudflared access login`) is picked up within a minute.
+	fn member_token(&self) -> Option<String> {
+		let now = now_secs();
+		let mut cached = self.access_token.lock().unwrap_or_else(|p| p.into_inner());
+		if let Some(c) = cached.as_ref().filter(|c| now < c.refresh_at) {
+			return c.token.clone();
+		}
+		// The variable first (a shell that has one), then the token the
+		// browser handed over (40c) — the profile's, or a newer one written
+		// to the profile file since — then the command.
+		let env = std::env::var("GORANI_ACCESS_TOKEN").ok().filter(|t| !t.trim().is_empty());
+		if env.is_none() {
+			if let Some(stored) = self.stored_token(now) {
+				let at = refresh_at(Some(&stored), now);
+				*cached = Some(CachedToken { token: Some(stored.clone()), refresh_at: at });
+				return Some(stored);
+			}
+		}
+		let (token, refresh) = match access_token_from(env, self.profile.access_token_cmd.as_deref()) {
+			Ok(t) => {
+				let at = refresh_at(t.as_deref(), now);
+				(t, at)
+			}
+			Err(e) => {
+				eprintln!("gorani: {e}");
+				(None, now + 60)
+			}
+		};
+		*cached = Some(CachedToken { token: token.clone(), refresh_at: refresh });
+		token
+	}
+
+	/// The browser's token: the profile's while it lasts, else the one in
+	/// the profile file now (the app may have signed in again). An expired
+	/// one is still sent when there is nothing else: Access then refuses
+	/// it, and the refusal says "Sign in again".
+	fn stored_token(&self, now: u64) -> Option<String> {
+		let mine = self.profile.access_token.clone().filter(|t| !t.is_empty())?;
+		let fresh = |t: &str| jwt_exp(t).is_none_or(|exp| exp > now + TOKEN_MARGIN_SECS);
+		if fresh(&mine) {
+			return Some(mine);
+		}
+		let newer = self.profile_path.as_deref().and_then(|p| crate::session::load_profile(p).ok()).and_then(|p| p.access_token).filter(|t| fresh(t));
+		Some(newer.unwrap_or(mine))
 	}
 
 	fn req(&self, method: &str, url: &str) -> ureq::Request {
@@ -156,7 +259,7 @@ impl Client {
 		// The member, signed in through Access (commit 33a): their token, which
 		// Access validates and hands the Worker as the member's JWT.
 		if let Some(token) = self.member_token() {
-			r = r.set("cf-access-token", token);
+			r = r.set("cf-access-token", &token);
 		}
 		if let (Some(id), Some(secret)) = (&self.profile.access_id, &self.profile.access_secret) {
 			r = r.set("CF-Access-Client-Id", id).set("CF-Access-Client-Secret", secret);
@@ -232,6 +335,27 @@ impl Client {
 			v["salt"].as_str().unwrap_or_default().to_string(),
 			serde_json::from_value(v["settings"].clone()).map_err(|e| Error::Config(format!("settings: {e}")))?,
 		))
+	}
+
+	/// Who the server says is signed in (`GET /api/v1/me`): the Access email,
+	/// and the team account it belongs to, or null. Needs no member id, so
+	/// the desktop apps can fill it in for the person (40a).
+	pub fn me(&self) -> Result<Value, Error> {
+		self.team_get("me")
+	}
+
+	/// This computer leaves (`POST …/devices/<id>/leave`, with its own
+	/// token): the server deletes its wrapped copy of the root. Sign out
+	/// (settings.rs) calls it before forgetting the local parts.
+	pub fn leave(&self, device_id: &str, token: &str) -> Result<(), Error> {
+		self.req("POST", &self.url(&format!("/devices/{device_id}/leave")))
+			.set("x-gorani-device-token", token)
+			.send_json(json!({}))
+			.map_err(|e| match e {
+				ureq::Error::Status(code, resp) => Error::Http(code, resp.into_string().unwrap_or_default()),
+				other => Error::Config(other.to_string()),
+			})?;
+		Ok(())
 	}
 
 	/// The member's devices (`GET …/devices`): name, platform, protection, last seen.
@@ -488,7 +612,34 @@ pub struct UploadFields {
 
 #[cfg(test)]
 mod tests {
-	use super::access_token_from;
+	use super::{access_token_from, jwt_exp, refresh_at, TOKEN_MARGIN_SECS, TOKEN_RECHECK_SECS};
+
+	#[test]
+	fn a_quoted_program_path_runs_whole() {
+		// "C:\Program Files (x86)\cloudflared\cloudflared.exe" access token …
+		// is one program: quotes group, as on a command line (40a).
+		assert_eq!(access_token_from(None, Some("\"echo\" ey.quoted")).unwrap().as_deref(), Some("ey.quoted"));
+		assert!(access_token_from(None, Some("\"echo ey.open")).unwrap_err().to_string().contains("unclosed quote"));
+	}
+
+	#[test]
+	fn a_token_is_fetched_again_before_it_expires() {
+		use base64::Engine;
+		let b64 = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+		let token = |exp: u64| format!("{}.{}.sig", b64(r#"{"alg":"RS256"}"#), b64(&format!(r#"{{"exp":{exp},"email":"jinu@family.test"}}"#)));
+		let now = 1_800_000_000;
+		assert_eq!(jwt_exp(&token(now + 3600)), Some(now + 3600));
+		assert_eq!(jwt_exp("not a jwt"), None);
+		// An hour left: asked again at the latest after the recheck period.
+		assert_eq!(refresh_at(Some(&token(now + 3600)), now), now + TOKEN_RECHECK_SECS);
+		// Five minutes left: asked again two minutes before the end.
+		assert_eq!(refresh_at(Some(&token(now + 300)), now), now + 300 - TOKEN_MARGIN_SECS);
+		// Already expired: asked again soon, never in a busy loop.
+		assert_eq!(refresh_at(Some(&token(now - 10)), now), now + 30);
+		// No readable exp, or no token at all: the recheck period.
+		assert_eq!(refresh_at(Some("opaque"), now), now + TOKEN_RECHECK_SECS);
+		assert_eq!(refresh_at(None, now), now + TOKEN_RECHECK_SECS);
+	}
 
 	#[test]
 	fn the_variable_wins_then_the_command_then_nothing() {

@@ -30,20 +30,29 @@ targets:
     platform: macOS
     sources: [App]
     scheme: {}
-    # (The app only adds and removes the domain: it does not link the core.)
+    # (Since 40d the app links the core too: its Settings enrol the Mac,
+    # sign it in through the browser and choose what Finder shows —
+    # AppBridge → clients/macos/src/app.rs.)
     dependencies:
       - target: GoraniFileProvider
         embed: true
+      - package: GoraniKit
     info:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Gorani
         GoraniAppGroup: $(TeamIdentifierPrefix)io.gorani
         LSApplicationCategoryType: public.app-category.productivity
+        # A menu-bar app (40d): no Dock icon; Settings opens as a window.
+        LSUIElement: true
     entitlements:
       path: App/Gorani.entitlements
       properties:
         com.apple.security.app-sandbox: true
+        # (40d) The server, for enrolling and the device list; and the
+        # loopback listener the browser hands the sign-in to (127.0.0.1).
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
         com.apple.security.application-groups: [$(TeamIdentifierPrefix)io.gorani]
     settings:
       base:

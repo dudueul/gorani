@@ -3,8 +3,8 @@
 /**
  * The app's side of the preview frame (commit 42a, docs/PREVIEWS.md).
  *
- * A file whose format needs a parser — PDF now; Office, email and the rest
- * as they land — is shown in a frame of its own: /preview.html, framed with
+ * A file whose format needs a parser — PDF, Office, 한글; email and the
+ * rest as they land — is shown in a frame of its own: /preview.html, framed with
  * sandbox="allow-scripts" and nothing else. That gives it an OPAQUE origin:
  *
  *   - no cookies, no localStorage or IndexedDB, no service worker of ours —
@@ -31,16 +31,29 @@
 
 import { isPhone } from "../../lib/phone.ts";
 
-/** The readers that exist (web/src/preview/readers/<id>.ts). */
-export type ReaderId = "pdf";
+/** The readers that exist (web/src/preview/readers/<id>.ts):
+ *   pdf     PDF (pdf.js)                                         42a
+ *   docx    Word 2007+ (docx-preview)                            42b
+ *   sheet   Excel, OpenDocument sheets, CSV (SheetJS, in a worker)
+ *   pptx    PowerPoint 2007+ (pptx-preview)
+ *   hwp     한글 HWP and HWPX (rhwp, WebAssembly)
+ *   legacy  Word and PowerPoint 97–2003, RTF, OpenDocument text and
+ *           slides: their text and their facts, read by our own code */
+export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy";
 
 /** The asset names each reader may ask for — and nothing else is fetched for it. */
-const ASSETS: Record<ReaderId, RegExp> = {
+const ASSETS: Record<ReaderId, RegExp | null> = {
 	pdf: /^(cmaps\/[A-Za-z0-9_-]+(\.bcmap)?|standard_fonts\/[A-Za-z0-9_-]+\.(pfb|ttf)|wasm\/[a-z0-9_]+(\.wasm|_nowasm_fallback\.js))$/,
+	docx: null,
+	sheet: null,
+	pptx: null,
+	// rhwp's parser and renderer, 12 MB of WebAssembly.
+	hwp: /^rhwp_bg\.wasm$/,
+	legacy: null,
 };
 
 /** Readers that run a worker of their own (its code is sent with theirs). */
-const WORKERS: Partial<Record<ReaderId, true>> = { pdf: true };
+const WORKERS: Partial<Record<ReaderId, true>> = { pdf: true, sheet: true };
 
 /** Is this a name the reader may be sent? (Exported for unit:preview-frame.) */
 export function assetPath(reader: ReaderId, path: unknown): string | null {

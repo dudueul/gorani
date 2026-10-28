@@ -11,14 +11,27 @@
 	},
 	"dependencies": {
 		"@noble/post-quantum": "^0.7.1",
+		"@rhwp/core": "0.8.7",
+		"cfb": "1.2.2",
+		"docx-preview": "0.4.1",
+		"dompurify": "3.4.17",
+		"fflate": "0.8.3",
 		"hash-wasm": "^4.12.0",
 		"lit": "^3.3.0",
-		"pdfjs-dist": "6.4.299"
+		"pdfjs-dist": "6.4.299",
+		"pptx-preview": "1.0.7",
+		"xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
 	},
 	"devDependencies": {
 		"@tailwindcss/vite": "^4.1.4",
 		"tailwindcss": "^4.1.4",
 		"typescript": "^5.8.3",
 		"vite": "^7.1.0"
+	},
+	"overrides": {
+		"pptx-preview": {
+			"echarts": "6.1.0",
+			"uuid": "11.1.1"
+		}
 	}
 }

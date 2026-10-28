@@ -7,12 +7,15 @@
  * from a blob: URL it makes from the code the app hands it, so a reader
  * cannot import anything at run time: everything it needs is bundled in.
  *
- * Also copied, as-is, for the readers that need them:
+ * Also built or copied, for the readers that need them:
  *   readers/pdf.worker.js   pdf.js's worker (parses the PDF), re-bundled as a
  *                           classic script (see below)
  *   readers/pdf/            its CMaps (CJK text), standard fonts and image
  *                           decoders, which the frame asks the app for by
  *                           name (ui/viewer/sandbox.ts › assetPath)
+ *   readers/sheet.worker.js SheetJS, parsing the workbook off the frame's
+ *                           main thread (preview/readers/sheet.worker.ts)
+ *   readers/hwp/            rhwp's WebAssembly (and its licence)
  *
  * Run by `npm run build` in web/ before Vite (Vite copies public/ into
  * dist/). Skipped when every output is newer than every source. The
@@ -44,6 +47,12 @@ const READERS = {
 			["pdfjs-dist/wasm", "wasm", (f) => (/\.wasm$|_nowasm_fallback\.js$|^LICENSE_/.test(f)) && !/quickjs/i.test(f)],
 		],
 	},
+	docx: {},
+	// The parser runs in a worker of ours (src/preview/readers/sheet.worker.ts).
+	sheet: { worker: "./readers/sheet.worker.ts" },
+	pptx: {},
+	hwp: { files: [["@rhwp/core/rhwp_bg.wasm", "rhwp_bg.wasm"], ["@rhwp/core/LICENSE", "LICENSE"]] },
+	legacy: {},
 };
 
 const pkgDir = (spec) => path.dirname(require.resolve(`${spec.split("/").slice(0, spec.startsWith("@") ? 2 : 1).join("/")}/package.json`));
@@ -95,13 +104,13 @@ for (const [name, spec] of Object.entries(READERS)) {
 		logLevel: "warning",
 	});
 	// The worker as a CLASSIC script (an IIFE), though pdf.js ships it as a
-	// module: an opaque-origin frame cannot start a module worker from a
+	// module (and ours is written as one): an opaque-origin frame cannot start a module worker from a
 	// blob: URL (Chromium fails it with a bare error event), and a classic
 	// one starts fine. Its two `import.meta.url`s are Emscripten's guess at
 	// a script directory, inside a try — empty here, and unused.
 	if (spec.worker) {
 		await build({
-			entryPoints: [resolveIn(spec.worker)],
+			entryPoints: [spec.worker.startsWith("./") ? path.join(SRC, spec.worker) : resolveIn(spec.worker)],
 			outfile: path.join(OUT, `${name}.worker.js`),
 			bundle: true,
 			format: "iife",
@@ -112,6 +121,10 @@ for (const [name, spec] of Object.entries(READERS)) {
 			logLevel: "warning",
 			logOverride: { "empty-import-meta": "silent" },
 		});
+	}
+	for (const [from, to] of spec.files ?? []) {
+		fs.mkdirSync(path.join(OUT, name), { recursive: true });
+		fs.copyFileSync(resolveIn(from), path.join(OUT, name, to));
 	}
 	for (const [from, to, keep = () => true] of spec.assets ?? []) {
 		const src = resolveIn(from);

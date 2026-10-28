@@ -16,11 +16,77 @@ import type { ReaderId } from "./sandbox.ts";
 // sandboxed preview frame, never in the app's own page (42a, sandbox.ts).)
 export type ViewerMode = "image" | "video" | "audio" | "text" | "document" | "unsupported" | "too-large" | "refused";
 
-/** Which sandboxed reader shows a file, if one does (42a: PDF). */
+/** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글). */
+const BY_EXT: Record<string, ReaderId> = {
+	pdf: "pdf",
+	docx: "docx", docm: "docx", dotx: "docx", dotm: "docx",
+	xlsx: "sheet", xlsm: "sheet", xlsb: "sheet", xltx: "sheet", xltm: "sheet", xls: "sheet", xlt: "sheet", ods: "sheet", csv: "sheet", tsv: "sheet",
+	pptx: "pptx", pptm: "pptx", ppsx: "pptx", ppsm: "pptx", potx: "pptx", potm: "pptx",
+	hwp: "hwp", hwpx: "hwp", hwt: "hwp",
+	doc: "legacy", dot: "legacy", ppt: "legacy", pps: "legacy", pot: "legacy", rtf: "legacy", odt: "legacy", ott: "legacy", odp: "legacy", otp: "legacy",
+};
+
+/** …and the types, for a file whose name says nothing. */
+const BY_MIME: Record<string, ReaderId> = {
+	"application/pdf": "pdf",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+	"application/vnd.ms-word.document.macroenabled.12": "docx",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "sheet",
+	"application/vnd.ms-excel": "sheet",
+	"application/vnd.ms-excel.sheet.macroenabled.12": "sheet",
+	"application/vnd.ms-excel.sheet.binary.macroenabled.12": "sheet",
+	"application/vnd.oasis.opendocument.spreadsheet": "sheet",
+	"text/csv": "sheet",
+	"text/tab-separated-values": "sheet",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+	"application/vnd.ms-powerpoint.presentation.macroenabled.12": "pptx",
+	"application/x-hwp": "hwp",
+	"application/haansofthwp": "hwp",
+	"application/vnd.hancom.hwp": "hwp",
+	"application/vnd.hancom.hwpx": "hwp",
+	"application/hwp+zip": "hwp",
+	"application/msword": "legacy",
+	"application/vnd.ms-powerpoint": "legacy",
+	"application/rtf": "legacy",
+	"text/rtf": "legacy",
+	"application/vnd.oasis.opendocument.text": "legacy",
+	"application/vnd.oasis.opendocument.presentation": "legacy",
+};
+
+/** Which sandboxed reader shows a file, if one does: by its name first
+ * (what the person sees), then its stored type. */
 export function readerFor(kind: string, mime: string | null, name: string): ReaderId | null {
 	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
-	if (kind === "pdf" || mime === "application/pdf" || ext === "pdf") return "pdf";
-	return null;
+	if (kind === "pdf") return "pdf";
+	return BY_EXT[ext] ?? BY_MIME[(mime ?? "").split(";")[0]!.trim().toLowerCase()] ?? null;
+}
+
+/**
+ * The reader for what the bytes ARE, when the name says something else
+ * (42b). Disguise is the point of a lure: "invoice.doc" is very often RTF
+ * (the Equation Editor exploits), a web archive, or a .docx renamed; a
+ * ".docx" may be a Word 97 file carrying macros. The name picked a reader;
+ * the first bytes correct it, within the family the name promised (a
+ * ".doc" that is a PDF is shown as the PDF it is). The reader then names
+ * the mismatch among its facts. Pure: unit:viewer-modes.
+ */
+export function sniffReader(head: Uint8Array, guess: ReaderId, name: string): ReaderId {
+	const ascii = String.fromCharCode(...head.subarray(0, 16));
+	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
+	if (ascii.startsWith("%PDF-")) return "pdf";
+	if (ascii.startsWith("{\\rtf")) return "legacy";
+	const zip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
+	const ole = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
+	if (guess === "sheet" || guess === "hwp") return guess; // each reads every form of its family
+	if (zip && guess === "legacy") {
+		// A ".doc" or ".ppt" that is really the 2007+ format, renamed.
+		if (/^(doc|dot)$/.test(ext)) return "docx";
+		if (/^(ppt|pps|pot)$/.test(ext)) return "pptx";
+	}
+	// A ".docx"/".pptx" that is an OLE container: a 97–2003 file renamed
+	// (or a password-protected one — the legacy reader says which).
+	if (ole && (guess === "docx" || guess === "pptx")) return "legacy";
+	return guess;
 }
 
 /** Above this, what is shown by reading it WHOLE into the tab — an image,
@@ -60,8 +126,8 @@ function modeOf(kind: string, mime: string | null): ViewerMode {
 		case "sheet":
 		case "slides":
 		case "archive":
-			// Office, HWP and archives get their readers in the frame next
-			// (42b, 42e); PDF already has one (readerFor, above).
+			// The formats with a reader in the frame never get here
+			// (readerFor, above); archives get theirs next (42e).
 			return mime === "text/plain" ? "text" : "unsupported";
 		default: {
 			if (mime?.startsWith("image/")) return "image";

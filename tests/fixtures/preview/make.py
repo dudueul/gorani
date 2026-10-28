@@ -10,6 +10,8 @@ report.pdf   three pages of text; page two in Korean, in a CID font the
              PDF does NOT embed (HYSMyeongJo-Medium), so pdf.js needs a CMap
              (UniKS-UCS2-H) — fetched for the frame by the app, the one
              asset path the frame has. Title and author in its metadata.
+locked.pdf   the report, protected with the password "gorani" (the reader
+             asks for it — inside the frame, where it stays).
 hostile.pdf  what a phishing or malware PDF carries: an OpenAction that
              runs JavaScript, document-level JavaScript, a link to a
              credential page, and an embedded file. The reader must run
@@ -87,6 +89,17 @@ with open(out / "hostile.pdf", "wb") as f:
     w.write(f)
 plain.unlink()
 
-for p in (report, out / "hostile.pdf"):
+# locked.pdf: the report, protected with the password "gorani" (RC4-128,
+# which with the fixed document id gives the same bytes every run — AES
+# would draw a random salt; this is a fixture, not a secret).
+w = PdfWriter(clone_from=str(report))
+w._ID = ArrayObject([ByteStringObject(b"gorani-fixture-2"), ByteStringObject(b"gorani-fixture-2")])
+w.encrypt("gorani", algorithm="RC4-128")
+with open(out / "locked.pdf", "wb") as f:
+    w.write(f)
+
+for p in (report, out / "hostile.pdf", out / "locked.pdf"):
     r = PdfReader(str(p))
+    if r.is_encrypted:
+        r.decrypt("gorani")
     print(f"{p.name}: {len(r.pages)} page(s), {p.stat().st_size} bytes")

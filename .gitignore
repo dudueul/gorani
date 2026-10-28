@@ -22,3 +22,5 @@ wrangler.r2.jsonc
 tests/output/
 # The video engine, built for the browser (scripts/build-media-wasm.mjs)
 web/public/gorani-media.wasm
+# The preview frame's readers, bundled for the frame (scripts/build-readers.mjs)
+web/public/readers/

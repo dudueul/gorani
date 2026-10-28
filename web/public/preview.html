@@ -1,0 +1,55 @@
+<!-- Copyright 2026- Seongwoo Hong. All rights reserved. -->
+<!doctype html>
+<!--
+  The preview frame (commit 42a, docs/PREVIEWS.md). The viewer opens a file
+  whose format needs a parser (PDF, Office, email…) HERE, in an iframe with
+  sandbox="allow-scripts" and nothing else: an opaque origin. Code in it
+  cannot read the app's storage, cookies or keys, cannot call the API,
+  cannot reach the network at all (its CSP, public/_headers: connect-src,
+  img-src, font-src and the rest allow only blob: and data:), cannot open
+  windows, submit forms or download, and cannot navigate itself elsewhere
+  (the app's own CSP says frame-src 'self').
+
+  It fetches nothing either: the app hands it the reader's code and the
+  file's decrypted bytes in one message, and answers its few requests for
+  a reader's own assets (pdf.js's CMaps and fonts) from a fixed list. This
+  page is the whole of what loads over the network, and the script below
+  is the only script it runs from itself — its SHA-256 is pinned in the
+  CSP, so a single changed byte stops it (unit:preview-frame checks the
+  two agree).
+-->
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="dark" />
+		<meta name="robots" content="noindex" />
+		<title>Preview</title>
+	</head>
+	<body>
+		<div id="root"></div>
+		<script>
+(() => {
+	"use strict";
+	// Only the app that framed this page may open a file in it, and only once:
+	// a frame shows one file and is thrown away with it.
+	const app = new URL(location.href).origin;
+	let opened = false;
+	addEventListener("message", async (e) => {
+		if (opened || e.source !== parent || e.origin !== app || !e.data || e.data.t !== "open" || !e.ports[0]) return;
+		opened = true;
+		const port = e.ports[0];
+		try {
+			const url = URL.createObjectURL(new Blob([e.data.code], { type: "text/javascript" }));
+			const reader = await import(url);
+			URL.revokeObjectURL(url);
+			await reader.start(e.data, port);
+		} catch (err) {
+			port.postMessage({ t: "error", message: String((err && err.message) || err) });
+		}
+	});
+	parent.postMessage({ t: "ready" }, app);
+})();
+		</script>
+	</body>
+</html>

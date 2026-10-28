@@ -7,10 +7,21 @@
  * falls back to Download rather than being read whole into a tab.
  */
 
+import type { ReaderId } from "./sandbox.ts";
+
 // (`refused`: a malware sample, or a file whose type does not verify —
 // commit 29e. Decided before anything else, and nothing is decrypted.
-// `too-large`: something only shown by reading it whole, above MAX_INLINE.)
-export type ViewerMode = "image" | "video" | "audio" | "text" | "unsupported" | "too-large" | "refused";
+// `too-large`: something only shown by reading it whole, above MAX_INLINE.
+// `document`: a format that needs a parser — shown by a reader in the
+// sandboxed preview frame, never in the app's own page (42a, sandbox.ts).)
+export type ViewerMode = "image" | "video" | "audio" | "text" | "document" | "unsupported" | "too-large" | "refused";
+
+/** Which sandboxed reader shows a file, if one does (42a: PDF). */
+export function readerFor(kind: string, mime: string | null, name: string): ReaderId | null {
+	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
+	if (kind === "pdf" || mime === "application/pdf" || ext === "pdf") return "pdf";
+	return null;
+}
 
 /** Above this, what is shown by reading it WHOLE into the tab — an image,
  * or media when neither streaming path is there — is offered as a
@@ -19,8 +30,10 @@ export const MAX_INLINE = 256 * 1024 * 1024;
 /** Text is rendered up to this many bytes, then truncated with a note. */
 export const TEXT_CAP = 2 * 1024 * 1024;
 
-export function pickViewerMode(kind: string, mime: string | null, size: number, policy: "normal" | "sample" | "unverified" = "normal"): ViewerMode {
+export function pickViewerMode(kind: string, mime: string | null, size: number, policy: "normal" | "sample" | "unverified" = "normal", name = ""): ViewerMode {
 	if (policy !== "normal" || kind === "sample") return "refused";
+	// A reader in the frame takes the file whole, so it meets the same cap.
+	if (readerFor(kind, mime, name)) return size > MAX_INLINE ? "too-large" : "document";
 	const mode = modeOf(kind, mime);
 	// Only an image is read whole to be shown, so only an image meets the
 	// cap here. Video and audio stream: the in-page player (39p) and the
@@ -43,13 +56,12 @@ function modeOf(kind: string, mime: string | null): ViewerMode {
 		case "text":
 		case "code":
 			return "text";
-		case "pdf":
 		case "doc":
 		case "sheet":
 		case "slides":
 		case "archive":
-			// The styled document readers and the archive browser land with the
-			// streaming commit (⑩b): mp4-hls-core for video, pdf.js for PDFs.
+			// Office, HWP and archives get their readers in the frame next
+			// (42b, 42e); PDF already has one (readerFor, above).
 			return mime === "text/plain" ? "text" : "unsupported";
 		default: {
 			if (mime?.startsWith("image/")) return "image";

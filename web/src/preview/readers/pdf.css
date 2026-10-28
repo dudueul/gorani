@@ -1,0 +1,142 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The PDF reader's layout (commit 42a). The .textLayer rules follow
+   pdf.js's web/pdf_viewer.css (Apache-2.0, Mozilla), flattened: they place
+   each run of text, invisible, exactly over its glyphs on the canvas, so
+   it can be selected and searched. */
+
+.body {
+	display: flex;
+	flex: 1;
+	min-height: 0;
+}
+
+.pages {
+	/* positioned, so a page's offsetTop is measured from here (goto) */
+	position: relative;
+	padding: 12px;
+	background: #262626;
+}
+
+.page {
+	position: relative;
+	margin: 0 auto 12px;
+	background: #fff;
+	box-shadow: 0 2px 10px rgb(0 0 0 / 0.5);
+}
+
+.page canvas {
+	display: block;
+}
+
+.thumbs {
+	width: 128px;
+	flex: none;
+	overflow-y: auto;
+	padding: 8px;
+	border-right: 1px solid var(--line);
+	background: var(--panel);
+}
+
+.thumbs[hidden] {
+	display: none;
+}
+
+.thumb {
+	display: block;
+	width: 100%;
+	margin: 0 0 8px;
+	padding: 4px;
+	text-align: center;
+	border-color: transparent;
+}
+
+.thumb.on {
+	border-color: var(--accent);
+}
+
+.thumb canvas {
+	display: block;
+	width: 96px;
+	margin: 0 auto 2px;
+	background: #fff;
+}
+
+.thumb .num {
+	font-size: 11px;
+	color: var(--muted);
+}
+
+.zoomlabel {
+	min-width: 3.2em;
+	text-align: center;
+}
+
+.sep {
+	width: 1px;
+	height: 20px;
+	background: var(--line);
+}
+
+.pw {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	align-items: stretch;
+}
+
+.textLayer {
+	position: absolute;
+	inset: 0;
+	overflow: clip;
+	opacity: 1;
+	line-height: 1;
+	text-align: initial;
+	letter-spacing: normal;
+	word-spacing: normal;
+	text-size-adjust: none;
+	forced-color-adjust: none;
+	transform-origin: 0 0;
+	z-index: 0;
+	--min-font-size: 1;
+	--text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+	--min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.textLayer span,
+.textLayer br {
+	color: transparent;
+	position: absolute;
+	white-space: pre;
+	cursor: text;
+	transform-origin: 0% 0%;
+	user-select: text;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+	z-index: 1;
+	--font-height: 0;
+	font-size: calc(var(--text-scale-factor) * var(--font-height));
+	--scale-x: 1;
+	--rotate: 0deg;
+	transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent {
+	display: contents;
+}
+
+.textLayer ::selection {
+	background: rgb(0 0 255 / 0.25);
+}
+
+.textLayer span.hit {
+	background: rgb(255 200 0 / 0.45);
+	border-radius: 2px;
+}
+
+.phone .bar input[type="search"] {
+	order: 10;
+	flex: 1 1 100%;
+}

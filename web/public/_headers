@@ -16,6 +16,9 @@
 #   media-src 'self' blob:      the media service worker (/media/) and decrypted blobs
 #   connect-src 'self'          the API; no third-party origin, ever
 #   worker-src 'self'           the local-index worker and the media service worker
+#   frame-src 'self'            the preview frame (/preview.html, commit 42a) — and,
+#                               because frame-src also governs where a frame may
+#                               NAVIGATE, it keeps that frame from going anywhere else
 #   form-action 'none'          the app has no HTML form submissions
 #   frame-ancestors 'none'      never framed (clickjacking); X-Frame-Options for old browsers
 #   base-uri 'none'             no <base> hijack of relative URLs
@@ -26,7 +29,7 @@
 #                               ours (web/src/lib/trusted-types.ts) exist
 
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types lit-html default
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; frame-src 'self'; manifest-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types lit-html default
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer
@@ -34,6 +37,37 @@
   Cross-Origin-Resource-Policy: same-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), interest-cohort=()
   Strict-Transport-Security: max-age=63072000; includeSubDomains
+
+# The preview frame (/preview.html, commit 42a, docs/PREVIEWS.md): where PDFs,
+# Office files, email and the rest are parsed. The app frames it with
+# sandbox="allow-scripts" — an opaque origin, so nothing in it can read the
+# app's storage, cookies or keys — and this policy REPLACES the app's
+# (the "!" lines detach what /* set) rather than adding to it:
+#   script-src 'sha256-…'       only the page's own bootstrap (its hash; unit:preview-frame
+#               blob:           keeps the two in step) and the readers it makes from the
+#               'wasm-unsafe-eval'  code the app hands it; WebAssembly for the decoders
+#   worker-src blob:            a reader's worker (pdf.js), from code handed over too
+#   connect-src/img-src/font-src/media-src blob: data:
+#                               nothing off this computer: no request leaves the frame —
+#                               not to the network, not even to this site
+#   style-src 'unsafe-inline'   readers style what they draw; CSS cannot reach out either
+#   frame-src 'none'            no frames inside it; frame-ancestors 'self': only the app
+#   require-trusted-types-for 'script'; trusted-types gorani-preview dompurify
+#                               the reader's own policy (blob: script URLs) and DOMPurify's
+/preview.html
+  ! Content-Security-Policy
+  ! X-Frame-Options
+  ! Permissions-Policy
+  Content-Security-Policy: default-src 'none'; script-src 'sha256-sDp19oFlYwyzI/wqFPCQGhE/gRGcQ9GAUV/jTK0qmD0=' blob: 'wasm-unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src blob: data:; font-src blob: data:; media-src blob: data:; connect-src blob: data:; form-action 'none'; frame-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; require-trusted-types-for 'script'; trusted-types gorani-preview dompurify
+  X-Frame-Options: SAMEORIGIN
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), clipboard-read=(), clipboard-write=(), display-capture=(), fullscreen=(), publickey-credentials-get=(), interest-cohort=()
+/preview
+  ! Content-Security-Policy
+  ! X-Frame-Options
+  ! Permissions-Policy
+  Content-Security-Policy: default-src 'none'; script-src 'sha256-sDp19oFlYwyzI/wqFPCQGhE/gRGcQ9GAUV/jTK0qmD0=' blob: 'wasm-unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src blob: data:; font-src blob: data:; media-src blob: data:; connect-src blob: data:; form-action 'none'; frame-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; require-trusted-types-for 'script'; trusted-types gorani-preview dompurify
+  X-Frame-Options: SAMEORIGIN
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), clipboard-read=(), clipboard-write=(), display-capture=(), fullscreen=(), publickey-credentials-get=(), interest-cohort=()
 
 # The share recipient page (/s.html, and /s — the asset server's
 # extension-less canonical path). A SECOND policy is added: browsers enforce

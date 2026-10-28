@@ -25,8 +25,9 @@ import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel } from "../files/model.ts";
 import { pickViewerMode, readerFor, renderMime, sniffReader, TEXT_CAP, MAX_INLINE, type ViewerMode } from "./mode.ts";
-import { openPreview, type Fact, type PreviewFrame } from "./sandbox.ts";
-import { icon, type FileKind } from "../files/icons.ts";
+import { openPreview, type Fact, type HandedFile, type PreviewFrame } from "./sandbox.ts";
+import { icon, kindOf, type FileKind } from "../files/icons.ts";
+import { partRisk } from "../../preview/facts/mail.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
 import { forgetMedia } from "../../lib/media-worker.ts";
@@ -93,6 +94,16 @@ export class GoraniViewer extends LitElement {
 	private docBytes: Uint8Array | null = null;
 	private docMime: string | null = null;
 	@state() private facts: Fact[] = [];
+	/**
+	 * Files found inside the one opened — an email's attachments (42c) —
+	 * opened in turn: the last is on screen, Back returns to the one
+	 * before, and to the file itself when none is left. They are NOT files
+	 * of the vault: nothing here downloads them; Save puts one in the vault
+	 * (after asking), where it gets custody like any upload.
+	 */
+	@state() private inner: HandedFile[] = [];
+	/** The Save-into-the-vault question, while it is asked. */
+	@state() private saving: { file: HandedFile; sample: boolean; risk: string | null; busy: boolean; error: string | null } | null = null;
 	/** A lead packaging the copy: how far. */
 	@state() private protecting: { done: number; total: number } | null = null;
 	private stopProtected: (() => void) | null = null;
@@ -145,6 +156,90 @@ export class GoraniViewer extends LitElement {
 			revokeBlobURL(this.url);
 		}
 		this.url = null;
+	}
+
+	/** What is on screen: an attachment opened from the file, or the file. */
+	private shown(): { name: string; kind: FileKind; mime: string | null } {
+		const top = this.inner.at(-1);
+		return top ? { name: top.name, kind: kindOf(top.name, top.mime), mime: top.mime } : { name: this.target.name, kind: this.target.kind, mime: this.docMime };
+	}
+
+	/** Open a file the reader found inside this one, in its own preview. */
+	private openInner(file: HandedFile): void {
+		this.reset();
+		this.inner = [...this.inner, file];
+		this.loadInner();
+	}
+
+	/** One step back: the attachment before, or the file itself. */
+	private back(): void {
+		this.reset();
+		this.inner = this.inner.slice(0, -1);
+		if (this.inner.length) this.loadInner();
+		else {
+			this.busy = true;
+			// (The Back button that had the focus is gone with the
+			// attachment: give it back to the viewer, or Escape reaches
+			// nothing.)
+			void this.load().then(() => this.refocus());
+		}
+	}
+
+	private reset(): void {
+		this.release();
+		this.mode = "unsupported";
+		this.text = null;
+		this.truncated = false;
+		this.error = null;
+		this.facts = [];
+	}
+
+	/**
+	 * An attachment, shown as its kind is: a format with a reader in a NEW
+	 * sandboxed frame; a raster picture or text as the viewer shows any;
+	 * anything else not at all (Save offers to keep it). Its bytes are the
+	 * attachment's own — as untrusted as the message they came in.
+	 */
+	private loadInner(): void {
+		const f = this.inner.at(-1)!;
+		const kind = kindOf(f.name, f.mime);
+		const mode = pickViewerMode(kind, f.mime, f.bytes.length, "normal", f.name);
+		this.mode = mode === "video" || mode === "audio" ? "unsupported" : mode;
+		if (this.mode === "document") {
+			this.docBytes = f.bytes.slice();
+			this.docMime = f.mime;
+		} else if (this.mode === "image") {
+			this.url = blobURL(new Blob([f.bytes as BlobPart], { type: renderMime(kind, f.mime, f.name) }));
+		} else if (this.mode === "text") {
+			this.text = new TextDecoder().decode(f.bytes.subarray(0, TEXT_CAP));
+			this.truncated = f.bytes.length > TEXT_CAP;
+		}
+		this.busy = false;
+		void this.updateComplete.then(() => this.refocus());
+	}
+
+	/** Save an attachment into the vault: the app judges it for itself
+	 * (partRisk, on the bytes it was handed — not on what the frame said)
+	 * and asks first; a risky one is offered as a malware sample. */
+	private askSave(file: HandedFile): void {
+		const risk = partRisk(file.name, file.bytes);
+		this.saving = { file, sample: !!risk, risk, busy: false, error: null };
+	}
+
+	private async confirmSave(): Promise<void> {
+		const s = this.saving;
+		if (!s || s.busy) return;
+		this.saving = { ...s, busy: true };
+		try {
+			const file = new File([s.file.bytes as BlobPart], s.file.name, { type: s.file.mime ?? "application/octet-stream" });
+			await this.model.upload([file], { sample: s.sample, into: this.target.folderId !== undefined ? this.target.folderId : undefined });
+			this.model.notify(`Saved “${s.file.name}” beside “${this.target.name}”${s.sample ? ", as a malware sample" : ""}.`);
+			this.saving = null;
+		} catch (e) {
+			this.saving = { ...s, busy: false, error: e instanceof Error ? e.message : String(e) };
+		}
+		await this.updateComplete;
+		this.refocus();
 	}
 
 	private async load(): Promise<void> {
@@ -333,15 +428,17 @@ export class GoraniViewer extends LitElement {
 		if (!host) return;
 		const bytes = this.docBytes;
 		this.docBytes = null;
+		const shown = this.shown();
 		// The name picks the reader; the first bytes correct it (a ".doc"
 		// that is RTF, a ".docx" that is a Word 97 file — mode.ts).
-		const reader = sniffReader(bytes.subarray(0, 16), readerFor(this.target.kind, this.docMime, this.target.name) ?? "pdf", this.target.name);
+		const reader = sniffReader(bytes.subarray(0, 16), readerFor(shown.kind, this.docMime, shown.name) ?? "pdf", shown.name);
 		this.frame = { close: () => {} };
-		void openPreview(host, reader, { name: this.target.name, mime: this.docMime, bytes }, {
-			onKey: (key) => (key === "Escape" ? this.close() : this.step(key === "ArrowRight" ? 1 : -1)),
+		void openPreview(host, reader, { name: shown.name, mime: this.docMime, bytes }, {
+			onKey: (key) => (key === "Escape" ? this.escape() : this.step(key === "ArrowRight" ? 1 : -1)),
 			onStep: (delta) => this.step(delta),
 			onShown: (facts) => (this.facts = facts),
 			onError: (message) => (this.error = message),
+			onHandover: (action, file) => (action === "open" ? this.openInner(file) : this.askSave(file)),
 		})
 			.then((f) => {
 				if (this.frame && this.isConnected) this.frame = f;
@@ -473,24 +570,65 @@ export class GoraniViewer extends LitElement {
 
 	protected override render(): TemplateResult {
 		const t = this.target;
-		const pos = this.place();
-		const details = `${fmtSize(t.size)} · v${t.version ?? 1} · ${this.drm?.protected && !this.drm.original ? "a protected copy, decrypted only inside Safari's DRM" : "decrypted here, sealed everywhere else"}`;
+		const top = this.inner.at(-1);
+		const pos = top ? null : this.place();
+		const details = top
+			? `${fmtSize(top.bytes.length)} · an attachment of “${this.inner.length > 1 ? this.inner.at(-2)!.name : t.name}” — not a file in the vault`
+			: `${fmtSize(t.size)} · v${t.version ?? 1} · ${this.drm?.protected && !this.drm.original ? "a protected copy, decrypted only inside Safari's DRM" : "decrypted here, sealed everywhere else"}`;
 		return html`
 			<div class="fixed inset-0 z-50 flex flex-col bg-black/80 outline-none max-sm:bg-black" tabindex="-1" data-viewer-root @keydown=${(e: KeyboardEvent) => this.onKey(e)}>
 				<!-- On a phone (41b) the header is one short row: the name, Download
 				     and ✕; the details line moves under the picture. -->
 				<header class="flex items-center gap-2 border-b border-neutral-800 bg-neutral-900/95 px-2 py-2 pt-[max(0.5rem,env(safe-area-inset-top))] text-sm sm:gap-3 sm:px-4 sm:py-2.5">
-					${icon(t.kind, "hidden h-5 w-5 text-neutral-400 sm:block")}
-					<span class="min-w-0 flex-1 truncate pl-1 text-neutral-100 sm:pl-0">${t.name}</span>
+					${top ? html`<button class="shrink-0 rounded-lg border border-neutral-700 px-2.5 py-1.5 text-xs hover:border-accent" data-test="viewer-back" title="Back (esc)" @click=${() => this.back()}>‹ Back</button>` : nothing}
+					${icon(top ? kindOf(top.name, top.mime) : t.kind, "hidden h-5 w-5 text-neutral-400 sm:block")}
+					<span class="min-w-0 flex-1 truncate pl-1 text-neutral-100 sm:pl-0" data-test="viewer-name">${top ? html`<span class="text-neutral-500">${[t.name, ...this.inner.slice(0, -1).map((f) => f.name)].join(" › ")} › </span>${top.name}` : t.name}</span>
 					${pos ? html`<span class="shrink-0 tabular-nums text-xs text-neutral-500" data-test="viewer-position">${pos.at + 1} / ${pos.of}</span>` : nothing}
 					${pos ? html`<span class="hidden shrink-0 sm:flex"><button class="rounded-l-lg border border-neutral-700 px-2 py-1 text-xs hover:border-accent disabled:opacity-30" title="Previous (←)" ?disabled=${pos.at === 0} @click=${() => this.step(-1)}>‹</button><button class="rounded-r-lg border border-l-0 border-neutral-700 px-2 py-1 text-xs hover:border-accent disabled:opacity-30" title="Next (→)" ?disabled=${pos.at === pos.of - 1} @click=${() => this.step(1)}>›</button></span>` : nothing}
 					<span class="hidden shrink-0 text-xs text-neutral-500 sm:inline">${details}</span>
-					${this.protectionControls()}
-					${this.drm?.protected && !this.drm.original ? nothing : html`<button class="shrink-0 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.model.download(t.id, t.name)}>Download</button>`}
+					${top ? nothing : this.protectionControls()}
+					${top
+						? html`<button class="shrink-0 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" data-test="viewer-save-inner" title="Save this attachment into the vault (you are asked first)" @click=${() => this.askSave(top)}>Save to vault</button>`
+						: this.drm?.protected && !this.drm.original
+							? nothing
+							: html`<button class="shrink-0 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.model.download(t.id, t.name)}>Download</button>`}
 					<button class="shrink-0 rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" aria-label="Close" data-test="viewer-close" @click=${() => this.close()}><span class="sm:hidden" aria-hidden="true">✕</span><span class="hidden sm:inline">Close (esc)</span></button>
 				</header>
 				<main class="flex min-h-0 flex-1 touch-pan-y overflow-auto ${this.mode === "document" && !this.busy && !this.error ? "items-stretch p-0" : "items-center justify-center p-1 sm:p-6"}" @touchstart=${{ handleEvent: (e: TouchEvent) => this.onTouchStart(e), passive: true }} @touchend=${{ handleEvent: (e: TouchEvent) => this.onTouchEnd(e), passive: true }}>${this.content()}</main>
 				<p class="truncate border-t border-neutral-900 px-3 py-1.5 pb-[max(0.375rem,env(safe-area-inset-bottom))] text-center text-[11px] text-neutral-500 sm:hidden">${details}${pos ? " · swipe for the next" : ""}</p>
+				${this.saving ? this.saveDialog() : nothing}
+			</div>
+		`;
+	}
+
+	/** Save into the vault (42c): asked here, outside any frame — a reader
+	 * can request it, never do it. */
+	private saveDialog(): TemplateResult {
+		const s = this.saving!;
+		return html`
+			<div class="absolute inset-0 z-10 flex items-center justify-center bg-black/60 p-4" data-test="viewer-save-dialog" @keydown=${(e: KeyboardEvent) => {
+				if (e.key === "Escape") {
+					e.stopPropagation();
+					this.saving = null;
+					this.refocus();
+				}
+			}}>
+				<div class="w-full max-w-md rounded-2xl border border-neutral-700 bg-neutral-900 p-6 text-sm shadow-2xl" role="dialog" aria-label="Save into the vault">
+					<p class="text-neutral-100">Save <strong class="break-all">“${s.file.name}”</strong> (${fmtSize(s.file.bytes.length)}) into the vault, beside “${this.target.name}”?</p>
+					${s.risk ? html`<p class="mt-2 text-amber-300" data-test="viewer-save-risk">⚠ It is ${s.risk}.</p>` : nothing}
+					<label class="mt-3 flex items-start gap-2 text-neutral-300">
+						<input type="checkbox" class="mt-0.5" data-test="viewer-save-sample" .checked=${s.sample} @change=${(e: Event) => (this.saving = { ...s, sample: (e.target as HTMLInputElement).checked })} />
+						<span>Mark it as a malware sample — never previewed here, and downloaded only zipped with the password <code>${SAMPLE_PASSWORD}</code></span>
+					</label>
+					${s.error ? html`<p class="mt-2 text-red-400">${s.error}</p>` : nothing}
+					<div class="mt-4 flex justify-end gap-2">
+						<button class="rounded-xl border border-neutral-700 px-4 py-2 hover:border-accent" @click=${() => {
+							this.saving = null;
+							this.refocus();
+						}}>Cancel</button>
+						<button class="rounded-xl bg-accent px-4 py-2 font-medium text-neutral-950 hover:opacity-90 disabled:opacity-50" data-test="viewer-save-confirm" ?disabled=${s.busy} @click=${() => void this.confirmSave()}>${s.busy ? "Saving…" : "Save"}</button>
+					</div>
+				</div>
 			</div>
 		`;
 	}
@@ -533,7 +671,7 @@ export class GoraniViewer extends LitElement {
 			case "document":
 				return html`<div class="flex h-full w-full flex-col">
 					${this.facts.length
-						? html`<ul class="shrink-0 space-y-0.5 border-b border-neutral-800 bg-neutral-900/95 px-3 py-1.5 text-xs" data-test="viewer-facts" aria-label="What this file holds">
+						? html`<ul class="max-h-[30vh] shrink-0 space-y-0.5 overflow-y-auto border-b border-neutral-800 bg-neutral-900/95 px-3 py-1.5 text-xs" data-test="viewer-facts" aria-label="What this file holds">
 								${this.facts.map((f) => html`<li class=${f.level === "warn" ? "text-amber-300" : "text-neutral-400"}>${f.level === "warn" ? "⚠ " : ""}${f.text}</li>`)}
 							</ul>`
 						: nothing}
@@ -575,6 +713,16 @@ export class GoraniViewer extends LitElement {
 	/** Nothing to show here: a format the viewer has no reader for, or
 	 * something only shown by reading it whole that is too big for that. */
 	private unknown(): TemplateResult {
+		const top = this.inner.at(-1);
+		if (top)
+			return html`
+				<div class="max-w-md rounded-2xl border border-neutral-800 bg-neutral-900 p-8 text-center" data-test="viewer-no-preview">
+					${icon(kindOf(top.name, top.mime), "h-16 w-16 text-neutral-600 mx-auto")}
+					<p class="mt-3 text-sm text-neutral-300">${this.mode === "too-large" ? "Too large to open in the page." : "No preview for this kind of attachment."}</p>
+					<p class="mt-1 text-xs text-neutral-500">It is not opened here. Save it into the vault to keep it — as a malware sample, if it is one.</p>
+					<button class="mt-4 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" data-test="viewer-save-inner-body" @click=${() => this.askSave(top)}>Save to vault</button>
+				</div>
+			`;
 		const large = this.mode === "too-large";
 		return html`
 			<div class="max-w-md rounded-2xl border border-neutral-800 bg-neutral-900 p-8 text-center" data-test=${large ? "viewer-too-large" : "viewer-no-preview"}>
@@ -608,6 +756,7 @@ export class GoraniViewer extends LitElement {
 	 * player, its key in the media worker — carries over: release() runs as
 	 * this element leaves. */
 	private step(delta: number): void {
+		if (this.inner.length) return; // the siblings are the vault's files, not the attachment's
 		const p = this.place();
 		const next = p ? this.target.siblings![p.at + delta] : undefined;
 		if (!next) return;
@@ -636,8 +785,17 @@ export class GoraniViewer extends LitElement {
 		this.step(dx < 0 ? 1 : -1); // finger to the left: the next file, as a photo roll
 	}
 
+	/** Escape: out of an attachment first, then the viewer. */
+	private escape(): void {
+		if (this.saving) {
+			this.saving = null;
+			this.refocus();
+		} else if (this.inner.length) this.back();
+		else this.close();
+	}
+
 	private onKey(e: KeyboardEvent): void {
-		if (e.key === "Escape") return this.close();
+		if (e.key === "Escape") return this.escape();
 		// ← → belong to a player that has the focus (it seeks with them).
 		if ((e.target as HTMLElement | null)?.closest?.("video, audio, input, textarea")) return;
 		if (e.key === "ArrowRight") this.step(1);

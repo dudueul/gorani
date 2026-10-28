@@ -29,7 +29,7 @@ export function askIntake(files: File[], collector: string): Promise<IntakeField
 		};
 		const draw = () =>
 			render(
-				html`<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" data-test="intake-dialog">
+				html`<div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4" data-test="intake-dialog">
 					<form class="w-full max-w-lg space-y-3 rounded-2xl border border-neutral-800 bg-neutral-900 p-5 text-sm text-neutral-200" @submit=${(e: Event) => {
 						e.preventDefault();
 						const v = (name: string) => ((e.target as HTMLFormElement).elements.namedItem(name) as HTMLInputElement).value;

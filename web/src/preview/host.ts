@@ -43,6 +43,9 @@ export interface OpenMessage {
 	phone: boolean;
 }
 
+/** At most this many facts are sent (an email's can run long — 42c). */
+export const MAX_FACTS = 40;
+
 /** A finding the viewer shows above the preview (a security fact about the file). */
 export interface Fact {
 	level: "info" | "warn";
@@ -63,6 +66,13 @@ export interface Host {
 	/** Elements whose own horizontal scrolling a swipe must not override
 	 * (by default: anything scrolled sideways). */
 	setSwipeGuard(guard: (target: EventTarget | null) => boolean): void;
+	/**
+	 * Hand a file found INSIDE this one (an email's attachment, 42c) to the
+	 * app: "open" it in a preview of its own, or "save" it into the vault.
+	 * A request, nothing more — the app opens it in a new frame, and asks
+	 * the person before it saves anything. A copy of the bytes goes.
+	 */
+	handOver(action: "open" | "save", file: { name: string; mime: string | null; bytes: Uint8Array }): void;
 }
 
 interface TrustedTypesLike {
@@ -150,13 +160,21 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 				return worker;
 			},
 			shown(facts = []) {
-				port.postMessage({ t: "shown", facts: facts.slice(0, 20).map((f) => ({ level: f.level === "warn" ? "warn" : "info", text: String(f.text).slice(0, 300) })) });
+				// The first fact is the file's summary; then every warning, then
+				// the rest — so what matters most survives the cap.
+				const [first, ...rest] = facts.filter((f) => f.text);
+				const ordered = first ? [first, ...rest.filter((f) => f.level === "warn"), ...rest.filter((f) => f.level !== "warn")] : [];
+				port.postMessage({ t: "shown", facts: ordered.slice(0, MAX_FACTS).map((f) => ({ level: f.level === "warn" ? "warn" : "info", text: String(f.text).slice(0, 300) })) });
 			},
 			fail(message) {
 				port.postMessage({ t: "error", message: String(message).slice(0, 500) });
 			},
 			setSwipeGuard(g) {
 				guard = g;
+			},
+			handOver(action, file) {
+				const copy = file.bytes.slice().buffer as ArrayBuffer;
+				port.postMessage({ t: "handover", action, name: String(file.name).slice(0, 255), mime: file.mime ? String(file.mime).slice(0, 127) : null, bytes: copy }, [copy]);
 			},
 		};
 
@@ -165,8 +183,10 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 		// The frame could not go anywhere anyway (sandbox, CSP, the app's
 		// frame-src); this keeps it from even trying. The readers list a
 		// file's links among its facts.
+		// (composedPath: a link inside a shadow root — an email's body, 42c —
+		// reaches this listener retargeted to the root's host.)
 		const inert = (e: MouseEvent) => {
-			const a = (e.target as Element | null)?.closest?.("a[href], area[href]");
+			const a = e.composedPath().find((n): n is Element => n instanceof Element && n.matches("a[href], area[href]"));
 			if (a && !(a.getAttribute("href") ?? "").startsWith("#")) e.preventDefault();
 		};
 		document.addEventListener("click", inert, true);

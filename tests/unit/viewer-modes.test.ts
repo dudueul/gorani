@@ -53,6 +53,11 @@ for (const [name, reader] of [["a.docx", "docx"], ["a.DOCM", "docx"], ["a.xlsx",
 }
 assert.equal(readerFor("file", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "noext"), "sheet", "by its type");
 assert.equal(readerFor("file", "text/csv; charset=utf-8", "noext"), "sheet", "a type with parameters");
+// Email (42c): .eml and Outlook's .msg, by name or type — a .msg is an OLE file and stays an email.
+assert.equal(readerFor("doc", null, "phish.eml"), "email");
+assert.equal(readerFor("doc", null, "phish.MSG"), "email");
+assert.equal(readerFor("file", "message/rfc822", "noext"), "email");
+assert.equal(pickViewerMode("doc", null, 10, "normal", "phish.eml"), "document");
 assert.equal(readerFor("file", "application/x-hwp", "noext"), "hwp");
 assert.equal(pickViewerMode("doc", null, MAX_INLINE + 1, "normal", "big.docx"), "too-large", "read whole, so capped");
 assert.equal(pickViewerMode("doc", null, 10, "sample", "lure.docm"), "refused", "a sample is never parsed");
@@ -71,6 +76,7 @@ assert.equal(sniffReader(head("%PDF-1.7"), "docx", "fake.docx"), "pdf", "a PDF u
 assert.equal(sniffReader(head(OLE), "sheet", "book.xlsx"), "sheet", "the sheet reader reads every form of its family (and password-protected ones say so)");
 assert.equal(sniffReader(head(ZIP), "hwp", "a.hwp"), "hwp", "…as does 한글's (HWPX is a ZIP)");
 assert.equal(sniffReader(head(ZIP), "docx", "a.docx"), "docx", "what the name says, when the bytes agree");
+assert.equal(sniffReader(head(OLE), "email", "outlook.msg"), "email", "an Outlook .msg is an OLE file, and an email");
 
 // Formats whose readers are still to come are honest about it — except a
 // text/plain mime, which still shows.

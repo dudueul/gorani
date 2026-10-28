@@ -16,6 +16,9 @@
  *               Word 97 lure carries in its container: a macro project
  *               (Macros/VBA), an Equation Editor 3.0 object, a packaged
  *               program (\x01Ole10Native)
+ * outlook.msg   a phishing message as Outlook saves it (42c): its headers as
+ *               received (SPF failing), an HTML body with a link that reads
+ *               paypal.com and a tracking pixel, invoice.pdf.exe attached
  *
  * Every byte is ours; nothing here is a working exploit (the "script" is
  * text, the PostScript draws nothing, the "program" is a sentence).
@@ -111,4 +114,69 @@ if (fs.existsSync(docPath)) {
 	}
 } else console.log("(no hostile.doc: run office.py first, with LibreOffice)");
 
-for (const f of ["report.hwp", "report.hwpx", "locked.hwp", "hostile.hwp", "hostile.doc"]) if (fs.existsSync(path.join(out, f))) console.log(`${f}: ${fs.statSync(path.join(out, f)).size} bytes`);
+// ── outlook.msg ─────────────────────────────────────────────────────────
+// Outlook's own file: an OLE container of MAPI properties, each a stream
+// named __substg1.0_<tag><type> (001F a UTF-16 string, 0102 bytes), listed
+// with their sizes in __properties_version1.0; recipients and attachments
+// in storages of their own. Its headers as received are one property
+// (PR_TRANSPORT_MESSAGE_HEADERS, 007D) — the phishing's, SPF failing.
+
+const msg = CFB.utils.cfb_new();
+const add = (p, d) => CFB.utils.cfb_add(msg, `/${p}`, d);
+const u16 = (s) => Buffer.from(s, "utf16le");
+/** A property stream: a header (32 bytes at the top: counts and next ids;
+ * 8 in a recipient or attachment), then 16 bytes a property. */
+const propsOf = (entries, top) => {
+	const head = Buffer.alloc(top ? 32 : 8);
+	if (top) for (const at of [8, 12, 16, 20]) head.writeUInt32LE(1, at);
+	return Buffer.concat([head, ...entries.map(([tag, value]) => {
+		const b = Buffer.alloc(16);
+		b.writeUInt32LE(tag, 0);
+		b.writeUInt32LE(6, 4); // readable, writable
+		b.writeUInt32LE(value, 8);
+		return b;
+	})]);
+};
+const strProp = (dir, tag, text) => {
+	const data = u16(text);
+	add(`${dir}__substg1.0_${tag.toString(16).toUpperCase().padStart(8, "0")}`, data);
+	return [tag, data.length + 2];
+};
+const binProp = (dir, tag, data) => {
+	add(`${dir}__substg1.0_${tag.toString(16).toUpperCase().padStart(8, "0")}`, data);
+	return [tag, data.length];
+};
+const headersAsReceived = [
+	"Received: from mx.gorani.example (mx.gorani.example [192.0.2.10]) by mail.gorani.example; Fri, 2 Jan 2026 05:00:02 +0000",
+	"Received: from mail.secure-login.example (unknown [203.0.113.7]) by mx.gorani.example; Fri, 2 Jan 2026 05:00:01 +0000",
+	"Authentication-Results: mx.gorani.example; spf=fail smtp.mailfrom=secure-login.example; dkim=none; dmarc=fail header.from=paypal.com.secure-login.example",
+	'From: "PayPal Security" <service@paypal.com.secure-login.example>',
+	"Reply-To: <collect@phish.example>",
+	"To: <rin@gorani.example>",
+	"Subject: Invoice overdue (Outlook)",
+	"Date: Fri, 02 Jan 2026 05:00:00 +0000",
+	"",
+	"",
+].join("\r\n");
+const top = [
+	strProp("", 0x001a001f, "IPM.Note"),
+	strProp("", 0x0037001f, "Invoice overdue (Outlook)"),
+	strProp("", 0x0c1a001f, "PayPal Security"),
+	strProp("", 0x0c1f001f, "service@paypal.com.secure-login.example"),
+	strProp("", 0x1000001f, "Pay the invoice today: https://phish.example/login"),
+	strProp("", 0x007d001f, headersAsReceived),
+	binProp("", 0x10130102, Buffer.from('<html><body><p>Pay the invoice today.</p><p><a href="https://phish.example/login">https://www.paypal.com/signin</a></p><img src="https://phish.example/open.gif" width="1" height="1"></body></html>')),
+];
+add("__properties_version1.0", propsOf(top, true));
+const recip = "__recip_version1.0_#00000000/";
+strProp(recip, 0x3001001f, "Rin");
+strProp(recip, 0x39fe001f, "rin@gorani.example");
+add(`${recip}__properties_version1.0`, propsOf([[0x0c150003, 1]], false)); // a To: recipient
+const attach = "__attach_version1.0_#00000000/";
+const program = Buffer.from("MZ gorani fixture: not a program\n");
+strProp(attach, 0x3707001f, "invoice.pdf.exe");
+binProp(attach, 0x37010102, program);
+add(`${attach}__properties_version1.0`, propsOf([[0x37050003, 1], [0x0e200003, program.length]], false)); // attached by value
+fs.writeFileSync(path.join(out, "outlook.msg"), CFB.write(msg, { type: "buffer", fileType: "cfb" }));
+
+for (const f of ["report.hwp", "report.hwpx", "locked.hwp", "hostile.hwp", "hostile.doc", "outlook.msg"]) if (fs.existsSync(path.join(out, f))) console.log(`${f}: ${fs.statSync(path.join(out, f)).size} bytes`);

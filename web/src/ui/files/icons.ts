@@ -22,6 +22,7 @@ export function kindOf(name: string, mime?: string | null): FileKind {
 		docx: "doc", doc: "doc", hwp: "doc", hwpx: "doc", rtf: "doc", odt: "doc", md: "text", txt: "text",
 		xlsx: "sheet", xls: "sheet", csv: "sheet", ods: "sheet",
 		pptx: "slides", ppt: "slides", odp: "slides",
+		eml: "doc", msg: "doc",
 		ts: "code", js: "code", rs: "code", py: "code", go: "code", json: "code", toml: "code", yaml: "code", yml: "code", sh: "code", c: "code", cpp: "code", java: "code", kt: "code", swift: "code", html: "code", css: "code",
 		zip: "archive", "7z": "archive", tar: "archive", gz: "archive", xz: "archive", rar: "archive",
 	};

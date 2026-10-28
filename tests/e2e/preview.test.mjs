@@ -28,7 +28,15 @@
  *     markup in their text shown as text, nothing run, nothing fetched;
  *     an RTF and a web archive named .doc named as the disguises they are;
  *   - the frame's default Trusted Types policy, attacked from inside: an
- *     HTML string is cleaned, strings never run as code, no new policy.
+ *     HTML string is cleaned, strings never run as code, no new policy;
+ *   - email (42c): .eml and .msg, the message cleaned (no script, form or
+ *     frame; the tracking pixel a placeholder; the cid: picture drawn),
+ *     Find inside it, its headers and source; the phishing message's every
+ *     trick named and the forged results below the receiving server's not
+ *     believed; a link that hovers true and clicks nowhere; attachments
+ *     opened in previews of their own (a PDF, a Word file, a forwarded
+ *     message) and back; one saved into the vault — asked for outside the
+ *     frame, offered as a sample, never opened after.
  */
 
 import assert from "node:assert/strict";
@@ -213,7 +221,7 @@ try {
 	consoleCsp.length = 0;
 	const rtf = fixture("hostile.rtf");
 	await page.locator("gorani-win11 [data-upload]").first().setInputFiles([
-		...["locked.pdf", "report.docx", "hostile.docx", "report.xlsx", "hostile.xlsx", "ledger.csv", "report.pptx", "hostile.pptx", "report.hwp", "report.hwpx", "locked.hwp", "hostile.hwp", "report.doc", "hostile.doc", "report.ppt", "report.rtf", "report.odt", "report.odp"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
+		...["report.eml", "phish.eml", "report-to-soc.eml", "outlook.msg", "locked.pdf", "report.docx", "hostile.docx", "report.xlsx", "hostile.xlsx", "ledger.csv", "report.pptx", "hostile.pptx", "report.hwp", "report.hwpx", "locked.hwp", "hostile.hwp", "report.doc", "hostile.doc", "report.ppt", "report.rtf", "report.odt", "report.odp"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		// Disguises, as lures arrive: an RTF and a web archive named .doc.
 		// (The RTF gets a byte more, so the upload's duplicate check does not ask.)
 		{ name: "invoice.doc", mimeType: "application/msword", buffer: Buffer.concat([rtf, Buffer.from("\n")]) },
@@ -384,10 +392,90 @@ try {
 	for (const want of [/Contains 1 script — none of it was run/, /open\.gif \(not fetched\)/]) assert.match(tells, want);
 	await closeDoc();
 
+	// ── Email (42c): the message, its facts, its attachments opened and saved ──
+	const shadow = (frame, fn) => frame.locator('[data-test="mail-message"]').evaluate(fn);
+	d = await openDoc("report.eml", "email");
+	await d.locator('[data-test="mail-subject"]', { hasText: "분기 보고서 — Quarterly report" }).waitFor({ timeout: 30_000 });
+	assert.match(await shadow(d, (el) => el.shadowRoot.textContent), /Gorani email body one[\s\S]*고라니 메일 본문/);
+	await page.waitForTimeout(300);
+	assert.ok(await shadow(d, (el) => { const img = el.shadowRoot.querySelector("img"); return !!img && img.complete && img.naturalWidth > 0 && img.src.startsWith("blob:"); }), "the cid: picture is drawn from the message's own part");
+	await factsSay(/SPF pass · DKIM pass · DMARC pass/);
+	await d.locator('[data-test="find"]').fill("고라니");
+	await d.locator('[data-test="find"]').press("Enter");
+	await d.locator('[data-test="found"]', { hasText: "1 of 1" }).waitFor();
+	await d.locator('[data-test="mail-tab-headers"]').click();
+	await d.locator('[data-test="mail-hops"]', { hasText: "out.gorani.example [192.0.2.20]" }).waitFor();
+	await d.locator('[data-test="mail-tab-text"]').click();
+	await d.locator('[data-test="mail-text"]', { hasText: "The report is attached." }).waitFor();
+	await d.locator('[data-test="mail-tab-source"]').click();
+	await d.locator('[data-test="mail-source"]', { hasText: "Message-ID: <report-1@gorani.example>" }).waitFor();
+	// An attachment opens in a preview of its own — a new frame — and Back returns.
+	await d.locator('[data-test="mail-attachment"]', { hasText: "report.pdf" }).locator('[data-test="mail-open"]').click();
+	await page.locator('iframe[data-preview="pdf"]').waitFor({ timeout: 30_000 });
+	await page.locator('[data-test="viewer-name"]', { hasText: "report.eml › report.pdf" }).waitFor();
+	await page.frameLocator('iframe[data-preview="pdf"]').locator('[data-test="pdf-page"]', { hasText: "/ 3" }).waitFor({ timeout: 30_000 });
+	await factsSay(/3 pages/);
+	await page.locator('[data-test="viewer-back"]').click();
+	await page.locator('iframe[data-preview="email"]').waitFor({ timeout: 30_000 });
+	await closeDoc();
+
+	d = await openDoc("phish.eml", "email");
+	tells = await factsSay(/SPF fail, DMARC fail/);
+	for (const want of [/a domain dressed as another/, /Replies go to collect@phish\.example/, /Handed to mx\.gorani\.example by 203\.0\.113\.7/, /goes to https:\/\/phish\.example\/login/, /search-ms:/, /punycode/, /a tracker learns it was read/, /asks for a password/, /Contains 2 scripts — removed/, /HTML smuggling/, /pretends to be \.pdf/]) assert.match(tells, want);
+	assert.doesNotMatch(tells, /SPF pass/, "the forged results below the receiving server's are not believed");
+	// Hovering a link says where it goes; clicking it goes nowhere.
+	const fake = d.locator('[data-test="mail-message"] a', { hasText: "https://www.paypal.com/signin" });
+	await fake.hover();
+	await d.locator('[data-test="mail-link"]', { hasText: "→ https://phish.example/login" }).waitFor();
+	await fake.click();
+	await page.waitForTimeout(500);
+	assert.equal(await page.locator('iframe[data-preview="email"]').count(), 1, "the click went nowhere: the frame is still the reader");
+	assert.equal(await shadow(d, (el) => el.shadowRoot.querySelectorAll("script, form, iframe, input").length), 0, "no script, form, frame or field in what is drawn");
+	assert.equal(await shadow(d, (el) => el.shadowRoot.querySelector('img[data-remote]')?.getAttribute("src")?.startsWith("data:image/svg+xml")), true, "the tracking pixel is a placeholder");
+	// The Word attachment, in its own preview, says what IT holds.
+	await d.locator('[data-test="mail-attachment"]', { hasText: "statement.docx" }).locator('[data-test="mail-open"]').click();
+	await page.locator('iframe[data-preview="docx"]').waitFor({ timeout: 30_000 });
+	await factsSay(/template injection/);
+	await page.locator('[data-test="viewer-back"]').click();
+	await page.locator('iframe[data-preview="email"]').waitFor({ timeout: 30_000 });
+	// Save: the app asks — and, judging the bytes itself, offers it as a sample.
+	d = page.frameLocator('iframe[data-preview="email"]');
+	await d.locator('[data-test="mail-attachment"]', { hasText: "invoice.pdf.exe" }).locator('[data-test="mail-save"]').click();
+	await page.locator('[data-test="viewer-save-dialog"]').waitFor({ timeout: 10_000 });
+	assert.match(await page.locator('[data-test="viewer-save-risk"]').innerText(), /pretends to be \.pdf — it is a Windows program/);
+	assert.equal(await page.locator('[data-test="viewer-save-sample"]').isChecked(), true, "a risky attachment is offered as a sample");
+	await page.locator('[data-test="viewer-save-confirm"]').click();
+	await page.locator('[data-test="viewer-save-dialog"]').waitFor({ state: "detached", timeout: 60_000 });
+	await closeDoc();
+	await exact("invoice.pdf.exe").waitFor({ timeout: 60_000 });
+	assert.match(await exact("invoice.pdf.exe").innerText(), /Malware sample/, "saved beside the message, as a sample");
+	await exact("invoice.pdf.exe").dblclick();
+	await page.locator('[data-test="viewer-refused"]').waitFor({ timeout: 30_000 });
+	await page.keyboard.press("Escape");
+	await page.locator('[data-test="viewer-refused"]').waitFor({ state: "detached" });
+
+	// A user's report, with the phishing forwarded AS an attachment: opened in turn.
+	d = await openDoc("report-to-soc.eml", "email");
+	await factsSay(/Carries a message of its own/);
+	await d.locator('[data-test="mail-attachment"]', { hasText: "phish.eml" }).locator('[data-test="mail-open"]').click();
+	await page.locator('[data-test="viewer-name"]', { hasText: "report-to-soc.eml › phish.eml" }).waitFor({ timeout: 30_000 });
+	await page.frameLocator('iframe[data-preview="email"]').locator('[data-test="mail-subject"]', { hasText: "Invoice overdue - action required" }).waitFor({ timeout: 30_000 });
+	await factsSay(/SPF fail/);
+	await page.keyboard.press("Escape");
+	await page.frameLocator('iframe[data-preview="email"]').locator('[data-test="mail-subject"]', { hasText: "Fwd: suspicious invoice" }).waitFor({ timeout: 30_000 });
+	await closeDoc();
+
+	// Outlook's .msg.
+	d = await openDoc("outlook.msg", "email");
+	await d.locator('[data-test="mail-subject"]', { hasText: "Invoice overdue (Outlook)" }).waitFor({ timeout: 30_000 });
+	tells = await factsSay(/an Outlook \.msg/);
+	for (const want of [/SPF fail/, /goes to https:\/\/phish\.example\/login/, /Attachment invoice\.pdf\.exe/]) assert.match(tells, want);
+	await closeDoc();
+
 	await page.waitForTimeout(500);
 	assert.deepEqual(consoleCsp, [], "every reader ran under the frame's policy with nothing blocked (nothing tried)");
 	assert.deepEqual(dialogs, [], "no script in any file ran");
-	assert.deepEqual(offSite, [], "no file reached the network: no beacon, no template, no tracking picture");
+	assert.deepEqual(offSite, [], "no file reached the network: no beacon, no template, no tracking pixel, no CSS from outside");
 	assert.ok(blockedByCsp.some((b) => b.startsWith("https://phish.example/tt.png")), "the picture the cleaned HTML kept was stopped by the frame's CSP");
 	assert.deepEqual([...new Set(fromFrame)].filter((p) => !/^\/preview(\.html)?$/.test(p)), [], `the frames' only requests were their own page — rhwp's WebAssembly came through the app: ${JSON.stringify(fromFrame)}`);
 	assert.deepEqual(errors, [], "no page error");
@@ -436,7 +524,7 @@ try {
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

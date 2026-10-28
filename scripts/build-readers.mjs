@@ -53,6 +53,7 @@ const READERS = {
 	pptx: {},
 	hwp: { files: [["@rhwp/core/rhwp_bg.wasm", "rhwp_bg.wasm"], ["@rhwp/core/LICENSE", "LICENSE"]] },
 	legacy: {},
+	email: {},
 };
 
 const pkgDir = (spec) => path.dirname(require.resolve(`${spec.split("/").slice(0, spec.startsWith("@") ? 2 : 1).join("/")}/package.json`));
@@ -79,6 +80,16 @@ if (outputs.every((o) => fs.existsSync(o)) && oldest(OUT) >= sourcesAt) process.
 
 const { build } = await import(require.resolve("esbuild"));
 
+/** msgreader decodes Outlook's 8-bit strings with iconv-lite, which is built
+ * on Node's Buffer; in the frame the browser's TextDecoder does the same
+ * (src/preview/shims/iconv-lite.ts). */
+const shims = {
+	name: "shims",
+	setup(b) {
+		b.onResolve({ filter: /^iconv-lite$/ }, () => ({ path: path.join(SRC, "shims/iconv-lite.ts") }));
+	},
+};
+
 /** `import css from "./x.css?inline"`: the file's text, as Vite does it. */
 const inlineCss = {
 	name: "inline-css",
@@ -100,7 +111,7 @@ for (const [name, spec] of Object.entries(READERS)) {
 		target: "es2022",
 		minify: true,
 		legalComments: "eof",
-		plugins: [inlineCss],
+		plugins: [inlineCss, shims],
 		logLevel: "warning",
 	});
 	// The worker as a CLASSIC script (an IIFE), though pdf.js ships it as a

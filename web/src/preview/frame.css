@@ -130,3 +130,22 @@ input:focus {
 	min-height: 40px;
 	font-size: 16px;
 }
+
+/* A divider in a bar. */
+.sep {
+	width: 1px;
+	height: 20px;
+	background: var(--line);
+}
+
+/* The zoom buttons (kit.ts › Zoom), in any reader's bar. */
+.zoom {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.zoomlabel {
+	min-width: 3.2em;
+	text-align: center;
+}

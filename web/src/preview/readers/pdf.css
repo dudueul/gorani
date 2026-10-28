@@ -67,17 +67,6 @@
 	color: var(--muted);
 }
 
-.zoomlabel {
-	min-width: 3.2em;
-	text-align: center;
-}
-
-.sep {
-	width: 1px;
-	height: 20px;
-	background: var(--line);
-}
-
 .pw {
 	display: flex;
 	flex-direction: column;

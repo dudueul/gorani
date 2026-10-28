@@ -19,7 +19,18 @@
  * vocabulary, so the app's side (ui/viewer/sandbox.ts) checks one thing.
  */
 
+import DOMPurify from "dompurify";
 import frameCss from "./frame.css?inline";
+
+/** What DOMPurify keeps of an HTML string a library writes (see the default
+ * policy below): text, formatting and pictures — no forms, no <style> (a
+ * slide's text must not restyle the reader around it), no <meta>/<link>/
+ * <base>, no data-* attributes. Scripts and event handlers it removes
+ * always; the frame's CSP would refuse them anyway. */
+const SANITIZE = {
+	FORBID_TAGS: ["style", "form", "input", "button", "textarea", "select", "meta", "link", "base", "iframe", "frame", "object", "embed"],
+	ALLOW_DATA_ATTR: false,
+};
 
 /** What the app sends with the file. */
 export interface OpenMessage {
@@ -49,19 +60,46 @@ export interface Host {
 	/** The preview is up; `facts` are shown by the viewer, outside the frame. */
 	shown(facts?: Fact[]): void;
 	fail(message: string): void;
-	/** Elements whose own horizontal scrolling a swipe must not override. */
+	/** Elements whose own horizontal scrolling a swipe must not override
+	 * (by default: anything scrolled sideways). */
 	setSwipeGuard(guard: (target: EventTarget | null) => boolean): void;
 }
 
-/** Trusted Types in the frame (its CSP requires them): our only policy turns
- * the blob: URLs this file makes into script URLs — for the reader's worker —
- * and nothing else. A reader that renders HTML sanitises it first and uses
- * DOMPurify's own policy (allowed by name in the CSP). */
-const policy = (globalThis as { trustedTypes?: { createPolicy(name: string, rules: { createScriptURL(u: string): string }): { createScriptURL(u: string): unknown } } }).trustedTypes?.createPolicy("gorani-preview", {
+interface TrustedTypesLike {
+	createPolicy(name: string, rules: { createHTML?(s: string, type: string, sink: string): string; createScript?(s: string): string | null; createScriptURL?(u: string): string | null }): { createScriptURL(u: string): unknown };
+}
+const tt = (globalThis as { trustedTypes?: TrustedTypesLike }).trustedTypes;
+
+/** Trusted Types in the frame (its CSP requires them). Three policies, each
+ * named in the frame's CSP, and no other can be made:
+ *
+ *   gorani-preview  ours: turns the blob: URLs this file makes into script
+ *                   URLs — for a reader's worker — and nothing else;
+ *   dompurify       DOMPurify's own, which it uses to hand back what it
+ *                   cleaned;
+ *   default         what the browser calls when a library writes a plain
+ *                   STRING into an HTML sink — the readers' libraries do:
+ *                   pptx-preview sets each run of slide text with
+ *                   innerHTML (42b). Every such string goes through
+ *                   DOMPurify first, so a slide whose text is
+ *                   `<img src=x onerror=…>` draws nothing that runs. One
+ *                   sink is let through untouched: DOMParser, which
+ *                   docx-preview uses to read the file's XML — a parsed
+ *                   document is inert (nothing in it loads or runs), and
+ *                   DOMPurify would strip the XML it does not know.
+ *                   Strings as code (eval, setTimeout("…"), javascript:
+ *                   URLs) and script URLs are refused outright.
+ */
+const policy = tt?.createPolicy("gorani-preview", {
 	createScriptURL: (u: string) => {
 		if (!u.startsWith("blob:")) throw new TypeError("the preview frame runs only code it was handed");
 		return u;
 	},
+});
+tt?.createPolicy("default", {
+	createHTML: (s, _type, sink) => (sink === "DOMParser parseFromString" ? s : DOMPurify.sanitize(s, SANITIZE)),
+	createScript: () => null,
+	createScriptURL: () => null,
 });
 
 /**
@@ -89,7 +127,7 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 		};
 
 		let worker: Worker | null | undefined;
-		let guard: (target: EventTarget | null) => boolean = () => false;
+		let guard: (target: EventTarget | null) => boolean = scrollsSideways;
 		const host: Host = {
 			root,
 			file: msg.file,
@@ -121,6 +159,18 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 				guard = g;
 			},
 		};
+
+		// Links in a file are evidence, not a way out: a click on one does
+		// nothing (a jump within the document — href="#…" — still works).
+		// The frame could not go anywhere anyway (sandbox, CSP, the app's
+		// frame-src); this keeps it from even trying. The readers list a
+		// file's links among its facts.
+		const inert = (e: MouseEvent) => {
+			const a = (e.target as Element | null)?.closest?.("a[href], area[href]");
+			if (a && !(a.getAttribute("href") ?? "").startsWith("#")) e.preventDefault();
+		};
+		document.addEventListener("click", inert, true);
+		document.addEventListener("auxclick", inert, true);
 
 		// Keys the viewer owns — Escape closes, ← → move to the next file —
 		// go out to it: a focused frame keeps every key to itself otherwise.
@@ -170,6 +220,16 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 			host.fail(e instanceof Error ? e.message : String(e));
 		}
 	};
+}
+
+/** The default swipe guard: a finger that starts on something scrolled
+ * sideways — a wide sheet, a zoomed page — is panning it, not asking for
+ * the next file. */
+function scrollsSideways(target: EventTarget | null): boolean {
+	for (let e = target instanceof Element ? target : null; e && e !== document.documentElement; e = e.parentElement) {
+		if (e.scrollWidth > e.clientWidth + 2 && /(auto|scroll)/.test(getComputedStyle(e).overflowX)) return true;
+	}
+	return false;
 }
 
 /** An element, built without any HTML string (there is no HTML sink here). */

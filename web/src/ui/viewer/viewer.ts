@@ -24,7 +24,7 @@
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel } from "../files/model.ts";
-import { pickViewerMode, readerFor, renderMime, TEXT_CAP, MAX_INLINE, type ViewerMode } from "./mode.ts";
+import { pickViewerMode, readerFor, renderMime, sniffReader, TEXT_CAP, MAX_INLINE, type ViewerMode } from "./mode.ts";
 import { openPreview, type Fact, type PreviewFrame } from "./sandbox.ts";
 import { icon, type FileKind } from "../files/icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
@@ -91,6 +91,7 @@ export class GoraniViewer extends LitElement {
 	 * where the file cannot draw over it. */
 	private frame: PreviewFrame | null = null;
 	private docBytes: Uint8Array | null = null;
+	private docMime: string | null = null;
 	@state() private facts: Fact[] = [];
 	/** A lead packaging the copy: how far. */
 	@state() private protecting: { done: number; total: number } | null = null;
@@ -173,6 +174,7 @@ export class GoraniViewer extends LitElement {
 				const parts: Uint8Array[] = [];
 				await this.model.openBytes(id, this.target.version, (plain) => void parts.push(plain));
 				this.docBytes = concat(parts);
+				this.docMime = mime;
 			} else if (this.mode === "video" && (await this.startProtected(id))) {
 				// A protected video this member gets only as its copy (40c):
 				// FairPlay plays it, or the viewer says where it plays.
@@ -328,12 +330,14 @@ export class GoraniViewer extends LitElement {
 	private attachDocument(): void {
 		if (this.mode !== "document" || !this.docBytes || this.frame) return;
 		const host = this.querySelector<HTMLElement>("[data-preview-host]");
-		const reader = readerFor(this.target.kind, null, this.target.name) ?? "pdf";
 		if (!host) return;
 		const bytes = this.docBytes;
 		this.docBytes = null;
+		// The name picks the reader; the first bytes correct it (a ".doc"
+		// that is RTF, a ".docx" that is a Word 97 file — mode.ts).
+		const reader = sniffReader(bytes.subarray(0, 16), readerFor(this.target.kind, this.docMime, this.target.name) ?? "pdf", this.target.name);
 		this.frame = { close: () => {} };
-		void openPreview(host, reader, { name: this.target.name, mime: null, bytes }, {
+		void openPreview(host, reader, { name: this.target.name, mime: this.docMime, bytes }, {
 			onKey: (key) => (key === "Escape" ? this.close() : this.step(key === "ArrowRight" ? 1 : -1)),
 			onStep: (delta) => this.step(delta),
 			onShown: (facts) => (this.facts = facts),

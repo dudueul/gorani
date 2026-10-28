@@ -107,11 +107,18 @@ export const start = boot(async (host) => {
 });
 
 function passwordForm(wrong: boolean, update: (pw: string) => void): HTMLElement {
-	const input = el("input", { type: "password", placeholder: "Password", autocomplete: "off", "aria-label": "The PDF's password" });
-	const form = el("form", { class: "pw" }, el("p", {}, wrong ? "That password is not it. Try again:" : "This PDF is protected with a password:"), input, el("button", { type: "submit" }, "Open"));
-	form.addEventListener("submit", (e) => {
-		e.preventDefault();
-		update(input.value);
+	const input = el("input", { type: "password", placeholder: "Password", autocomplete: "off", "aria-label": "The PDF's password", "data-test": "pdf-password" });
+	const open = el("button", { type: "button" }, "Open");
+	// Not a <form> (42b): the frame's sandbox has no allow-forms, and the
+	// browser stops a sandboxed form's submission before its submit event
+	// fires — so a form here would never open anything.
+	const form = el("div", { class: "pw", role: "form" }, el("p", {}, wrong ? "That password is not it. Try again:" : "This PDF is protected with a password:"), input, open);
+	open.addEventListener("click", () => update(input.value));
+	input.addEventListener("keydown", (e) => {
+		if (e.key === "Enter") {
+			e.preventDefault();
+			update(input.value);
+		}
 	});
 	queueMicrotask(() => input.focus());
 	return form;
@@ -435,7 +442,7 @@ class Viewer {
 		const changed = typeof info.ModDate === "string" ? pdfjs.PDFDateString.toDateObject(info.ModDate) : null;
 		if (created) said.push(`made ${created.toISOString().slice(0, 10)}`);
 		if (changed) said.push(`changed ${changed.toISOString().slice(0, 10)}`);
-		facts.unshift({ level: "info", text: [`${doc.numPages} page${doc.numPages === 1 ? "" : "s"}`, typeof info.PDFFormatVersion === "string" ? `PDF ${info.PDFFormatVersion}` : "", info.IsEncrypted ? "encrypted" : "", ...said].filter(Boolean).join(" · ") });
+		facts.unshift({ level: "info", text: [`${doc.numPages} page${doc.numPages === 1 ? "" : "s"}`, typeof info.PDFFormatVersion === "string" ? `PDF ${info.PDFFormatVersion}` : "", info.IsEncrypted || info.EncryptFilterName ? "encrypted" : "", ...said].filter(Boolean).join(" · ") });
 		return facts;
 	}
 }

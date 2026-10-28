@@ -15,7 +15,9 @@
  *   3. the app's policy has frame-src 'self' — what also stops the frame
  *      navigating itself off this site to carry a file out;
  *   4. the frame is made with sandbox="allow-scripts" and no other flag;
- *   5. an asset request names a file of the reader's, never a path out.
+ *   5. an asset request names a file of the reader's, never a path out;
+ *   6. Trusted Types: three named policies — ours, DOMPurify's, and the
+ *      default that sanitises (42b) — and no others.
  */
 
 import assert from "node:assert/strict";
@@ -66,6 +68,10 @@ for (const path of ["/preview.html", "/preview"]) {
 	assert.deepEqual(directives.get("frame-ancestors"), ["'self'"], "only the app frames it");
 	assert.deepEqual(directives.get("form-action"), ["'none'"]);
 	assert.deepEqual(directives.get("require-trusted-types-for"), ["'script'"]);
+	// Three policies, and no other can be made: ours (blob: script URLs),
+	// DOMPurify's, and the default that sanitises every HTML string (42b).
+	assert.deepEqual(directives.get("trusted-types"), ["gorani-preview", "dompurify", "default"]);
+	assert.ok(!directives.get("trusted-types")!.includes("'allow-duplicates'"), "a policy name cannot be taken twice");
 	assert.ok(b.includes("X-Frame-Options: SAMEORIGIN"));
 }
 
@@ -89,4 +95,10 @@ for (const bad of ["../index.html", "cmaps/../../api/v1/family", "cmaps/a/b.bcma
 	assert.equal(assetPath("pdf", bad), null, `refused: ${JSON.stringify(bad)}`);
 }
 
-console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out");
+// 한글's reader asks for its WebAssembly, and nothing else; the readers
+// that need nothing are sent nothing.
+assert.equal(assetPath("hwp", "rhwp_bg.wasm"), "/readers/hwp/rhwp_bg.wasm");
+for (const bad of ["LICENSE", "../pdf/wasm/openjpeg.wasm", "rhwp_bg.wasm.map", "cmaps/UniKS-UCS2-H.bcmap"]) assert.equal(assetPath("hwp", bad), null, `hwp refused: ${bad}`);
+for (const reader of ["docx", "sheet", "pptx", "legacy"] as const) assert.equal(assetPath(reader, "rhwp_bg.wasm"), null, `${reader} has no assets`);
+
+console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more");

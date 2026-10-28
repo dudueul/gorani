@@ -1,0 +1,10 @@
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="----=_gorani"
+
+------=_gorani
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+Content-Location: file:///C:/statement.htm
+
+<html><head><title>Statement</title></head><body><p>Your statement is ready</p><img src=3D"https://phish.example/open.gif"><script>alert('mht ran')</script><p><a href=3D"https://phish.example/login">View the statement</a></p></body></html>
+------=_gorani--

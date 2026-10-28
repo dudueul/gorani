@@ -304,6 +304,43 @@ has an opaque origin and nothing of the vault's.
 `unit:preview-frame` checks the policy files, and `e2e:preview` attacks
 the frame from inside. Details are in docs/PREVIEWS.md.
 
+### Office and 한글 readers (commit 42b)
+
+The threat: the readers of 42b are more code, and more of it written to
+render rather than to resist: docx-preview, SheetJS, pptx-preview (which
+writes slide text with `innerHTML`), ECharts, rhwp as WebAssembly, and our
+own parsers for the older formats. Each is fed attacker bytes.
+
+The controls, on top of the frame:
+
+- **Markup:** a `default` Trusted Types policy sends every HTML string a
+  library writes through DOMPurify. Only `DOMParser` is let through, since
+  a parsed document is inert. Strings as code stay refused. Attacked from
+  inside in `e2e:preview`.
+- **Resources:** an altChunk (raw HTML in a .docx) is not rendered;
+  embedded fonts are not loaded; outside-linked pictures are removed
+  before pptx-preview sees a deck. Nothing could be fetched anyway (the
+  frame's CSP).
+- **Size:** every ZIP is inflated as a stream and counted before any
+  library holds it; a lying or over-claiming archive is refused. Our
+  parsers stop at fixed limits of text, depth and nesting.
+- **Time:** SheetJS parses in a worker, as pdf.js does.
+- **Disguise:** the first bytes, not the name, pick the reader; a mismatch
+  is a fact.
+- **Evidence:** what a file would do (macros, DDE, template injection,
+  Run-program actions, 한글 scripts, PostScript, Equation Editor objects,
+  packaged programs, hidden sheets and text) is reported as text outside
+  the frame, never run. `unit:preview-facts` checks every planted case.
+
+Accepted: a file that sends a reader into an endless loop freezes the tab
+on browsers that keep sandboxed frames in the page's own process. Desktop
+Chrome and Edge do not. Nothing is read or sent either way
+(docs/PREVIEWS.md › Limits).
+
+Found while testing: a frame sandboxed without `allow-forms` never fires a
+form's submit event, so 42a's PDF password prompt could not have worked.
+It now uses Enter and a button, and is tested.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

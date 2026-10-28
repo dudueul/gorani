@@ -1,0 +1,31 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The Word reader's layout (commit 42b), over docx-preview's own styles:
+   its pages on the frame's dark ground instead of its grey, and a wrapper
+   as wide as its widest page, so a page zoomed past the window scrolls
+   sideways instead of being cut off at the left (a centred flex column
+   overflows both ways, and the left side cannot be scrolled to). */
+
+.docx-host {
+	min-height: 100%;
+	background: #262626;
+}
+
+.docx-host .docx-wrapper {
+	background: transparent;
+	padding: 24px;
+	width: max-content;
+	min-width: 100%;
+}
+
+.docx-host .docx-wrapper > section.docx {
+	margin-bottom: 24px;
+}
+
+.phone .docx-host .docx-wrapper {
+	padding: 8px;
+}
+
+.phone .docx-host .docx-wrapper > section.docx {
+	margin-bottom: 8px;
+}

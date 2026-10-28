@@ -6,7 +6,7 @@
  * set as much as a UX table (see the module docs in viewer.ts).
  */
 
-import { pickViewerMode, readerFor, renderMime, MAX_INLINE } from "../../web/src/ui/viewer/mode.ts";
+import { pickViewerMode, readerFor, renderMime, sniffReader, MAX_INLINE } from "../../web/src/ui/viewer/mode.ts";
 import assert from "node:assert/strict";
 
 // (The signature is (kind, mime, size[, policy]). Until commit 29e half of
@@ -46,6 +46,32 @@ assert.equal(pickViewerMode("pdf", "application/pdf", 10, "sample"), "refused", 
 assert.equal(readerFor("pdf", null, "a.pdf"), "pdf");
 assert.equal(readerFor("text", "text/plain", "a.txt"), null, "plain text needs no parser: it stays in the page, escaped");
 
+// Office and 한글 (42b): each family to its reader, by name or by type.
+for (const [name, reader] of [["a.docx", "docx"], ["a.DOCM", "docx"], ["a.xlsx", "sheet"], ["a.xlsm", "sheet"], ["a.xlsb", "sheet"], ["a.xls", "sheet"], ["a.ods", "sheet"], ["a.csv", "sheet"], ["a.tsv", "sheet"], ["a.pptx", "pptx"], ["a.ppsx", "pptx"], ["a.hwp", "hwp"], ["a.hwpx", "hwp"], ["a.doc", "legacy"], ["a.ppt", "legacy"], ["a.rtf", "legacy"], ["a.odt", "legacy"], ["a.odp", "legacy"]] as const) {
+	assert.equal(readerFor("file", null, name), reader, name);
+	assert.equal(pickViewerMode("doc", null, 10, "normal", name), "document", `${name} opens in the frame`);
+}
+assert.equal(readerFor("file", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "noext"), "sheet", "by its type");
+assert.equal(readerFor("file", "text/csv; charset=utf-8", "noext"), "sheet", "a type with parameters");
+assert.equal(readerFor("file", "application/x-hwp", "noext"), "hwp");
+assert.equal(pickViewerMode("doc", null, MAX_INLINE + 1, "normal", "big.docx"), "too-large", "read whole, so capped");
+assert.equal(pickViewerMode("doc", null, 10, "sample", "lure.docm"), "refused", "a sample is never parsed");
+
+// The first bytes correct the name (sniffReader): disguise is the point of a lure.
+const head = (s: string | number[]) => (typeof s === "string" ? new TextEncoder().encode(s) : new Uint8Array(s));
+const ZIP = [0x50, 0x4b, 0x03, 0x04];
+const OLE = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+assert.equal(sniffReader(head("{\\rtf1\\ansi"), "legacy", "invoice.doc"), "legacy", "an RTF named .doc: the legacy reader (which says so)");
+assert.equal(sniffReader(head("{\\rtf1\\ansi"), "docx", "invoice.docx"), "legacy", "an RTF named .docx");
+assert.equal(sniffReader(head(ZIP), "legacy", "report.doc"), "docx", "a .docx renamed .doc");
+assert.equal(sniffReader(head(ZIP), "legacy", "deck.ppt"), "pptx", "a .pptx renamed .ppt");
+assert.equal(sniffReader(head(OLE), "docx", "macro.docx"), "legacy", "a Word 97 file (macros and all) renamed .docx");
+assert.equal(sniffReader(head(OLE), "pptx", "old.pptx"), "legacy");
+assert.equal(sniffReader(head("%PDF-1.7"), "docx", "fake.docx"), "pdf", "a PDF under any name is shown as the PDF it is");
+assert.equal(sniffReader(head(OLE), "sheet", "book.xlsx"), "sheet", "the sheet reader reads every form of its family (and password-protected ones say so)");
+assert.equal(sniffReader(head(ZIP), "hwp", "a.hwp"), "hwp", "…as does 한글's (HWPX is a ZIP)");
+assert.equal(sniffReader(head(ZIP), "docx", "a.docx"), "docx", "what the name says, when the bytes agree");
+
 // Formats whose readers are still to come are honest about it — except a
 // text/plain mime, which still shows.
 assert.equal(pickViewerMode("archive", null, 10), "unsupported");
@@ -67,4 +93,4 @@ assert.equal(renderMime("image", null, "pic.jpg"), "image/jpeg");
 assert.equal(renderMime("video", null, "v.mkv"), "video/mp4");
 assert.equal(renderMime("text", "text/plain", "n"), "text/plain");
 
-console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused");
+console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused; Office and 한글 to their readers, and the first bytes correcting a disguised name");

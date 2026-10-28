@@ -52,20 +52,23 @@
 #                               not to the network, not even to this site
 #   style-src 'unsafe-inline'   readers style what they draw; CSS cannot reach out either
 #   frame-src 'none'            no frames inside it; frame-ancestors 'self': only the app
-#   require-trusted-types-for 'script'; trusted-types gorani-preview dompurify
-#                               the reader's own policy (blob: script URLs) and DOMPurify's
+#   require-trusted-types-for 'script'; trusted-types gorani-preview dompurify default
+#                               the reader's own policy (blob: script URLs), DOMPurify's,
+#                               and a default that sends every HTML string a library writes
+#                               through DOMPurify first (42b: pptx-preview sets slide text
+#                               with innerHTML) and refuses strings as code (preview/host.ts)
 /preview.html
   ! Content-Security-Policy
   ! X-Frame-Options
   ! Permissions-Policy
-  Content-Security-Policy: default-src 'none'; script-src 'sha256-sDp19oFlYwyzI/wqFPCQGhE/gRGcQ9GAUV/jTK0qmD0=' blob: 'wasm-unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src blob: data:; font-src blob: data:; media-src blob: data:; connect-src blob: data:; form-action 'none'; frame-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; require-trusted-types-for 'script'; trusted-types gorani-preview dompurify
+  Content-Security-Policy: default-src 'none'; script-src 'sha256-sDp19oFlYwyzI/wqFPCQGhE/gRGcQ9GAUV/jTK0qmD0=' blob: 'wasm-unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src blob: data:; font-src blob: data:; media-src blob: data:; connect-src blob: data:; form-action 'none'; frame-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; require-trusted-types-for 'script'; trusted-types gorani-preview dompurify default
   X-Frame-Options: SAMEORIGIN
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), clipboard-read=(), clipboard-write=(), display-capture=(), fullscreen=(), publickey-credentials-get=(), interest-cohort=()
 /preview
   ! Content-Security-Policy
   ! X-Frame-Options
   ! Permissions-Policy
-  Content-Security-Policy: default-src 'none'; script-src 'sha256-sDp19oFlYwyzI/wqFPCQGhE/gRGcQ9GAUV/jTK0qmD0=' blob: 'wasm-unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src blob: data:; font-src blob: data:; media-src blob: data:; connect-src blob: data:; form-action 'none'; frame-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; require-trusted-types-for 'script'; trusted-types gorani-preview dompurify
+  Content-Security-Policy: default-src 'none'; script-src 'sha256-sDp19oFlYwyzI/wqFPCQGhE/gRGcQ9GAUV/jTK0qmD0=' blob: 'wasm-unsafe-eval'; worker-src blob:; style-src 'unsafe-inline'; img-src blob: data:; font-src blob: data:; media-src blob: data:; connect-src blob: data:; form-action 'none'; frame-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; require-trusted-types-for 'script'; trusted-types gorani-preview dompurify default
   X-Frame-Options: SAMEORIGIN
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), clipboard-read=(), clipboard-write=(), display-capture=(), fullscreen=(), publickey-credentials-get=(), interest-cohort=()
 

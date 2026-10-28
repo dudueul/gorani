@@ -28,8 +28,9 @@ architecture map is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (duplicate
 detection: [docs/DUPLICATES.md](docs/DUPLICATES.md); uploads, folders and
 where a drop goes: [docs/UPLOADS.md](docs/UPLOADS.md); downloads, and a zip
 that carries its own check report: [docs/DOWNLOADS.md](docs/DOWNLOADS.md); the app on a
-phone, and Add to Home Screen: [docs/PHONE.md](docs/PHONE.md); PDFs and other hostile
-formats, opened in a sandboxed frame: [docs/PREVIEWS.md](docs/PREVIEWS.md); records that point at
+phone, and Add to Home Screen: [docs/PHONE.md](docs/PHONE.md); PDFs, Word, Excel,
+PowerPoint and 한글 files — and what a hostile one would do — opened in a sandboxed
+frame: [docs/PREVIEWS.md](docs/PREVIEWS.md); records that point at
 nothing: [docs/ORPHANS.md](docs/ORPHANS.md); video in the page and the Movie
 tab: [docs/VIDEO.md](docs/VIDEO.md), [docs/MOVIES.md](docs/MOVIES.md);
 protected copies of videos, played through FairPlay:

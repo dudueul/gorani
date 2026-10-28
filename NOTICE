@@ -44,3 +44,13 @@ portions are marked, their original notices are retained in place.
 4. Runtime dependencies retain their own licenses (RustCrypto crates,
    @noble/*, hash-wasm, pdf.js, SQLite WASM, Lit, and others). They are
    declared in Cargo.toml / package.json and are not reproduced here.
+
+5. The preview readers (commit 42a, docs/PREVIEWS.md) are bundled from
+   their packages by scripts/build-readers.mjs into web/public/readers/,
+   each bundle keeping its packages' license comments at its end. pdf.js
+   (Mozilla, Apache-2.0) ships with parts under their own terms, copied
+   beside them with their LICENSE_* files: the OpenJPEG decoder (BSD-2),
+   PDFium's JBIG2 decoder and Foxit fonts (BSD-3, The PDFium Authors),
+   qcms (MIT, Mozilla and Marti Maria) and the Liberation fonts (Red Hat's
+   Liberation license). The PDF reader's text-layer rules
+   (web/src/preview/readers/pdf.css) follow pdf.js's pdf_viewer.css.

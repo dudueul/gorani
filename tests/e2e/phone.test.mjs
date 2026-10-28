@@ -41,7 +41,7 @@ if (!playwright) {
 }
 const { chromium, devices } = playwright;
 
-const dev = await startDev();
+const dev = await startDev({ persist: "e2e-phone" });
 try {
 	// ── seed: the first lead, Rin, with a recovery-code vault and a files store
 	const boot = await fetch(`${dev.base}/api/v1/family/members`, {

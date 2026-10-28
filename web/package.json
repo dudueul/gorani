@@ -5,14 +5,15 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "node ../scripts/build-media-wasm.mjs && vite",
-		"build": "node ../scripts/build-media-wasm.mjs && vite build",
+		"dev": "node ../scripts/build-media-wasm.mjs && node ../scripts/build-readers.mjs && vite",
+		"build": "node ../scripts/build-media-wasm.mjs && node ../scripts/build-readers.mjs && vite build",
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
 		"@noble/post-quantum": "^0.7.1",
 		"hash-wasm": "^4.12.0",
-		"lit": "^3.3.0"
+		"lit": "^3.3.0",
+		"pdfjs-dist": "6.4.299"
 	},
 	"devDependencies": {
 		"@tailwindcss/vite": "^4.1.4",

@@ -24,7 +24,8 @@
 import { LitElement, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import type { FilesModel } from "../files/model.ts";
-import { pickViewerMode, renderMime, TEXT_CAP, MAX_INLINE, type ViewerMode } from "./mode.ts";
+import { pickViewerMode, readerFor, renderMime, TEXT_CAP, MAX_INLINE, type ViewerMode } from "./mode.ts";
+import { openPreview, type Fact, type PreviewFrame } from "./sandbox.ts";
 import { icon, type FileKind } from "../files/icons.ts";
 import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import { fmtSize } from "../files/shared.ts";
@@ -85,6 +86,12 @@ export class GoraniViewer extends LitElement {
 	/** A protected copy playing through FairPlay — or, where it cannot, why. */
 	@state() private protectedPlay: FairPlayRoutes | null = null;
 	@state() private protectedNote: string | null = null;
+	/** A document's reader in the sandboxed frame (42a, sandbox.ts), and
+	 * what it reported about the file — shown here, outside the frame,
+	 * where the file cannot draw over it. */
+	private frame: PreviewFrame | null = null;
+	private docBytes: Uint8Array | null = null;
+	@state() private facts: Fact[] = [];
 	/** A lead packaging the copy: how far. */
 	@state() private protecting: { done: number; total: number } | null = null;
 	private stopProtected: (() => void) | null = null;
@@ -116,6 +123,9 @@ export class GoraniViewer extends LitElement {
 	/** Let go of the decrypted handle: revoke the blob URL, or tell the media
 	 * service worker to forget this file's content key (streamed media). */
 	private release(): void {
+		this.frame?.close();
+		this.frame = null;
+		this.docBytes = null;
 		this.savePosition(true);
 		for (const t of this.tracks) revokeBlobURL(t.url);
 		this.tracks = [];
@@ -140,7 +150,7 @@ export class GoraniViewer extends LitElement {
 		const { id, kind, size } = this.target;
 		const info = await this.model.renderInfo(id);
 		const mime = info?.mime ?? null;
-		this.mode = pickViewerMode(kind, mime, size, info?.policy ?? "unverified");
+		this.mode = pickViewerMode(kind, mime, size, info?.policy ?? "unverified", this.target.name);
 		this.policy = info?.policy ?? "unverified";
 		this.shownType = info?.shownType ?? null;
 		if (this.mode === "unsupported" || this.mode === "too-large" || this.mode === "refused") {
@@ -157,6 +167,12 @@ export class GoraniViewer extends LitElement {
 					this.truncated = head.bytes.length >= TEXT_CAP && (info?.size ?? 0) > TEXT_CAP;
 					this.text = new TextDecoder().decode(head.bytes.subarray(0, TEXT_CAP));
 				}
+			} else if (this.mode === "document") {
+				// Read whole, then handed to the reader in the frame (updated()):
+				// the bytes are transferred there, not kept here.
+				const parts: Uint8Array[] = [];
+				await this.model.openBytes(id, this.target.version, (plain) => void parts.push(plain));
+				this.docBytes = concat(parts);
 			} else if (this.mode === "video" && (await this.startProtected(id))) {
 				// A protected video this member gets only as its copy (40c):
 				// FairPlay plays it, or the viewer says where it plays.
@@ -297,6 +313,7 @@ export class GoraniViewer extends LitElement {
 	protected override updated(): void {
 		this.wireVideo();
 		this.attachProtected();
+		this.attachDocument();
 		if (!this.mse || this.player) return;
 		const video = this.querySelector<HTMLMediaElement>("main [data-engine=mse]");
 		if (!video) return;
@@ -305,6 +322,28 @@ export class GoraniViewer extends LitElement {
 			// The engine or the decoder refused a piece: play it the older way.
 			onFail: () => void this.fallBack(),
 		});
+	}
+
+	/** Once the document's place is on screen: its reader, in a sandboxed frame. */
+	private attachDocument(): void {
+		if (this.mode !== "document" || !this.docBytes || this.frame) return;
+		const host = this.querySelector<HTMLElement>("[data-preview-host]");
+		const reader = readerFor(this.target.kind, null, this.target.name) ?? "pdf";
+		if (!host) return;
+		const bytes = this.docBytes;
+		this.docBytes = null;
+		this.frame = { close: () => {} };
+		void openPreview(host, reader, { name: this.target.name, mime: null, bytes }, {
+			onKey: (key) => (key === "Escape" ? this.close() : this.step(key === "ArrowRight" ? 1 : -1)),
+			onStep: (delta) => this.step(delta),
+			onShown: (facts) => (this.facts = facts),
+			onError: (message) => (this.error = message),
+		})
+			.then((f) => {
+				if (this.frame && this.isConnected) this.frame = f;
+				else f.close();
+			})
+			.catch((e: unknown) => (this.error = e instanceof Error ? e.message : String(e)));
 	}
 
 	/** Once the protected copy's `<video>` is on screen: FairPlay. */
@@ -446,7 +485,7 @@ export class GoraniViewer extends LitElement {
 					${this.drm?.protected && !this.drm.original ? nothing : html`<button class="shrink-0 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.model.download(t.id, t.name)}>Download</button>`}
 					<button class="shrink-0 rounded-lg border border-neutral-700 px-3 py-1.5 text-xs hover:border-accent" aria-label="Close" data-test="viewer-close" @click=${() => this.close()}><span class="sm:hidden" aria-hidden="true">✕</span><span class="hidden sm:inline">Close (esc)</span></button>
 				</header>
-				<main class="flex min-h-0 flex-1 touch-pan-y items-center justify-center overflow-auto p-1 sm:p-6" @touchstart=${{ handleEvent: (e: TouchEvent) => this.onTouchStart(e), passive: true }} @touchend=${{ handleEvent: (e: TouchEvent) => this.onTouchEnd(e), passive: true }}>${this.content()}</main>
+				<main class="flex min-h-0 flex-1 touch-pan-y overflow-auto ${this.mode === "document" && !this.busy && !this.error ? "items-stretch p-0" : "items-center justify-center p-1 sm:p-6"}" @touchstart=${{ handleEvent: (e: TouchEvent) => this.onTouchStart(e), passive: true }} @touchend=${{ handleEvent: (e: TouchEvent) => this.onTouchEnd(e), passive: true }}>${this.content()}</main>
 				<p class="truncate border-t border-neutral-900 px-3 py-1.5 pb-[max(0.375rem,env(safe-area-inset-bottom))] text-center text-[11px] text-neutral-500 sm:hidden">${details}${pos ? " · swipe for the next" : ""}</p>
 			</div>
 		`;
@@ -487,6 +526,15 @@ export class GoraniViewer extends LitElement {
 						${this.truncated ? html`<p class="border-t border-neutral-800 px-5 py-2 text-xs text-neutral-500">Shown: the first ${fmtSize(TEXT_CAP)} — Download for the rest.</p>` : nothing}
 					</div>
 				`;
+			case "document":
+				return html`<div class="flex h-full w-full flex-col">
+					${this.facts.length
+						? html`<ul class="shrink-0 space-y-0.5 border-b border-neutral-800 bg-neutral-900/95 px-3 py-1.5 text-xs" data-test="viewer-facts" aria-label="What this file holds">
+								${this.facts.map((f) => html`<li class=${f.level === "warn" ? "text-amber-300" : "text-neutral-400"}>${f.level === "warn" ? "⚠ " : ""}${f.text}</li>`)}
+							</ul>`
+						: nothing}
+					<div class="min-h-0 flex-1" data-preview-host></div>
+				</div>`;
 			case "refused":
 				return this.refused();
 			default:

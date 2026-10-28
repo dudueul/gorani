@@ -283,6 +283,27 @@ on record), `api:bootstrap` (new, its own server with the secret set),
 `unit:vendored` (new), the Rust tests for `bootstrap_allowed` and the
 redacted `Debug`.
 
+### Parsing hostile files (commit 42a) — the preview frame
+
+The threat: a file crafted against its reader (a pdf.js bug such as
+CVE-2024-4367, and later the Office, email and archive readers) running
+code in the page that holds the unlocked vault.
+
+The control: every format that needs a parser is read in
+`/preview.html`. That page is framed with `sandbox="allow-scripts"`, so it
+has an opaque origin and nothing of the vault's.
+
+- **No network:** its own CSP allows only `blob:` and `data:` for every
+  kind of request.
+- **No way out:** the app's `frame-src 'self'` stops it navigating away;
+  a frame that navigates at all is closed.
+- **One file:** every file gets a new frame.
+- **No fetching:** the frame is handed its code and bytes; its asset
+  requests are answered from a fixed list.
+
+`unit:preview-frame` checks the policy files, and `e2e:preview` attacks
+the frame from inside. Details are in docs/PREVIEWS.md.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

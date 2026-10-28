@@ -6,7 +6,7 @@
  * set as much as a UX table (see the module docs in viewer.ts).
  */
 
-import { pickViewerMode, renderMime, MAX_INLINE } from "../../web/src/ui/viewer/mode.ts";
+import { pickViewerMode, readerFor, renderMime, MAX_INLINE } from "../../web/src/ui/viewer/mode.ts";
 import assert from "node:assert/strict";
 
 // (The signature is (kind, mime, size[, policy]). Until commit 29e half of
@@ -36,11 +36,18 @@ assert.equal(pickViewerMode("image", "image/png", MAX_INLINE), "image", "at the 
 assert.equal(pickViewerMode("video", null, 20 * 1024 ** 3), "video", "a 20 GB film streams");
 assert.equal(pickViewerMode("audio", "audio/flac", MAX_INLINE + 1), "audio", "so does a long recording");
 assert.equal(pickViewerMode("text", "text/plain", MAX_INLINE + 1), "text", "a big log opens its first part");
-assert.equal(pickViewerMode("pdf", "application/pdf", MAX_INLINE + 1), "unsupported", "no reader is no reader, at any size");
+// PDFs open in the sandboxed preview frame (42a, sandbox.ts) — by kind, by
+// mime or by name — read whole into it, so they meet the same cap.
+assert.equal(pickViewerMode("pdf", "application/pdf", 10), "document");
+assert.equal(pickViewerMode("file", "application/pdf", 10), "document", "by its mime");
+assert.equal(pickViewerMode("file", null, 10, "normal", "report.PDF"), "document", "by its name");
+assert.equal(pickViewerMode("pdf", "application/pdf", MAX_INLINE + 1), "too-large", "read whole, so capped");
+assert.equal(pickViewerMode("pdf", "application/pdf", 10, "sample"), "refused", "a PDF that is a sample is never parsed, sandbox or not");
+assert.equal(readerFor("pdf", null, "a.pdf"), "pdf");
+assert.equal(readerFor("text", "text/plain", "a.txt"), null, "plain text needs no parser: it stays in the page, escaped");
 
-// Structured formats are honest about not being ready (the styled readers
-// and pdf.js land with ⑩b) — except a text/plain mime, which still shows.
-assert.equal(pickViewerMode("pdf", "application/pdf", 10), "unsupported");
+// Formats whose readers are still to come are honest about it — except a
+// text/plain mime, which still shows.
 assert.equal(pickViewerMode("archive", null, 10), "unsupported");
 assert.equal(pickViewerMode("doc", "text/plain", 10), "text");
 

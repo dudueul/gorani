@@ -2,7 +2,8 @@
 
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > How the viewer shows formats that need a parser (commit 42a onward: PDF;
-> 42b: Word, Excel, PowerPoint, 한글 and the older Office formats). The
+> 42b: Word, Excel, PowerPoint, 한글 and the older Office formats; 42c:
+> email, .eml and Outlook's .msg). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -155,6 +156,7 @@ for readers that draw HTML.
 | `pptx` | .pptx .pptm .ppsx .potx | pptx-preview (with ECharts for charts) |
 | `hwp` | .hwp (HWP 5 and 3) .hwpx | rhwp, as WebAssembly (12 MB, asked of the app) |
 | `legacy` | .doc .ppt .rtf .odt .odp, and web pages or MHT archives named .doc | our own parsers (`preview/legacy/`) |
+| `email` | .eml (and message/rfc822), .msg | postal-mime; msgreader for .msg; DOMPurify |
 
 ### PDF (pdf.js, `readers/pdf.ts`)
 
@@ -310,6 +312,109 @@ says — and their **facts**, read by small parsers of our own:
 Every parser stops at a size or depth no document reaches: four million
 characters of text, 64 nested record containers, 5000 nested RTF groups.
 
+### Email (`readers/email.ts`, `mail/parse.ts`, `facts/mail.ts`) (42c)
+
+A security team's commonest hostile file is an email someone reported. It
+arrives as an `.eml` (the message as it travelled, MIME) or as Outlook's
+`.msg` (an OLE container of MAPI properties). `mail/parse.ts` reads both
+into one shape: postal-mime for MIME, msgreader for .msg, whose headers as
+received are a single property (PR_TRANSPORT_MESSAGE_HEADERS). msgreader
+was written for Node and asks for iconv-lite; the bundle gets a small shim
+in its place (`preview/shims/iconv-lite.ts`) that decodes with the
+browser's own `TextDecoder`.
+
+The message is shown in four tabs:
+
+| tab | what it shows |
+|---|---|
+| Message | the HTML body, cleaned (below), in a shadow root |
+| Text | the text body, or the HTML's text when there is none |
+| Headers | the Received chain as a table, oldest hop first, then every header as written |
+| Source | the raw message, up to 2 MB (.eml only; a .msg has no source) |
+
+Above them: the subject, From, Reply-To, To, Cc, the Date line exactly as
+it is written (evidence, not a parsed date), and every attachment with its
+type, size and SHA-256 (to look up), and Open and Save buttons.
+
+**The HTML is cleaned in an inert parse first.** The body is parsed with
+`DOMParser`, so nothing in it loads or runs. In that parsed copy:
+
+1. what it would do is collected for the facts: links, forms, scripts and
+   event handlers, frames, a meta refresh;
+2. every picture from outside becomes a grey placeholder ("picture from
+   outside, not loaded"); every outside `url()` and `@import` in its CSS is
+   removed. A tracker therefore never learns the message was opened, and
+   would not even if the frame's CSP failed;
+3. `cid:` pictures are drawn from the message's own parts, as `blob:` URLs.
+
+Only then does DOMPurify turn it into nodes, removing scripts, forms and
+inputs, frames, objects, `<base>`, `<link>`, `<meta>` and media, and the
+attributes that fetch (`srcset`, `ping`, `background`, `poster`). Only
+`http(s):`, `mailto:`, `tel:`, `blob:` and pictures as `data:` survive as
+URLs. The result goes into a **shadow root**, so the message's CSS styles
+only itself and cannot draw over the reader. Each link's title is replaced
+by where it really goes (the sender's own title is the sender's words); a
+bar at the bottom shows it on hover; a click goes nowhere.
+
+**The facts** (`facts/mail.ts`, pure), the questions a phishing triage
+starts with:
+
+- **Did the receiving server believe it?** SPF, DKIM and DMARC from the
+  **topmost** Authentication-Results only. That one is added by the last
+  server, the receiving organisation's own; anything below it was already
+  in the message when it arrived, and a sender can write it. The fixture
+  carries a forged "all pass" below the real "fail", and the reader says
+  fail.
+- **Where did it come from?** The Received chain, oldest first. The hop
+  that counts is the one written by the server named in that
+  Authentication-Results (its authserv-id): its "from" is the computer
+  that connected, which the sender could not choose. The hops before it
+  are the sender's own claims, and the fact says how many there are. A
+  Date far from the first hop is named.
+- **Is it who it says?** A display name that is another address
+  (`"service@paypal.com" <…@secure-login.example>`); a domain dressed as
+  another (`paypal.com.secure-login.example`); punycode; a Reply-To or an
+  envelope sender (Return-Path) at another organisation.
+- **Where do its links go?** Text that reads one address over a link to
+  another; punycode, IP and `user@host` links; shorteners; Windows
+  protocol handlers (`search-ms:`, `ms-msdt:`, `ms-officecmd:` …) and file
+  shares (`\\host\share`), the routes of several exploits; `javascript:`
+  and `data:` links.
+- **What would it load?** Pictures and CSS from outside (trackers), forms,
+  and forms asking for a password, scripts and handlers, frames, a refresh
+  to another page.
+- **What does it carry?** Each attachment judged by its name **and** its
+  bytes (`partRisk`): a double extension (`invoice.pdf.exe`), a
+  right-to-left mark hiding the real one, a kind that runs (programs,
+  scripts, shortcuts, disk images, OneNote, macro-enabled Office), a
+  "PDF" whose first bytes are a Windows program, an encrypted ZIP (no
+  scanner could look inside), and HTML that builds a file in the browser
+  (HTML smuggling). Also: S/MIME or PGP signatures, a calendar invitation,
+  a forwarded message.
+
+There can be many facts in a lure, so the viewer shows 40 at most:
+the summary line first, then the warnings, then the rest, in a panel that
+scrolls.
+
+**Attachments: the frame asks, the app decides.** The frame cannot open a
+file or write to the vault, and it should not be able to. Open and Save
+send the attachment's bytes to the app (`host.handOver`). `sandbox.ts`
+accepts only a known action, bytes under the whole-read cap, at most one
+request every half second, and cleans the name: no path, no control or
+bidirectional characters, at most 200 characters.
+
+- **Open** shows the attachment in a **new** frame with its own reader, as
+  any file is shown: a forwarded `.eml` in an email reader, a `.docx` in
+  Word's, a picture as a picture. They stack: the header reads
+  "phish.eml › statement.docx", and Back, or Escape, returns. A
+  program is not shown; it can be saved.
+- **Save** asks first, in the app, outside any frame. The app judges the
+  bytes itself with the same `partRisk` (the reader in the frame is only
+  believed about what the app can see too), and offers a risky attachment
+  as a **malware sample** by default: uploaded beside the message,
+  flagged, never previewed, downloaded only inside an "infected" zip
+  (CUSTODY.md, stage 5). It is signed and recorded like any upload.
+
 ## Limits
 
 - **A reader that hangs can freeze the tab on some browsers.** Desktop
@@ -328,6 +433,10 @@ characters of text, 64 nested record containers, 5000 nested RTF groups.
   The facts do not depend on any of it.
 - **Formulas are never recalculated**; spreadsheets show saved values.
 - **The older formats are text only.**
+- **An email's HTML is shown as cleaned, not as sent.** Forms, scripts and
+  outside pictures are gone, by design; the Source tab has the original.
+- **A .msg has no source**: Outlook keeps properties, not the message.
+  Its headers are there only when it came from outside the organisation.
 
 ## Tests
 
@@ -339,15 +448,20 @@ characters of text, 64 nested record containers, 5000 nested RTF groups.
   - the app keeps `frame-src 'self'`;
   - the sandbox flags are `allow-scripts` only;
   - asset names cannot climb out of a reader's folder; 한글's reader may
-    ask for its WebAssembly and nothing else; the others for nothing.
+    ask for its WebAssembly and nothing else; the others for nothing;
+  - an attachment's name cleaned before the app uses it (42c): no path, no
+    control or right-to-left characters, a length cap.
 - **`unit:viewer-modes`:** each format to its reader, by name or type,
   capped like any whole read, samples refused first; the first bytes
-  correcting a disguised name.
+  correcting a disguised name (a .msg is OLE, and stays email).
 - **`unit:preview-facts`** (Node, milliseconds): ZIP bombs refused (a part
   that lies, a directory that over-claims); every planted trick in the
   hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named, the
   honest ones warning of nothing; .xls and .ods read; CP949 CSV detected;
-  .doc, .ppt and RTF text read right (Korean included).
+  .doc, .ppt and RTF text read right (Korean included); (42c) the email
+  fixtures' facts: the forged Authentication-Results not believed, the
+  entry hop, the sender's disguises, every planted link and attachment,
+  the .msg read like the .eml, and the honest message warning of nothing.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -362,6 +476,12 @@ characters of text, 64 nested record containers, 5000 nested RTF groups.
     their markup shown as text; an RTF and a web archive named .doc named
     as disguises;
   - the default Trusted Types policy attacked from inside;
+  - email (42c): an .eml drawn with its own picture, Find, the headers,
+    text and source tabs, its PDF opened in its own preview and back; a
+    phishing message's facts, its link shown on hover and dead on click,
+    no script, form or outside picture drawn; its .docx opened, its
+    "invoice.pdf.exe" saved as a sample and then refused; a forwarded
+    message opened from the report; Outlook's .msg;
   - no dialog, no CSP or Trusted Types violation, no request off the
     computer, and the frames' only requests their own page;
   - on a phone the PDF and a Word page fit the screen, and a swipe inside
@@ -370,8 +490,10 @@ characters of text, 64 nested record containers, 5000 nested RTF groups.
   - `tests/fixtures/preview/make.py` (reportlab, pypdf): the PDFs;
   - `office.py` (python-docx, openpyxl, python-pptx; LibreOffice for the
     older formats): the Office files and the hostile variants;
-  - `ole.mjs` (rhwp, cfb): the 한글 files, and the OLE surgery Python
-    cannot do.
+  - `ole.mjs` (rhwp, cfb): the 한글 files, the OLE surgery Python
+    cannot do, and Outlook's .msg;
+  - `mail.py` (no libraries: MIME written out by hand, so every header is
+    exactly what a test expects): the .eml messages.
 
   Everything except what LibreOffice writes is the same bytes on every run.
   Nothing in them is a working exploit: the scripts are text, the

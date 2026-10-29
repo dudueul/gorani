@@ -30,6 +30,7 @@
  */
 
 import { isPhone } from "../../lib/phone.ts";
+import { MAX_INLINE } from "./mode.ts";
 
 /** The readers that exist (web/src/preview/readers/<id>.ts):
  *   pdf     PDF (pdf.js)                                         42a
@@ -38,8 +39,9 @@ import { isPhone } from "../../lib/phone.ts";
  *   pptx    PowerPoint 2007+ (pptx-preview)
  *   hwp     한글 HWP and HWPX (rhwp, WebAssembly)
  *   legacy  Word and PowerPoint 97–2003, RTF, OpenDocument text and
- *           slides: their text and their facts, read by our own code */
-export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy";
+ *           slides: their text and their facts, read by our own code
+ *   email   .eml (postal-mime) and Outlook .msg (msgreader)          42c */
+export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email";
 
 /** The asset names each reader may ask for — and nothing else is fetched for it. */
 const ASSETS: Record<ReaderId, RegExp | null> = {
@@ -50,6 +52,7 @@ const ASSETS: Record<ReaderId, RegExp | null> = {
 	// rhwp's parser and renderer, 12 MB of WebAssembly.
 	hwp: /^rhwp_bg\.wasm$/,
 	legacy: null,
+	email: null,
 };
 
 /** Readers that run a worker of their own (its code is sent with theirs). */
@@ -74,6 +77,35 @@ export interface PreviewHandlers {
 	onStep(delta: 1 | -1): void;
 	onShown(facts: Fact[]): void;
 	onError(message: string): void;
+	/** A file inside this one (an email's attachment, 42c) that the reader
+	 * asks to have opened in a preview of its own, or saved into the vault.
+	 * Its name is cleaned and its size capped here; it is still the file's
+	 * own bytes, as untrusted as the file. */
+	onHandover?(action: "open" | "save", file: HandedFile): void;
+}
+
+export interface HandedFile {
+	name: string;
+	mime: string | null;
+	bytes: Uint8Array;
+}
+
+/**
+ * A name a reader handed over, made safe to show and to store: no control
+ * or direction-changing characters (an attachment named
+ * "invoice\u202Efdp.exe" would show as "invoiceexe.pdf" — the facts
+ * already name the trick), no path, at most 200 characters.
+ * Pure: unit:preview-frame.
+ */
+export function cleanName(name: unknown): string {
+	const s = String(name ?? "")
+		.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+		.split(/[\\/]/)
+		.pop()!
+		.replace(/^[.\s]+|[.\s]+$/g, "")
+		.slice(0, 200)
+		.trim();
+	return s || "attachment";
 }
 
 /** A reader's code, fetched once per page load (it is the app's own code, not secret). */
@@ -158,9 +190,10 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 
 	const channel = new MessageChannel();
 	port = channel.port1;
+	let lastHandover = 0;
 	port.onmessage = (e: MessageEvent) => {
 		if (closed) return;
-		const d = e.data as { t?: string; id?: unknown; path?: unknown; key?: unknown; delta?: unknown; facts?: unknown; message?: unknown };
+		const d = e.data as { t?: string; id?: unknown; path?: unknown; key?: unknown; delta?: unknown; facts?: unknown; message?: unknown; action?: unknown; name?: unknown; mime?: unknown; bytes?: unknown };
 		switch (d?.t) {
 			case "asset": {
 				const url = assetPath(reader, d.path);
@@ -185,11 +218,23 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 				if (d.delta === 1 || d.delta === -1) on.onStep(d.delta);
 				return;
 			case "shown":
-				on.onShown(Array.isArray(d.facts) ? d.facts.slice(0, 20).map((f: { level?: unknown; text?: unknown }) => ({ level: f?.level === "warn" ? "warn" : "info", text: String(f?.text ?? "").slice(0, 300) })) : []);
+				on.onShown(Array.isArray(d.facts) ? d.facts.slice(0, 40).map((f: { level?: unknown; text?: unknown }) => ({ level: f?.level === "warn" ? "warn" : "info", text: String(f?.text ?? "").slice(0, 300) })) : []);
 				return;
 			case "error":
 				on.onError(String(d.message ?? "the reader failed").slice(0, 500));
 				return;
+			case "handover": {
+				// A request, checked: a known action, real bytes under the cap,
+				// and not more than one every half second (a reader gone wrong
+				// cannot flood the app with "open this").
+				if ((d.action !== "open" && d.action !== "save") || !(d.bytes instanceof ArrayBuffer) || d.bytes.byteLength > MAX_INLINE || !on.onHandover) return;
+				const now = Date.now();
+				if (now - lastHandover < 500) return;
+				lastHandover = now;
+				const mime = typeof d.mime === "string" && /^[\w.+-]+\/[\w.+-]+$/.test(d.mime) ? d.mime.toLowerCase().slice(0, 127) : null;
+				on.onHandover(d.action, { name: cleanName(d.name), mime, bytes: new Uint8Array(d.bytes) });
+				return;
+			}
 		}
 	};
 	// The bytes are TRANSFERRED, not copied: after this the app holds no

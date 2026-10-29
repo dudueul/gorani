@@ -341,6 +341,44 @@ Found while testing: a frame sandboxed without `allow-forms` never fires a
 form's submit event, so 42a's PDF password prompt could not have worked.
 It now uses Enter and a button, and is tested.
 
+### The email reader (commit 42c)
+
+The threat: an email is written to be opened by the person it targets,
+and a reported phishing message is opened by the analyst too. Opening it
+should tell its sender nothing, run nothing, and let nothing it carries
+out of the frame by itself. Its headers lie wherever the sender could
+write them.
+
+The controls, on top of the frame:
+
+- **Nothing loads:** outside pictures and CSS are swapped out in an inert
+  parse before the body becomes nodes, so a tracking pixel is never
+  requested, even if the frame's CSP failed. The frame's CSP stops it
+  anyway (`e2e:preview` counts the network).
+- **Nothing runs:** DOMPurify removes scripts, handlers, forms and inputs,
+  frames, objects, `<base>`, `<meta>` and media, and keeps only plain
+  URL schemes. The body is drawn in a shadow root, so its CSS cannot draw
+  over the reader. Links do nothing when clicked; hovering shows where
+  they go.
+- **Only what the receiving server wrote is believed:** SPF, DKIM and
+  DMARC are taken from the topmost Authentication-Results, and the entry
+  hop is the Received line written by that same server. Anything below
+  is shown as the sender's claim. The fixture's forged "pass" is tested
+  (`unit:preview-facts`).
+- **Attachments leave the frame only by asking:** the frame sends the
+  bytes to the app with an action. The app accepts two actions, under the
+  size cap, one a half second, and cleans the name (no path, no control
+  or bidirectional characters). Open shows the attachment in a new frame.
+  Save asks the person first, outside the frame, after the app judges the
+  bytes itself; a risky one is saved as a malware sample by default.
+- **Evidence:** the SHA-256 of every attachment, the Date and every header
+  as written, and the raw source, for the investigation.
+
+Accepted: a .msg carries no raw source and, when it was sent inside the
+organisation, often no transport headers. The facts then say less. The
+reader shows the HTML as cleaned; someone who needs it exactly as sent
+has the Source tab, as text.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

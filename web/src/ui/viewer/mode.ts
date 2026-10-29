@@ -16,7 +16,7 @@ import type { ReaderId } from "./sandbox.ts";
 // sandboxed preview frame, never in the app's own page (42a, sandbox.ts).)
 export type ViewerMode = "image" | "video" | "audio" | "text" | "document" | "unsupported" | "too-large" | "refused";
 
-/** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글). */
+/** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email). */
 const BY_EXT: Record<string, ReaderId> = {
 	pdf: "pdf",
 	docx: "docx", docm: "docx", dotx: "docx", dotm: "docx",
@@ -24,6 +24,7 @@ const BY_EXT: Record<string, ReaderId> = {
 	pptx: "pptx", pptm: "pptx", ppsx: "pptx", ppsm: "pptx", potx: "pptx", potm: "pptx",
 	hwp: "hwp", hwpx: "hwp", hwt: "hwp",
 	doc: "legacy", dot: "legacy", ppt: "legacy", pps: "legacy", pot: "legacy", rtf: "legacy", odt: "legacy", ott: "legacy", odp: "legacy", otp: "legacy",
+	eml: "email", msg: "email",
 };
 
 /** …and the types, for a file whose name says nothing. */
@@ -51,6 +52,8 @@ const BY_MIME: Record<string, ReaderId> = {
 	"text/rtf": "legacy",
 	"application/vnd.oasis.opendocument.text": "legacy",
 	"application/vnd.oasis.opendocument.presentation": "legacy",
+	"message/rfc822": "email",
+	"application/vnd.ms-outlook": "email",
 };
 
 /** Which sandboxed reader shows a file, if one does: by its name first
@@ -77,7 +80,7 @@ export function sniffReader(head: Uint8Array, guess: ReaderId, name: string): Re
 	if (ascii.startsWith("{\\rtf")) return "legacy";
 	const zip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
 	const ole = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
-	if (guess === "sheet" || guess === "hwp") return guess; // each reads every form of its family
+	if (guess === "sheet" || guess === "hwp" || guess === "email") return guess; // each reads every form of its family (a .msg is an OLE file)
 	if (zip && guess === "legacy") {
 		// A ".doc" or ".ppt" that is really the 2007+ format, renamed.
 		if (/^(doc|dot)$/.test(ext)) return "docx";

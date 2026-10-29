@@ -45,7 +45,7 @@ portions are marked, their original notices are retained in place.
    @noble/*, hash-wasm, pdf.js, SQLite WASM, Lit, and others). They are
    declared in Cargo.toml / package.json and are not reproduced here.
 
-5. The preview readers (commits 42a–42b, docs/PREVIEWS.md) are bundled from
+5. The preview readers (commits 42a–42c, docs/PREVIEWS.md) are bundled from
    their packages by scripts/build-readers.mjs into web/public/readers/,
    each bundle keeping its packages' license comments at its end. pdf.js
    (Mozilla, Apache-2.0) ships with parts under their own terms, copied
@@ -68,3 +68,9 @@ portions are marked, their original notices are retained in place.
    legacy reader's parsers (web/src/preview/legacy/) are ours, written
    from Microsoft's published [MS-DOC], [MS-PPT], [MS-OLEPS] and RTF
    specifications.
+
+   The email reader (commit 42c) bundles: postal-mime (Andris Reinman,
+   MIT-0); @kenjiuno/msgreader (kenjiuno, Apache-2.0) with its
+   decompressrtf (BSD-2); and DOMPurify again. msgreader's
+   iconv-lite is replaced in the bundle by our own few lines
+   (web/src/preview/shims/iconv-lite.ts) over the browser's TextDecoder.

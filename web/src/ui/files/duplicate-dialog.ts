@@ -46,7 +46,7 @@ export function askDuplicate(q: DuplicateQuestion): Promise<DuplicateAnswer> {
 		document.addEventListener("keydown", onKey, true);
 		const draw = () =>
 			render(
-				html`<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" data-test="duplicate-dialog" role="dialog" aria-modal="true" aria-labelledby="duplicate-title">
+				html`<div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4" data-test="duplicate-dialog" role="dialog" aria-modal="true" aria-labelledby="duplicate-title">
 					<div class="w-full max-w-md space-y-3 rounded-2xl border border-neutral-800 bg-neutral-900 p-5 text-sm text-neutral-200">
 						<h2 id="duplicate-title" class="text-base font-medium">“${q.file.name}” is already here</h2>
 						<p class="text-xs text-neutral-400">Exactly the same ${fmtSize(q.file.size)} ${q.twins.length === 1 ? "is already stored as" : `are already stored ${q.twins.length} times`}:</p>

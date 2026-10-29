@@ -1,0 +1,151 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The email reader (commit 42c): tabs, the header block and attachments
+   on the frame's dark ground; the message itself on white, in its shadow
+   root; a status line under it saying where a hovered link goes. */
+
+.tabs {
+	display: flex;
+	gap: 4px;
+}
+
+.tabs [aria-selected="true"] {
+	background: #262626;
+	border-color: var(--accent);
+}
+
+.mailhead {
+	flex: none;
+	padding: 10px 14px;
+	border-bottom: 1px solid var(--line);
+	background: var(--panel);
+	font-size: 13px;
+	max-height: 40%;
+	overflow: auto;
+}
+
+.mailhead h1 {
+	margin: 0 0 6px;
+	font-size: 16px;
+	font-weight: 600;
+	overflow-wrap: anywhere;
+}
+
+.mailhead .row {
+	display: flex;
+	gap: 10px;
+	margin: 2px 0;
+}
+
+.mailhead .k {
+	flex: none;
+	width: 5.5em;
+	color: var(--muted);
+}
+
+.mailhead .v {
+	overflow-wrap: anywhere;
+}
+
+.atts {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	min-width: 0;
+	flex: 1;
+}
+
+.att {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+}
+
+.att .name {
+	font-weight: 500;
+	overflow-wrap: anywhere;
+}
+
+.att.risky .name {
+	color: var(--warn);
+}
+
+.att .sha {
+	font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	color: var(--muted);
+	overflow-wrap: anywhere;
+	max-width: 100%;
+}
+
+.att button {
+	min-height: 26px;
+	padding: 1px 8px;
+	font-size: 12px;
+}
+
+.panes {
+	background: #262626;
+}
+
+.pane.text {
+	margin: 0;
+	padding: 14px 18px;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	color: var(--text);
+}
+
+.pane.headers {
+	padding: 10px 14px;
+	font-size: 12px;
+}
+
+.pane.headers h2 {
+	margin: 12px 0 6px;
+	font-size: 13px;
+	color: var(--muted);
+}
+
+.pane.headers table {
+	border-collapse: collapse;
+	width: 100%;
+}
+
+.pane.headers th,
+.pane.headers td {
+	padding: 3px 8px;
+	border-bottom: 1px solid var(--line);
+	text-align: left;
+	vertical-align: top;
+	overflow-wrap: anywhere;
+}
+
+.pane.headers .all th {
+	width: 14em;
+	color: var(--muted);
+	font-weight: 500;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.pane.headers .all td {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.linkbar {
+	flex: none;
+	min-height: 22px;
+	padding: 3px 10px;
+	border-top: 1px solid var(--line);
+	background: var(--panel);
+	color: var(--muted);
+	font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.phone .mailhead .k {
+	width: 4.5em;
+}

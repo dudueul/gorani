@@ -37,6 +37,8 @@ import { rels } from "../../web/src/preview/office.ts";
 import { Ole } from "../../web/src/preview/ole.ts";
 import { analyse } from "../../web/src/preview/readers/sheet.worker.ts";
 import { Zip } from "../../web/src/preview/zip.ts";
+import { authResults, mailFacts, orgDomain, partRisk, receivedChain } from "../../web/src/preview/facts/mail.ts";
+import { parseMail } from "../../web/src/preview/mail/parse.ts";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
 const said = (facts: { text: string }[]) => facts.map((f) => f.text).join("\n");
@@ -176,4 +178,70 @@ const rtfReport = readRtf(fixture("report.rtf"));
 assert.ok(rtfReport.sections[0]!.paras.includes("고라니 보고서 둘째 쪽"), `Korean through \\u escapes: ${rtfReport.sections[0]!.paras.join(" | ")}`);
 assert.ok(readRtf(new TextEncoder().encode("{\\rtf1 {{{{ unclosed")).facts.some((f) => /malformed/.test(f.text)), "unclosed groups are named");
 
-console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing");
+// ── 7. Email (42c) ────────────────────────────────────────────────────
+const plainMail = await parseMail(fixture("report.eml"));
+assert.equal(plainMail.subject, "분기 보고서 — Quarterly report", "an RFC 2047 subject, decoded");
+assert.deepEqual(plainMail.attachments.map((a) => [a.name, a.inline, a.cid]), [["logo.png", true, "logo@gorani"], ["report.pdf", false, null]]);
+const reportSaid = said(mailFacts(plainMail, null).facts);
+assert.match(reportSaid, /SPF pass · DKIM pass · DMARC pass/);
+assert.match(reportSaid, /Handed to mx\.gorani\.example by 192\.0\.2\.20 \(out\.gorani\.example\)/);
+assert.ok(mailFacts(plainMail, null).facts.every((f) => f.level === "info"), `an honest message warns of nothing: ${reportSaid}`);
+
+const phish = await parseMail(fixture("phish.eml"));
+// What the reader finds in its HTML (in the frame, from an inert parse) — given here as data.
+const found = { links: [{ href: "https://phish.example/login", text: "https://www.paypal.com/signin" }, { href: "https://xn--pypal-4ve.example/", text: "PayPal support" }, { href: "https://paypal.com@203.0.113.7/verify", text: "Verify" }, { href: "search-ms:query=invoice", text: "Open" }, { href: "https://bit.ly/3gorani", text: "Track" }, { href: "javascript:alert(1)", text: "x" }, { href: "\\\\203.0.113.7\\share", text: "share" }], remote: ["https://phish.example/open.gif", "https://phish.example/bg.png"], forms: [{ action: "https://phish.example/collect", password: true }], scripts: 2, frames: ["https://phish.example/frame"], refresh: "https://phish.example/login" };
+const { facts: phishFacts, hops } = mailFacts(phish, found);
+const ph = said(phishFacts);
+for (const want of [
+	/The receiving server's checks failed: SPF fail, DMARC fail/,
+	/The sender's name says “service@paypal\.com”, but it was sent from service@paypal\.com\.secure-login\.example/,
+	/starts with paypal\.com but is at secure-login\.example — a domain dressed as another/,
+	/Replies go to collect@phish\.example/,
+	/envelope sender bounce@mailer\.bulk-sender\.example/,
+	/Handed to mx\.gorani\.example by 203\.0\.113\.7 \(mail\.secure-login\.example\) — the hop the sender could not write; the 1 hop before it is the sender's own account/,
+	/“https:\/\/www\.paypal\.com\/signin” goes to https:\/\/phish\.example\/login/,
+	/search-ms:/,
+	/file share/,
+	/javascript: or data: link/,
+	/punycode .*xn--pypal-4ve\.example/,
+	/straight to an IP address: 203\.0\.113\.7/,
+	/behind user@: paypal\.com@203\.0\.113\.7/,
+	/shorteners \(bit\.ly\)/,
+	/Would load 2 pictures and styles from outside .*phish\.example \(not loaded\)/,
+	/form that sends what is typed to https:\/\/phish\.example\/collect — and it asks for a password/,
+	/Contains 2 scripts/,
+	/Would redirect the reader/,
+	/Attachment invoice\.pdf\.exe: it pretends to be \.pdf — it is a Windows program/,
+	/Attachment invoice\.html: a web page that builds a file in the browser and saves it — HTML smuggling/,
+]) assert.match(ph, want);
+assert.doesNotMatch(ph, /SPF pass/, "the forged Authentication-Results below the receiving server's is not believed");
+assert.equal(authResults(phish.headers).spf, "fail");
+assert.deepEqual(hops.map((h) => h.ip), ["198.51.100.23", "203.0.113.7", "192.0.2.10"], "the Received chain, oldest first");
+assert.equal(receivedChain([{ name: "Received", value: "from a.example (a.example [2001:db8::1]) by b.example; Fri, 2 Jan 2026 03:04:05 +0000" }])[0]?.ip, "2001:db8::1", "IPv6");
+
+const fwd = await parseMail(fixture("report-to-soc.eml"));
+const inner = fwd.attachments.find((a) => a.name === "phish.eml");
+assert.ok(inner && inner.mime === "message/rfc822", "a forward as an attachment stays one");
+assert.equal((await parseMail(inner.bytes)).subject, "Invoice overdue - action required", "…and parses as the message it is");
+assert.match(said(mailFacts(fwd, null).facts), /Carries a message of its own/);
+
+const outlook = await parseMail(fixture("outlook.msg"));
+assert.equal(outlook.format, "msg");
+assert.equal(outlook.subject, "Invoice overdue (Outlook)");
+assert.deepEqual(outlook.attachments.map((a) => a.name), ["invoice.pdf.exe"]);
+const ol = said(mailFacts(outlook, null).facts);
+for (const want of [/an Outlook \.msg/, /SPF fail, DMARC fail/, /Replies go to collect@phish\.example/, /Attachment invoice\.pdf\.exe/, /Links to 1 address .*phish\.example\/login/]) assert.match(ol, want);
+
+// Attachments judged by name and by bytes.
+const MZ = new TextEncoder().encode("MZ…");
+assert.match(partRisk("invoice.pdf", MZ) ?? "", /named \.pdf, but it is a Windows program/);
+assert.match(partRisk("invoice\u202Efdp.exe", new Uint8Array(4)) ?? "", /right-to-left mark/);
+assert.match(partRisk("photos.iso", new Uint8Array(4)) ?? "", /disk image/);
+assert.match(partRisk("notes.one", new Uint8Array(4)) ?? "", /OneNote/);
+assert.match(partRisk("secret.zip", new Uint8Array([0x50, 0x4b, 3, 4, 20, 0, 1, 0])) ?? "", /password-protected archive/);
+assert.equal(partRisk("report.pdf", fixture("report.pdf")), null, "a PDF that is a PDF is not a risk");
+assert.equal(partRisk("statement.docx", fixture("report.docx")), null);
+assert.equal(orgDomain("mail.gorani.co.kr"), "gorani.co.kr");
+assert.equal(orgDomain("paypal.com.secure-login.example"), "secure-login.example");
+
+console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes");

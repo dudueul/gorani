@@ -23,7 +23,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { assetPath } from "../../web/src/ui/viewer/sandbox.ts";
+import { assetPath, cleanName } from "../../web/src/ui/viewer/sandbox.ts";
 
 const root = new URL("../../", import.meta.url);
 const read = (p: string) => readFileSync(new URL(p, root), "utf8");
@@ -101,4 +101,14 @@ assert.equal(assetPath("hwp", "rhwp_bg.wasm"), "/readers/hwp/rhwp_bg.wasm");
 for (const bad of ["LICENSE", "../pdf/wasm/openjpeg.wasm", "rhwp_bg.wasm.map", "cmaps/UniKS-UCS2-H.bcmap"]) assert.equal(assetPath("hwp", bad), null, `hwp refused: ${bad}`);
 for (const reader of ["docx", "sheet", "pptx", "legacy"] as const) assert.equal(assetPath(reader, "rhwp_bg.wasm"), null, `${reader} has no assets`);
 
-console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more");
+// 7. A name a reader hands over (an attachment, 42c) is made safe to show
+// and store: no direction marks, no control characters, no path.
+assert.equal(cleanName("invoice\u202Efdp.exe"), "invoicefdp.exe", "the right-to-left override is gone (the facts name the trick)");
+assert.equal(cleanName("..\\..\\Windows\\evil.dll"), "evil.dll");
+assert.equal(cleanName("a/b/c.txt"), "c.txt");
+assert.equal(cleanName("bell\u0007.txt"), "bell.txt");
+assert.equal(cleanName("   "), "attachment");
+assert.equal(cleanName(null), "attachment");
+assert.equal(cleanName("x".repeat(500)).length, 200);
+
+console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more, handed-over names cleaned");

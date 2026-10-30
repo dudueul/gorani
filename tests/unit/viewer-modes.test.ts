@@ -109,7 +109,7 @@ assert.equal(sniffReader(head("Rar!\x1a\x07"), "archive", "a.zip"), "archive", "
 // name, by type; its first bytes do not move it — unless they are a
 // program's (42g, below): a binary that is not a program is shown as
 // characters, and the reader says it is binary.
-for (const name of ["README.md", "a.json", "a.jsonl", "a.geojson", "a.ipynb", "a.xml", "a.plist", "a.csproj", "a.html", "a.HTA", "a.js", "a.ts", "a.py", "a.sh", "a.ps1", "a.psm1", "a.bat", "a.cmd", "a.vbs", "a.vbe", "a.jse", "a.wsf", "a.sct", "a.css", "a.yaml", "a.toml", "a.ini", "a.reg", "a.env", "a.sql", "a.c", "a.rs", "a.go", "a.php", "a.rb", "a.yar", "a.ahk", "Dockerfile.dockerfile", "a.patch"]) {
+for (const name of ["README.md", "a.json", "a.jsonl", "a.geojson", "a.ipynb", "a.xml", "a.plist", "a.csproj", "a.html", "a.HTA", "a.js", "a.ts", "a.py", "a.sh", "a.ps1", "a.psm1", "a.bat", "a.cmd", "a.vbs", "a.vbe", "a.bas", "a.cls", "a.jse", "a.wsf", "a.sct", "a.css", "a.yaml", "a.toml", "a.ini", "a.reg", "a.env", "a.sql", "a.c", "a.rs", "a.go", "a.php", "a.rb", "a.yar", "a.ahk", "Dockerfile.dockerfile", "a.patch"]) {
 	assert.equal(readerFor("file", null, name), "text", name);
 }
 for (const name of ["a.txt", "a.log", "a.TXT", "noext"]) assert.equal(readerFor("text", "text/plain", name), null, `${name}: stays in the page`);

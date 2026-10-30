@@ -1,0 +1,108 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The Macros pane (commit 42h): over the reader, the modules and their source. */
+
+.macrobtn {
+	border-color: #92400e;
+	color: var(--warn);
+}
+
+.macros {
+	position: fixed;
+	inset: 0;
+	z-index: 20;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg);
+}
+
+.macros[hidden] {
+	display: none;
+}
+
+.mmain {
+	flex: 1;
+	min-height: 0;
+	display: grid;
+	grid-template-columns: minmax(12rem, 18rem) 1fr;
+}
+
+.mlist {
+	overflow: auto;
+	border-right: 1px solid var(--line);
+	padding: 6px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.mitem {
+	text-align: left;
+	border-color: transparent;
+	font-size: 13px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.mitem[aria-selected="true"] {
+	background: #262626;
+	border-color: var(--accent);
+}
+
+.mitem.flagged span:first-child {
+	color: var(--warn);
+}
+
+.mright {
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+}
+
+.mhead {
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--line);
+	font-size: 13px;
+}
+
+.mnote {
+	color: var(--warn);
+	margin-top: 2px;
+}
+
+.mbody {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	display: grid;
+	grid-template-columns: auto 1fr;
+}
+
+.mbody pre {
+	margin: 0;
+	padding: 10px 12px;
+	font: 12.5px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, "D2Coding", monospace;
+	white-space: pre;
+	tab-size: 4;
+}
+
+.mgutter {
+	color: #525252;
+	text-align: right;
+	user-select: none;
+	border-right: 1px solid var(--line);
+	background: #0f0f0f;
+}
+
+.phone .mmain {
+	grid-template-columns: 1fr;
+	grid-template-rows: auto 1fr;
+}
+
+.phone .mlist {
+	flex-direction: row;
+	overflow-x: auto;
+	border-right: 0;
+	border-bottom: 1px solid var(--line);
+}

@@ -5,7 +5,8 @@
 > 42b: Word, Excel, PowerPoint, 한글 and the older Office formats; 42c:
 > email, .eml and Outlook's .msg; 42d: every picture; 42e: archives; 42f:
 > Markdown, JSON, XML, web pages and code; 42g: programs and any file as
-> bytes — the one view a malware sample may have). The
+> bytes — the one view a malware sample may have; 42h: Office macros'
+> source). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -663,6 +664,65 @@ first in a leaked file or a lure's script:
   XSLT stylesheet (`msxsl:script`).
 - **JSON**: why it is not valid, or how many records and bad lines.
 
+### Macros (`preview/vba/`, `facts/vba.ts`) (42h)
+
+Every Office reader shows a file's macros, not just that it has them: a
+**Macros** button in its bar opens the modules — flagged where they hide
+something — with each one's source as text. **Open as text** hands a
+module to the text reader (42f: VBA highlighted, its own facts), and
+**Save** puts it into the vault as a `.bas` or `.cls`, after asking.
+Nothing is run.
+
+| file | where the macros are |
+|---|---|
+| .docm .xlsm .pptm (and templates, add-ins) | `word/`, `xl/` or `ppt/vbaProject.bin` — an OLE file of its own |
+| .doc | the `Macros/` storage |
+| .xls | `_VBA_PROJECT_CUR/` |
+| .ppt | an ExOleObjStg record in the PowerPoint stream: zlib, then an OLE file (inflated up to its declared size) |
+| .odt .ods .odp | `Basic/<library>/<module>.xml` — StarBasic, as text |
+
+**Reading a VBA project** follows Microsoft's specification [MS-OVBA]:
+`VBA/dir` (compressed) lists the modules, their streams and the code page;
+each module's stream is its **compiled code** (p-code) followed by its
+**compressed source**; `PROJECT` is what the VBA editor reads. The
+decompressor reproduces the specification's own examples; the PROJECT
+values decrypt as Excel's own do.
+
+**Is the source what runs?** Office runs the compiled code when its
+version matches, and never looks at the source. So:
+
+- **VBA stomping** — a tool replaces the source with something harmless
+  and leaves the compiled code. In p-code a string literal is its length
+  and its text, so the reader lists the literals the compiled code holds:
+  any the source never says ("certutil -urlcache …" behind an empty Sub)
+  is named; a source that is gone beside real compiled code is named too;
+- **hidden modules** — in the project's directory but not in the list the
+  editor shows: their code runs all the same;
+- a **form's controls** keep text in its `o` stream, a usual hiding place
+  for a payload: listed, and read by the script triage;
+- a project **locked for viewing** (its DPB decrypts to a password hash)
+  is locked in the editor only: the source is read here.
+
+**The facts** (`facts/vba.ts`, replacing the bare "Contains macros"):
+
+- **When:** what runs by itself — on open (AutoOpen, Document_Open,
+  Workbook_Open, Auto_Open…), when a document is made from a template, on
+  close, or when an ActiveX control is drawn (InkPicture1_Painted,
+  Frame1_Layout…: an automatic start not called AutoOpen);
+- **What:** running programs (Shell, WScript.Shell, ShellExecute,
+  MacScript), downloading, writing and deleting files, COM objects,
+  Excel 4 macros, calls by name, rewriting VBA, the environment, the
+  registry, keystrokes, sandbox checks, payloads read from the document's
+  own properties, shapes, cells or forms, hiding what it does — each with
+  its module and line;
+- **Declares** of Windows functions, and the shellcode loader's set by
+  name (VirtualAlloc, RtlMoveMemory, CreateThread,
+  EnumSystemLanguageGroupsW, CallWindowProc…);
+- **How it hides:** characters built with Chr(), reversed strings, long
+  hex or base64 runs, strings cut and joined, very long lines;
+- the 42f triage over the source, the compiled code's unseen strings and
+  the forms' text: command lines, encoded PowerShell (decoded), addresses.
+
 ### Programs (`readers/hex.ts`, `preview/binary/`, `facts/binary.ts`) (42g)
 
 Any file can be shown as bytes, and a program is taken apart; nothing is
@@ -783,6 +843,12 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   assignments that look like passwords. A key in another shape is missed;
   a test key in the right shape is reported.
 - **Highlighting stops at 1 MB** and showing at 8 MB.
+- **Macros: the compiled code is not disassembled.** Stomping is found
+  by the literals the compiled code holds and the source does not; code
+  that builds its strings at run time (Chr(), arithmetic) and has a
+  plausible source can pass that check. olevba's pcodedmp-style
+  disassembly would go further; it is not here. Excel 4.0 macro sheets
+  are quoted (42b), not evaluated.
 - **Signatures are not verified.** The hex reader names what an
   Authenticode or Mach-O signature carries; checking it needs the
   certificate chain and its revocation status, which a sandbox with no
@@ -841,7 +907,12 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   and UTF-16 text decoded; (42g) mingw's .exe and .dll, gcc's ELF and
   clang's universal Mach-O read as pefile, readelf and llvm-otool read
   them; the hostile PE's every trick named; files cut short anywhere said,
-  never thrown; strings, Find, capabilities.
+  never thrown; strings, Find, capabilities; (42h) MS-OVBA's example
+  vectors decompressed, Excel's own PROJECT values decrypted, a project
+  built at test time read alike from .docm, .xlsm, .pptm, .doc, .xls and
+  .ppt, and OpenDocument Basic: auto-run, Shell, Declares, stomping (the
+  source wiped, or literals it never says), hidden modules, a lock, a
+  form's text; an honest macro warning of nothing more than its presence.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -856,6 +927,9 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
     their markup shown as text; an RTF and a web archive named .doc named
     as disguises;
   - the default Trusted Types policy attacked from inside;
+  - macros (42h): a .docm's project named fact by fact, the Macros pane's
+    flagged modules, a module opened in the text reader and back; the
+    same project in an .xlsm, a .doc and a .ppt; OpenDocument Basic;
   - programs (42g): the four real builds taken apart; the hostile PE's
     facts, its sections, Go to, Find in text and hex, a string followed
     into Hex; a program named .pdf; a file of no format inspected as hex;
@@ -903,6 +977,10 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   - `archives.py` (each format's own tool — zip, 7z, rar, gcab, xorriso,
     arj, zstd; LHA, the hostile ZIPs, ALZ and EGG written by hand, ALZ
     checked with unalz, EGG from ESTsoft's specification): the archives.
+  - `tests/lib/vba.mjs` builds VBA projects at test time (an [MS-OVBA]
+    compressor, the dir and PROJECT streams, DPB "encryption") and puts
+    them into copies of the Office fixtures; olevba reads what it writes
+    as it reads Office's own. No macro is kept as a file;
   - `programs.sh` (mingw-w64, gcc, clang with ld64.lld and llvm-lipo): the
     honest programs, each printing one line. The hostile PE is built when
     the tests run (`tests/lib/programs.mjs`): structurally valid, a RET

@@ -462,6 +462,41 @@ Accepted:
   bound what a bug could do.
 - **AZO and LEA are not supported.**
 
+### Text (commit 42f)
+
+The threat: scripts are how most intrusions start (a PowerShell
+one-liner, a VBScript in a ZIP, an HTA), configs are how they spread (a
+leaked .env), and the parsers for structured text have their own attacks:
+a Markdown file carries raw HTML; a JSON nested a million deep exhausts a
+parser's stack; an XML file with entities expands to gigabytes or, through
+an outside entity, reads a file it should not (XXE).
+
+The controls, on top of the frame:
+
+- **Plain text never meets a parser.** .txt and .log stay in the app's
+  page, escaped, as before.
+- **Markdown's HTML is cleaned like an email's:** an inert parse first,
+  outside and relative pictures swapped for placeholders, DOMPurify
+  (scripts, styles, forms, frames, media removed), a shadow root.
+  highlight.js's output (escaped text in `<span class>`) goes through the
+  frame's default Trusted Types policy, which runs DOMPurify on it.
+- **Limits before parsing:** JSON nesting is counted first and refused
+  past 512 levels; XML that declares entities or names an outside DTD is
+  never parsed; text past 8 MB is not parsed; highlighting stops at 1 MB.
+- **Secrets stay masked** in the facts: the facts are shown outside the
+  frame and can be copied, so they never repeat a key in full.
+- **Test inputs that would be flagged are not committed:** the dropper,
+  the reverse shell and the keys are assembled from pieces when the tests
+  run (`tests/lib/hostile-text.mjs`). Every address is a documentation
+  range, and every key is fake.
+
+Accepted:
+
+- **The triage is pattern matching** and can be evaded; it says so
+  (PREVIEWS.md › Limits). It adds evidence and never clears a file.
+- **A file named as text but holding a program** is shown as characters
+  in the text reader until 42g's hex reader takes such files.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

@@ -98,6 +98,13 @@ portions are marked, their original notices are retained in place.
    WinZip AES are decrypted with @noble/ciphers and @noble/hashes (Paul
    Miller, MIT).
 
+   The text reader (commit 42f) bundles marked (Christopher Jeffrey and
+   the marked contributors, MIT) for Markdown and highlight.js (Ivan
+   Sagalaev and contributors, BSD-3-Clause) for highlighting: their
+   licences travel with the reader bundle's legal comments. Its trees,
+   limits, secret patterns and script triage (web/src/preview/text/) are
+   our own.
+
    Our ZIP, ALZ and EGG readers (web/src/preview/archive/) are our own
    code:
    - ALZ has no published specification. Its reader follows the layout

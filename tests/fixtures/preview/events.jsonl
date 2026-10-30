@@ -1,0 +1,4 @@
+{"at":"2026-10-01T09:00:00Z","event":"login","user":"rin"}
+{"at":"2026-10-01T09:05:00Z","event":"upload","user":"rin"}
+this line is not JSON
+{"at":"2026-10-01T09:07:00Z","event":"logout","user":"rin"}

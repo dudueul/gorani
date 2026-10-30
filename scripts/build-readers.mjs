@@ -63,6 +63,8 @@ const READERS = {
 	hwp: { files: [["@rhwp/core/rhwp_bg.wasm", "rhwp_bg.wasm"], ["@rhwp/core/LICENSE", "LICENSE"]] },
 	legacy: {},
 	email: {},
+	// marked and highlight.js, bundled in (MIT, BSD-3: NOTICE).
+	text: {},
 	archive: {
 		worker: "./readers/archive.worker.ts",
 		files: [["7z-wasm/7zz.umd.js", "7zz.js"], ["7z-wasm/7zz.wasm", "7zz.wasm"], ["7z-wasm/License.txt", "License.txt"], ["7z-wasm/unRarLicense.txt", "unRarLicense.txt"]],

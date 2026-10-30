@@ -18,7 +18,17 @@ import type { ReaderId } from "./sandbox.ts";
 // parser a crafted picture attacks too.)
 export type ViewerMode = "video" | "audio" | "text" | "document" | "unsupported" | "too-large" | "refused";
 
-/** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email; 42d pictures). */
+/** The text reader's extensions (42f; its languages: preview/text/structured.ts › LANGUAGES). */
+const TEXT_EXTS = [
+	"md", "markdown", "mdx", "json", "jsonl", "ndjson", "geojson", "har", "ipynb", "webmanifest",
+	"xml", "xsd", "xsl", "xslt", "plist", "rss", "atom", "csproj", "vbproj", "vcxproj", "resx", "config", "manifest", "wsf", "sct", "html", "htm", "xhtml", "hta",
+	"js", "mjs", "cjs", "jsx", "jse", "ts", "tsx", "mts", "cts", "py", "pyw", "sh", "bash", "zsh", "ksh", "command",
+	"ps1", "psm1", "psd1", "bat", "cmd", "vbs", "vbe", "vba", "bas", "css", "scss", "less", "yaml", "yml", "toml", "ini", "cfg", "conf", "inf", "reg", "properties", "env",
+	"sql", "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "cs", "java", "kt", "kts", "swift", "go", "rs", "php", "phtml", "rb", "pl", "pm", "lua", "r", "scala", "groovy", "gradle", "dart", "m", "mm",
+	"dockerfile", "makefile", "mk", "diff", "patch", "yar", "yara", "ahk", "au3", "nim", "asm", "s",
+];
+
+/** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email; 42d pictures; 42e archives; 42f text). */
 const BY_EXT: Record<string, ReaderId> = {
 	pdf: "pdf",
 	docx: "docx", docm: "docx", dotx: "docx", dotm: "docx",
@@ -38,6 +48,10 @@ const BY_EXT: Record<string, ReaderId> = {
 	cab: "archive", iso: "archive", udf: "archive", wim: "archive", swm: "archive", esd: "archive", dmg: "archive", vhd: "archive", vhdx: "archive", vmdk: "archive", vdi: "archive", qcow2: "archive",
 	arj: "archive", lzh: "archive", lha: "archive", cpio: "archive", rpm: "archive", deb: "archive", xar: "archive", pkg: "archive", chm: "archive", squashfs: "archive", sfs: "archive", cramfs: "archive", msi: "archive",
 	alz: "archive", egg: "archive",
+	// Text that needs a parser to be shown well (42f): Markdown, JSON, XML,
+	// web pages, code. Plain .txt and .log are not here: they stay in the
+	// app's page, escaped (a parser for them is attack surface for nothing).
+	...Object.fromEntries(TEXT_EXTS.map((e) => [e, "text" as const])),
 };
 
 /** …and the types, for a file whose name says nothing. */
@@ -85,6 +99,23 @@ const BY_MIME: Record<string, ReaderId> = {
 	"application/x-apple-diskimage": "archive",
 	"application/java-archive": "archive",
 	"application/vnd.android.package-archive": "archive",
+	"text/markdown": "text",
+	"application/json": "text",
+	"application/ld+json": "text",
+	"application/x-ndjson": "text",
+	"application/xml": "text",
+	"text/xml": "text",
+	"text/html": "text",
+	"application/xhtml+xml": "text",
+	"application/javascript": "text",
+	"text/javascript": "text",
+	"application/x-sh": "text",
+	"text/x-shellscript": "text",
+	"text/x-python": "text",
+	"application/x-powershell": "text",
+	"text/yaml": "text",
+	"application/yaml": "text",
+	"text/css": "text",
 };
 
 /** Which sandboxed reader shows a file, if one does: by its name first
@@ -112,7 +143,7 @@ export function sniffReader(head: Uint8Array, guess: ReaderId, name: string): Re
 	if (ascii.startsWith("{\\rtf")) return "legacy";
 	const zip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
 	const ole = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
-	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image" || guess === "archive") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)
+	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image" || guess === "archive" || guess === "text") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)
 	if (zip && guess === "legacy") {
 		// A ".doc" or ".ppt" that is really the 2007+ format, renamed.
 		if (/^(doc|dot)$/.test(ext)) return "docx";

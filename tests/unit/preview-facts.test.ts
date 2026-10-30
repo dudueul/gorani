@@ -402,7 +402,7 @@ assert.equal(z.items.find((i) => i.path === "passwd")?.link, "", "a Unix symboli
 assert.equal(text(await extractZip(fixture("lure.zip"), z.items.find((i) => i.path === "passwd")!, null, LIM, noFallback)), "/etc/passwd", "its body is its target");
 z = listZip(fixture("infected.zip"))!;
 assert.equal(z.encryption, "ZipCrypto");
-assert.equal(text(await extractZip(fixture("infected.zip"), z.items[0]!, "infected", LIM, noFallback)), "MZ gorani fixture: not a program\n");
+assert.equal(text(await extractZip(fixture("infected.zip"), z.items[0]!, "infected", LIM, noFallback)), "MZ gorani fixture: not a program (a sample, swapped zipped)\n");
 assert.equal(await refused(() => extractZip(fixture("infected.zip"), z.items[0]!, "wrong", LIM, noFallback)), "password");
 assert.equal(await refused(() => extractZip(fixture("infected.zip"), z.items[0]!, null, LIM, noFallback)), "password");
 z = listZip(fixture("aes.zip"))!;

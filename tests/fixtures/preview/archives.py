@@ -226,7 +226,8 @@ keep("bomb.zip", raw_zip([{"name": b"zeros.bin", "data": zeros}]))
 keep("liar.zip", raw_zip([{"name": b"small.txt", "data": b"A" * (4 * 1024 * 1024), "claim": 1024}]))
 
 # Encrypted: ZipCrypto with "infected" (zip -P), and 7z AES-256 with its names hidden.
-(d / "sample.exe").write_bytes(program)
+# (Its own bytes: not the email fixtures' "program", so saving both is not a duplicate.)
+(d / "sample.exe").write_bytes(b"MZ gorani fixture: not a program (a sample, swapped zipped)\n")
 os.utime(d / "sample.exe", (WHEN, WHEN))
 run(["zip", "-q", "-X", "-P", "infected", "infected.zip", "sample.exe"], d)
 take("infected.zip", d / "infected.zip")

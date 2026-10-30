@@ -31,9 +31,9 @@ import { icon, type FileKind } from "./icons.ts";
 import { cssom, fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, deleteForever, emptyTrash, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
 import { fromRelativePaths } from "./dropped.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
-import { renderMime } from "../viewer/mode.ts";
-import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import "../viewer/viewer.ts";
+import "../viewer/picture.ts";
+import type { PictureFile } from "../viewer/picture.ts";
 import "./share-dialog.ts";
 import "./requests-dialog.ts";
 import { showDuplicates } from "./duplicates-dialog.ts";
@@ -163,7 +163,7 @@ export class GoraniWin11 extends LitElement {
 		this.dispatchEvent(new CustomEvent("open-viewer", { detail: { ...target(row), siblings } as ViewerTarget, bubbles: true, composed: true }));
 	}
 
-	@state() private previewFile: { id: string; name: string; url?: string; text?: string; kind: FileKind } | null = null;
+	@state() private previewFile: { id: string; name: string; picture?: PictureFile; text?: string; kind: FileKind } | null = null;
 	@state() private shareTarget: { id: string; name: string; size: number; version: number; modified: string | null } | null = null;
 	/** The upload-links dialog (commit 38): its tab, and the folder a new link files into. */
 	@state() private requests: { tab: "inbox" | "links"; folderId: string | null; folderName: string } | null = null;
@@ -182,13 +182,13 @@ export class GoraniWin11 extends LitElement {
 		const row = this.s().files.find((f) => f.id === id);
 		if (!row) return;
 		this.showPreview = true;
-		revokeBlobURL(this.previewFile?.url); // the previous preview's handle
 		this.previewFile = { id, name: row.name, kind: row.kind };
 		if (row.kind === "image" || row.kind === "text" || row.kind === "code") {
 			try {
 				const p = await this.model.preview(id);
 				if (p && this.previewFile?.id === id) {
-					if (row.kind === "image") this.previewFile.url = blobURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
+					// A picture is drawn in the preview frame (42d, viewer/picture.ts), not in this page.
+					if (row.kind === "image") this.previewFile.picture = { name: row.name, mime: p.mime, bytes: p.bytes };
 					else this.previewFile.text = new TextDecoder().decode(p.bytes.subarray(0, 8192));
 				}
 			} catch {
@@ -1027,7 +1027,7 @@ export class GoraniWin11 extends LitElement {
 				${p && sel && p.id === sel.id
 					? html`
 							<div class="flex h-40 items-center justify-center rounded-xl bg-neutral-950">
-								${p.url ? html`<img class="max-h-full max-w-full rounded" src=${p.url} alt=${p.name} />` : icon(p.kind as never, "h-16 w-16 text-neutral-600")}
+								${p.picture ? html`<gorani-picture class="block h-full w-full" data-test="preview-picture" .file=${p.picture} .fallback=${icon(p.kind as never, "h-16 w-16 text-neutral-600")}></gorani-picture>` : icon(p.kind as never, "h-16 w-16 text-neutral-600")}
 							</div>
 							<p class="mt-3 truncate font-medium text-neutral-100">${p.name}</p>
 							${p.text ? html`<pre class="mt-2 max-h-64 overflow-auto rounded-lg bg-neutral-950 p-2 text-xs text-neutral-300">${p.text}</pre>` : nothing}

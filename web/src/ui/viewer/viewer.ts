@@ -94,6 +94,8 @@ export class GoraniViewer extends LitElement {
 	private docBytes: Uint8Array | null = null;
 	private docMime: string | null = null;
 	@state() private facts: Fact[] = [];
+	/** A fact's words just copied (its button says so for a moment). */
+	@state() private copied: string | null = null;
 	/**
 	 * Files found inside the one opened — an email's attachments (42c) —
 	 * opened in turn: the last is on screen, Back returns to the one
@@ -195,10 +197,11 @@ export class GoraniViewer extends LitElement {
 	}
 
 	/**
-	 * An attachment, shown as its kind is: a format with a reader in a NEW
-	 * sandboxed frame; a raster picture or text as the viewer shows any;
-	 * anything else not at all (Save offers to keep it). Its bytes are the
-	 * attachment's own — as untrusted as the message they came in.
+	 * An attachment, shown as its kind is: a format with a reader — a
+	 * picture included (42d) — in a NEW sandboxed frame; text as the viewer
+	 * shows any; anything else not at all (Save offers to keep it). Its
+	 * bytes are the attachment's own — as untrusted as the message they
+	 * came in.
 	 */
 	private loadInner(): void {
 		const f = this.inner.at(-1)!;
@@ -208,14 +211,25 @@ export class GoraniViewer extends LitElement {
 		if (this.mode === "document") {
 			this.docBytes = f.bytes.slice();
 			this.docMime = f.mime;
-		} else if (this.mode === "image") {
-			this.url = blobURL(new Blob([f.bytes as BlobPart], { type: renderMime(kind, f.mime, f.name) }));
 		} else if (this.mode === "text") {
 			this.text = new TextDecoder().decode(f.bytes.subarray(0, TEXT_CAP));
 			this.truncated = f.bytes.length > TEXT_CAP;
 		}
 		this.busy = false;
 		void this.updateComplete.then(() => this.refocus());
+	}
+
+	/** A fact's words onto the clipboard — the app's, on the person's click
+	 * (the frame has no clipboard; sandbox.ts › cleanFact kept only words
+	 * the fact shows). */
+	private async copyFact(text: string): Promise<void> {
+		try {
+			await navigator.clipboard.writeText(text);
+			this.copied = text;
+			setTimeout(() => (this.copied === text ? (this.copied = null) : undefined), 1500);
+		} catch {
+			this.model.notify("The browser did not allow copying here.");
+		}
 	}
 
 	/** Save an attachment into the vault: the app judges it for itself
@@ -637,8 +651,6 @@ export class GoraniViewer extends LitElement {
 		if (this.busy) return html`<p class="text-sm text-neutral-400">Opening…</p>`;
 		if (this.error) return html`<p class="max-w-md text-center text-sm text-red-400">${this.error}</p>`;
 		switch (this.mode) {
-			case "image":
-				return this.url ? html`<img class="max-h-full max-w-full rounded-lg object-contain shadow-2xl" src=${this.url} alt=${this.target.name} />` : this.unknown();
 			case "video": {
 				const tracks = this.tracks.map((tr) => html`<track kind="subtitles" src=${tr.url} srclang=${tr.lang ?? nothing} label=${tr.label} />`);
 				const resume = this.resumeAt !== null
@@ -672,7 +684,7 @@ export class GoraniViewer extends LitElement {
 				return html`<div class="flex h-full w-full flex-col">
 					${this.facts.length
 						? html`<ul class="max-h-[30vh] shrink-0 space-y-0.5 overflow-y-auto border-b border-neutral-800 bg-neutral-900/95 px-3 py-1.5 text-xs" data-test="viewer-facts" aria-label="What this file holds">
-								${this.facts.map((f) => html`<li class=${f.level === "warn" ? "text-amber-300" : "text-neutral-400"}>${f.level === "warn" ? "⚠ " : ""}${f.text}</li>`)}
+								${this.facts.map((f) => html`<li class=${f.level === "warn" ? "text-amber-300" : "text-neutral-400"}>${f.level === "warn" ? "⚠ " : ""}${f.text}${f.copy ? html` <button class="ml-1 rounded border border-neutral-700 px-1.5 text-[11px] text-neutral-300 hover:border-accent" data-test="viewer-fact-copy" title="Copy ${f.copy}" @click=${() => void this.copyFact(f.copy!)}>${this.copied === f.copy ? "Copied" : "Copy"}</button>` : nothing}</li>`)}
 							</ul>`
 						: nothing}
 					<div class="min-h-0 flex-1" data-preview-host></div>

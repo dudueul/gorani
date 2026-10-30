@@ -36,7 +36,19 @@
  *     believed; a link that hovers true and clicks nowhere; attachments
  *     opened in previews of their own (a PDF, a Word file, a forwarded
  *     message) and back; one saved into the vault — asked for outside the
- *     frame, offered as a sample, never opened after.
+ *     frame, offered as a sample, never opened after;
+ *   - pictures (42d): every one drawn in the frame, none in the app's page —
+ *     JPEG, PNG, GIF, WebP, AVIF by the browser; TIFF pages by UTIF; HEIF
+ *     by libheif (its WebAssembly fetched by the app); a DNG's, CR3's and
+ *     RAF's own previews; an SVG as a picture, its source in a tab, its
+ *     script never run and its beacons never asked for; a phone photo
+ *     upright by its EXIF; GPS named and copied (by the app, from words it
+ *     shows); a redacted photo's thumbnail that still shows the name, a
+ *     cropped one's other shape; a polyglot's ZIP and web shell; an AI
+ *     model's mark; a decompression bomb named and not drawn; disguises;
+ *     zoom by wheel, keys and double click, a drag that pans; the details
+ *     pane's small picture in a compact frame of its own; on a phone, a
+ *     pinch that zooms and a swipe that pans instead of moving on.
  */
 
 import assert from "node:assert/strict";
@@ -73,7 +85,8 @@ try {
 	assert.match(appCsp, /frame-src 'self'/);
 
 	const browser = await chromium.launch({ headless: true });
-	const ctx = await browser.newContext({ acceptDownloads: true });
+	// (The clipboard: a photo's coordinates are copied by the app — 42d.)
+	const ctx = await browser.newContext({ acceptDownloads: true, permissions: ["clipboard-read", "clipboard-write"] });
 	// (Init scripts run in every frame; the sandboxed one has no storage.)
 	await ctx.addInitScript(() => self.origin !== "null" && localStorage.setItem("gorani-dev-email", "rin@preview.test"));
 	const page = await ctx.newPage();
@@ -221,6 +234,11 @@ try {
 	consoleCsp.length = 0;
 	const rtf = fixture("hostile.rtf");
 	await page.locator("gorani-win11 [data-upload]").first().setInputFiles([
+		...["photo.jpg", "portrait.jpg", "redacted.jpg", "cropped.jpg", "polyglot.jpg", "generated.png", "bomb.png", "animated.gif", "photo.webp", "photo.avif", "scan.tiff", "photo.heic", "camera.dng", "camera.cr3", "camera.raf", "drawing.svg", "hostile.svg", "entities.svg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
+		// Disguises: a JPEG named .png (a zero byte more, so the upload's
+		// duplicate check does not ask), and a web page named .png.
+		{ name: "holiday.png", mimeType: "image/png", buffer: Buffer.concat([fixture("photo.jpg"), Buffer.from([0])]) },
+		{ name: "invoice.png", mimeType: "image/png", buffer: Buffer.from("<!doctype html><html><body><script>alert('png')</script></body></html>") },
 		...["report.eml", "phish.eml", "report-to-soc.eml", "outlook.msg", "locked.pdf", "report.docx", "hostile.docx", "report.xlsx", "hostile.xlsx", "ledger.csv", "report.pptx", "hostile.pptx", "report.hwp", "report.hwpx", "locked.hwp", "hostile.hwp", "report.doc", "hostile.doc", "report.ppt", "report.rtf", "report.odt", "report.odp"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		// Disguises, as lures arrive: an RTF and a web archive named .doc.
 		// (The RTF gets a byte more, so the upload's duplicate check does not ask.)
@@ -472,6 +490,161 @@ try {
 	for (const want of [/SPF fail/, /goes to https:\/\/phish\.example\/login/, /Attachment invoice\.pdf\.exe/]) assert.match(tells, want);
 	await closeDoc();
 
+	// ── pictures (42d): every one in the frame ─────────────────────────
+	const shot = (dd) => dd.locator('[data-test="img-picture"]').first();
+	const dims = (dd) => shot(dd).evaluate((e) => ({ tag: e.tagName, w: e.naturalWidth ?? e.width, h: e.naturalHeight ?? e.height }));
+	const zoom = async (dd) => Number((await dd.locator('[data-test="img-zoom"]').innerText()).replace("%", ""));
+
+	d = await openDoc("photo.jpg", "image");
+	await shot(d).waitFor({ timeout: 30_000 });
+	assert.deepEqual(await dims(d), { tag: "IMG", w: 640, h: 480 }, "drawn by the browser — in the frame");
+	assert.equal(await page.locator("gorani-viewer main img").count(), 0, "and no picture in the app's own page");
+	tells = await factsSay(/Carries where it was taken/);
+	for (const want of [/JPEG picture · 640×480 · Gorani Test Camera 1 · taken 2026-01-02 03:04:05 \+09:00/, /37\.56630° N, 126\.97790° E · 38 m up · facing 128° · ±5 m/, /serial number “GRN-0042-7781”/]) assert.match(tells, want);
+	// The coordinates, copied — by the app, words the fact shows.
+	await page.locator('[data-test="viewer-fact-copy"]').click();
+	await page.locator('[data-test="viewer-fact-copy"]', { hasText: "Copied" }).waitFor();
+	assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "37.56630° N, 126.97790° E");
+	await d.locator('[data-test="img-thumb"]', { hasText: "matches the picture" }).waitFor({ timeout: 30_000 });
+	await d.locator('[data-test="img-meta-location"]', { hasText: "37.566300, 126.977900" }).waitFor();
+	// Zoom: the wheel around the pointer, a drag that pans, a double click back to the fit.
+	const stageBox = await page.locator('iframe[data-preview="image"]').boundingBox();
+	const atPicture = { x: stageBox.x + stageBox.width * 0.35, y: stageBox.y + stageBox.height * 0.55 };
+	const fitted = await zoom(d);
+	await page.mouse.move(atPicture.x, atPicture.y);
+	for (let i = 0; i < 4; i++) await page.mouse.wheel(0, -200);
+	await page.waitForTimeout(200);
+	assert.ok((await zoom(d)) > fitted * 1.5, `the wheel zooms in (${fitted}% → ${await zoom(d)}%)`);
+	const leftBefore = await shot(d).evaluate((e) => parseFloat(e.style.left));
+	await page.mouse.down();
+	await page.mouse.move(atPicture.x - 120, atPicture.y, { steps: 6 });
+	await page.mouse.up();
+	assert.ok((await shot(d).evaluate((e) => parseFloat(e.style.left))) < leftBefore - 60, "a drag pans the zoomed picture");
+	await d.locator('[data-test="img-stage"]').dblclick({ position: { x: 50, y: 50 } });
+	assert.equal(await zoom(d), fitted, "a double click fits it again");
+	await d.locator('[data-test="img-stage"]').click({ position: { x: 50, y: 50 } });
+	await page.keyboard.press("+");
+	assert.equal(await zoom(d), Math.round(fitted * 1.25), "+ zooms in");
+	await page.keyboard.press("0");
+	assert.equal(await zoom(d), fitted, "0 fits");
+	await closeDoc();
+
+	// A phone photo stored on its side: upright, and its thumbnail (on its side too) still matches.
+	d = await openDoc("portrait.jpg", "image");
+	await shot(d).waitFor({ timeout: 30_000 });
+	assert.deepEqual(await dims(d), { tag: "IMG", w: 480, h: 640 }, "turned by its Orientation");
+	await d.locator('[data-test="img-thumb"]', { hasText: "matches the picture" }).waitFor({ timeout: 30_000 });
+	assert.doesNotMatch(await factsSay(/taken/), /thumbnail/);
+	await closeDoc();
+
+	// Redacted after the thumbnail was made: the thumbnail still shows the name.
+	d = await openDoc("redacted.jpg", "image");
+	tells = await factsSay(/thumbnail shows a different picture/);
+	assert.match(tells, /Edited with “Adobe Photoshop 25\.0 \(Windows\)”/);
+	await d.locator('[data-test="img-thumb"]', { hasText: "a different picture" }).waitFor();
+	await closeDoc();
+	d = await openDoc("cropped.jpg", "image");
+	await factsSay(/another shape .* the picture was cropped/);
+	await closeDoc();
+
+	d = await openDoc("polyglot.jpg", "image");
+	tells = await factsSay(/after the end of the picture: a ZIP archive/);
+	assert.match(tells, /Its comment holds code: “<\?php system/);
+	await closeDoc();
+	d = await openDoc("generated.png", "image");
+	tells = await factsSay(/made by an AI model/);
+	assert.match(tells, /image generator's settings \(parameters\)/);
+	await closeDoc();
+
+	// A decompression bomb: its claim read, nothing decoded.
+	d = await openDoc("bomb.png", "image");
+	await factsSay(/Declares 60000×60000 pixels \(3\.6 gigapixels\) — not drawn/);
+	await d.locator('[data-test="img-refused"]').waitFor();
+	assert.equal(await d.locator('[data-test="img-picture"]').count(), 0, "no picture made of it");
+	await closeDoc();
+
+	for (const [name, w, h, re] of [["animated.gif", 160, 120, /Animated: 3 frames/], ["photo.webp", 320, 240, /WebP picture · 320×240/], ["photo.avif", 320, 240, /AVIF picture · 320×240/]]) {
+		d = await openDoc(name, "image");
+		await shot(d).waitFor({ timeout: 30_000 });
+		assert.deepEqual(await dims(d), { tag: "IMG", w, h }, name);
+		await factsSay(re);
+		await closeDoc();
+	}
+
+	// TIFF: each page decoded (UTIF, in the worker), turned through with ‹ ›.
+	d = await openDoc("scan.tiff", "image");
+	await d.locator('[data-test="img-page"]', { hasText: "1 / 2" }).waitFor({ timeout: 30_000 });
+	assert.deepEqual(await dims(d), { tag: "CANVAS", w: 400, h: 300 });
+	await d.locator('[data-test="img-next-page"]').click();
+	await d.locator('[data-test="img-page"]', { hasText: "2 / 2" }).waitFor();
+	tells = await factsSay(/TIFF picture · 400×300 · 2 pages/);
+	assert.match(tells, /artist “Rin Kim”/);
+	await closeDoc();
+
+	// HEIF: libheif's WebAssembly, asked of the app by the frame, decoding in the worker.
+	d = await openDoc("photo.heic", "image");
+	await shot(d).waitFor({ timeout: 60_000 });
+	assert.deepEqual(await dims(d), { tag: "CANVAS", w: 640, h: 480 });
+	tells = await factsSay(/HEIF picture \(HEIC\) · 640×480 · Gorani Test Phone 15/);
+	assert.match(tells, /Carries where it was taken: 37\.56630° N/);
+	await closeDoc();
+
+	// RAW: the camera's own previews.
+	for (const [name, w, h] of [["camera.dng", 1024, 768], ["camera.cr3", 800, 534], ["camera.raf", 640, 426]]) {
+		d = await openDoc(name, "image");
+		await shot(d).waitFor({ timeout: 30_000 });
+		assert.deepEqual(await dims(d), { tag: "IMG", w, h }, name);
+		await factsSay(new RegExp(`camera's own ${w}×${h} preview`));
+		await closeDoc();
+	}
+
+	// SVG: a picture (nothing in it runs or loads), its source as text.
+	d = await openDoc("drawing.svg", "image");
+	await shot(d).waitFor({ timeout: 30_000 });
+	assert.equal((await dims(d)).w, 400);
+	await d.locator('[data-test="img-tab-source"]').click();
+	await d.locator('[data-test="img-source"]', { hasText: "<text x=\"40\" y=\"220\"" }).waitFor();
+	await d.locator('[data-test="find"]').fill("Gorani SVG");
+	await d.locator('[data-test="find"]').press("Enter");
+	await d.locator('[data-test="found"]', { hasText: "1 of 1" }).waitFor();
+	await closeDoc();
+	d = await openDoc("hostile.svg", "image");
+	await shot(d).waitFor({ timeout: 30_000 });
+	tells = await factsSay(/Contains script/);
+	for (const want of [/1 <script>, 1 event handler\) — not run/, /HTML \(1 foreignObject\) with a form asking for a password/, /Would load 3 things from outside \(not loaded\)/, /1 javascript: link — inert/, /Links to 1 address \(not followed\): https:\/\/phish\.example\/login/]) assert.match(tells, want);
+	await d.locator('[data-test="img-tab-source"]').click();
+	await d.locator('[data-test="img-source"]', { hasText: "<script>alert('svg script')" }).waitFor();
+	await page.waitForTimeout(500);
+	assert.deepEqual(dialogs, [], "the SVG's script never ran");
+	assert.ok(!offSite.some((u) => /svg-beacon|svg\.css|sprite\.svg|svg-ran/.test(u)) && !blockedByCsp.some((u) => /svg-beacon|svg\.css|sprite\.svg/.test(u)), "an SVG drawn as a picture asks for nothing at all");
+	await closeDoc();
+	d = await openDoc("entities.svg", "image");
+	await factsSay(/Declares XML entities/);
+	await d.locator('[data-test="img-refused"]').waitFor();
+	await d.locator('[data-test="img-source"]', { hasText: "<!ENTITY c" }).waitFor({ state: "attached" });
+	await closeDoc();
+
+	// Disguises.
+	d = await openDoc("holiday.png", "image");
+	await shot(d).waitFor({ timeout: 30_000 });
+	await factsSay(/Named \.png, but it is a JPEG picture/);
+	await closeDoc();
+	d = await openDoc("invoice.png", "image");
+	await factsSay(/Named \.png, but it is a web page — not drawn/);
+	await d.locator('[data-test="img-refused"]', { hasText: "This is not a picture." }).waitFor();
+	await closeDoc();
+	assert.deepEqual(dialogs, [], "no script in any picture ran");
+
+	// The details pane: a small picture, in a compact frame of its own.
+	await exact("photo.jpg").click();
+	await page.keyboard.press(" ");
+	const small = page.locator('[data-test="preview-picture"] iframe[data-preview="image"]');
+	await small.waitFor({ timeout: 30_000 });
+	assert.equal(await small.getAttribute("sandbox"), "allow-scripts");
+	assert.equal(await small.evaluate((e) => getComputedStyle(e).pointerEvents), "none", "looked at, not used: clicks stay with the explorer");
+	await page.frameLocator('[data-test="preview-picture"] iframe[data-preview="image"]').locator('[data-test="img-picture"]').waitFor({ timeout: 30_000 });
+	assert.equal(await page.locator('[data-test="preview-picture"] img').count(), 0, "no picture in the app's page");
+
 	await page.waitForTimeout(500);
 	assert.deepEqual(consoleCsp, [], "every reader ran under the frame's policy with nothing blocked (nothing tried)");
 	assert.deepEqual(dialogs, [], "no script in any file ran");
@@ -521,10 +694,45 @@ try {
 			return { page: page.width, room: innerWidth };
 		});
 		assert.ok(wide.page <= wide.room, `zoomed to the frame's width (${Math.round(wide.page)} in ${wide.room})`);
+		await p.keyboard.press("Escape");
+		// A picture: two fingers pinch it bigger; one finger then pans it
+		// (the next file does not open); a double tap fits it; then a swipe moves on.
+		await phoneRow("photo.jpg").locator("button").first().tap();
+		const pic = p.frameLocator('iframe[data-preview="image"]');
+		await pic.locator('[data-test="img-picture"]').waitFor({ timeout: 30_000 });
+		const pbox = await p.locator('iframe[data-preview="image"]').boundingBox();
+		const pzoom = async () => Number((await pic.locator('[data-test="img-zoom"]').innerText()).replace("%", ""));
+		const before = await pzoom();
+		const [pAt, pOf] = (await p.locator('[data-test="viewer-position"]').innerText()).split("/").map((x) => Number(x.trim()));
+		const cx = pbox.x + pbox.width / 2;
+		const cy = pbox.y + pbox.height / 2;
+		await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: cx - 20, y: cy, id: 1 }, { x: cx + 20, y: cy, id: 2 }] });
+		for (let i = 1; i <= 8; i++) await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: cx - 20 - 12 * i, y: cy, id: 1 }, { x: cx + 20 + 12 * i, y: cy, id: 2 }] });
+		await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+		await p.waitForTimeout(200);
+		assert.ok((await pzoom()) > before * 1.8, `a pinch zooms in (${before}% → ${await pzoom()}%)`);
+		await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: pbox.x + pbox.width * 0.8, y: cy }] });
+		for (let i = 1; i <= 8; i++) await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: pbox.x + pbox.width * (0.8 - 0.07 * i), y: cy }] });
+		await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+		await p.waitForTimeout(500);
+		assert.equal((await p.locator('[data-test="viewer-position"]').innerText()).split("/").map((x) => Number(x.trim()))[0], pAt, "zoomed in, a swipe pans the picture: the next file did not open");
+		for (let tap = 0; tap < 2; tap++) {
+			await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: cx, y: cy }] });
+			await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+			await p.waitForTimeout(80);
+		}
+		await p.waitForTimeout(200);
+		assert.equal(await pzoom(), before, "a double tap fits it again");
+		await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: pbox.x + pbox.width * 0.8, y: cy }] });
+		for (let i = 1; i <= 8; i++) await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: pbox.x + pbox.width * (0.8 - 0.07 * i), y: cy + i }] });
+		await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+		await p.locator('[data-test="viewer-position"]', { hasText: `${pAt + 1} / ${pOf}` }).waitFor({ timeout: 30_000 });
+		const sheet = await p.evaluate(() => ({ scroll: document.documentElement.scrollWidth, width: innerWidth }));
+		assert.ok(sheet.scroll <= sheet.width, "the picture viewer fits the phone");
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

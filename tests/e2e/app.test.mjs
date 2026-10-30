@@ -892,6 +892,9 @@ try {
 			await card.waitFor({ timeout: 30_000 });
 			assert.equal((await card.locator('[data-test="movie-length"]').innerText()).trim(), "0:06", "the length, from the sealed sidecar");
 			await card.locator('[data-test="movie-poster"]').waitFor({ timeout: 30_000 }); // made at upload, from the local file
+			// …and drawn in a compact preview frame (42d), not as a picture in this page.
+			await page.frameLocator('[data-test="movie-card"]:has-text("family-video") [data-test="movie-poster"] iframe[data-preview="image"]').locator('[data-test="img-picture"]').waitFor({ timeout: 30_000 });
+			assert.equal(await card.locator("img").count(), 0, "no poster decoded in the app's page");
 			assert.ok((await page.locator('[data-test="movie-collection"]').count()) >= 1, "collections by folder");
 			await card.click();
 			await page.locator("gorani-viewer video[data-engine=mse]").waitFor({ state: "attached", timeout: 30_000 });
@@ -1003,34 +1006,23 @@ try {
 		}
 
 		// ── Lock means locked (docs/SECURITY-REVIEW.md › O2) ───────────
-		// An image opened in the viewer is a blob: URL over DECRYPTED bytes.
-		// After Lock, that handle must stop resolving, the explorer must be
-		// gone (not hidden), and no device hold may remain.
+		// A picture opened in the viewer is DECRYPTED bytes — since 42d held
+		// only in the sandboxed preview frame (drawn there, never in this
+		// page). After Lock, that frame must be gone with them, the explorer
+		// must be gone (not hidden), and no device hold may remain.
 		const PNG_1x1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 		await page.locator("gorani-win11 [data-upload]").first().setInputFiles({ name: "pixel.png", mimeType: "image/png", buffer: PNG_1x1 });
 		await page.locator('[data-body] [data-item^="file:"]', { hasText: "pixel.png" }).first().waitFor({ timeout: 60_000 });
 		await page.locator('[data-body] [data-item^="file:"]', { hasText: "pixel.png" }).first().dblclick();
-		const img = page.locator("gorani-viewer img").first();
-		await img.waitFor({ timeout: 30_000 });
-		const src = (await img.getAttribute("src")) ?? "";
-		assert.match(src, /^blob:/, "the decrypted image is a blob: URL");
-		// Probe with an <img> load (img-src allows blob:). Not fetch(): the CSP's
-		// connect-src is 'self' only, so page scripts cannot read a blob: URL
-		// back at all — a welcome side effect of the policy.
-		const loads = (u) => page.evaluate((url) => new Promise((ok) => {
-			const probe = new Image();
-			probe.onload = () => ok(true);
-			probe.onerror = () => ok(false);
-			probe.src = url;
-		}), u);
-		assert.equal(await loads(src), true, "…which resolves while unlocked");
-		// Lock WITH the image still open — the case that matters (an idle or
+		await page.frameLocator('gorani-viewer iframe[data-preview="image"]').locator('[data-test="img-picture"]').waitFor({ timeout: 30_000 });
+		assert.equal(await page.locator("gorani-viewer main img").count(), 0, "the decrypted picture is drawn in the frame, not in the app's page");
+		// Lock WITH the picture still open — the case that matters (an idle or
 		// hidden-tab lock arrives while plaintext is on screen; the overlay
 		// covers the header, so the click is dispatched to the button).
 		await page.getByRole("button", { name: "Lock" }).dispatchEvent("click");
 		await page.getByPlaceholder(/Recovery code/).waitFor({ timeout: 30_000 });
 		assert.equal(await page.locator("gorani-shell").count(), 0, "the explorer is unmounted, not hidden");
-		assert.equal(await loads(src), false, "the decrypted image's blob: URL no longer resolves");
+		assert.equal(await page.locator("iframe[data-preview]").count(), 0, "the frame holding the decrypted picture is gone with it");
 		assert.equal(await page.evaluate(() => Object.keys(sessionStorage).filter((k) => k.startsWith("gorani-hold:")).length), 0, "no device hold left in the tab");
 		await assertNoViolations(page, "lock");
 		await ctx.close();

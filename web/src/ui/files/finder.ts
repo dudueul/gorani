@@ -31,9 +31,9 @@ import { icon, type FileKind } from "./icons.ts";
 import { fmtSize, fmtDate, typingInField, showMenu, startRename, promptName, setDragIds, dragIds, kindLabel, modKey, markSample, custodyAction, deleteForever, emptyTrash, moveTargets, takeDrop, isOwnDrag, carriesFiles, uploadStatus, type MenuItem } from "./shared.ts";
 import { fromRelativePaths } from "./dropped.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
-import { renderMime } from "../viewer/mode.ts";
-import { blobURL, revokeBlobURL } from "../../lib/blob-urls.ts";
 import "../viewer/viewer.ts";
+import "../viewer/picture.ts";
+import type { PictureFile } from "../viewer/picture.ts";
 import "./share-dialog.ts";
 import "./requests-dialog.ts";
 import { showDuplicates } from "./duplicates-dialog.ts";
@@ -57,7 +57,7 @@ export class GoraniFinder extends LitElement {
 	@state() private recentRows: { id: string; kind: "file" | "folder"; folderId: string | null; name: string; updatedAt: number; size?: number }[] = [];
 	private typeBuffer = "";
 	private typeTimer: ReturnType<typeof setTimeout> | undefined;
-	@state() private quickLook: { id: string; name: string; url?: string; text?: string; kind: FileKind; meta?: { size: number; version: number; updatedAt: string } } | null = null;
+	@state() private quickLook: { id: string; name: string; picture?: PictureFile; text?: string; kind: FileKind; meta?: { size: number; version: number; updatedAt: string } } | null = null;
 	@state() private info: Awaited<ReturnType<FilesModel["info"]>> = null;
 	@state() private shareTarget: { id: string; name: string; size: number; version: number; modified: string | null } | null = null;
 	/** The upload-links dialog (commit 38): its tab, and the folder a new link files into. */
@@ -169,12 +169,12 @@ export class GoraniFinder extends LitElement {
 	private async quickLookOn(id: string): Promise<void> {
 		const row = this.s().files.find((f) => f.id === id) ?? this.s().trashFiles.find((f) => f.id === id);
 		if (!row) return;
-		revokeBlobURL(this.quickLook?.url); // the previous preview's handle
 		this.quickLook = { id, name: row.name, kind: row.kind };
 		try {
 			const p = await this.model.preview(id, 512 * 1024);
 			if (p && this.quickLook?.id === id) {
-				if (row.kind === "image") this.quickLook.url = blobURL(new Blob([p.bytes as BlobPart], { type: renderMime("image", p.mime, row.name) }));
+				// A picture is drawn in the preview frame (42d, viewer/picture.ts), not in this page.
+				if (row.kind === "image") this.quickLook.picture = { name: row.name, mime: p.mime, bytes: p.bytes };
 				else if (row.kind === "text" || row.kind === "code" || row.kind === "pdf") this.quickLook.text = new TextDecoder().decode(p.bytes.subarray(0, 16384));
 				this.quickLook.meta = { size: row.size, version: row.version, updatedAt: shownModified(row) };
 			}
@@ -930,7 +930,7 @@ export class GoraniFinder extends LitElement {
 		const p = this.quickLook?.id === id ? this.quickLook : null;
 		return html`
 			<div class="w-64 shrink-0 overflow-y-auto bg-neutral-950/40 p-4 text-center text-sm">
-				${p?.url ? html`<img class="mx-auto max-h-48 rounded-lg" src=${p.url} alt="" />` : icon(row?.kind ?? "file", "h-20 w-20 text-neutral-600 mx-auto")}
+				${p?.picture ? html`<gorani-picture class="mx-auto block h-48 w-full" .file=${p.picture} .fallback=${icon(row?.kind ?? "file", "h-20 w-20 text-neutral-600 mx-auto")}></gorani-picture>` : icon(row?.kind ?? "file", "h-20 w-20 text-neutral-600 mx-auto")}
 				<p class="mt-3 truncate font-medium">${row?.name ?? ""}</p>
 				${row ? html`<p class="mt-1 text-xs text-neutral-400">${kindLabel(row.kind)} · ${fmtSize(row.size)}</p>` : nothing}
 				<button class="mt-3 rounded-lg bg-neutral-800 px-3 py-1.5 text-xs hover:bg-neutral-700" @click=${() => void this.quickLookOn(id)}>Quick Look (space)</button>
@@ -997,7 +997,7 @@ export class GoraniFinder extends LitElement {
 			<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-8" @click=${() => (this.quickLook = null)}>
 				<div class="max-h-full w-full max-w-2xl overflow-auto rounded-2xl border border-neutral-700 bg-neutral-900 p-6 shadow-2xl" @click=${(e: Event) => e.stopPropagation()}>
 					<div class="flex min-h-64 items-center justify-center rounded-xl bg-black/40">
-						${q.url ? html`<img class="max-h-96 rounded" src=${q.url} alt=${q.name} />` : icon(q.kind, "h-24 w-24 text-neutral-700")}
+						${q.picture ? html`<gorani-picture class="block h-96 w-full" data-test="quicklook-picture" .file=${q.picture} .fallback=${icon(q.kind, "h-24 w-24 text-neutral-700")}></gorani-picture>` : icon(q.kind, "h-24 w-24 text-neutral-700")}
 					</div>
 					<div class="mt-4 flex items-center justify-between">
 						<div>

@@ -34,6 +34,7 @@ const TABLE: [string, Family, (b: Uint8Array) => boolean][] = [
 	["an Android DEX (Dalvik code)", "program", (b) => at(b, 0, "dex\n")],
 	["WebAssembly", "program", (b) => at(b, 0, [0, 0x61, 0x73, 0x6d])],
 	["a Windows shortcut (.lnk)", "program", (b) => at(b, 0, [0x4c, 0, 0, 0, 0x01, 0x14, 0x02, 0])],
+	["a Windows Prefetch file", "data", (b) => at(b, 0, "MAM\x04") || at(b, 4, "SCCA")],
 	["a ZIP", "archive", (b) => at(b, 0, [0x50, 0x4b, 3, 4]) || at(b, 0, [0x50, 0x4b, 5, 6])],
 	["a RAR", "archive", (b) => at(b, 0, "Rar!\x1a\x07")],
 	["a 7z archive", "archive", (b) => at(b, 0, [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])],

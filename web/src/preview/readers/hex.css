@@ -264,3 +264,21 @@ table.grid tr.link:hover td {
 .phone .row .off {
 	display: none;
 }
+
+.args {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	background: #141414;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 8px 10px;
+	max-width: 70rem;
+}
+
+.flist {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	padding: 4px 0 6px 18px;
+	color: #d4d4d4;
+}

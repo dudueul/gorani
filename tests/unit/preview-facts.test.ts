@@ -39,6 +39,12 @@ import { analyse } from "../../web/src/preview/readers/sheet.worker.ts";
 import { Zip } from "../../web/src/preview/zip.ts";
 import { authResults, mailFacts, orgDomain, partRisk, receivedChain } from "../../web/src/preview/facts/mail.ts";
 import { parseMail } from "../../web/src/preview/mail/parse.ts";
+import { classifyTrailing, sniffImage, structureOf } from "../../web/src/preview/image/structure.ts";
+import { rawPreviews, cr3Metadata } from "../../web/src/preview/image/raw.ts";
+import { readMeta, readThumbnail } from "../../web/src/preview/image/meta.ts";
+import { gpsOf, orientationOf } from "../../web/src/preview/image/tags.ts";
+import { readTiff } from "../../web/src/preview/image/tiff.ts";
+import { imageFacts, metaGroups, type ImageFindings } from "../../web/src/preview/facts/image.ts";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
 const said = (facts: { text: string }[]) => facts.map((f) => f.text).join("\n");
@@ -244,4 +250,110 @@ assert.equal(partRisk("statement.docx", fixture("report.docx")), null);
 assert.equal(orgDomain("mail.gorani.co.kr"), "gorani.co.kr");
 assert.equal(orgDomain("paypal.com.secure-login.example"), "secure-login.example");
 
-console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes");
+// ── 8. Pictures (42d) ────────────────────────────────────────────────
+// What the bytes are and how they are built, read without decoding; the
+// metadata, read by exifr; and what the facts make of both. (What only a
+// browser can measure — a thumbnail's likeness, an SVG's parsed elements —
+// goes in as the reader would hand it; e2e:preview measures them.)
+
+const pictureFacts = async (name: string, over: Partial<ImageFindings> = {}, as = name) => {
+	const bytes = fixture(name);
+	const sniff = sniffImage(bytes, as);
+	const structure = structureOf(bytes, sniff.format);
+	const previews = /^(dng|cr3|raf)$/.test(sniff.format ?? "") ? rawPreviews(bytes, sniff.format) : [];
+	const f: ImageFindings = { name: as, sniff, structure, meta: await readMeta(bytes), previews, pages: 0, shown: null, refused: null, thumb: null, svg: null, ...over };
+	return { f, facts: imageFacts(f), text: said(imageFacts(f)) };
+};
+
+// Formats, by their first bytes (the name only breaks ties).
+for (const [name, format] of [["photo.jpg", "jpeg"], ["generated.png", "png"], ["animated.gif", "gif"], ["photo.webp", "webp"], ["photo.avif", "avif"], ["photo.heic", "heic"], ["scan.tiff", "tiff"], ["camera.dng", "dng"], ["camera.cr3", "cr3"], ["camera.raf", "raf"], ["drawing.svg", "svg"], ["entities.svg", "svg"]] as const) {
+	assert.equal(sniffImage(fixture(name), name).format, format, name);
+}
+assert.equal(sniffImage(fixture("photo.jpg"), "holiday.png").format, "jpeg", "the bytes, not the name");
+assert.equal(sniffImage(fixture("report.pdf"), "scan.jpg").other, "a PDF");
+assert.equal(sniffImage(new TextEncoder().encode("<!doctype html><script>x</script>"), "cat.png").other, "a web page");
+assert.equal(sniffImage(fixture("photo.heic")).native, false, "HEIF is decoded by libheif, not the browser");
+assert.equal(sniffImage(fixture("photo.avif")).native, true, "AVIF the browser draws");
+
+// Sizes declared, frames, pages, orientation, ends — read, not decoded.
+let st = structureOf(fixture("bomb.png"), "png");
+assert.deepEqual([st.width, st.height], [60000, 60000], "a bomb's claim, read from 69 bytes");
+assert.equal(structureOf(fixture("animated.gif"), "gif").frames, 3);
+assert.equal(structureOf(fixture("scan.tiff"), "tiff").frames, 2, "a scan's two pages");
+assert.equal(structureOf(fixture("portrait.jpg"), "jpeg").orientation, 6);
+st = structureOf(fixture("photo.jpg"), "jpeg");
+assert.deepEqual([st.width, st.height, st.end, st.trailing], [640, 480, fixture("photo.jpg").length, null], "a JPEG with EXIF (and a JPEG inside it): its end is its end");
+assert.equal(structureOf(fixture("photo.heic"), "heic").width, 640, "HEIF's declared size (ispe)");
+
+// What follows a picture's end.
+st = structureOf(fixture("polyglot.jpg"), "jpeg");
+assert.match(st.trailing?.kind ?? "", /ZIP archive/);
+assert.equal(st.trailing?.benign, false);
+assert.match(st.comments[0] ?? "", /<\?php system/);
+const tail = (s: string | number[]) => (typeof s === "string" ? new TextEncoder().encode(s) : new Uint8Array(s));
+const glued = (t: Uint8Array) => new Uint8Array([...tail([0xff, 0xd9]), ...t]);
+assert.equal(classifyTrailing(glued(tail([0, 0, 0, 0, 0xff, 0xff])), 2), null, "padding is not news");
+assert.equal(classifyTrailing(glued(tail([0, 0, 0, 0x18, ...new TextEncoder().encode("ftypmp42"), 0, 0, 0, 0])), 2)?.benign, true, "a motion photo's video");
+assert.match(classifyTrailing(glued(tail("MZ\x90\x00 program")), 2)?.kind ?? "", /Windows program/);
+assert.match(classifyTrailing(glued(tail("<?php eval($_POST[1]); ?>")), 2)?.kind ?? "", /PHP script/);
+assert.equal(classifyTrailing(glued(tail([0xff, 0xd8, 0xff, 0xe0])), 2, 1)?.benign, true, "MPF declared it: a phone's second picture");
+assert.equal(classifyTrailing(glued(tail([0xff, 0xd8, 0xff, 0xe0])), 2, 0)?.benign, false, "nothing declared it: a hidden picture");
+
+// RAW: the camera's own JPEGs, largest first, sensor data never mistaken for one.
+assert.deepEqual(rawPreviews(fixture("camera.dng"), "dng").map((x) => [x.width, x.height]), [[1024, 768]], "a DNG's preview SubIFD (its lossless sensor IFD is not a preview)");
+assert.deepEqual(rawPreviews(fixture("camera.cr3"), "cr3").map((x) => [x.width, x.height]), [[800, 534], [160, 120]], "CR3's PRVW, then THMB");
+assert.deepEqual(rawPreviews(fixture("camera.raf"), "raf").map((x) => [x.width, x.height]), [[640, 426]], "the JPEG RAF's header points at");
+const dng = readTiff(fixture("camera.dng"))!;
+assert.equal(dng.ifds.filter((i) => i.sub).length, 2, "both SubIFDs walked");
+const loop = new Uint8Array([0x49, 0x49, 42, 0, 8, 0, 0, 0, 1, 0, 0x00, 0x01, 3, 0, 1, 0, 0, 0, 16, 0, 0, 0, 8, 0, 0, 0]);
+assert.equal(readTiff(loop)?.ifds.length, 1, "an IFD that points back at itself is read once");
+assert.equal((await readMeta(cr3Metadata(fixture("camera.cr3"))[0]!))?.ifd0?.Model, "Canon-ish R", "CR3's CMT1 read as the TIFF it is");
+
+// Metadata: GPS to the metre, the time and its zone, the thumbnail.
+const photoMeta = await readMeta(fixture("photo.jpg"));
+const gps = gpsOf(photoMeta)!;
+assert.deepEqual([gps.lat.toFixed(5), gps.lon.toFixed(5), gps.alt, gps.direction, gps.accuracy, gps.when], ["37.56630", "126.97790", 38, 128, 5, "2026-01-01 18:04:05 UTC"]);
+assert.equal(gpsOf(await readMeta(fixture("photo.heic")))?.lat.toFixed(4), "37.5663", "HEIF's EXIF item too");
+assert.equal(orientationOf(await readMeta(fixture("portrait.jpg"))), 6);
+assert.equal((await readThumbnail(fixture("photo.jpg")))?.length, 2609, "the 160×120 EXIF thumbnail");
+assert.equal(await readThumbnail(fixture("scan.tiff")), null, "a TIFF's second page is not a thumbnail");
+
+// The facts.
+let pf = await pictureFacts("photo.jpg");
+for (const want of [/JPEG picture · 640×480 · Gorani Test Camera 1 · taken 2026-01-02 03:04:05 \+09:00/, /Carries where it was taken: 37\.56630° N, 126\.97790° E · 38 m up · facing 128° · ±5 m/, /artist “Rin Kim”, owner “Rin Kim”/, /serial number “GRN-0042-7781”/]) assert.match(pf.text, want);
+assert.equal(pf.facts.find((x) => x.copy)?.copy, "37.56630° N, 126.97790° E", "the coordinates offered to copy are words the fact shows");
+assert.ok(pf.facts.find((x) => x.copy)!.text.includes(pf.facts.find((x) => x.copy)!.copy!));
+assert.doesNotMatch(pf.text, /Edited|thumbnail|after the end|AI model/, "an honest photo: no editing, no hidden data");
+const groups = metaGroups(pf.f).map((g) => g.title);
+for (const g of ["Picture", "Taken", "Camera", "Location", "People and rights", "All metadata"]) assert.ok(groups.includes(g), `the Info panel has ${g}`);
+pf = await pictureFacts("redacted.jpg", { thumb: { width: 160, height: 120, shape: false, thumbAspect: 4 / 3, pictureAspect: 4 / 3, mean: 14, far: 0.12 } });
+assert.match(pf.text, /Edited with “Adobe Photoshop 25\.0 \(Windows\)” — its XMP history records 2 steps, the last “saved”/);
+assert.match(pf.text, /Modified 31 hours after it was taken/);
+assert.match(pf.text, /thumbnail shows a different picture/, "a box painted over a name, after the thumbnail");
+pf = await pictureFacts("cropped.jpg", { thumb: { width: 160, height: 90, shape: true, thumbAspect: 16 / 9, pictureAspect: 1, mean: 40, far: 0.2 } });
+assert.match(pf.text, /another shape \(1\.78:1 against 1\.00:1\): the picture was cropped/);
+assert.doesNotMatch((await pictureFacts("photo.jpg", { thumb: { width: 160, height: 120, shape: false, thumbAspect: 4 / 3, pictureAspect: 4 / 3, mean: 3, far: 0 } })).text, /thumbnail/, "a matching thumbnail is no news");
+pf = await pictureFacts("polyglot.jpg");
+assert.match(pf.text, /176 bytes after the end of the picture: a ZIP archive/);
+assert.match(pf.text, /Its comment holds code: “<\?php system/);
+pf = await pictureFacts("generated.png");
+assert.match(pf.text, /made by an AI model \(IPTC DigitalSourceType: trainedAlgorithmicMedia\)/);
+assert.match(pf.text, /an image generator's settings \(parameters\): “a water deer in the snow/);
+pf = await pictureFacts("bomb.png", { refused: "too-large" });
+assert.match(pf.text, /Declares 60000×60000 pixels \(3\.6 gigapixels\) — not drawn: a decompression bomb/);
+pf = await pictureFacts("camera.dng", { shown: { width: 1024, height: 768, what: "preview" } });
+assert.match(pf.text, /A camera RAW file: showing the camera's own 1024×768 preview — the sensor data \(16×16\) is not decoded/);
+pf = await pictureFacts("photo.jpg", {}, "holiday.png");
+assert.match(pf.text, /Named \.png, but it is a JPEG picture/);
+pf = await pictureFacts("drawing.svg", {}, "logo.png");
+assert.equal(pf.facts.find((x) => /Named \.png/.test(x.text))?.level, "warn", "an SVG under a raster name is a warning: SVG can carry script");
+pf = await pictureFacts("report.pdf", { refused: "not-a-picture" }, "scan.jpg");
+assert.match(pf.text, /Named \.jpg, but it is a PDF — not drawn/);
+pf = await pictureFacts("hostile.svg", { svg: { scripts: 1, handlers: 1, foreign: 1, password: true, remote: ["https://phish.example/svg.css", "https://phish.example/svg-beacon.png", "https://phish.example/sprite.svg#logo"], links: ["https://phish.example/login"], jsLinks: 1, entities: false, embedded: 0 } });
+for (const want of [/Contains script \(1 <script>, 1 event handler\) — not run/, /Contains HTML \(1 foreignObject\) with a form asking for a password/, /Would load 3 things from outside \(not loaded\)/, /1 javascript: link — inert/, /Links to 1 address \(not followed\): https:\/\/phish\.example\/login/]) assert.match(pf.text, want);
+pf = await pictureFacts("entities.svg", { refused: "entities", svg: { scripts: 0, handlers: 0, foreign: 0, password: false, remote: [], links: [], jsLinks: 0, entities: true, embedded: 0 } });
+assert.match(pf.text, /Declares XML entities .* not drawn/);
+assert.match((await pictureFacts("animated.gif")).text, /Animated: 3 frames/);
+assert.doesNotMatch((await pictureFacts("drawing.svg", { svg: { scripts: 0, handlers: 0, foreign: 0, password: false, remote: [], links: [], jsLinks: 0, entities: false, embedded: 0 } })).facts.filter((x) => x.level === "warn").map((x) => x.text).join(), /./, "an honest drawing warns of nothing");
+
+console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named");

@@ -23,7 +23,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { assetPath, cleanName } from "../../web/src/ui/viewer/sandbox.ts";
+import { assetPath, cleanFact, cleanName } from "../../web/src/ui/viewer/sandbox.ts";
 
 const root = new URL("../../", import.meta.url);
 const read = (p: string) => readFileSync(new URL(p, root), "utf8");
@@ -99,7 +99,18 @@ for (const bad of ["../index.html", "cmaps/../../api/v1/family", "cmaps/a/b.bcma
 // that need nothing are sent nothing.
 assert.equal(assetPath("hwp", "rhwp_bg.wasm"), "/readers/hwp/rhwp_bg.wasm");
 for (const bad of ["LICENSE", "../pdf/wasm/openjpeg.wasm", "rhwp_bg.wasm.map", "cmaps/UniKS-UCS2-H.bcmap"]) assert.equal(assetPath("hwp", bad), null, `hwp refused: ${bad}`);
-for (const reader of ["docx", "sheet", "pptx", "legacy"] as const) assert.equal(assetPath(reader, "rhwp_bg.wasm"), null, `${reader} has no assets`);
+for (const reader of ["docx", "sheet", "pptx", "legacy", "email"] as const) assert.equal(assetPath(reader, "rhwp_bg.wasm"), null, `${reader} has no assets`);
+// The image reader (42d) asks for libheif — its script and its WebAssembly — and nothing else.
+assert.equal(assetPath("image", "libheif.js"), "/readers/image/libheif.js");
+assert.equal(assetPath("image", "libheif.wasm"), "/readers/image/libheif.wasm");
+for (const bad of ["LICENSE", "libheif.js.map", "../hwp/rhwp_bg.wasm", "libheif-bundle.js", "image.worker.js"]) assert.equal(assetPath("image", bad), null, `image refused: ${bad}`);
+
+// A fact's Copy (42d): only words the fact shows, short, as text.
+assert.deepEqual(cleanFact({ level: "warn", text: "Carries where it was taken: 37.56630° N, 126.97790° E · 38 m up", copy: "37.56630° N, 126.97790° E" }), { level: "warn", text: "Carries where it was taken: 37.56630° N, 126.97790° E · 38 m up", copy: "37.56630° N, 126.97790° E" });
+assert.equal(cleanFact({ level: "info", text: "A photo", copy: "https://phish.example/paste-me" }).copy, undefined, "words the fact does not show are not offered");
+assert.equal(cleanFact({ level: "info", text: "x".repeat(200), copy: "x".repeat(101) }).copy, undefined, "at most 100 characters");
+assert.equal(cleanFact({ level: "info", text: "a b", copy: "   " }).copy, undefined);
+assert.deepEqual(cleanFact({ level: "evil", text: { toString: () => "t" } }), { level: "info", text: "t" }, "a level it does not know is info; a text is text");
 
 // 7. A name a reader hands over (an attachment, 42c) is made safe to show
 // and store: no direction marks, no control characters, no path.
@@ -111,4 +122,4 @@ assert.equal(cleanName("   "), "attachment");
 assert.equal(cleanName(null), "attachment");
 assert.equal(cleanName("x".repeat(500)).length, 200);
 
-console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more, handed-over names cleaned");
+console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more, handed-over names cleaned, a fact's Copy only words it shows");

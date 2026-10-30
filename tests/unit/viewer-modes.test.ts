@@ -15,9 +15,17 @@ import assert from "node:assert/strict";
 // decided alone. A fourth parameter now exists, and would have read "100"
 // as a policy: the calls say what they mean again.)
 
-// Images by kind and by mime.
-assert.equal(pickViewerMode("image", null, 100), "image");
-assert.equal(pickViewerMode("file", "image/webp", 100), "image");
+// Pictures (42d): every one opens in the sandboxed frame's image reader —
+// by kind, by mime, by name — the browser's own decoders included (a
+// crafted WebP was CVE-2023-4863): none is drawn in the app's page.
+assert.equal(pickViewerMode("image", null, 100), "document");
+assert.equal(pickViewerMode("file", "image/webp", 100), "document", "by its mime");
+for (const name of ["a.jpg", "a.JPEG", "a.png", "a.gif", "a.webp", "a.avif", "a.bmp", "a.ico", "a.heic", "a.HEIF", "a.tif", "a.tiff", "a.svg", "a.svgz", "a.jxl", "a.dng", "a.cr2", "a.CR3", "a.nef", "a.arw", "a.orf", "a.rw2", "a.raf", "a.pef"]) {
+	assert.equal(readerFor("file", null, name), "image", name);
+}
+assert.equal(readerFor("image", null, "noext"), "image", "by its kind");
+assert.equal(readerFor("file", "image/x-adobe-dng", "noext"), "image", "any image/ type");
+assert.equal(readerFor("file", "image/svg+xml", "noext"), "image", "an SVG too: in the frame, drawn as a picture");
 
 // Media plays inline under the size cap.
 assert.equal(pickViewerMode("video", null, 1024), "video");
@@ -28,11 +36,12 @@ assert.equal(pickViewerMode("text", null, 10), "text");
 assert.equal(pickViewerMode("code", null, 10), "text");
 assert.equal(pickViewerMode("file", "text/markdown", 10), "text");
 
-// The size cap is for what is read WHOLE to be shown: an image. Video and
-// audio stream at any size, and text opens only its head (39w — the cap
-// used to come first, so a film over 256 MB had "no preview" at all).
+// The size cap is for what is read WHOLE to be shown: a picture, a
+// document. Video and audio stream at any size, and text opens only its
+// head (39w — the cap used to come first, so a film over 256 MB had "no
+// preview" at all).
 assert.equal(pickViewerMode("image", "image/png", MAX_INLINE + 1), "too-large");
-assert.equal(pickViewerMode("image", "image/png", MAX_INLINE), "image", "at the cap, still shown");
+assert.equal(pickViewerMode("image", "image/png", MAX_INLINE), "document", "at the cap, still shown");
 assert.equal(pickViewerMode("video", null, 20 * 1024 ** 3), "video", "a 20 GB film streams");
 assert.equal(pickViewerMode("audio", "audio/flac", MAX_INLINE + 1), "audio", "so does a long recording");
 assert.equal(pickViewerMode("text", "text/plain", MAX_INLINE + 1), "text", "a big log opens its first part");
@@ -77,6 +86,8 @@ assert.equal(sniffReader(head(OLE), "sheet", "book.xlsx"), "sheet", "the sheet r
 assert.equal(sniffReader(head(ZIP), "hwp", "a.hwp"), "hwp", "…as does 한글's (HWPX is a ZIP)");
 assert.equal(sniffReader(head(ZIP), "docx", "a.docx"), "docx", "what the name says, when the bytes agree");
 assert.equal(sniffReader(head(OLE), "email", "outlook.msg"), "email", "an Outlook .msg is an OLE file, and an email");
+assert.equal(sniffReader(head("<html><script>"), "image", "photo.jpg"), "image", "a web page named .jpg stays with the picture reader, which names it and draws nothing");
+assert.equal(sniffReader(head("%PDF-1.7"), "image", "scan.jpg"), "pdf", "a PDF named .jpg is shown as the PDF it is");
 
 // Formats whose readers are still to come are honest about it — except a
 // text/plain mime, which still shows.
@@ -88,15 +99,16 @@ assert.equal(pickViewerMode("doc", "text/plain", 10), "text");
 assert.equal(pickViewerMode("image", "image/png", 10, "sample"), "refused");
 assert.equal(pickViewerMode("text", "text/plain", 10, "unverified"), "refused");
 assert.equal(pickViewerMode("sample", null, 10), "refused", "the sample kind alone refuses");
-assert.equal(pickViewerMode("image", "image/png", 10, "normal"), "image");
+assert.equal(pickViewerMode("image", "image/png", 10, "normal"), "document");
+assert.equal(pickViewerMode("image", "image/svg+xml", 10, "sample"), "refused", "a sample picture is refused before any decoder sees it");
 
-// Render mimes never let stored content run as the app.
-assert.equal(renderMime("image", null, "pic.svg"), "image/png", "SVG never runs");
-assert.equal(renderMime("image", "image/svg+xml", "pic"), "image/png", "a stored SVG mime never reaches a blob URL either (commit 23)");
-assert.equal(renderMime("image", "text/html", "x.png"), "image/png", "the extension wins only inside the raster list");
-assert.equal(renderMime("image", "image/webp", "noext"), "image/webp", "a raster stored mime is kept");
-assert.equal(renderMime("image", null, "pic.jpg"), "image/jpeg");
+// Render mimes (media the page plays) never let stored content run as the
+// app: whatever the stored type says, never a document type. (Pictures had
+// their own raster list here — commit 23 — and since 42d get no blob: URL
+// in the page at all.)
+assert.equal(renderMime("image", "image/svg+xml", "pic.svg"), "text/plain", "a picture is not the page's to render");
+assert.equal(renderMime("video", "text/html", "v.mp4"), "video/mp4", "a stored document type never reaches a media blob");
 assert.equal(renderMime("video", null, "v.mkv"), "video/mp4");
 assert.equal(renderMime("text", "text/plain", "n"), "text/plain");
 
-console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused; Office and 한글 to their readers, and the first bytes correcting a disguised name");
+console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused; Office, 한글, email and every picture to their readers in the frame, and the first bytes correcting a disguised name");

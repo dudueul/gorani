@@ -16,6 +16,9 @@ export function kindOf(name: string, mime?: string | null): FileKind {
 	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
 	const table: Record<string, FileKind> = {
 		png: "image", jpg: "image", jpeg: "image", gif: "image", webp: "image", heic: "image", avif: "image", svg: "image", bmp: "image", tiff: "image",
+		jpe: "image", jfif: "image", apng: "image", ico: "image", cur: "image", dib: "image", heif: "image", hif: "image", tif: "image", svgz: "image", jxl: "image", psd: "image", jp2: "image",
+		// Camera RAW files (42d: shown by their own JPEG preview).
+		dng: "image", cr2: "image", cr3: "image", nef: "image", nrw: "image", arw: "image", srf: "image", sr2: "image", orf: "image", rw2: "image", rwl: "image", pef: "image", srw: "image", raf: "image", "3fr": "image", erf: "image", kdc: "image", dcr: "image", iiq: "image", mef: "image", x3f: "image",
 		mp4: "video", mov: "video", mkv: "video", webm: "video", avi: "video", m4v: "video",
 		mp3: "audio", m4a: "audio", flac: "audio", ogg: "audio", opus: "audio", wav: "audio", aac: "audio",
 		pdf: "pdf",

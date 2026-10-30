@@ -40,8 +40,11 @@ import { MAX_INLINE } from "./mode.ts";
  *   hwp     한글 HWP and HWPX (rhwp, WebAssembly)
  *   legacy  Word and PowerPoint 97–2003, RTF, OpenDocument text and
  *           slides: their text and their facts, read by our own code
- *   email   .eml (postal-mime) and Outlook .msg (msgreader)          42c */
-export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email";
+ *   email   .eml (postal-mime) and Outlook .msg (msgreader)          42c
+ *   image   every picture: the browser's own decoders, in the frame;
+ *           TIFF (UTIF) and HEIF (libheif) in a worker; a RAW file's
+ *           own JPEG preview; metadata (exifr)                        42d */
+export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email" | "image";
 
 /** The asset names each reader may ask for — and nothing else is fetched for it. */
 const ASSETS: Record<ReaderId, RegExp | null> = {
@@ -53,10 +56,13 @@ const ASSETS: Record<ReaderId, RegExp | null> = {
 	hwp: /^rhwp_bg\.wasm$/,
 	legacy: null,
 	email: null,
+	// libheif (LGPL-3.0): its script and its WebAssembly, asked for only
+	// when a HEIF is opened.
+	image: /^libheif\.(js|wasm)$/,
 };
 
 /** Readers that run a worker of their own (its code is sent with theirs). */
-const WORKERS: Partial<Record<ReaderId, true>> = { pdf: true, sheet: true };
+const WORKERS: Partial<Record<ReaderId, true>> = { pdf: true, sheet: true, image: true };
 
 /** Is this a name the reader may be sent? (Exported for unit:preview-frame.) */
 export function assetPath(reader: ReaderId, path: unknown): string | null {
@@ -68,6 +74,19 @@ export function assetPath(reader: ReaderId, path: unknown): string | null {
 export interface Fact {
 	level: "info" | "warn";
 	text: string;
+	/** Words of `text` the viewer offers to copy (a photo's coordinates). */
+	copy?: string;
+}
+
+/** A fact from the frame, as the viewer will show it: text only, capped;
+ * a `copy` kept only if it is words the fact shows (the frame cannot put
+ * on the clipboard anything the person did not see). Pure: unit:preview-frame. */
+export function cleanFact(f: unknown): Fact {
+	const o = (f ?? {}) as { level?: unknown; text?: unknown; copy?: unknown };
+	const text = String(o.text ?? "").slice(0, 300);
+	const out: Fact = { level: o.level === "warn" ? "warn" : "info", text };
+	if (typeof o.copy === "string" && o.copy.trim() && o.copy.length <= 100 && text.includes(o.copy)) out.copy = o.copy;
+	return out;
 }
 
 export interface PreviewHandlers {
@@ -144,7 +163,7 @@ export interface PreviewFrame {
  * Show `file` with `reader` in a new sandboxed frame inside `container`.
  * Resolves once the frame has the file (the reader then draws on its own).
  */
-export async function openPreview(container: HTMLElement, reader: ReaderId, file: { name: string; mime: string | null; bytes: Uint8Array }, on: PreviewHandlers): Promise<PreviewFrame> {
+export async function openPreview(container: HTMLElement, reader: ReaderId, file: { name: string; mime: string | null; bytes: Uint8Array }, on: PreviewHandlers, opts: { compact?: boolean } = {}): Promise<PreviewFrame> {
 	const frame = document.createElement("iframe");
 	frame.src = "/preview.html";
 	// allow-scripts and NOTHING else — above all not allow-same-origin, which
@@ -155,6 +174,14 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 	frame.setAttribute("data-preview", reader);
 	frame.title = `Preview of ${file.name}`;
 	frame.className = "block h-full w-full border-0 bg-neutral-950";
+	// A small preview (Quick Look, a details pane — 42d) is a picture to
+	// look at, not to use: clicks go to the app around it, and the frame
+	// never takes the keyboard.
+	if (opts.compact) {
+		frame.style.pointerEvents = "none";
+		frame.tabIndex = -1;
+		frame.classList.replace("bg-neutral-950", "bg-transparent");
+	}
 	let closed = false;
 	let port: MessagePort | null = null;
 	const close = () => {
@@ -218,7 +245,7 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 				if (d.delta === 1 || d.delta === -1) on.onStep(d.delta);
 				return;
 			case "shown":
-				on.onShown(Array.isArray(d.facts) ? d.facts.slice(0, 40).map((f: { level?: unknown; text?: unknown }) => ({ level: f?.level === "warn" ? "warn" : "info", text: String(f?.text ?? "").slice(0, 300) })) : []);
+				on.onShown(Array.isArray(d.facts) ? d.facts.slice(0, 40).map(cleanFact) : []);
 				return;
 			case "error":
 				on.onError(String(d.message ?? "the reader failed").slice(0, 500));
@@ -245,6 +272,6 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 	// just said ready, still running only our hash-pinned bootstrap (no
 	// reader code has been sent yet), unable to navigate off this site
 	// (frame-src 'self') and closed if it navigates at all (the load count).
-	frame.contentWindow?.postMessage({ t: "open", code: readerJs, worker: workerJs, file: { name: file.name, mime: file.mime, size: bytes.byteLength, bytes }, phone: isPhone() }, "*", [channel.port2, bytes]);
+	frame.contentWindow?.postMessage({ t: "open", code: readerJs, worker: workerJs, file: { name: file.name, mime: file.mime, size: bytes.byteLength, bytes }, phone: isPhone(), compact: opts.compact === true }, "*", [channel.port2, bytes]);
 	return { close };
 }

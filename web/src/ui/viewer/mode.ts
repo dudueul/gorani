@@ -13,10 +13,12 @@ import type { ReaderId } from "./sandbox.ts";
 // commit 29e. Decided before anything else, and nothing is decrypted.
 // `too-large`: something only shown by reading it whole, above MAX_INLINE.
 // `document`: a format that needs a parser — shown by a reader in the
-// sandboxed preview frame, never in the app's own page (42a, sandbox.ts).)
-export type ViewerMode = "image" | "video" | "audio" | "text" | "document" | "unsupported" | "too-large" | "refused";
+// sandboxed preview frame, never in the app's own page (42a, sandbox.ts).
+// Pictures are among them since 42d: the browser's own decoders are a
+// parser a crafted picture attacks too.)
+export type ViewerMode = "video" | "audio" | "text" | "document" | "unsupported" | "too-large" | "refused";
 
-/** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email). */
+/** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email; 42d pictures). */
 const BY_EXT: Record<string, ReaderId> = {
 	pdf: "pdf",
 	docx: "docx", docm: "docx", dotx: "docx", dotm: "docx",
@@ -25,6 +27,10 @@ const BY_EXT: Record<string, ReaderId> = {
 	hwp: "hwp", hwpx: "hwp", hwt: "hwp",
 	doc: "legacy", dot: "legacy", ppt: "legacy", pps: "legacy", pot: "legacy", rtf: "legacy", odt: "legacy", ott: "legacy", odp: "legacy", otp: "legacy",
 	eml: "email", msg: "email",
+	jpg: "image", jpeg: "image", jpe: "image", jfif: "image", png: "image", apng: "image", gif: "image", webp: "image", avif: "image", bmp: "image", dib: "image", ico: "image", cur: "image",
+	heic: "image", heif: "image", hif: "image", tif: "image", tiff: "image", svg: "image", svgz: "image", jxl: "image", psd: "image", jp2: "image",
+	dng: "image", cr2: "image", cr3: "image", nef: "image", nrw: "image", arw: "image", srf: "image", sr2: "image", orf: "image", rw2: "image", raw: "image", rwl: "image",
+	pef: "image", srw: "image", raf: "image", "3fr": "image", erf: "image", kdc: "image", dcr: "image", mos: "image", iiq: "image", mef: "image", x3f: "image",
 };
 
 /** …and the types, for a file whose name says nothing. */
@@ -61,7 +67,8 @@ const BY_MIME: Record<string, ReaderId> = {
 export function readerFor(kind: string, mime: string | null, name: string): ReaderId | null {
 	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
 	if (kind === "pdf") return "pdf";
-	return BY_EXT[ext] ?? BY_MIME[(mime ?? "").split(";")[0]!.trim().toLowerCase()] ?? null;
+	const type = (mime ?? "").split(";")[0]!.trim().toLowerCase();
+	return BY_EXT[ext] ?? BY_MIME[type] ?? (kind === "image" || type.startsWith("image/") ? "image" : null);
 }
 
 /**
@@ -80,7 +87,7 @@ export function sniffReader(head: Uint8Array, guess: ReaderId, name: string): Re
 	if (ascii.startsWith("{\\rtf")) return "legacy";
 	const zip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
 	const ole = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
-	if (guess === "sheet" || guess === "hwp" || guess === "email") return guess; // each reads every form of its family (a .msg is an OLE file)
+	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)
 	if (zip && guess === "legacy") {
 		// A ".doc" or ".ppt" that is really the 2007+ format, renamed.
 		if (/^(doc|dot)$/.test(ext)) return "docx";
@@ -103,21 +110,18 @@ export function pickViewerMode(kind: string, mime: string | null, size: number, 
 	if (policy !== "normal" || kind === "sample") return "refused";
 	// A reader in the frame takes the file whole, so it meets the same cap.
 	if (readerFor(kind, mime, name)) return size > MAX_INLINE ? "too-large" : "document";
-	const mode = modeOf(kind, mime);
-	// Only an image is read whole to be shown, so only an image meets the
-	// cap here. Video and audio stream: the in-page player (39p) and the
-	// media worker fetch just the frames being played, from a file of any
-	// size — the viewer caps their whole-blob FALLBACK (viewer.ts ›
-	// readWhole). Text opens only its first TEXT_CAP bytes. (Until 39w the
-	// cap came first, for every kind: a film over 256 MB — what the
-	// streamer exists for — said "no inline preview yet".)
-	return mode === "image" && size > MAX_INLINE ? "too-large" : mode;
+	// Video and audio stream: the in-page player (39p) and the media worker
+	// fetch just the frames being played, from a file of any size — the
+	// viewer caps their whole-blob FALLBACK (viewer.ts › readWhole). Text
+	// opens only its first TEXT_CAP bytes. (Until 39w the cap came first,
+	// for every kind: a film over 256 MB — what the streamer exists for —
+	// said "no inline preview yet". Pictures, read whole, met the cap here
+	// until 42d; now they meet it above, as every reader does.)
+	return modeOf(kind, mime);
 }
 
 function modeOf(kind: string, mime: string | null): ViewerMode {
 	switch (kind) {
-		case "image":
-			return "image";
 		case "video":
 			return "video";
 		case "audio":
@@ -133,7 +137,6 @@ function modeOf(kind: string, mime: string | null): ViewerMode {
 			// (readerFor, above); archives get theirs next (42e).
 			return mime === "text/plain" ? "text" : "unsupported";
 		default: {
-			if (mime?.startsWith("image/")) return "image";
 			if (mime?.startsWith("video/")) return "video";
 			if (mime?.startsWith("audio/")) return "audio";
 			if (mime?.startsWith("text/")) return "text";
@@ -142,23 +145,14 @@ function modeOf(kind: string, mime: string | null): ViewerMode {
 	}
 }
 
-/** The blob mime for rendering (never application/octet-stream — a stored
- * HTML/SVG must not run as the app). */
-export function renderMime(kind: string, mime: string | null, name: string): string {
-	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
-	if (kind === "image") {
-		// A RASTER allow-list — for the stored mime too, not only the
-		// extension (security review, commit 23). The stored mime is chosen by
-		// whoever uploaded (and, sealed or not, a hostile server can swap it):
-		// `image/svg+xml` passed `startsWith("image/")`, and a blob URL lives
-		// on the APP's origin — "open image in new tab" would run the SVG's
-		// script next to the vault.
-		const raster = ["png", "jpeg", "gif", "webp", "avif", "bmp"];
-		const fromExt = ext === "jpg" ? "jpeg" : ext;
-		if (raster.includes(fromExt)) return `image/${fromExt}`;
-		const sub = mime?.startsWith("image/") ? (mime.slice("image/".length).split(";")[0] ?? "").trim().toLowerCase() : "";
-		return raster.includes(sub) ? `image/${sub}` : "image/png";
-	}
+/** The blob mime for media the page plays (never application/octet-stream,
+ * and never a type the browser would run as a document). Pictures had a
+ * raster allow-list here (security review, commit 23: a stored
+ * `image/svg+xml` must not become a blob: URL on the APP's origin, where
+ * "open image in new tab" would run its script beside the vault); since
+ * 42d no picture becomes a blob: URL in the app's page at all — each is
+ * drawn in the preview frame. */
+export function renderMime(kind: string, mime: string | null, _name: string): string {
 	if (kind === "video") return mime?.startsWith("video/") ? mime : "video/mp4";
 	if (kind === "audio") return mime?.startsWith("audio/") ? mime : "audio/mpeg";
 	return "text/plain";

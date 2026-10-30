@@ -1067,9 +1067,11 @@ export class FilesModel {
 		return [...byFolder.values()].sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
 	}
 
-	/** A video's poster frame, opened here — as a blob: URL (revoked on
-	 * Lock with every other), or null when it has none yet. */
-	async posterOf(id: string, version: number): Promise<string | null> {
+	/** A video's poster frame, opened here — its bytes, drawn by the Movie
+	 * tab in the preview frame (42d: a poster is a picture whoever can write
+	 * the area made, and no picture is decoded in this page) — or null when
+	 * it has none yet. */
+	async posterOf(id: string, version: number): Promise<{ name: string; mime: string; bytes: Uint8Array } | null> {
 		let got: { poster: string | null } | null = null;
 		try {
 			got = await this.bridge.apiGet<{ poster: string | null }>(`${areaPath(this.memberId)}/files/${id}/video?version=${version}`);
@@ -1080,7 +1082,7 @@ export class FilesModel {
 		try {
 			const b64 = await openPlacedText(await this.bridge.storePrivate(), places.filePoster(this.memberId, id, version), got.poster);
 			const bytes = fromBase64(b64);
-			return blobURL(new Blob([bytes as BlobPart], { type: imageType(bytes) }));
+			return { name: "poster.webp", mime: imageType(bytes), bytes };
 		} catch {
 			return null;
 		}

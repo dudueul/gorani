@@ -45,7 +45,7 @@ portions are marked, their original notices are retained in place.
    @noble/*, hash-wasm, pdf.js, SQLite WASM, Lit, and others). They are
    declared in Cargo.toml / package.json and are not reproduced here.
 
-5. The preview readers (commits 42a–42c, docs/PREVIEWS.md) are bundled from
+5. The preview readers (commits 42a–42d, docs/PREVIEWS.md) are bundled from
    their packages by scripts/build-readers.mjs into web/public/readers/,
    each bundle keeping its packages' license comments at its end. pdf.js
    (Mozilla, Apache-2.0) ships with parts under their own terms, copied
@@ -74,3 +74,15 @@ portions are marked, their original notices are retained in place.
    decompressrtf (BSD-2); and DOMPurify again. msgreader's
    iconv-lite is replaced in the bundle by our own few lines
    (web/src/preview/shims/iconv-lite.ts) over the browser's TextDecoder.
+
+   The image reader (commit 42d) bundles exifr (Mike Kovařík, MIT) and
+   UTIF.js (Photopea, MIT, as the utif2 package) with pako (MIT and Zlib).
+   It uses libheif (struktur AG, LGPL-3.0), compiled to WebAssembly with
+   its HEVC decoder libde265 (LGPL-3.0) by libheif-js (Kiril Vatev,
+   LGPL-3.0). libheif is not bundled with our code: its script and
+   WebAssembly are copied unchanged, with their LICENSE, into
+   web/public/readers/image/. They are loaded at run time only to open a
+   HEIF, and can be replaced by any build of the same interface, as the
+   LGPL requires. The RAW, TIFF-directory and structure readers
+   (web/src/preview/image/) are ours, written from the TIFF 6.0, DNG,
+   JPEG, PNG, GIF, RIFF and ISO base media file format specifications.

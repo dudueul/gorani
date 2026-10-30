@@ -19,7 +19,8 @@ import type { FilesModel, Movie, MovieCollection } from "./model.ts";
 import type { ViewerTarget } from "../viewer/viewer.ts";
 import { icon } from "./icons.ts";
 import { fmtSize, cssom } from "./shared.ts";
-import { revokeBlobURL } from "../../lib/blob-urls.ts";
+import "../viewer/picture.ts";
+import type { PictureFile } from "../viewer/picture.ts";
 
 /** 1:02:03, or 4:05. */
 function fmtLength(ms: number): string {
@@ -45,7 +46,8 @@ export class GoraniMovies extends LitElement {
 
 	@state() private collections: MovieCollection[] | null = null;
 	@state() private error = "";
-	@state() private posters = new Map<string, string>();
+	/** Each card's poster, as bytes: drawn in the preview frame (viewer/picture.ts), not in this page. */
+	@state() private posters = new Map<string, PictureFile>();
 	private observer: IntersectionObserver | null = null;
 	private asked = new Set<string>();
 
@@ -61,7 +63,6 @@ export class GoraniMovies extends LitElement {
 	override disconnectedCallback(): void {
 		super.disconnectedCallback();
 		this.observer?.disconnect();
-		for (const url of this.posters.values()) revokeBlobURL(url);
 		this.posters = new Map();
 	}
 
@@ -93,8 +94,8 @@ export class GoraniMovies extends LitElement {
 	private async fetchPoster(id: string, version: number): Promise<void> {
 		if (!id || this.asked.has(id)) return;
 		this.asked.add(id);
-		const url = await this.model.posterOf(id, version);
-		if (url) this.posters = new Map(this.posters).set(id, url);
+		const poster = await this.model.posterOf(id, version);
+		if (poster) this.posters = new Map(this.posters).set(id, poster);
 	}
 
 	private play(m: Movie): void {
@@ -138,7 +139,7 @@ export class GoraniMovies extends LitElement {
 		return html`
 			<button class="group text-left" data-movie data-id=${m.id} data-version=${String(m.version)} ?data-has-poster=${m.hasPoster} data-test="movie-card" title=${m.name} @click=${() => this.play(m)}>
 				<div class="relative aspect-video overflow-hidden rounded-lg bg-neutral-800 ring-accent group-hover:ring-2">
-					${poster ? html`<img class="h-full w-full object-cover" src=${poster} alt="" data-test="movie-poster" />` : html`<div class="flex h-full items-center justify-center">${icon("video", "h-10 w-10 text-neutral-600")}</div>`}
+					${poster ? html`<gorani-picture class="block h-full w-full" data-test="movie-poster" .file=${poster} .fallback=${html`<div class="flex h-full items-center justify-center">${icon("video", "h-10 w-10 text-neutral-600")}</div>`}></gorani-picture>` : html`<div class="flex h-full items-center justify-center">${icon("video", "h-10 w-10 text-neutral-600")}</div>`}
 					${m.durationMs ? html`<span class="absolute bottom-1.5 right-1.5 rounded bg-black/75 px-1.5 py-0.5 text-[11px] text-neutral-100" data-test="movie-length">${fmtLength(m.durationMs)}</span>` : nothing}
 					${watched > 0.01 ? html`<span class="absolute inset-x-0 bottom-0 h-1 bg-neutral-700/80"><span class="block h-full bg-accent" ${cssom({ width: `${Math.round(watched * 100)}%` })}></span></span>` : nothing}
 				</div>

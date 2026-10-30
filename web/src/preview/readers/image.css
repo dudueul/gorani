@@ -1,0 +1,178 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The image reader (commit 42d): a stage that zooms and pans, an Info
+   panel beside it (a sheet over it on a phone), an SVG's source. */
+
+.bar .tools,
+.bar .pages,
+.bar .tabs {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.bar .pages:not([hidden]),
+.bar .tabs:not([hidden]) {
+	margin-left: 8px;
+}
+
+.zoomlabel {
+	min-width: 3.4em;
+	text-align: center;
+	font-variant-numeric: tabular-nums;
+}
+
+.body {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	position: relative;
+}
+
+.stage {
+	flex: 1;
+	min-width: 0;
+	position: relative;
+	overflow: hidden;
+	/* The page must not scroll or zoom under a pinch: the stage does it. */
+	touch-action: none;
+	user-select: none;
+	-webkit-user-select: none;
+	background:
+		repeating-conic-gradient(#141414 0% 25%, #1c1c1c 0% 50%) 50% / 24px 24px;
+	cursor: default;
+}
+
+.stage.zoomed {
+	cursor: grab;
+}
+
+.stage.zoomed:active {
+	cursor: grabbing;
+}
+
+.stage .picture {
+	position: absolute;
+	max-width: none;
+	max-height: none;
+	transform-origin: 50% 50%;
+	box-shadow: 0 4px 30px rgb(0 0 0 / 0.5);
+	-webkit-user-drag: none;
+}
+
+.stage .notice {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	margin: auto;
+}
+
+.info {
+	width: 340px;
+	flex: none;
+	overflow: auto;
+	overscroll-behavior: contain;
+	border-left: 1px solid var(--line);
+	background: var(--panel);
+	padding: 8px 12px 24px;
+	font-size: 12.5px;
+}
+
+.info h3 {
+	margin: 14px 0 4px;
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--muted);
+}
+
+.info .row {
+	display: grid;
+	grid-template-columns: 7.5em 1fr;
+	gap: 8px;
+	padding: 2px 0;
+	border-bottom: 1px solid #1f1f1f;
+}
+
+.info .k {
+	color: var(--muted);
+	overflow-wrap: anywhere;
+}
+
+.info .v {
+	overflow-wrap: anywhere;
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+.info details summary {
+	margin: 14px 0 4px;
+	cursor: pointer;
+	color: var(--muted);
+}
+
+.info .thumb {
+	margin: 8px 0 4px;
+}
+
+.info .thumb img {
+	display: block;
+	max-width: 100%;
+	max-height: 160px;
+	border: 1px solid var(--line);
+}
+
+.source-pane {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	overflow: auto;
+}
+
+.source-pane[hidden],
+.stage[hidden] {
+	display: none;
+}
+
+.source {
+	margin: 0;
+	padding: 12px;
+	font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	user-select: text;
+}
+
+/* A phone: the panel is a sheet over the picture. */
+.phone .info {
+	position: absolute;
+	inset: auto 0 0 0;
+	width: auto;
+	max-height: 60%;
+	border-left: 0;
+	border-top: 1px solid var(--line);
+	border-radius: 14px 14px 0 0;
+	box-shadow: 0 -8px 30px rgb(0 0 0 / 0.6);
+}
+
+/* Compact (Quick Look, the details pane): the picture, fitted, and nothing else. */
+.compact body,
+.compact #root {
+	background: transparent;
+}
+
+.compact #root {
+	align-items: center;
+	justify-content: center;
+}
+
+.compact-picture {
+	display: block;
+	max-width: 100%;
+	max-height: 100%;
+	object-fit: contain;
+}

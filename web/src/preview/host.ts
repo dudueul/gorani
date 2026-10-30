@@ -41,6 +41,9 @@ export interface OpenMessage {
 	file: { name: string; mime: string | null; size: number; bytes: ArrayBuffer };
 	/** A phone-narrow window: readers start fitted to the width, panels closed. */
 	phone: boolean;
+	/** A small preview (the explorer's Quick Look, its details pane — 42d):
+	 * the picture alone, fitted; no tools, no facts, no worker. */
+	compact?: boolean;
 }
 
 /** At most this many facts are sent (an email's can run long — 42c). */
@@ -50,12 +53,17 @@ export const MAX_FACTS = 40;
 export interface Fact {
 	level: "info" | "warn";
 	text: string;
+	/** A part of `text` the viewer offers to copy (a photo's coordinates,
+	 * 42d): the frame has no clipboard, and the app copies only words it
+	 * shows (sandbox.ts checks it is part of the text). */
+	copy?: string;
 }
 
 export interface Host {
 	readonly root: HTMLElement;
 	readonly file: OpenMessage["file"];
 	readonly phone: boolean;
+	readonly compact: boolean;
 	/** The reader's own asset (e.g. "cmaps/UniKS-UCS2-H.bcmap"), asked of the app. */
 	asset(path: string): Promise<Uint8Array>;
 	/** A Worker running the code the app sent, or null when none was sent. */
@@ -123,6 +131,7 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 		document.head.append(style);
 		const root = document.getElementById("root") ?? document.body;
 		document.documentElement.classList.toggle("phone", msg.phone);
+		document.documentElement.classList.toggle("compact", msg.compact === true);
 
 		let next = 1;
 		const waiting = new Map<number, { ok(b: Uint8Array): void; no(e: Error): void }>();
@@ -142,6 +151,7 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 			root,
 			file: msg.file,
 			phone: msg.phone,
+			compact: msg.compact === true,
 			asset(path) {
 				const id = next++;
 				return new Promise((ok, no) => {
@@ -164,7 +174,7 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 				// the rest — so what matters most survives the cap.
 				const [first, ...rest] = facts.filter((f) => f.text);
 				const ordered = first ? [first, ...rest.filter((f) => f.level === "warn"), ...rest.filter((f) => f.level !== "warn")] : [];
-				port.postMessage({ t: "shown", facts: ordered.slice(0, MAX_FACTS).map((f) => ({ level: f.level === "warn" ? "warn" : "info", text: String(f.text).slice(0, 300) })) });
+				port.postMessage({ t: "shown", facts: ordered.slice(0, MAX_FACTS).map((f) => ({ level: f.level === "warn" ? "warn" : "info", text: String(f.text).slice(0, 300), ...(f.copy ? { copy: String(f.copy).slice(0, 100) } : {}) })) });
 			},
 			fail(message) {
 				port.postMessage({ t: "error", message: String(message).slice(0, 500) });

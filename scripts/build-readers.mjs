@@ -16,6 +16,10 @@
  *   readers/sheet.worker.js SheetJS, parsing the workbook off the frame's
  *                           main thread (preview/readers/sheet.worker.ts)
  *   readers/hwp/            rhwp's WebAssembly (and its licence)
+ *   readers/image.worker.js the image reader's worker: exifr, UTIF, RAW previews
+ *   readers/image/          libheif (LGPL-3.0): its script and WebAssembly,
+ *                           kept as files of their own — replaceable, as the
+ *                           licence asks — with its LICENSE
  *
  * Run by `npm run build` in web/ before Vite (Vite copies public/ into
  * dist/). Skipped when every output is newer than every source. The
@@ -54,6 +58,10 @@ const READERS = {
 	hwp: { files: [["@rhwp/core/rhwp_bg.wasm", "rhwp_bg.wasm"], ["@rhwp/core/LICENSE", "LICENSE"]] },
 	legacy: {},
 	email: {},
+	image: {
+		worker: "./readers/image.worker.ts",
+		files: [["libheif-js/libheif-wasm/libheif.js", "libheif.js"], ["libheif-js/libheif-wasm/libheif.wasm", "libheif.wasm"], ["libheif-js/libheif-wasm/LICENSE", "LICENSE"]],
+	},
 };
 
 const pkgDir = (spec) => path.dirname(require.resolve(`${spec.split("/").slice(0, spec.startsWith("@") ? 2 : 1).join("/")}/package.json`));

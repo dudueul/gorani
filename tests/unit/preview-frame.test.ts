@@ -23,7 +23,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { assetPath, cleanFact, cleanName } from "../../web/src/ui/viewer/sandbox.ts";
+import { assetPath, cleanFact, cleanName, visibleControls } from "../../web/src/ui/viewer/sandbox.ts";
 
 const root = new URL("../../", import.meta.url);
 const read = (p: string) => readFileSync(new URL(p, root), "utf8");
@@ -104,6 +104,13 @@ for (const reader of ["docx", "sheet", "pptx", "legacy", "email"] as const) asse
 assert.equal(assetPath("image", "libheif.js"), "/readers/image/libheif.js");
 assert.equal(assetPath("image", "libheif.wasm"), "/readers/image/libheif.wasm");
 for (const bad of ["LICENSE", "libheif.js.map", "../hwp/rhwp_bg.wasm", "libheif-bundle.js", "image.worker.js"]) assert.equal(assetPath("image", bad), null, `image refused: ${bad}`);
+// The archive reader (42e) asks for 7-Zip — its script and WebAssembly — and nothing else.
+assert.equal(assetPath("archive", "7zz.js"), "/readers/archive/7zz.js");
+assert.equal(assetPath("archive", "7zz.wasm"), "/readers/archive/7zz.wasm");
+for (const bad of ["License.txt", "unRarLicense.txt", "7zz.umd.js", "../image/libheif.wasm", "7zz.wasm.map"]) assert.equal(assetPath("archive", bad), null, `archive refused: ${bad}`);
+// A name with a right-to-left override cannot reorder the fact it is quoted in.
+assert.equal(visibleControls("invoice\u202efdp.exe"), "invoice[RLO]fdp.exe");
+assert.equal(cleanFact({ level: "warn", text: "Entry “invoice\u202efdp.exe” pretends" }).text, "Entry “invoice[RLO]fdp.exe” pretends", "every reader's facts, cleaned in one place");
 
 // A fact's Copy (42d): only words the fact shows, short, as text.
 assert.deepEqual(cleanFact({ level: "warn", text: "Carries where it was taken: 37.56630° N, 126.97790° E · 38 m up", copy: "37.56630° N, 126.97790° E" }), { level: "warn", text: "Carries where it was taken: 37.56630° N, 126.97790° E · 38 m up", copy: "37.56630° N, 126.97790° E" });
@@ -122,4 +129,4 @@ assert.equal(cleanName("   "), "attachment");
 assert.equal(cleanName(null), "attachment");
 assert.equal(cleanName("x".repeat(500)).length, 200);
 
-console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more, handed-over names cleaned, a fact's Copy only words it shows");
+console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more, handed-over names cleaned, a fact's Copy only words it shows, direction controls shown and not obeyed, 7-Zip the archive reader's only asset");

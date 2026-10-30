@@ -80,7 +80,7 @@ export interface Host {
 	 * A request, nothing more — the app opens it in a new frame, and asks
 	 * the person before it saves anything. A copy of the bytes goes.
 	 */
-	handOver(action: "open" | "save", file: { name: string; mime: string | null; bytes: Uint8Array }): void;
+	handOver(action: "open" | "save", file: { name: string; mime: string | null; bytes: Uint8Array }, opts?: { sample?: boolean }): void;
 }
 
 interface TrustedTypesLike {
@@ -182,9 +182,10 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 			setSwipeGuard(g) {
 				guard = g;
 			},
-			handOver(action, file) {
+			handOver(action, file, opts = {}) {
 				const copy = file.bytes.slice().buffer as ArrayBuffer;
-				port.postMessage({ t: "handover", action, name: String(file.name).slice(0, 255), mime: file.mime ? String(file.mime).slice(0, 127) : null, bytes: copy }, [copy]);
+				// sample: it came out of an archive opened with "infected" (42e).
+				port.postMessage({ t: "handover", action, name: String(file.name).slice(0, 255), mime: file.mime ? String(file.mime).slice(0, 127) : null, bytes: copy, sample: opts.sample === true }, [copy]);
 			},
 		};
 

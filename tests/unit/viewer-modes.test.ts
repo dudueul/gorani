@@ -89,8 +89,20 @@ assert.equal(sniffReader(head(OLE), "email", "outlook.msg"), "email", "an Outloo
 assert.equal(sniffReader(head("<html><script>"), "image", "photo.jpg"), "image", "a web page named .jpg stays with the picture reader, which names it and draws nothing");
 assert.equal(sniffReader(head("%PDF-1.7"), "image", "scan.jpg"), "pdf", "a PDF named .jpg is shown as the PDF it is");
 
-// Formats whose readers are still to come are honest about it — except a
-// text/plain mime, which still shows.
+// Archives (42e): to the archive reader in the frame — by name, by type,
+// by kind; any first bytes stay with it (it reads every form of its family).
+for (const name of ["a.zip", "a.JAR", "a.apk", "a.7z", "a.rar", "a.tar", "a.tgz", "a.tar.gz", "a.gz", "a.bz2", "a.xz", "a.zst", "a.cab", "a.iso", "a.wim", "a.dmg", "a.vhdx", "a.arj", "a.lzh", "a.cpio", "a.rpm", "a.deb", "a.msi", "a.alz", "a.egg"]) {
+	assert.equal(readerFor("file", null, name), "archive", name);
+}
+assert.equal(readerFor("archive", null, "noext"), null, "an archive with no name and no type: nothing guesses");
+assert.equal(readerFor("file", "application/x-7z-compressed", "noext"), "archive", "by its type");
+assert.equal(pickViewerMode("archive", null, 10, "normal", "a.zip"), "document");
+assert.equal(pickViewerMode("archive", null, 10, "sample", "infected.zip"), "refused", "a sample archive is never listed");
+assert.equal(sniffReader(head(ZIP), "archive", "a.zip"), "archive");
+assert.equal(sniffReader(head("Rar!\x1a\x07"), "archive", "a.zip"), "archive", "a RAR named .zip: the archive reader, which names it");
+
+// Formats with no reader are honest about it — except a text/plain mime,
+// which still shows.
 assert.equal(pickViewerMode("archive", null, 10), "unsupported");
 assert.equal(pickViewerMode("doc", "text/plain", 10), "text");
 

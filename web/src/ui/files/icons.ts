@@ -28,6 +28,8 @@ export function kindOf(name: string, mime?: string | null): FileKind {
 		eml: "doc", msg: "doc",
 		ts: "code", js: "code", rs: "code", py: "code", go: "code", json: "code", toml: "code", yaml: "code", yml: "code", sh: "code", c: "code", cpp: "code", java: "code", kt: "code", swift: "code", html: "code", css: "code",
 		zip: "archive", "7z": "archive", tar: "archive", gz: "archive", xz: "archive", rar: "archive",
+		tgz: "archive", bz2: "archive", tbz2: "archive", txz: "archive", zst: "archive", lz: "archive", lzma: "archive", lz4: "archive", z: "archive", cab: "archive", iso: "archive", wim: "archive", dmg: "archive", vhd: "archive", vhdx: "archive",
+		arj: "archive", lzh: "archive", lha: "archive", cpio: "archive", rpm: "archive", deb: "archive", xar: "archive", jar: "archive", apk: "archive", ipa: "archive", alz: "archive", egg: "archive",
 	};
 	if (table[ext]) return table[ext];
 	if (mime?.startsWith("image/")) return "image";

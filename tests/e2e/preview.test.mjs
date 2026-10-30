@@ -48,7 +48,14 @@
  *     model's mark; a decompression bomb named and not drawn; disguises;
  *     zoom by wheel, keys and double click, a drag that pans; the details
  *     pane's small picture in a compact frame of its own; on a phone, a
- *     pinch that zooms and a swipe that pans instead of moving on.
+ *     pinch that zooms and a swipe that pans instead of moving on;
+ *   - archives (42e): ZIP, ALZ and EGG by our readers, 7z, RAR, TAR.GZ,
+ *     ISO by 7-Zip (its WebAssembly fetched by the app, for the frame):
+ *     listed, folders walked, entries opened in previews of their own (an
+ *     archive inside an archive in turn); a lure's every trick named; a
+ *     password asked for, a wrong one refused, "infected" one click away
+ *     and everything it opens a sample (saved only as one); a liar
+ *     stopped; AZO named and not opened.
  */
 
 import assert from "node:assert/strict";
@@ -234,6 +241,7 @@ try {
 	consoleCsp.length = 0;
 	const rtf = fixture("hostile.rtf");
 	await page.locator("gorani-win11 [data-upload]").first().setInputFiles([
+		...["bundle.zip", "bundle.7z", "bundle.rar", "bundle.tar.gz", "bundle.iso", "korean.zip", "lure.zip", "infected.zip", "locked.7z", "liar.zip", "report.alz", "report.egg", "azo.egg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		...["photo.jpg", "portrait.jpg", "redacted.jpg", "cropped.jpg", "polyglot.jpg", "generated.png", "bomb.png", "animated.gif", "photo.webp", "photo.avif", "scan.tiff", "photo.heic", "camera.dng", "camera.cr3", "camera.raf", "drawing.svg", "hostile.svg", "entities.svg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		// Disguises: a JPEG named .png (a zero byte more, so the upload's
 		// duplicate check does not ask), and a web page named .png.
@@ -635,6 +643,121 @@ try {
 	await closeDoc();
 	assert.deepEqual(dialogs, [], "no script in any picture ran");
 
+	// ── archives (42e) ─────────────────────────────────────────────────
+	const rows = (dd) => dd.locator('[data-test="arc-row"]');
+	const rowOf = (dd, label) => rows(dd).filter({ has: dd.locator(".label", { hasText: new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) }) }).first();
+
+	d = await openDoc("bundle.zip", "archive");
+	await rowOf(d, "docs").waitFor({ timeout: 30_000 });
+	tells = await factsSay(/ZIP · 5 files/);
+	assert.match(tells, /Comment: “Gorani test bundle”/);
+	await rowOf(d, "docs").click();
+	await rowOf(d, "고라니.txt").waitFor();
+	await d.locator('[data-test="arc-path"]', { hasText: "docs" }).waitFor();
+	await rowOf(d, "notes.md").locator('[data-test="arc-open"]').click();
+	await page.locator('[data-test="viewer-name"]', { hasText: "bundle.zip › notes.md" }).waitFor({ timeout: 30_000 });
+	await page.getByText("- 고라니 (water deer)").waitFor({ timeout: 30_000 });
+	await page.locator('[data-test="viewer-back"]').click();
+	await page.locator('iframe[data-preview="archive"]').waitFor({ timeout: 30_000 });
+	await closeDoc();
+
+	// 7-Zip's formats: its WebAssembly asked of the app by the frame.
+	for (const [name, top, format] of [["bundle.7z", "bundle", /7z · 5 files/], ["bundle.rar", "bundle", /RAR 5 · 5 files/], ["bundle.tar.gz", "bundle", /gzip › TAR holding bundle\.tar/], ["bundle.iso", "docs", /ISO 9660 disk image/]]) {
+		d = await openDoc(name, "archive");
+		await rowOf(d, top).waitFor({ timeout: 60_000 });
+		await factsSay(format);
+		await closeDoc();
+	}
+	tells = await (async () => {
+		d = await openDoc("bundle.rar", "archive");
+		await rowOf(d, "bundle").click();
+		await rowOf(d, "report.txt").locator('[data-test="arc-open"]').click();
+		await page.locator('[data-test="viewer-name"]', { hasText: "bundle.rar › report.txt" }).waitFor({ timeout: 60_000 });
+		await page.getByText("Gorani archive report").waitFor({ timeout: 30_000 });
+		return "";
+	})();
+	await closeDoc();
+	d = await openDoc("bundle.iso", "archive");
+	await factsSay(/A disk image: files taken out of it do not carry Windows' downloaded-from-the-internet mark/);
+	await closeDoc();
+
+	// Korean names, as Korean Windows writes them (CP949, unflagged).
+	d = await openDoc("korean.zip", "archive");
+	await rowOf(d, "보고서.txt").waitFor({ timeout: 30_000 });
+	await rowOf(d, "사진").waitFor();
+	await closeDoc();
+
+	// A lure: every trick named; the right-to-left mark shown, not obeyed; an archive inside opened in turn.
+	d = await openDoc("lure.zip", "archive");
+	tells = await factsSay(/Zip Slip/);
+	for (const want of [/“\.\.\/\.\.\/evil\.txt”/, /absolute path, written wherever it names: “\/etc\/cron\.d\/gorani”/, /symbolic link: “passwd” → “\/etc\/passwd”/, /invoice\.pdf\.exe” \(it pretends to be \.pdf/, /invoice\[RLO\]fdp\.exe/, /Open me\.lnk” \(a Windows shortcut\)/, /The same path more than once: “report\.txt”/, /Comment: “Your invoice is attached”/]) assert.match(tells, want);
+	assert.doesNotMatch(tells, /‮/, "no direction control reaches the facts");
+	await rowOf(d, "invoice[RLO]fdp.exe").waitFor();
+	assert.equal(await rows(d).filter({ has: d.locator(".label", { hasText: /^report\.txt$/ }) }).count(), 2, "both report.txt entries shown");
+	await rowOf(d, "nested.zip").locator('[data-test="arc-open"]').click();
+	await page.locator('[data-test="viewer-name"]', { hasText: "lure.zip › nested.zip" }).waitFor({ timeout: 30_000 });
+	await rowOf(page.frameLocator('iframe[data-preview="archive"]'), "inner.txt").waitFor({ timeout: 30_000 });
+	await page.locator('[data-test="viewer-back"]').click();
+	await page.locator('iframe[data-preview="archive"]').waitFor({ timeout: 30_000 });
+	await closeDoc();
+
+	// Encrypted with "infected": one click, and everything in it is a sample.
+	d = await openDoc("infected.zip", "archive");
+	await factsSay(/Every entry is encrypted \(ZipCrypto\)/);
+	await d.locator('[data-test="arc-password"]').fill("wrong");
+	await d.locator('[data-test="arc-unlock"]').click();
+	await d.locator('[data-test="arc-password-msg"]', { hasText: "That password is wrong." }).waitFor({ timeout: 30_000 });
+	await d.locator('[data-test="arc-try-infected"]').click();
+	await d.locator('[data-test="arc-unlocked"]', { hasText: "malware samples" }).waitFor({ timeout: 30_000 });
+	await factsSay(/Opened with the password “infected”/);
+	assert.equal(await d.locator('[data-test="arc-open"]').count(), 0, "a sample is never opened");
+	await rowOf(d, "sample.exe").locator('[data-test="arc-save"]', { hasText: "Save as sample" }).click();
+	await page.locator('[data-test="viewer-save-dialog"]').waitFor({ timeout: 30_000 });
+	assert.match(await page.locator('[data-test="viewer-save-risk"]').innerText(), /Windows program/);
+	assert.equal(await page.locator('[data-test="viewer-save-sample"]').isChecked(), true);
+	assert.equal(await page.locator('[data-test="viewer-save-sample"]').isDisabled(), true, "and it cannot be unticked");
+	await page.locator('[data-test="viewer-save-confirm"]').click();
+	await page.locator('[data-test="viewer-save-dialog"]').waitFor({ state: "detached", timeout: 60_000 });
+	await closeDoc();
+	await exact("sample.exe").waitFor({ timeout: 60_000 });
+	assert.match(await exact("sample.exe").innerText(), /Malware sample/, "saved beside the archive, as a sample");
+
+	// Names hidden by AES (7z -mhe): a wrong password, then the right one.
+	d = await openDoc("locked.7z", "archive");
+	await factsSay(/Even its names are encrypted/);
+	assert.equal(await rows(d).count(), 0);
+	await d.locator('[data-test="arc-password"]').fill("nope");
+	await d.locator('[data-test="arc-password"]').press("Enter");
+	await d.locator('[data-test="arc-password-msg"]', { hasText: "That password is wrong." }).waitFor({ timeout: 60_000 });
+	await d.locator('[data-test="arc-password"]').fill("gorani");
+	await d.locator('[data-test="arc-password"]').press("Enter");
+	await rowOf(d, "bundle").waitFor({ timeout: 60_000 });
+	await closeDoc();
+
+	// A liar: stopped as it inflates past its claim.
+	d = await openDoc("liar.zip", "archive");
+	await rowOf(d, "small.txt").locator('[data-test="arc-open"]').click();
+	await d.locator('[data-test="arc-note"]', { hasText: "inflates past what it claims" }).waitFor({ timeout: 30_000 });
+	await closeDoc();
+
+	// ALZ and EGG (ALZip's own formats): listed, a Korean name opened.
+	for (const [name, format] of [["report.alz", /ALZ \(ALZip\) · 4 files/], ["report.egg", /EGG \(ALZip\) · 5 files/]]) {
+		d = await openDoc(name, "archive");
+		await factsSay(format);
+		await rowOf(d, "docs").click();
+		await rowOf(d, "고라니.txt").locator('[data-test="arc-open"]').click();
+		await page.locator('[data-test="viewer-name"]', { hasText: `${name} › 고라니.txt` }).waitFor({ timeout: 60_000 });
+		await page.getByText("고라니 메모 — a Korean file name").waitFor({ timeout: 30_000 });
+		await page.locator('[data-test="viewer-back"]').click();
+		await page.locator('iframe[data-preview="archive"]').waitFor({ timeout: 30_000 });
+		await closeDoc();
+	}
+	d = await openDoc("azo.egg", "archive");
+	await factsSay(/compressed with AZO/);
+	await rowOf(d, "packed.txt").locator('[data-test="arc-open"]').click();
+	await d.locator('[data-test="arc-note"]', { hasText: "AZO" }).waitFor({ timeout: 30_000 });
+	await closeDoc();
+
 	// The details pane: a small picture, in a compact frame of its own.
 	await exact("photo.jpg").click();
 	await page.keyboard.press(" ");
@@ -732,7 +855,7 @@ try {
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

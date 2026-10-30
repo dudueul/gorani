@@ -168,6 +168,9 @@ export class GoraniViewer extends LitElement {
 
 	/** Open a file the reader found inside this one, in its own preview. */
 	private openInner(file: HandedFile): void {
+		// A malware sample (out of an archive opened with "infected"): never
+		// opened — offered to save, as a sample, instead.
+		if (file.sample) return this.askSave(file);
 		this.reset();
 		this.inner = [...this.inner, file];
 		this.loadInner();
@@ -237,7 +240,7 @@ export class GoraniViewer extends LitElement {
 	 * and asks first; a risky one is offered as a malware sample. */
 	private askSave(file: HandedFile): void {
 		const risk = partRisk(file.name, file.bytes);
-		this.saving = { file, sample: !!risk, risk, busy: false, error: null };
+		this.saving = { file, sample: !!risk || !!file.sample, risk: risk ?? (file.sample ? "out of an archive opened with the password “infected” — a malware sample" : null), busy: false, error: null };
 	}
 
 	private async confirmSave(): Promise<void> {
@@ -246,7 +249,8 @@ export class GoraniViewer extends LitElement {
 		this.saving = { ...s, busy: true };
 		try {
 			const file = new File([s.file.bytes as BlobPart], s.file.name, { type: s.file.mime ?? "application/octet-stream" });
-			await this.model.upload([file], { sample: s.sample, into: this.target.folderId !== undefined ? this.target.folderId : undefined });
+			// (A file the reader marked a sample is saved as one, whatever the box says.)
+			await this.model.upload([file], { sample: s.sample || !!s.file.sample, into: this.target.folderId !== undefined ? this.target.folderId : undefined });
 			this.model.notify(`Saved “${s.file.name}” beside “${this.target.name}”${s.sample ? ", as a malware sample" : ""}.`);
 			this.saving = null;
 		} catch (e) {
@@ -631,7 +635,7 @@ export class GoraniViewer extends LitElement {
 					<p class="text-neutral-100">Save <strong class="break-all">“${s.file.name}”</strong> (${fmtSize(s.file.bytes.length)}) into the vault, beside “${this.target.name}”?</p>
 					${s.risk ? html`<p class="mt-2 text-amber-300" data-test="viewer-save-risk">⚠ It is ${s.risk}.</p>` : nothing}
 					<label class="mt-3 flex items-start gap-2 text-neutral-300">
-						<input type="checkbox" class="mt-0.5" data-test="viewer-save-sample" .checked=${s.sample} @change=${(e: Event) => (this.saving = { ...s, sample: (e.target as HTMLInputElement).checked })} />
+						<input type="checkbox" class="mt-0.5" data-test="viewer-save-sample" .checked=${s.sample} ?disabled=${!!s.file.sample} @change=${(e: Event) => (this.saving = { ...s, sample: (e.target as HTMLInputElement).checked })} />
 						<span>Mark it as a malware sample — never previewed here, and downloaded only zipped with the password <code>${SAMPLE_PASSWORD}</code></span>
 					</label>
 					${s.error ? html`<p class="mt-2 text-red-400">${s.error}</p>` : nothing}

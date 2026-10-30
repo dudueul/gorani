@@ -1,0 +1,131 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The hex reader's Registry tab (commit 42k): a lazy tree of keys, a key's values. */
+
+.rtools input[type="text"] {
+	flex: 1 1 18rem;
+	min-width: 10rem;
+}
+
+.rtools select {
+	max-width: 22rem;
+}
+
+.rbody {
+	flex: 1;
+	min-height: 0;
+	display: grid;
+	grid-template-columns: minmax(14rem, 38%) minmax(0, 1fr);
+}
+
+.rtree {
+	overflow: auto;
+	overscroll-behavior: contain;
+	border-right: 1px solid var(--line);
+	padding: 4px 0;
+	font-size: 13px;
+}
+
+.rrow {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 1px 8px;
+	white-space: nowrap;
+	cursor: pointer;
+	outline: none;
+}
+
+.rrow:hover {
+	background: #171717;
+}
+
+.rrow.sel {
+	background: oklch(0.72 0.17 145 / 0.3);
+}
+
+.rrow:focus-visible {
+	outline: 1px solid oklch(0.72 0.17 145);
+	outline-offset: -1px;
+}
+
+.rtoggle {
+	display: inline-block;
+	width: 1em;
+	color: var(--muted);
+}
+
+.rmark {
+	display: inline-block;
+	width: 1em;
+	color: var(--warn);
+}
+
+.rname {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.rcount {
+	font-size: 11px;
+}
+
+.rmore {
+	padding: 2px 8px 2px 40px;
+	font-size: 12px;
+}
+
+.rright {
+	overflow: auto;
+	overscroll-behavior: contain;
+	padding: 8px 12px 12px;
+	min-width: 0;
+}
+
+.rpath {
+	font-size: 13px;
+	overflow-wrap: anywhere;
+	margin-bottom: 2px;
+}
+
+.rvalues td.rdata {
+	white-space: pre;
+	max-width: 36rem;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.rvalue h4 {
+	font-size: 13px;
+	margin: 14px 0 4px;
+	color: var(--muted);
+	font-weight: 500;
+}
+
+.rtext,
+.rhex {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	background: #141414;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 8px 10px;
+	margin: 4px 0 8px;
+	max-height: 18rem;
+	overflow: auto;
+}
+
+.rhex {
+	white-space: pre;
+	overflow-wrap: normal;
+}
+
+.phone .rbody {
+	grid-template-columns: 1fr;
+	grid-template-rows: minmax(10rem, 40%) minmax(0, 1fr);
+}
+
+.phone .rtree {
+	border-right: 0;
+	border-bottom: 1px solid var(--line);
+}

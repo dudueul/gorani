@@ -27,6 +27,19 @@ export function trimNul(s: string): string {
 	return n === s.length ? s : s.slice(0, n);
 }
 
+/** A FILETIME (100 ns ticks since 1601) at `at`, as ISO 8601 to the tick:
+ * "2016-07-08T18:16:31.1081031Z" — what Event Viewer and forensic tools
+ * show. A number would lose the last digits (2^53 holds 9e15; FILETIMEs
+ * are 1.3e17), so the arithmetic is BigInt. "" for zero or past 9999.
+ * (Event logs, 42j; registry hives, 42k.) */
+export function filetimeIso(r: Reader, at: number): string {
+	const t = (BigInt(r.u32(at + 4)) << 32n) | BigInt(r.u32(at));
+	if (!t) return "";
+	const secs = Number(t / 10_000_000n) - 11_644_473_600;
+	if (secs < -11_644_473_600 || secs > 253_402_300_799) return "";
+	return `${new Date(secs * 1000).toISOString().slice(0, 19)}.${String(t % 10_000_000n).padStart(7, "0")}Z`;
+}
+
 /** Little- or big-endian reads over a byte array, each one bounds-checked. */
 export class Reader {
 	readonly b: Uint8Array;

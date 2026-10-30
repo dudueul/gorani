@@ -6,7 +6,7 @@
 > email, .eml and Outlook's .msg; 42d: every picture; 42e: archives; 42f:
 > Markdown, JSON, XML, web pages and code; 42g: programs and any file as
 > bytes — the one view a malware sample may have; 42h: Office macros'
-> source). The
+> source; 42i: shortcuts and Prefetch files). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -723,6 +723,50 @@ version matches, and never looks at the source. So:
 - the 42f triage over the source, the compiled code's unseen strings and
   the forms' text: command lines, encoded PowerShell (decoded), addresses.
 
+### Forensic formats (`preview/forensic/`, `facts/forensic.ts`) (42i)
+
+The hex reader takes apart the files an incident responder collects, each
+in a tab of its own beside Hex and Strings:
+
+**Windows shortcuts (.lnk)**, from [MS-SHLLINK]. Since Office blocked
+macros from the internet, a shortcut in a ZIP or an ISO is how much
+malware starts. And every shortcut Windows makes is evidence.
+
+- **What it runs:** the target from LinkInfo (a local path, or a share),
+  from the shell items (long names included) and from the
+  environment-variable block; the arguments, quoted and read by the 42f
+  triage (an encoded PowerShell command decoded).
+- **How it hides:** arguments padded with blanks past the 260 characters
+  the Properties box shows; a minimized window; an icon borrowed from a
+  browser or a PDF reader while the target is an interpreter; "run as
+  administrator"; a working folder in TEMP; a network share it reaches for
+  (and offers the user's sign-in hash to); bytes appended after its end.
+- **Where it was made:** the tracker block's machine name, and in its
+  version-1 object IDs the network card's MAC address (VMware's, VirtualBox's
+  or Hyper-V's: made in a virtual machine) and a time; the target's
+  volume (type, serial, label), times and size — or none at all, the mark
+  of a builder tool.
+
+**Prefetch files (.pf)**: Windows keeps one per program it has run.
+
+- Windows 10 and 11 compress them: "MAM\x04", the size, then Xpress
+  Huffman ([MS-XCA]), decompressed here (`forensic/xpress.ts`, written from
+  the specification).
+- Read from SCCA versions 17 (XP) to 31 (11), as dissect.target and
+  libscca document the layout: the program, its path hash, the run count,
+  the last eight run times, every file it touched in its first seconds,
+  and the volumes (device, serial, creation time, folders).
+- **The facts:** how often and when it ran; where it ran from (a folder
+  any user can write to is a warning); the files it touched in such
+  folders; a dual-use or offensive tool by name (rclone, PsExec, procdump,
+  Mimikatz, netcat, remote-access and tunnelling tools, AdFind,
+  wevtutil…); a file name whose program or hash no longer matches its
+  header (renamed, or brought from another machine).
+
+Both parsers were checked against independent readers on the same bytes:
+LnkParse3 for shortcuts, dissect.target for Prefetch and dissect.util for
+Xpress Huffman (both used only as test oracles, never shipped).
+
 ### Programs (`readers/hex.ts`, `preview/binary/`, `facts/binary.ts`) (42g)
 
 Any file can be shown as bytes, and a program is taken apart; nothing is
@@ -843,6 +887,9 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   assignments that look like passwords. A key in another shape is missed;
   a test key in the right shape is reported.
 - **Highlighting stops at 1 MB** and showing at 8 MB.
+- **Shortcuts: property stores are listed, not decoded**, and shell
+  items are read for their names only. A Prefetch file's trace chains
+  (which blocks were read) are not shown.
 - **Macros: the compiled code is not disassembled.** Stomping is found
   by the literals the compiled code holds and the source does not; code
   that builds its strings at run time (Chr(), arithmetic) and has a
@@ -912,7 +959,10 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   built at test time read alike from .docm, .xlsm, .pptm, .doc, .xls and
   .ppt, and OpenDocument Basic: auto-run, Shell, Declares, stomping (the
   source wiped, or literals it never says), hidden modules, a lock, a
-  form's text; an honest macro warning of nothing more than its presence.
+  form's text; an honest macro warning of nothing more than its presence;
+  (42i) a lure shortcut and a Prefetch file built at test time, every fact;
+  a share, a renamed Prefetch file, cut-short files; Xpress Huffman across
+  blocks and long matches.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -927,6 +977,8 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
     their markup shown as text; an RTF and a web archive named .doc named
     as disguises;
   - the default Trusted Types policy attacked from inside;
+  - forensic formats (42i): the lure shortcut's facts, its Shortcut tab
+    and arguments; the Prefetch file's facts and its flagged files;
   - macros (42h): a .docm's project named fact by fact, the Macros pane's
     flagged modules, a module opened in the text reader and back; the
     same project in an .xlsm, a .doc and a .ppt; OpenDocument Basic;
@@ -977,6 +1029,9 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   - `archives.py` (each format's own tool — zip, 7z, rar, gcab, xorriso,
     arj, zstd; LHA, the hostile ZIPs, ALZ and EGG written by hand, ALZ
     checked with unalz, EGG from ESTsoft's specification): the archives.
+  - `tests/lib/forensic.mjs` builds shortcuts ([MS-SHLLINK]) and Prefetch
+    files (with an Xpress Huffman writer) at test time; LnkParse3 and
+    dissect read them as written;
   - `tests/lib/vba.mjs` builds VBA projects at test time (an [MS-OVBA]
     compressor, the dir and PROJECT streams, DPB "encryption") and puts
     them into copies of the Office fixtures; olevba reads what it writes

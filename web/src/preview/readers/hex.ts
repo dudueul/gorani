@@ -34,6 +34,9 @@ import { findBytes } from "../binary/find.ts";
 import { hex } from "../binary/read.ts";
 import { identify } from "../binary/sniff.ts";
 import { StringScanner, stringFindings, type Found } from "../binary/strings.ts";
+import { lnkFacts, prefetchFacts } from "../facts/forensic.ts";
+import { parseLnk, type LnkInfo } from "../forensic/lnk.ts";
+import { parsePrefetch, type PrefetchInfo } from "../forensic/prefetch.ts";
 import hexCss from "./hex.css?inline";
 
 const ROW = 16;
@@ -58,10 +61,19 @@ export const start = boot(async (host) => {
 	const pe = tryParse(() => parsePe(bytes), "PE headers", warnings);
 	const elf = pe ? null : tryParse(() => parseElf(bytes), "ELF headers", warnings);
 	const macho = pe || elf ? null : tryParse(() => parseMachoFile(bytes), "Mach-O headers", warnings);
+	// Forensic formats (42i): a shortcut, a Prefetch file.
+	const lnk = pe || elf || macho ? null : tryParse(() => parseLnk(bytes), "shortcut", warnings);
+	const prefetch = pe || elf || macho || lnk ? null : tryParse(() => parsePrefetch(bytes), "Prefetch data", warnings);
 	const findings: BinaryFindings = { name: host.file.name, size: bytes.length, sha256: null, id: identify(bytes), pe, elf, macho, strings: null, entropy: 0, sample: host.sample };
-	const send = () => host.shown([...binaryFacts(findings), ...warnings.map((w) => ({ level: "warn" as const, text: `Malformed: ${w}` }))]);
+	const send = () => {
+		const forensic = lnk ? lnkFacts(lnk, host.file.name) : prefetch ? prefetchFacts(prefetch, host.file.name) : null;
+		const facts = forensic
+			? [forensic[0]!, ...(host.sample ? [{ level: "warn" as const, text: "A malware sample, shown as bytes only: nothing in it is run, drawn, or handed to another reader — and this inspection is in the audit trail" }] : []), ...(findings.sha256 ? [{ level: "info" as const, text: `SHA-256 ${findings.sha256}`, copy: findings.sha256 }] : []), ...forensic.slice(1)]
+			: binaryFacts(findings);
+		host.shown([...facts, ...warnings.map((w) => ({ level: "warn" as const, text: `Malformed: ${w}` }))]);
+	};
 
-	const view = new HexView(host, bytes, { pe, elf, macho });
+	const view = new HexView(host, bytes, { pe, elf, macho, lnk, prefetch });
 	view.show();
 	send();
 
@@ -112,6 +124,8 @@ interface Parsed {
 	pe: PeInfo | null;
 	elf: ElfInfo | null;
 	macho: MachoFile | null;
+	lnk: LnkInfo | null;
+	prefetch: PrefetchInfo | null;
 }
 
 class HexView {
@@ -146,7 +160,8 @@ class HexView {
 		const root = this.host.root;
 		if (this.host.sample) root.append(el("div", { class: "banner", "data-test": "hex-sample" }, "⚠ A malware sample — shown as bytes only. Nothing in it runs, is drawn, or leaves this frame; this inspection is in the audit trail."));
 		const program = this.parsed.pe || this.parsed.elf || this.parsed.macho;
-		const names = [...(program ? ["Program"] : []), "Hex", "Strings"];
+		const first = program ? "Program" : this.parsed.lnk ? "Shortcut" : this.parsed.prefetch ? "Prefetch" : null;
+		const names = [...(first ? [first] : []), "Hex", "Strings"];
 		for (const n of names) {
 			const b = el("button", { "aria-pressed": "false", "data-test": `hex-tab-${n.toLowerCase()}` }, n);
 			b.addEventListener("click", () => this.open(n));
@@ -176,7 +191,7 @@ class HexView {
 	private open(name: string): void {
 		let pane = this.built.get(name);
 		if (!pane) {
-			pane = name === "Program" ? this.programPane() : name === "Hex" ? this.hexView() : this.stringsView();
+			pane = name === "Program" || name === "Shortcut" || name === "Prefetch" ? this.programPane() : name === "Hex" ? this.hexView() : this.stringsView();
 			this.built.set(name, pane);
 			this.panes.append(pane);
 		}
@@ -367,12 +382,69 @@ class HexView {
 	// ── Program ─────────────────────────────────────────────────────────
 	private programPane(): HTMLElement {
 		const pane = el("div", { class: "pane scroll program", "data-test": "hex-program" });
-		const { pe, elf, macho } = this.parsed;
-		if (pe) this.peView(pe, pane);
+		const { pe, elf, macho, lnk, prefetch } = this.parsed;
+		if (lnk) this.lnkView(lnk, pane);
+		else if (prefetch) this.prefetchView(prefetch, pane);
+		else if (pe) this.peView(pe, pane);
 		else if (elf) this.elfView(elf, pane);
 		else if (macho) for (const [i, p] of macho.programs.entries()) this.machoView(p, pane, macho.universal ? macho.archs[i]?.offset ?? 0 : 0, macho.universal ? `${p.cpu} (at ${hex(macho.archs[i]?.offset ?? 0)})` : null);
 		pane.append(el("h2", {}, "Hashes"), el("p", { class: "muted", "data-test": "hex-hashes" }, "Computing…"));
 		return pane;
+	}
+
+	private lnkView(l: LnkInfo, pane: HTMLElement): void {
+		const t = (d: Date | null) => (d ? `${d.toISOString().replace("T", " ").slice(0, 19)} UTC` : "—");
+		pane.append(
+			el("h2", {}, "Windows shortcut"),
+			kv([
+				["Target", l.target ?? "—"],
+				...(l.idListPath && l.idListPath !== l.target ? [["Target (shell items)", l.idListPath] as [string, string]] : []),
+				...(l.envTarget ? [["Target (environment)", l.envTarget] as [string, string]] : []),
+				["Arguments", l.arguments ? `${l.arguments.length} characters${l.arguments.length - l.arguments.trimStart().length ? `, ${l.arguments.length - l.arguments.trimStart().length} leading blanks` : ""}` : "none"],
+				["Working folder", l.workingDir ?? "—"],
+				["Description", l.name ?? "—"],
+				["Icon", l.icon ? `${l.icon} (index ${l.iconIndex})` : "—"],
+				["Window", l.window],
+				["Run as administrator", l.runAsAdmin ? "yes" : "no"],
+				...(l.hotKey ? [["Hot key", l.hotKey] as [string, string]] : []),
+				["Target created", t(l.times.created)],
+				["Target changed", t(l.times.written)],
+				["Target opened", t(l.times.accessed)],
+				["Target size", `${l.size.toLocaleString("en")} bytes`],
+				...(l.volume ? [["Volume", `${l.volume.type} · serial ${l.volume.serial}${l.volume.label ? ` · “${l.volume.label}”` : ""}`] as [string, string]] : []),
+				...(l.share ? [["Network share", `${l.share.net}${l.share.device ? ` (${l.share.device})` : ""}`] as [string, string]] : []),
+				...(l.tracker ? [["Made on", `${l.tracker.machine}${l.tracker.mac ? ` · network card ${l.tracker.mac}` : ""}${l.tracker.time ? ` · ${t(l.tracker.time)}` : ""}`] as [string, string], ["Tracker IDs", `volume ${l.tracker.volumeId} · file ${l.tracker.fileId}`] as [string, string]] : []),
+				...(l.knownFolder ? [["Known folder", l.knownFolder] as [string, string]] : []),
+				...(l.shim ? [["Shim", l.shim] as [string, string]] : []),
+				["Extra data", l.blocks.join(", ") || "none"],
+				["After its end", l.appended ? `${l.appended.size.toLocaleString("en")} bytes at ${hex(l.appended.offset)}` : "nothing"],
+				["Flags", l.flags.join(", ")],
+			], "hex-lnk"),
+		);
+		if (l.arguments?.trim()) pane.append(el("h2", {}, "Arguments (as written)"), el("pre", { class: "args mono", "data-test": "hex-lnk-args" }, l.arguments));
+		if (l.appended) {
+			const go = el("button", {}, "Show the appended bytes in Hex");
+			go.addEventListener("click", () => this.goTo(l.appended!.offset, Math.min(16, l.appended!.size)));
+			pane.append(go);
+		}
+	}
+
+	private prefetchView(p: PrefetchInfo, pane: HTMLElement): void {
+		const t = (d: Date) => `${d.toISOString().replace("T", " ").slice(0, 19)} UTC`;
+		pane.append(
+			el("h2", {}, "Prefetch"),
+			kv([
+				["Program", p.exe],
+				["Path hash", p.hash],
+				["Format", `version ${p.version}${p.compressed ? " · compressed (Xpress Huffman)" : ""}`],
+				["Run count", String(p.runCount)],
+				...p.runs.map((d, i) => [i ? `Run before (${i})` : "Last run", t(d)] as [string, string]),
+			], "hex-prefetch"),
+			el("h2", {}, `Volumes (${p.volumes.length})`),
+			kv(p.volumes.map((v) => [v.device, `serial ${v.serial}${v.created ? ` · created ${t(v.created)}` : ""} · ${v.dirs.length} folders`])),
+			el("h2", {}, `Files it touched (${p.files.length})`),
+			el("div", { class: "flist mono", "data-test": "hex-prefetch-files" }, ...p.files.slice(0, 2000).map((f) => el("span", { class: /\\(?:USERS\\[^\\]+\\APPDATA|PROGRAMDATA|TEMP|USERS\\PUBLIC|\$RECYCLE\.BIN)\\/i.test(f) ? "warn" : "" }, f.replace(/^\\VOLUME\{[^}]+\}/i, "")))),
+		);
 	}
 
 	private hashTable(): HTMLElement {

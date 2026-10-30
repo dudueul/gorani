@@ -562,6 +562,32 @@ Accepted:
 - **No p-code disassembly** (PREVIEWS.md › Limits): stomping that leaves
   no literal behind is not caught here.
 
+### Shortcuts and Prefetch (commit 42i)
+
+The threat: a shortcut is today's most common first stage (an
+interpreter, a hidden payload, a borrowed icon), and both formats are
+binary structures an attacker writes. Prefetch adds a decompressor — the
+classic home of memory bugs in native code.
+
+The controls:
+
+- **Our own parsers, bounds-checked** (the 42g `Reader`): every offset
+  checked, every list capped (64 extra-data blocks and shell items, 10,000
+  file entries, 64 volumes), a file cut short reported, never thrown.
+- **The decompressor writes into a buffer of the declared size and no
+  more** (at most 32 MB for a Prefetch file); a table that over-claims its
+  codes, a match that reaches before the output, or a stream that ends
+  early returns nothing.
+- **Arguments and targets are text**, quoted in facts and shown through
+  textContent; the 42f triage reads them.
+- **Test inputs are built at test time** (`tests/lib/forensic.mjs`).
+
+Accepted:
+
+- **Independent readers as oracles only**: LnkParse3 (MIT) and dissect
+  (AGPL) checked our output while this was written; neither is a
+  dependency, and no code was taken from either.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

@@ -123,7 +123,7 @@ assert.equal(sniffReader(head("%PDF-1.7"), "text", "invoice.html"), "pdf", "a PD
 // Programs and other binaries (42g): to the hex reader — by name, by
 // type; and a program under ANY name but an archive's goes there too (an
 // "invoice.pdf" that is an .exe is the lure; a self-extractor stays an archive).
-for (const name of ["a.exe", "a.DLL", "a.sys", "a.scr", "a.cpl", "a.so", "a.dylib", "a.macho", "a.ko", "a.elf", "a.bin", "a.o", "a.wasm", "a.dex", "a.class", "a.lnk", "a.dmp"]) assert.equal(readerFor("file", null, name), "hex", name);
+for (const name of ["a.exe", "a.DLL", "a.sys", "a.scr", "a.cpl", "a.so", "a.dylib", "a.macho", "a.ko", "a.elf", "a.bin", "a.o", "a.wasm", "a.dex", "a.class", "a.lnk", "a.pf", "a.dmp"]) assert.equal(readerFor("file", null, name), "hex", name);
 for (const type of ["application/x-msdownload", "application/vnd.microsoft.portable-executable", "application/x-executable", "application/x-mach-binary"]) assert.equal(readerFor("file", type, "noext"), "hex", type);
 for (const [bytes, label] of [["MZ\x90\x00", "a PE"], ["\x7fELF", "an ELF"], [[0xcf, 0xfa, 0xed, 0xfe], "a Mach-O"]] as const) {
 	for (const guess of ["pdf", "docx", "image", "text", "legacy", "email"] as const) assert.equal(sniffReader(head(bytes as string | number[]), guess, "invoice.pdf"), "hex", `${label} named as a ${guess}`);

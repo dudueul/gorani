@@ -30,7 +30,7 @@ const TEXT_EXTS = [
 
 /** Programs and other binaries (42g): to the hex reader — their bytes,
  * strings and (for PE, ELF and Mach-O) their structure; never run. */
-const HEX_EXTS = ["exe", "macho", "dll", "sys", "scr", "cpl", "ocx", "drv", "efi", "mui", "ax", "com", "so", "dylib", "o", "obj", "ko", "elf", "bin", "axf", "node", "pyd", "dex", "class", "wasm", "lnk", "dmp", "mdmp", "pcap", "pcapng", "evtx", "dat", "db", "sqlite", "pf"];
+const HEX_EXTS = ["exe", "macho", "dll", "sys", "scr", "cpl", "ocx", "drv", "efi", "mui", "ax", "com", "so", "dylib", "o", "obj", "ko", "elf", "bin", "axf", "node", "pyd", "dex", "class", "wasm", "lnk", "pf", "dmp", "mdmp", "pcap", "pcapng", "evtx", "dat", "db", "sqlite", "pf"];
 
 /** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email; 42d pictures; 42e archives; 42f text). */
 const BY_EXT: Record<string, ReaderId> = {

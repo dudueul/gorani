@@ -15,12 +15,17 @@
  *      types, and is audited;
  *   4. the per-file version walk the mark uses lists only that file;
  *   5. on a case: samples and evidence combine (signed, then marked), and
- *      a read-only grantee cannot mark.
+ *      a read-only grantee cannot mark;
+ *   6. an inspection (commit 42g) is on the record before the bytes are
+ *      opened: the line names the version and that it was a sample; an
+ *      entry inside it rides sealed (plain text is refused); a version
+ *      the file does not have, a file that is not there, and another
+ *      member's area are refused; on a case, a read grant is enough.
  */
 
 import assert from "node:assert/strict";
 import { suiteDev, api } from "./_dev.mjs";
-import { newContentKey, importContentKey, sealWith, openPlacedText } from "../../web/src/vault/vault-crypto.ts";
+import { newContentKey, importContentKey, sealWith, openPlacedText, sealPlacedText } from "../../web/src/vault/vault-crypto.ts";
 import { places } from "../../web/src/vault/places.ts";
 import { isSampleType, originalType, sampleType } from "../../web/src/vault/samples.ts";
 import { newShareId, newShareSecret, shareKeys, sealShareMeta, newShareKdf } from "../../web/src/vault/share-crypto.ts";
@@ -118,7 +123,29 @@ try {
 	assert.equal((await api(dev.base, "PATCH", `${ev.base}/files/${emlId}`, { email: bo.email, body: caseMark })).status, 200, "a writer can — evidence stays evidence, and becomes a sample");
 	assert.equal((await api(dev.base, "DELETE", `${ev.base}/files/${emlId}`, { email: bo.email })).status, 409, "(still never trashed)");
 
-	console.log("ok  api:samples — uploaded as a sample (listed, keyed, audited), never linked, marking one way and complete, the per-file walk, samples on evidence, read-only cannot mark");
+	// ── 6. Inspected (42g): on the record before the bytes are opened ───
+	const inspect = (who, base, id, body = {}) => api(dev.base, "POST", `${base}/files/${id}/inspect`, { email: who.email, body });
+	let seen = await inspect(bo, own, s1.id, { version: 1 });
+	assert.equal(seen.status, 200, seen.text);
+	assert.deepEqual(seen.json, { inspected: s1.id, version: 1, sample: true });
+	let line = (await audit(bo, own)).find((l) => l.action === "file.inspect" && l.target === s1.id);
+	assert.ok(line, "the inspection is audited");
+	assert.equal(line.details, "version 1, a malware sample, in the hex view");
+	assert.equal(line.actor, bo.email);
+	assert.equal((await inspect(bo, own, s1.id, { version: 9 })).status, 404, "a version the file does not have");
+	assert.equal((await inspect(bo, own, "f-not-there")).status, 404);
+	assert.equal((await inspect(cy, own, s1.id)).status, 403, "another member's area: not theirs to look into");
+	assert.equal((await inspect(bo, own, s1.id, { entry: "payload.exe" })).status, 400, "an entry's name in plain text is refused: the server is not to read it");
+	const entry = await sealPlacedText(bo.sealer.priv, places.fileInspected("bo", s1.id, 1), "payload.exe");
+	assert.equal((await inspect(bo, own, s1.id, { entry })).status, 200, "(no version: the current one)");
+	line = (await audit(bo, own)).find((l) => l.action === "file.inspect" && l.target === s1.id && l.detailsSealed);
+	assert.equal(line.details, "an entry inside version 1 of a malware sample (its name sealed), in the hex view");
+	assert.equal(await openPlacedText(bo.sealer.priv, places.fileInspected("bo", s1.id, 1), line.detailsSealed), "payload.exe", "the name, sealed to the area: its members read it, the server does not");
+	seen = await inspect(cy, ev.base, kit.id, { version: 1 });
+	assert.equal(seen.status, 200, `a read-only grantee inspects too — inspecting is reading: ${seen.text}`);
+	assert.ok((await audit(ana, ev.base)).some((l) => l.action === "file.inspect" && l.target === kit.id && l.actor === cy.email), "…on the case's trail, under their name");
+
+	console.log("ok  api:samples — uploaded as a sample (listed, keyed, audited), never linked, marking one way and complete, the per-file walk, samples on evidence, read-only cannot mark, an inspection on the record before the bytes (its entry sealed, a read grant enough)");
 } finally {
 	await dev.close();
 }

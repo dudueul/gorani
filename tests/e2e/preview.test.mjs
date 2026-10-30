@@ -63,7 +63,16 @@
  *     refused, and said why; a phishing page shown as source only; code
  *     highlighted, wrapped on request; a dropper's every line named and
  *     its hidden command decoded; a leaked config's keys named, masked; a
- *     program named .js said to be binary; plain text kept in the page.
+ *     program named .js taken to the hex reader; plain text kept in the page;
+ *   - programs (42g): mingw's .exe and .dll, gcc's ELF, clang's universal
+ *     Mach-O taken apart in the hex reader (headers, sections, imports,
+ *     exports, the ad hoc signature); the hostile PE's every trick named;
+ *     Go to, Find (text and hex bytes), the strings filtered and followed;
+ *     a program named .pdf caught by its bytes; a file of no format
+ *     inspected as hex; a malware sample — out of an "infected" archive,
+ *     and saved — inspected as bytes only, in the hex reader and no other,
+ *     each inspection a line in the audit trail first (an entry's name
+ *     sealed in it).
  */
 
 import assert from "node:assert/strict";
@@ -71,6 +80,7 @@ import { readFileSync } from "node:fs";
 import { startDev } from "../api/_dev.mjs";
 import { seedLead } from "../lib/seed-lead.mjs";
 import { dropperPs1, installSh, leakedEnv } from "../lib/hostile-text.mjs";
+import { hostilePe } from "../lib/programs.mjs";
 
 let chromium = null;
 try {
@@ -257,6 +267,11 @@ try {
 		{ name: "prod.env", mimeType: "text/plain", buffer: Buffer.from(leakedEnv) },
 		{ name: "invoice.js", mimeType: "text/javascript", buffer: Buffer.from([0x4d, 0x5a, 0x90, 0, 3, 0, 0, 0, 0x50, 0x45, 0, 0]) },
 		{ name: "field.log", mimeType: "text/plain", buffer: Buffer.from("09:00 gorani seen\n09:05 gorani gone\n") },
+		...["hello.exe", "hello.dll", "hello.elf", "hello.macho"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
+		// (Built when the test runs — tests/lib/programs.mjs; a program named .pdf, a byte more so the duplicate check does not ask.)
+		{ name: "loader.exe", mimeType: "application/octet-stream", buffer: Buffer.from(hostilePe()) },
+		{ name: "receipt.pdf", mimeType: "application/pdf", buffer: Buffer.concat([fixture("hello.exe"), Buffer.from([1])]) },
+		{ name: "blob.xyz", mimeType: "application/octet-stream", buffer: Buffer.from("bytes of no format \u0000\u0001\u0002 gorani", "latin1") },
 		...["bundle.zip", "bundle.7z", "bundle.rar", "bundle.tar.gz", "bundle.iso", "korean.zip", "lure.zip", "infected.zip", "locked.7z", "liar.zip", "report.alz", "report.egg", "azo.egg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		...["photo.jpg", "portrait.jpg", "redacted.jpg", "cropped.jpg", "polyglot.jpg", "generated.png", "bomb.png", "animated.gif", "photo.webp", "photo.avif", "scan.tiff", "photo.heic", "camera.dng", "camera.cr3", "camera.raf", "drawing.svg", "hostile.svg", "entities.svg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		// Disguises: a JPEG named .png (a zero byte more, so the upload's
@@ -728,6 +743,17 @@ try {
 	await d.locator('[data-test="arc-unlocked"]', { hasText: "malware samples" }).waitFor({ timeout: 30_000 });
 	await factsSay(/Opened with the password “infected”/);
 	assert.equal(await d.locator('[data-test="arc-open"]').count(), 0, "a sample is never opened");
+	// …but it may be inspected (42g): bytes only, in the hex reader, on the record first.
+	await rowOf(d, "sample.exe").locator('[data-test="arc-inspect"]').click();
+	await page.locator('[data-test="viewer-name"]', { hasText: "infected.zip › sample.exe" }).waitFor({ timeout: 30_000 });
+	await page.frameLocator('iframe[data-preview="hex"]').locator('[data-test="hex-sample"]').waitFor({ timeout: 30_000 });
+	await factsSay(/A malware sample, shown as bytes only/);
+	assert.equal(await page.locator('iframe[data-preview]:not([data-preview="hex"]):not([data-preview="archive"])').count(), 0, "no other reader");
+	await page.locator('[data-test="viewer-back"]').click();
+	await page.locator('iframe[data-preview="archive"]').waitFor({ timeout: 30_000 });
+	d = page.frameLocator('iframe[data-preview="archive"]');
+	await d.locator('[data-test="arc-try-infected"]').click();
+	await d.locator('[data-test="arc-unlocked"]', { hasText: "malware samples" }).waitFor({ timeout: 30_000 });
 	await rowOf(d, "sample.exe").locator('[data-test="arc-save"]', { hasText: "Save as sample" }).click();
 	await page.locator('[data-test="viewer-save-dialog"]').waitFor({ timeout: 30_000 });
 	assert.match(await page.locator('[data-test="viewer-save-risk"]').innerText(), /Windows program/);
@@ -738,6 +764,21 @@ try {
 	await closeDoc();
 	await exact("sample.exe").waitFor({ timeout: 60_000 });
 	assert.match(await exact("sample.exe").innerText(), /Malware sample/, "saved beside the archive, as a sample");
+	// The saved sample: refused, and inspected as bytes on request — the line first.
+	await exact("sample.exe").dblclick();
+	await page.locator('[data-test="viewer-refused"]').waitFor({ timeout: 30_000 });
+	assert.equal(await page.locator("iframe[data-preview]").count(), 0, "nothing decrypted until asked");
+	await page.locator('[data-test="viewer-inspect"]').click();
+	await page.frameLocator('iframe[data-preview="hex"]').locator('[data-test="hex-sample"]').waitFor({ timeout: 30_000 });
+	tells = await factsSay(/A malware sample, shown as bytes only/);
+	assert.match(tells, /A DOS program \(MZ\)/);
+	assert.equal(await page.locator('iframe[data-preview]:not([data-preview="hex"])').count(), 0, "the hex reader, and no other");
+	await closeDoc();
+	const trail = await (await fetch(`${dev.base}/api/v1/members/rin/audit`, { headers: { "x-gorani-dev-email": "rin@preview.test" } })).json();
+	const inspected = trail.filter((l) => l.action === "file.inspect");
+	assert.ok(inspected.some((l) => /^version 1, a malware sample, in the hex view$/.test(l.details) && !l.detailsSealed), `the saved sample's inspection on the record: ${JSON.stringify(inspected)}`);
+	assert.ok(inspected.some((l) => /an entry inside version 1 of a file \(its name sealed\)/.test(l.details) && /^GV0\d:/.test(l.detailsSealed)), "the entry's, its name sealed");
+	assert.ok(!JSON.stringify(inspected).includes("sample.exe"), "no entry name in the server's plain text");
 
 	// Names hidden by AES (7z -mhe): a wrong password, then the right one.
 	d = await openDoc("locked.7z", "archive");
@@ -867,15 +908,76 @@ try {
 	assert.match(tells, /AKIA…MPLE \(line 2\)/);
 	assert.doesNotMatch(tells, /IOSFODNN7|K7MDENG|Gorani-s3cret/);
 	await closeDoc();
-	// A program named .js: said to be binary, shown as characters.
-	d = await openDoc("invoice.js", "text");
-	await factsSay(/Its name says text, but it is binary/);
+	// A program named .js: by its first bytes, the hex reader (42g), which names the disguise.
+	d = await openDoc("invoice.js", "hex");
+	await factsSay(/Named \.js, but it is a DOS program \(MZ\)/);
 	await closeDoc();
 	// Plain text needs no parser: it stays in the page, escaped.
 	await exact("field.log").dblclick();
 	await page.getByText("09:05 gorani gone").waitFor({ timeout: 30_000 });
 	assert.equal(await page.locator("iframe[data-preview]").count(), 0, "a log is not handed to a reader");
 	await page.keyboard.press("Escape");
+
+	// ── programs (42g) ───────────────────────────────────────────────────
+	const hexStatus = (dd) => dd.locator('[data-test="hex-status"]');
+	d = await openDoc("hello.exe", "hex");
+	await d.locator('[data-test="hex-program"] [data-test="hex-header"]', { hasText: "PE32+ · x64" }).waitFor({ timeout: 30_000 });
+	await d.locator('[data-test="hex-sections"] td', { hasText: /^\.text$/ }).waitFor();
+	tells = await factsSay(/imphash 8feeb4b8639b9197e7245e82d60db06f/);
+	assert.match(tells, /^A Windows program \(PE32\+, x64, console\)/);
+	assert.doesNotMatch(tells, /⚠/, "an honest program warns of nothing");
+	await d.locator('[data-test="hex-hashes"] td', { hasText: /^[0-9a-f]{64}$/ }).waitFor({ timeout: 30_000 });
+	await closeDoc();
+	d = await openDoc("hello.dll", "hex");
+	tells = await factsSay(/Exports 2 functions as “hello\.dll”: gorani_count · gorani_total/);
+	assert.match(tells, /Says it is “Counts water deer”, by “Gorani tests”/);
+	await closeDoc();
+	d = await openDoc("hello.elf", "hex");
+	await factsSay(/A Linux position-independent executable \(ELF 64-bit, x86-64\)/);
+	await d.locator('[data-test="hex-program"] h2', { hasText: "ELF program" }).waitFor();
+	await closeDoc();
+	d = await openDoc("hello.macho", "hex");
+	tells = await factsSay(/universal: x86-64, arm64/);
+	assert.match(tells, /Signed ad hoc \(its arm64 part\), as “hello-arm64”/);
+	await closeDoc();
+
+	// The hostile one: every trick named; its bytes walked.
+	d = await openDoc("loader.exe", "hex");
+	tells = await factsSay(/write into other processes \(code injection\)/);
+	for (const want of [/compile time is in the future/, /Packed or wrapped: UPX/, /both writable and executable/, /after its last section \(an overlay/, /NOT checked here; the names in it: “Microsoft Windows”/, /it deletes shadow copies/, /words of a ransom note/, /Bitcoin address/, /imphash 531fe725907a4fce772dad97850896e9/]) assert.match(tells, want);
+	await d.locator('[data-test="hex-imports"] .warn', { hasText: "CreateRemoteThread" }).waitFor();
+	await d.locator('[data-test="hex-sections"] tr', { hasText: "UPX1" }).click();
+	await hexStatus(d).filter({ hasText: "Offset 0x600" }).waitFor();
+	await hexStatus(d).filter({ hasText: "in UPX1" }).waitFor();
+	await d.locator('[data-test="hex-goto"]').fill("0x410");
+	await d.locator('[data-test="hex-goto"]').press("Enter");
+	await hexStatus(d).filter({ hasText: /^Offset 0x410 \(1,040\) · byte 0x76/ }).waitFor();
+	await d.locator('[data-test="hex-grid"] .sel', { hasText: "76" }).first().waitFor();
+	await d.locator('[data-test="hex-find"]').fill("payload.bin");
+	await d.locator('[data-test="hex-find"]').press("Enter");
+	await d.locator('[data-test="hex-found"]', { hasText: /^at 0x4[0-9a-f]{2}$/ }).waitFor();
+	await d.locator('[data-test="hex-find-mode"]').selectOption("hex");
+	await d.locator('[data-test="hex-find"]').fill("4d 5a");
+	await d.locator('[data-test="hex-find"]').press("Enter");
+	await d.locator('[data-test="hex-found"]', { hasText: "at 0x0" }).waitFor();
+	await d.locator('[data-test="hex-tab-strings"]').click();
+	await d.locator('[data-test="hex-strings-filter"]').fill(".onion");
+	await d.locator('[data-test="hex-strings-count"]', { hasText: /^1 of \d+/ }).waitFor();
+	await d.locator('[data-test="hex-string"]').first().click();
+	await d.locator('[data-test="hex-view"]').waitFor();
+	await hexStatus(d).filter({ hasText: "in UPX0" }).waitFor();
+	await closeDoc();
+
+	// A program named .pdf: its bytes decide.
+	d = await openDoc("receipt.pdf", "hex");
+	await factsSay(/Named \.pdf, but it is a program — a disguise/);
+	await closeDoc();
+	// A file of no format: offered, and inspected, as hex.
+	await exact("blob.xyz").dblclick();
+	await page.locator('[data-test="viewer-inspect-hex"]').click({ timeout: 30_000 });
+	await page.locator('iframe[data-preview="hex"]').waitFor({ timeout: 30_000 });
+	await factsSay(/Data of no format this reader knows · 29 bytes/);
+	await closeDoc();
 
 	// The details pane: a small picture, in a compact frame of its own.
 	await exact("photo.jpg").click();
@@ -974,7 +1076,7 @@ try {
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — programs (mingw, gcc and clang builds taken apart in the hex reader; the hostile PE's every trick named; Go to, Find, strings; a program named .pdf caught; a sample inspected as bytes only, each inspection in the audit trail first); text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

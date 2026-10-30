@@ -25,6 +25,11 @@
  *  10. text (42f): a leaked config's keys found and masked, a dropper read
  *      line by line (its -EncodedCommand decoded), shells; JSON nesting and
  *      XML entities refused before any parser; encodings
+ *  11. programs (42g): real mingw, gcc and clang builds read as pefile,
+ *      readelf and llvm-otool read them (imphash included); the hostile PE
+ *      built at run time — injection, a packer, an overlay, a forged
+ *      signature, a ransom note in its strings — named; malformed headers
+ *      said, never thrown
  */
 
 import assert from "node:assert/strict";
@@ -63,6 +68,16 @@ import { decodeText, jsonDepth, parseJson, parseJsonLines, textKind, xmlDanger }
 import { textFacts } from "../../web/src/preview/facts/text.ts";
 // (Built when the test runs: no file here a scanner would flag — tests/lib/hostile-text.mjs.)
 import { dropperPs1, installSh, leakedEnv, shellPhp } from "../lib/hostile-text.mjs";
+import { buildPe, hostilePe } from "../lib/programs.mjs";
+import { imphash, parsePe, versionStrings } from "../../web/src/preview/binary/pe.ts";
+import { parseElf } from "../../web/src/preview/binary/elf.ts";
+import { parseMachoFile } from "../../web/src/preview/binary/macho.ts";
+import { identify, isProgram } from "../../web/src/preview/binary/sniff.ts";
+import { extractStrings, stringFindings } from "../../web/src/preview/binary/strings.ts";
+import { capabilities } from "../../web/src/preview/binary/capabilities.ts";
+import { commonNames, entropy } from "../../web/src/preview/binary/read.ts";
+import { findBytes } from "../../web/src/preview/binary/find.ts";
+import { binaryFacts } from "../../web/src/preview/facts/binary.ts";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
 const said = (facts: { text: string }[]) => facts.map((f) => f.text).join("\n");
@@ -562,4 +577,99 @@ assert.deepEqual(decodeText(new Uint8Array([0xb0, 0xed, 0xb6, 0xf3, 0xb4, 0xcf])
 assert.equal(decodeText(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])).encoding, "UTF-8 (with BOM)");
 assert.deepEqual(decodeText(new Uint8Array([0xff, 0xfe, 0x41, 0x00])), { text: "A", encoding: "UTF-16 LE" });
 
-console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded");
+// ── 11. Programs (42g) ───────────────────────────────────────────────
+const bf = (name: string, b: Uint8Array, sample = false) => {
+	const st = extractStrings(b);
+	return said(binaryFacts({ name, size: b.length, sha256: "x", id: identify(b), pe: parsePe(b), elf: parseElf(b), macho: parseMachoFile(b), strings: { total: st.total, findings: stringFindings(st.items) }, entropy: entropy(b), sample }));
+};
+// A real mingw build, read as pefile reads it (its imphash is pefile's own answer).
+const exe = parsePe(fixture("hello.exe"))!;
+assert.deepEqual([exe.bits, exe.machine, exe.kind, exe.subsystem, exe.time, exe.entrySection, exe.tls], [64, "x64", "program", "console", 0, ".text", 2]);
+assert.deepEqual(exe.sections.map((x) => x.name), [".text", ".data", ".rdata", ".pdata", ".xdata", ".bss", ".idata", ".CRT", ".tls", ".reloc"]);
+assert.deepEqual(exe.imports.map((i) => [i.dll, i.names.length]), [["KERNEL32.dll", 10], ["msvcrt.dll", 25]]);
+assert.equal(exe.imphash, "8feeb4b8639b9197e7245e82d60db06f", "pefile's imphash");
+assert.deepEqual([exe.signature, exe.overlay, exe.dotnet], [null, null, null]);
+const dllInfo = parsePe(fixture("hello.dll"))!;
+assert.equal(dllInfo.kind, "DLL");
+assert.deepEqual(dllInfo.exports, { name: "hello.dll", names: ["gorani_count", "gorani_total"], count: 2 });
+assert.deepEqual(dllInfo.version, { CompanyName: "Gorani tests", FileDescription: "Counts water deer", OriginalFilename: "hello.dll", ProductName: "Gorani" }, "the version resource, read as pefile reads it");
+assert.equal(dllInfo.manifestLevel, "asInvoker");
+assert.equal(dllInfo.imphash, "df00652ad3e78ba777ba702462655cf8");
+assert.doesNotMatch(bf("hello.exe", fixture("hello.exe")), /⚠|Packed|inject|disguise/, "an honest program warns of nothing");
+// gcc's ELF, as readelf reads it.
+const elfInfo = parseElf(fixture("hello.elf"))!;
+assert.deepEqual([elfInfo.bits, elfInfo.machine, elfInfo.type, elfInfo.interpreter, elfInfo.stripped, elfInfo.needed], [64, "x86-64", "position-independent executable", "/lib64/ld-linux-x86-64.so.2", false, ["libc.so.6"]]);
+assert.ok(elfInfo.imports.includes("puts") && elfInfo.imports.includes("__libc_start_main"));
+assert.match(elfInfo.buildId ?? "", /^[0-9a-f]{40}$/);
+// clang + ld64.lld's universal Mach-O, as llvm-otool reads it.
+const mf = parseMachoFile(fixture("hello.macho"))!;
+assert.deepEqual([mf.universal, mf.archs.map((a) => a.cpu)], [true, ["x86-64", "arm64"]]);
+const arm = mf.programs.find((x) => x.cpu === "arm64")!;
+assert.deepEqual([arm.type, arm.platform, arm.minOs, arm.libraries.map((l) => l.path), arm.imports], ["executable", "macOS", "13.0", ["/usr/lib/libSystem.B.dylib"], ["_puts", "dyld_stub_binder"]]);
+assert.deepEqual([arm.signature?.adhoc, arm.signature?.identifier, arm.signature?.certificate], [true, "hello-arm64", false], "the linker's ad hoc signature, its identifier");
+assert.equal(mf.programs.find((x) => x.cpu === "x86-64")!.signature, null);
+// What the first bytes say, whatever the name.
+assert.equal(identify(fixture("hello.exe"))?.what, "a Windows program (PE)");
+assert.equal(identify(fixture("bundle.zip"))?.what, "a ZIP");
+assert.equal(identify(new Uint8Array([0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 0x34]))?.what, "a Java class", "0xCAFEBABE with 52 \"architectures\" is Java");
+assert.ok(isProgram(fixture("hello.macho")) && !isProgram(fixture("report.pdf")));
+assert.match(bf("invoice.pdf", fixture("hello.exe")), /Named \.pdf, but it is a program — a disguise/);
+
+// The hostile PE, built now (tests/lib/programs.mjs): every trick named.
+const hostile = hostilePe();
+const hp = parsePe(hostile)!;
+assert.deepEqual(hp.imports.find((i) => i.dll === "WS2_32.dll")!.names, ["#115", "#23", "#4"], "64-bit ordinals read exactly (2^63 + n is past a double's precision)");
+assert.equal(hp.imphash, "531fe725907a4fce772dad97850896e9", "pefile's imphash, Winsock ordinals named as pefile names them");
+assert.deepEqual(hp.signature?.names, ["Microsoft Windows", "Microsoft Windows Production PCA 2011"]);
+assert.deepEqual(hp.overlay, { offset: 0x3a00, size: 4096 }, "the overlay ends where the signature starts");
+const ht = bf("loader.exe", hostile);
+for (const want of [
+	/compile time is in the future \(2100-01-01\)/,
+	/debug-symbol path: “C:\\Users\\attacker\\.*loader\.pdb” — it names the builder's user folder/,
+	/Packed or wrapped: UPX/,
+	/near-random bytes \(UPX1 7\.9\d\) — compressed or encrypted code/,
+	/both writable and executable \(UPX0, UPX1\)/,
+	/4\.0 kB after its last section \(an overlay, at 0x3a00\)/,
+	/Authenticode signature — NOT checked here; the names in it: “Microsoft Windows”/,
+	/write into other processes \(code injection\): VirtualAllocEx · WriteProcessMemory · CreateRemoteThread/,
+	/watch the keyboard/, /download from the internet: URLDownloadToFile/, /read saved passwords or credentials: CryptUnprotectData/,
+	/at 0x410: it deletes shadow copies/, /adds itself to the Run keys/, /words of a ransom note/,
+	/Tor \(\.onion\) address/, /Bitcoin address: bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4/, /http:\/\/203\.0\.113\.9\/payload\.bin/,
+]) assert.match(ht, want);
+assert.match(bf("loader.exe", hostile, true), /A malware sample, shown as bytes only/);
+const pretender = { ...parsePe(fixture("hello.dll"))!, version: { CompanyName: "Microsoft Corporation", OriginalFilename: "svchost.exe" } };
+assert.match(said(binaryFacts({ name: "update.dll", size: 1, sha256: null, id: null, pe: pretender, elf: null, macho: null, strings: null, entropy: 0, sample: false })), /Claims to be “Microsoft Corporation”'s but carries no signature[\s\S]*Its own name for itself is “svchost\.exe”/);
+assert.match(said(binaryFacts({ name: "x.exe", size: 1, sha256: null, id: null, pe: { ...exe, manifestLevel: "requireAdministrator", imports: [], dotnet: null }, elf: null, macho: null, strings: null, entropy: 0, sample: false })), /Asks to run as administrator[\s\S]*Imports nothing/);
+
+// Malformed: cut short anywhere, it says so — it never throws.
+for (const n of [0x40, 0x90, 0x100, 0x200, 0x3000]) {
+	const cut = hostile.subarray(0, n);
+	const p = parsePe(cut);
+	if (p) assert.ok(p.warnings.length || p.sections.length < 3, `cut at ${n}: said`);
+}
+for (const f of ["hello.elf", "hello.macho"]) for (const n of [64, 200, 1000]) {
+	const cut = fixture(f).subarray(0, n);
+	assert.doesNotThrow(() => (parseElf(cut), parseMachoFile(cut)), `${f} cut at ${n}`);
+}
+// A PE whose section table claims more than Windows loads, and runs past its end.
+const claims = buildPe({ sections: [{ name: ".text", data: new Uint8Array(16), exec: true, write: false }] });
+new DataView(claims.buffer).setUint16(0x86, 500, true);
+assert.match(parsePe(claims)!.warnings.join(" "), /claims 500 sections/);
+
+// Capabilities: POSIX names with or without Mach-O's underscore; the reverse shell's shape.
+assert.equal(capabilities(["socket", "connect", "dup2", "execve"], false)[0]!.what, "make a reverse shell (a socket, dup2 onto the standard streams, a shell)");
+assert.ok(capabilities(["_ptrace"], false).some((c) => c.strong && c.calls.includes("ptrace")));
+assert.ok(capabilities(["SetWindowsHookExW"], true).some((c) => c.calls.includes("SetWindowsHookEx")), "W and Ex suffixes");
+assert.deepEqual(capabilities(["puts", "printf"], false), []);
+// Strings: ASCII and UTF-16LE, by offset, as `strings` and `strings -el` print them.
+// (Three NULs between: "d" and one NUL would be a UTF-16 character too — as `strings -el` reads it.)
+const sb = new Uint8Array([...new TextEncoder().encode("\0\0hello world\0\0\0"), ...[..."wide one"].flatMap((c) => [c.charCodeAt(0), 0]), 0, 0, 1]);
+assert.deepEqual(extractStrings(sb).items.map((x) => [x.at, x.text, x.wide]), [[2, "hello world", false], [16, "wide one", true]]);
+assert.deepEqual(commonNames(new Uint8Array([0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 3, 0x41, 0x42, 0x43])), ["ABC"]);
+// Find: forward, back, wrapping.
+const hay = new TextEncoder().encode("MZ..MZ..MZ");
+assert.deepEqual([findBytes(hay, new TextEncoder().encode("MZ"), 1, 1), findBytes(hay, new TextEncoder().encode("MZ"), 9, 1), findBytes(hay, new TextEncoder().encode("MZ"), 3, -1), findBytes(hay, new TextEncoder().encode("MZ"), -1, -1), findBytes(hay, new TextEncoder().encode("PE"), 0, 1)], [4, 0, 0, 8, -1], "next, wrapped forward, previous, wrapped back from the start, none");
+assert.equal(imphash([{ dll: "OLEAUT32.dll", names: ["#2"], delayed: false }]), null, "an oleaut32 ordinal: no imphash rather than a wrong one");
+assert.equal(versionStrings(new Uint8Array(10)), null);
+
+console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded; programs: mingw, gcc and clang builds read as pefile, readelf and llvm-otool read them (imphash, version, exports, ad hoc signature), the hostile PE's injection, packer, overlay, forged signature and ransom strings named, cut-short headers said and never thrown");

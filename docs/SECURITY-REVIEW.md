@@ -494,8 +494,47 @@ Accepted:
 
 - **The triage is pattern matching** and can be evaded; it says so
   (PREVIEWS.md › Limits). It adds evidence and never clears a file.
-- **A file named as text but holding a program** is shown as characters
-  in the text reader until 42g's hex reader takes such files.
+- (A file named as text but holding a program went to the text reader
+  until 42g; it goes to the hex reader now.)
+
+### Programs and samples (commit 42g)
+
+The threat: a program is the payload itself, and the question a responder
+needs answered first — what is it, what would it do, what is its hash — was
+until now answered only by downloading it zipped onto an analysis machine.
+Showing it means parsing headers an attacker wrote, and a sample being
+looked at by someone on the team is itself an event the record must hold.
+
+The controls, on top of the frame:
+
+- **Parsers that cannot be walked off the end.** Every offset is checked
+  before it is followed (`binary/read.ts › Reader`: a read past the end
+  throws a `Short` the parser catches and names); every loop a header
+  controls is capped; an RVA is mapped through the section table. The
+  tests cut each fixture short at many points and require a result, never
+  an exception.
+- **Nothing executes or is interpreted.** No disassembler, no emulator, no
+  resource renderer: bytes become numbers and Latin-1 characters through
+  `textContent`. The frame's CSP and sandbox stand behind it anyway.
+- **A sample reaches the hex reader and no other**, enforced in the app
+  (`viewer.ts` and `sandbox.ts › openPreview`, which throws otherwise), and
+  **only after `file.inspect` is in the chained audit trail** — written by
+  the Worker before the app decrypts, so a server that refuses (or a
+  network that drops the call) means nothing is opened. An archive entry's
+  name rides sealed.
+- **Signatures are named, never trusted.** The facts say "NOT checked
+  here"; an unsigned file that claims a vendor's name is called out.
+- **Test programs that would be flagged are not committed:** the hostile
+  PE is built at test time; the committed ones are compiled from a
+  one-line C file by mingw, gcc and clang (`programs.sh`).
+
+Accepted:
+
+- **The inspection line is the app's promise, not the server's proof**: a
+  modified client could decrypt without asking. The same is true of every
+  read in a zero-trust design; the read log (which records the download
+  of the bytes) is the server-side backstop.
+- **No signature verification, no disassembly** (PREVIEWS.md › Limits).
 
 ## Still open
 

@@ -94,6 +94,12 @@ export class GoraniViewer extends LitElement {
 	private docBytes: Uint8Array | null = null;
 	private docMime: string | null = null;
 	@state() private facts: Fact[] = [];
+	/** Shown as bytes, in the hex reader (42g): a file the person asked to
+	 * inspect — a malware sample among them (`sample`), only after the
+	 * inspection is in the audit trail (inspect()). */
+	private asHex: { sample: boolean } | null = null;
+	/** Why an inspection did not open (shown in the panel that offered it). */
+	@state() private inspectError: string | null = null;
 	/** A fact's words just copied (its button says so for a moment). */
 	@state() private copied: string | null = null;
 	/**
@@ -192,6 +198,8 @@ export class GoraniViewer extends LitElement {
 
 	private reset(): void {
 		this.release();
+		this.asHex = null;
+		this.inspectError = null;
 		this.mode = "unsupported";
 		this.text = null;
 		this.truncated = false;
@@ -208,6 +216,16 @@ export class GoraniViewer extends LitElement {
 	 */
 	private loadInner(): void {
 		const f = this.inner.at(-1)!;
+		if (f.hex) {
+			// Inspected (42g): bytes only, whatever its kind.
+			this.mode = "document";
+			this.docBytes = f.bytes.slice();
+			this.docMime = f.mime;
+			this.asHex = { sample: !!f.sample };
+			this.busy = false;
+			void this.updateComplete.then(() => this.refocus());
+			return;
+		}
 		const kind = kindOf(f.name, f.mime);
 		const mode = pickViewerMode(kind, f.mime, f.bytes.length, "normal", f.name);
 		this.mode = mode === "video" || mode === "audio" ? "unsupported" : mode;
@@ -260,7 +278,58 @@ export class GoraniViewer extends LitElement {
 		this.refocus();
 	}
 
+	/**
+	 * Inspect this file as bytes (42g, docs/CUSTODY.md › Stage 5): its hex,
+	 * strings and program headers, in the hex reader — the one way a
+	 * malware sample (or a file whose type does not verify) is ever opened.
+	 * The inspection goes on the record FIRST: if the server does not write
+	 * the audit line, nothing is decrypted. A file with no reader of its
+	 * own is inspected the same way, without the line (`sample` false: it
+	 * is an ordinary read, in the read log like any other).
+	 */
+	private async inspect(sample: boolean): Promise<void> {
+		const { id, size } = this.target;
+		if (size > MAX_INLINE) {
+			this.inspectError = `Too large to inspect here (${fmtSize(size)}; the limit is ${fmtSize(MAX_INLINE)}). Download it into an analysis environment.`;
+			return;
+		}
+		this.busy = true;
+		this.inspectError = null;
+		try {
+			if (sample) await this.model.inspect(id, this.target.version);
+			const parts: Uint8Array[] = [];
+			await this.model.openBytes(id, this.target.version, (plain) => void parts.push(plain));
+			this.docBytes = concat(parts);
+			this.docMime = null;
+			this.asHex = { sample };
+			this.mode = "document";
+		} catch (e) {
+			this.inspectError = `Not inspected: ${e instanceof Error ? e.message : String(e)}`;
+		}
+		this.busy = false;
+		// (The button that had the focus is gone with its panel: give it back
+		// to the viewer, or Escape reaches nothing.)
+		await this.updateComplete;
+		this.refocus();
+	}
+
+	/** An entry the reader found (a sample out of an "infected" archive)
+	 * inspected as bytes: on the record against the file it came out of,
+	 * its name sealed — then shown in the hex reader, nowhere else. */
+	private async inspectInner(file: HandedFile): Promise<void> {
+		try {
+			if (file.sample) await this.model.inspect(this.target.id, this.target.version, file.name);
+		} catch (e) {
+			this.model.notify(`Not inspected: ${e instanceof Error ? e.message : String(e)}`);
+			return;
+		}
+		this.reset();
+		this.inner = [...this.inner, { ...file, hex: true }];
+		this.loadInner();
+	}
+
 	private async load(): Promise<void> {
+		this.asHex = null;
 		const { id, kind, size } = this.target;
 		const info = await this.model.renderInfo(id);
 		const mime = info?.mime ?? null;
@@ -449,15 +518,16 @@ export class GoraniViewer extends LitElement {
 		const shown = this.shown();
 		// The name picks the reader; the first bytes correct it (a ".doc"
 		// that is RTF, a ".docx" that is a Word 97 file — mode.ts).
-		const reader = sniffReader(bytes.subarray(0, 16), readerFor(shown.kind, this.docMime, shown.name) ?? "pdf", shown.name);
+		// (Inspected — 42g — it is the hex reader, whatever the bytes are.)
+		const reader = this.asHex ? "hex" : sniffReader(bytes.subarray(0, 16), readerFor(shown.kind, this.docMime, shown.name) ?? "pdf", shown.name);
 		this.frame = { close: () => {} };
 		void openPreview(host, reader, { name: shown.name, mime: this.docMime, bytes }, {
 			onKey: (key) => (key === "Escape" ? this.escape() : this.step(key === "ArrowRight" ? 1 : -1)),
 			onStep: (delta) => this.step(delta),
 			onShown: (facts) => (this.facts = facts),
 			onError: (message) => (this.error = message),
-			onHandover: (action, file) => (action === "open" ? this.openInner(file) : this.askSave(file)),
-		})
+			onHandover: (action, file) => (action === "open" ? this.openInner(file) : action === "inspect" ? void this.inspectInner(file) : this.askSave(file)),
+		}, { sample: this.asHex?.sample === true })
 			.then((f) => {
 				if (this.frame && this.isConnected) this.frame = f;
 				else f.close();
@@ -712,16 +782,22 @@ export class GoraniViewer extends LitElement {
 		`;
 	}
 
-	/** A sample is never rendered here (commit 29e). Download zips it. */
+	/** A sample is never rendered here (commit 29e). Download zips it;
+	 * Inspect shows its bytes in the hex reader, on the record (42g). */
 	private refused(): TemplateResult {
 		const sample = this.policy === "sample";
 		return html`
 			<div class="max-w-md rounded-2xl border border-amber-700/60 bg-neutral-900 p-8 text-center" data-test="viewer-refused">
 				${icon("sample", "h-16 w-16 text-amber-500 mx-auto")}
-				<p class="mt-3 text-sm text-neutral-200">${sample ? "A malware sample — never opened in this app." : "This file's type does not verify in its place — not opened, as if it were a sample."}</p>
+				<p class="mt-3 text-sm text-neutral-200">${sample ? "A malware sample — never run or rendered in this app." : "This file's type does not verify in its place — not rendered, as if it were a sample."}</p>
 				${this.shownType ? html`<p class="mt-1 text-xs text-neutral-500">Type: ${this.shownType}</p>` : nothing}
 				<p class="mt-1 text-xs text-neutral-500">Download saves it as a zip encrypted with the password <code class="text-neutral-300">${SAMPLE_PASSWORD}</code>, the convention antivirus and analysts expect. Open it only inside an analysis environment.</p>
-				<button class="mt-4 rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" @click=${() => void this.model.download(this.target.id, this.target.name)}>Download zipped</button>
+				<div class="mt-4 flex flex-wrap justify-center gap-2">
+					<button class="rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" @click=${() => void this.model.download(this.target.id, this.target.name)}>Download zipped</button>
+					<button class="rounded-xl border border-amber-700/70 px-4 py-2 text-sm text-amber-200 hover:border-amber-500" data-test="viewer-inspect" title="Its bytes, strings and program headers — nothing in it runs or is drawn. The inspection is written into the audit trail first." @click=${() => void this.inspect(true)}>Inspect as bytes</button>
+				</div>
+				<p class="mt-2 text-[11px] text-neutral-500">Inspect shows its bytes, strings and program headers in a sandboxed frame, and is recorded in the audit trail.</p>
+				${this.inspectError ? html`<p class="mt-2 text-xs text-red-400" data-test="viewer-inspect-error">${this.inspectError}</p>` : nothing}
 			</div>
 		`;
 	}
@@ -736,7 +812,10 @@ export class GoraniViewer extends LitElement {
 					${icon(kindOf(top.name, top.mime), "h-16 w-16 text-neutral-600 mx-auto")}
 					<p class="mt-3 text-sm text-neutral-300">${this.mode === "too-large" ? "Too large to open in the page." : "No preview for this kind of attachment."}</p>
 					<p class="mt-1 text-xs text-neutral-500">It is not opened here. Save it into the vault to keep it — as a malware sample, if it is one.</p>
-					<button class="mt-4 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" data-test="viewer-save-inner-body" @click=${() => this.askSave(top)}>Save to vault</button>
+					<div class="mt-4 flex flex-wrap justify-center gap-2">
+						<button class="rounded-xl bg-accent px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" data-test="viewer-save-inner-body" @click=${() => this.askSave(top)}>Save to vault</button>
+						${this.mode === "too-large" ? nothing : html`<button class="rounded-xl border border-neutral-700 px-4 py-2 text-sm text-neutral-200 hover:border-accent" data-test="viewer-inspect-hex" @click=${() => void this.inspectInner(top)}>Inspect as hex</button>`}
+					</div>
 				</div>
 			`;
 		const large = this.mode === "too-large";
@@ -746,8 +825,12 @@ export class GoraniViewer extends LitElement {
 				<p class="mt-3 text-sm text-neutral-300">${large ? "Too large to open in the page." : "No preview for this format."}</p>
 				<p class="mt-1 text-xs text-neutral-500">${large
 					? `Shown only by reading it whole, and ${fmtSize(this.target.size)} is more than a tab should hold (${fmtSize(MAX_INLINE)}). Download it to open it.`
-					: "Video and music stream here, images and text open here; documents, PDFs and archives do not yet. Download opens it on this computer."}</p>
-				<button class="mt-4 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" @click=${() => void this.model.download(this.target.id, this.target.name)}>Download</button>
+					: "No reader takes this format. Inspect shows its bytes and strings; Download opens it on this computer."}</p>
+				<div class="mt-4 flex flex-wrap justify-center gap-2">
+					<button class="rounded-xl bg-accent px-4 py-2 text-sm font-medium text-neutral-950 hover:opacity-90" @click=${() => void this.model.download(this.target.id, this.target.name)}>Download</button>
+					${large ? nothing : html`<button class="rounded-xl border border-neutral-700 px-4 py-2 text-sm text-neutral-200 hover:border-accent" data-test="viewer-inspect-hex" title="Its bytes and strings (and, for a program, its headers), in a sandboxed frame" @click=${() => void this.inspect(false)}>Inspect as hex</button>`}
+				</div>
+				${this.inspectError ? html`<p class="mt-2 text-xs text-red-400" data-test="viewer-inspect-error">${this.inspectError}</p>` : nothing}
 			</div>
 		`;
 	}

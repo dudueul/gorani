@@ -882,6 +882,44 @@ impl GoraniMemberDO {
 		self.file_row(id).await
 	}
 
+	/// A file opened for INSPECTION (commit 42g, docs/CUSTODY.md › Stage 5):
+	/// `POST files-inspect/<id> { version, entry? }`, sent by the app BEFORE
+	/// it decrypts the bytes for the hex reader. Its one effect is the
+	/// line in the area's chained audit trail (and so in the SIEM feed):
+	/// who looked inside which version, and whether it was a sample.
+	///
+	/// - A malware sample (or a file whose type does not verify) opens in
+	///   the hex reader only — its bytes, strings and program headers, never
+	///   another reader — and only after this line is written: the app waits
+	///   for the answer, and a refusal here opens nothing.
+	/// - `entry`: something inside the file was inspected (an archive's
+	///   entry, opened with "infected"); its name rides SEALED — the server
+	///   records that there was one, and stores what it cannot read.
+	/// - The server cannot see whether the bytes were then shown as hex or
+	///   anything else: that is the app's rule. What it guarantees is that
+	///   an inspection the app asked for is on the record.
+	pub(crate) async fn file_inspect(&self, actor: &str, id: &str, body: &serde_json::Value) -> Result<Response> {
+		let Some(file) = self.file_sql_row(id).await? else { return json_error(404, "no such file") };
+		let version = body.get("version").and_then(|v| v.as_i64()).unwrap_or(file.version);
+		let held = self.sql.exec("SELECT COUNT(*) AS n FROM file_versions WHERE file_id = ?1 AND version = ?2", Some(vec![id.into(), version.into()]))?.one::<TotalCount>()?.n;
+		if held == 0 {
+			return json_error(404, "no such version");
+		}
+		let entry = body.get("entry").and_then(|v| v.as_str());
+		if let Some(e) = entry {
+			if !gorani_formats::formats::is_sealed_text(e) || e.len() > 4096 {
+				return json_error(400, "entry must be sealed text (its name is not the server's to read)");
+			}
+		}
+		let what = if file.sample != 0 { "a malware sample" } else { "a file" };
+		let detail = match entry {
+			Some(_) => format!("an entry inside version {version} of {what} (its name sealed), in the hex view"),
+			None => format!("version {version}, {what}, in the hex view"),
+		};
+		self.audit(actor, "file.inspect", id, entry, Some(&detail)).await?;
+		Response::from_json(&serde_json::json!({ "inspected": id, "version": version, "sample": file.sample != 0 }))
+	}
+
 	/// Is this store an EVIDENCE case (D6/D7, commit 29b)? Its settings say
 	/// so from the moment the case is opened (routes.rs › case_open).
 	pub(crate) async fn is_evidence(&self) -> Result<bool> {

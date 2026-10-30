@@ -1521,6 +1521,21 @@ export class FilesModel {
 	}
 
 	/**
+	 * Put an inspection on the record (commit 42g, docs/CUSTODY.md › Stage
+	 * 5) BEFORE its bytes are opened for the hex reader: the server writes
+	 * `file.inspect` into the area's chained audit trail and answers; a
+	 * refusal throws, and the viewer opens nothing. `entry`: what inside
+	 * the file was inspected (an archive's entry) — its name sealed with
+	 * the store key, so the line names it for the team and not the server.
+	 */
+	async inspect(id: string, version?: number, entry?: string): Promise<void> {
+		const v = version ?? (await this.renderInfo(id))?.version;
+		const body: { version?: number; entry?: string } = v === undefined ? {} : { version: v };
+		if (entry !== undefined && v !== undefined) body.entry = await sealPlacedText(await this.bridge.storePrivate(), places.fileInspected(this.memberId, id, v), entry.slice(0, 255));
+		await this.bridge.apiSend("POST", `${areaPath(this.memberId)}/files/${id}/inspect`, body);
+	}
+
+	/**
 	 * Mark a file as a malware sample — ONE WAY (the server refuses to
 	 * unmark). Every version's type is re-sealed with the sample mark in
 	 * the same request, keeping the original type for display; the server

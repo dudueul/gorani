@@ -965,6 +965,11 @@ impl GoraniMemberDO {
 			// Where each member left off (commit 39o). The Worker names the
 			// member (the caller's own id, never one the client sends).
 			("GET", "files/positions") => self.positions_get(req).await,
+			// An inspection, on the record before the bytes are opened (42g).
+			("POST", id) if id.starts_with("files-inspect/") => {
+				let body = req.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+				self.file_inspect(&actor, &id["files-inspect/".len()..], &body).await
+			}
 			("PUT", id) if id.starts_with("files-position/") => {
 				let body = req.json::<serde_json::Value>().await?;
 				self.position_put(&id["files-position/".len()..], body).await

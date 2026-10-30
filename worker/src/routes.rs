@@ -560,6 +560,8 @@ fn case_need(method: &str, content: &[&str]) -> Option<Option<Need>> {
 		// Where a member left off in a video (39o) is theirs, not the
 		// file's: a read-only grantee saves it too.
 		("PUT", ["files", _, "position"]) => Some(Need::Read),
+		// Inspecting a file (42g) is reading it — and saying so in the trail.
+		("POST", ["files", _, "inspect"]) => Some(Need::Read),
 		// A protected copy's license (40b) is a way of reading: every
 		// grantee who may watch asks for one. (Its GETs are reads anyway.)
 		("POST", ["files", _, "drm", _, "license"]) => Some(Need::Read),
@@ -863,6 +865,14 @@ async fn dispatch(mut req: Request, env: Env, identity: &Identity, method: &str,
 			Ok(actor) => forward_member(&env, id, "GET", format!("files/positions?member={}", urlencode(&actor.id)), None, actor.email).await,
 			Err(resp) => Ok(resp),
 		},
+		// An inspection (commit 42g): the hex reader's audit line, written
+		// before the app decrypts the bytes — files_store.rs › file_inspect.
+		("POST", ["members", id, "files", file, "inspect"]) => {
+			let body: serde_json::Value = req.json().await.unwrap_or(serde_json::json!({}));
+			let body = serde_json::json!({ "version": body.get("version"), "entry": body.get("entry") });
+			let path = format!("files-inspect/{file}");
+			member_call(&env, &identity, id, |actor| forward_member(&env, id, "POST", path, Some(body), actor)).await
+		}
 		("PUT", ["members", id, "files", file, "position"]) => {
 			let actor = match member_ctx(&env, &identity, id).await {
 				Ok(a) => a,

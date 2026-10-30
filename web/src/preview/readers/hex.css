@@ -1,0 +1,266 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The hex reader (commit 42g): a virtualized grid, strings, a program's tables. */
+
+.banner {
+	padding: 8px 12px;
+	background: #451a03;
+	border-bottom: 1px solid #92400e;
+	color: #fde68a;
+	font-size: 13px;
+}
+
+.tabs {
+	display: inline-flex;
+	gap: 4px;
+}
+
+.panes {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+
+.pane {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+
+.pane[hidden] {
+	display: none;
+}
+
+.tools {
+	border-top: 0;
+}
+
+select {
+	min-height: 30px;
+	padding: 2px 6px;
+	border: 1px solid #404040;
+	border-radius: 8px;
+	background: var(--bg);
+	color: inherit;
+	font: inherit;
+}
+
+.mono,
+.hexscroll,
+.list,
+.names {
+	font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, "D2Coding", monospace;
+}
+
+/* The grid: a spacer as tall as the file's rows, a window of rows moved with the scroll. */
+.hexscroll {
+	position: relative;
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	overscroll-behavior: contain;
+	outline: none;
+}
+
+.hexwin {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	padding: 0 12px;
+}
+
+.row {
+	display: flex;
+	gap: 18px;
+	height: 18px;
+	line-height: 18px;
+	white-space: pre;
+	user-select: none;
+}
+
+.row .off {
+	color: #737373;
+	min-width: 9ch;
+}
+
+.row .hx span {
+	display: inline-block;
+	width: 2.6ch;
+	cursor: pointer;
+}
+
+.row .hx .gap {
+	margin-left: 1ch;
+}
+
+.row .asc span {
+	display: inline-block;
+	width: 1ch;
+	cursor: pointer;
+}
+
+.row .z {
+	color: #525252;
+}
+
+.row .p {
+	color: #e5e5e5;
+}
+
+.row .n {
+	color: #93c5fd;
+}
+
+.row .sel {
+	background: oklch(0.72 0.17 145 / 0.45);
+	color: #fff;
+	border-radius: 2px;
+}
+
+.strip {
+	display: block;
+	width: 100%;
+	height: 14px;
+	image-rendering: pixelated;
+	cursor: pointer;
+	border-bottom: 1px solid var(--line);
+	background: #0f172a;
+}
+
+.status {
+	padding: 4px 10px;
+	border-top: 1px solid var(--line);
+	background: var(--panel);
+	font: 12px ui-monospace, Menlo, Consolas, monospace;
+	min-height: 1.9em;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* Strings. */
+.list {
+	padding: 4px 0;
+}
+
+.srow {
+	display: flex;
+	gap: 12px;
+	padding: 1px 12px;
+	cursor: pointer;
+	white-space: pre;
+}
+
+.srow:hover {
+	background: #171717;
+}
+
+.srow .off {
+	color: #737373;
+}
+
+.srow .txt {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* The Program tab. */
+.program {
+	padding: 8px 16px 32px;
+	display: block;
+}
+
+.program h2 {
+	font-size: 14px;
+	margin: 18px 0 6px;
+	color: var(--text);
+}
+
+table.kv,
+table.grid {
+	border-collapse: collapse;
+	font-size: 13px;
+	width: 100%;
+	max-width: 70rem;
+}
+
+table.kv th {
+	text-align: left;
+	font-weight: 500;
+	color: var(--muted);
+	padding: 2px 12px 2px 0;
+	white-space: nowrap;
+	vertical-align: top;
+	width: 12rem;
+}
+
+table.kv td {
+	padding: 2px 0;
+	overflow-wrap: anywhere;
+}
+
+table.grid th,
+table.grid td {
+	text-align: left;
+	padding: 3px 10px 3px 0;
+	border-bottom: 1px solid var(--line);
+	white-space: nowrap;
+}
+
+table.grid th {
+	color: var(--muted);
+	font-weight: 500;
+}
+
+table.grid tr.link {
+	cursor: pointer;
+}
+
+table.grid tr.link:hover td {
+	background: #171717;
+}
+
+.warn {
+	color: var(--warn);
+}
+
+.entropy {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.ebar {
+	display: inline-block;
+	width: 60px;
+	height: 6px;
+	border-radius: 3px;
+	background: linear-gradient(90deg, var(--accent) calc(var(--e) * 100%), #262626 0);
+}
+
+.ebar.hot {
+	background: linear-gradient(90deg, #f59e0b calc(var(--e) * 100%), #262626 0);
+}
+
+.imports details {
+	margin: 2px 0;
+}
+
+.imports summary {
+	cursor: pointer;
+}
+
+.names {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 2px 14px;
+	padding: 4px 0 6px 18px;
+	color: #d4d4d4;
+}
+
+.phone .row .off {
+	display: none;
+}

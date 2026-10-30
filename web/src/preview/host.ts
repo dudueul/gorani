@@ -44,6 +44,9 @@ export interface OpenMessage {
 	/** A small preview (the explorer's Quick Look, its details pane — 42d):
 	 * the picture alone, fitted; no tools, no facts, no worker. */
 	compact?: boolean;
+	/** A malware sample opened for inspection (42g): the hex reader says so,
+	 * and offers nothing to open, save or hand on. */
+	sample?: boolean;
 }
 
 /** At most this many facts are sent (an email's can run long — 42c). */
@@ -64,6 +67,7 @@ export interface Host {
 	readonly file: OpenMessage["file"];
 	readonly phone: boolean;
 	readonly compact: boolean;
+	readonly sample: boolean;
 	/** The reader's own asset (e.g. "cmaps/UniKS-UCS2-H.bcmap"), asked of the app. */
 	asset(path: string): Promise<Uint8Array>;
 	/** A Worker running the code the app sent, or null when none was sent. */
@@ -76,11 +80,13 @@ export interface Host {
 	setSwipeGuard(guard: (target: EventTarget | null) => boolean): void;
 	/**
 	 * Hand a file found INSIDE this one (an email's attachment, 42c) to the
-	 * app: "open" it in a preview of its own, or "save" it into the vault.
-	 * A request, nothing more — the app opens it in a new frame, and asks
-	 * the person before it saves anything. A copy of the bytes goes.
+	 * app: "open" it in a preview of its own, or "save" it into the vault —
+	 * or "inspect" it (42g): a sample's bytes, in the hex reader only, the
+	 * inspection on the record first. A request, nothing more — the app
+	 * opens it in a new frame, and asks the person before it saves
+	 * anything. A copy of the bytes goes.
 	 */
-	handOver(action: "open" | "save", file: { name: string; mime: string | null; bytes: Uint8Array }, opts?: { sample?: boolean }): void;
+	handOver(action: "open" | "save" | "inspect", file: { name: string; mime: string | null; bytes: Uint8Array }, opts?: { sample?: boolean }): void;
 }
 
 interface TrustedTypesLike {
@@ -152,6 +158,7 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 			file: msg.file,
 			phone: msg.phone,
 			compact: msg.compact === true,
+			sample: msg.sample === true,
 			asset(path) {
 				const id = next++;
 				return new Promise((ok, no) => {

@@ -668,14 +668,14 @@ try {
 		await factsSay(format);
 		await closeDoc();
 	}
-	tells = await (async () => {
-		d = await openDoc("bundle.rar", "archive");
-		await rowOf(d, "bundle").click();
-		await rowOf(d, "report.txt").locator('[data-test="arc-open"]').click();
-		await page.locator('[data-test="viewer-name"]', { hasText: "bundle.rar › report.txt" }).waitFor({ timeout: 60_000 });
-		await page.getByText("Gorani archive report").waitFor({ timeout: 30_000 });
-		return "";
-	})();
+	// An entry of a RAR, out through 7-Zip, shown as text; Back returns to the listing.
+	d = await openDoc("bundle.rar", "archive");
+	await rowOf(d, "bundle").click();
+	await rowOf(d, "report.txt").locator('[data-test="arc-open"]').click();
+	await page.locator('[data-test="viewer-name"]', { hasText: "bundle.rar › report.txt" }).waitFor({ timeout: 60_000 });
+	await page.getByText("Gorani archive report").waitFor({ timeout: 30_000 });
+	await page.locator('[data-test="viewer-back"]').click();
+	await page.locator('iframe[data-preview="archive"]').waitFor({ timeout: 30_000 });
 	await closeDoc();
 	d = await openDoc("bundle.iso", "archive");
 	await factsSay(/A disk image: files taken out of it do not carry Windows' downloaded-from-the-internet mark/);

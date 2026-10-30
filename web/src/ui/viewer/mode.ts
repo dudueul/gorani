@@ -30,7 +30,9 @@ const TEXT_EXTS = [
 
 /** Programs and other binaries (42g): to the hex reader — their bytes,
  * strings and (for PE, ELF and Mach-O) their structure; never run. */
-const HEX_EXTS = ["exe", "macho", "dll", "sys", "scr", "cpl", "ocx", "drv", "efi", "mui", "ax", "com", "so", "dylib", "o", "obj", "ko", "elf", "bin", "axf", "node", "pyd", "dex", "class", "wasm", "lnk", "pf", "dmp", "mdmp", "pcap", "pcapng", "evtx", "dat", "db", "sqlite", "pf"];
+const HEX_EXTS = ["exe", "macho", "dll", "sys", "scr", "cpl", "ocx", "drv", "efi", "mui", "ax", "com", "so", "dylib", "o", "obj", "ko", "elf", "bin", "axf", "node", "pyd", "dex", "class", "wasm", "lnk", "pf", "dmp", "mdmp", "pcap", "pcapng", "evtx", "dat", "hve", "db", "sqlite"];
+/** The registry hives Windows keeps under these names, with no extension (System32\config — 42k). */
+const HIVE_NAMES = /^(?:system|software|sam|security|default|components|drivers|bcd|bbi|elam)$/i;
 
 /** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email; 42d pictures; 42e archives; 42f text). */
 const BY_EXT: Record<string, ReaderId> = {
@@ -136,6 +138,7 @@ const BY_MIME: Record<string, ReaderId> = {
 export function readerFor(kind: string, mime: string | null, name: string): ReaderId | null {
 	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
 	if (kind === "pdf") return "pdf";
+	if (!ext && HIVE_NAMES.test(name)) return "hex";
 	const type = (mime ?? "").split(";")[0]!.trim().toLowerCase();
 	return BY_EXT[ext] ?? BY_MIME[type] ?? (kind === "image" || type.startsWith("image/") ? "image" : null);
 }
@@ -160,6 +163,10 @@ export function sniffReader(head: Uint8Array, guess: ReaderId, name: string): Re
 	// the archive reader lists it.)
 	const program = (head[0] === 0x4d && head[1] === 0x5a) || (head[0] === 0x7f && ascii.startsWith("\x7fELF")) || [0xfeedfacf, 0xfeedface, 0xcffaedfe, 0xcefaedfe].includes(((head[0]! << 24) | (head[1]! << 16) | (head[2]! << 8) | head[3]!) >>> 0);
 	if (program && guess !== "archive") return "hex";
+	// So is a forensic artefact (42i–42k), under any name: a registry hive,
+	// an event log, a Prefetch file — the hex reader takes each apart.
+	const artefact = ascii.startsWith("regf") || ascii.startsWith("ElfFile\0") || ascii.slice(4, 8) === "SCCA" || ascii.startsWith("MAM\x04");
+	if (artefact && guess !== "archive") return "hex";
 	const zip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
 	const ole = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
 	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image" || guess === "archive" || guess === "text" || guess === "hex") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)

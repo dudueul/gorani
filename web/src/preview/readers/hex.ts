@@ -17,7 +17,8 @@
  * and, for the forensic formats (42i, 42j), what they record: a shortcut's
  * target and where it was made (Shortcut), what a Prefetch file says ran
  * (Prefetch), every event of an event log in a table (Events,
- * readers/hex-events.ts).
+ * readers/hex-events.ts), a registry hive's keys and values (Registry,
+ * readers/hex-registry.ts).
  *
  * Nothing here runs, draws or decodes the file as what it claims to be:
  * every byte reaches the page as a number, through textContent. The work
@@ -45,6 +46,9 @@ import { parsePrefetch, type PrefetchInfo } from "../forensic/prefetch.ts";
 import { isEvtx, parseEvtx } from "../forensic/evtx.ts";
 import { evtxFindings } from "../facts/evtx.ts";
 import { EventsPane } from "./hex-events.ts";
+import { isHive, parseHive, type Hive } from "../forensic/regf.ts";
+import { hiveFindings, type HiveFindings } from "../facts/regf.ts";
+import { RegistryPane } from "./hex-registry.ts";
 import hexCss from "./hex.css?inline";
 
 const ROW = 16;
@@ -75,16 +79,19 @@ export const start = boot(async (host) => {
 	// An event log (42j): read after the frame is drawn, a chunk at a time.
 	const evtx = !pe && !elf && !macho && !lnk && !prefetch && isEvtx(bytes);
 	let evtxFacts: Fact[] | null = evtx ? [{ level: "info", text: "A Windows event log — reading its events…" }] : null;
+	// A registry hive (42k): read lazily, so at once — keys only as they are opened.
+	const hive = !pe && !elf && !macho && !lnk && !prefetch && !evtx && isHive(bytes) ? tryParse(() => parseHive(bytes), "registry hive", warnings) : null;
+	const hiveFound = hive ? tryParse(() => hiveFindings(hive), "registry keys", warnings) : null;
 	const findings: BinaryFindings = { name: host.file.name, size: bytes.length, sha256: null, id: identify(bytes), pe, elf, macho, strings: null, entropy: 0, sample: host.sample };
 	const send = () => {
-		const forensic = lnk ? lnkFacts(lnk, host.file.name) : prefetch ? prefetchFacts(prefetch, host.file.name) : evtxFacts;
+		const forensic = lnk ? lnkFacts(lnk, host.file.name) : prefetch ? prefetchFacts(prefetch, host.file.name) : hiveFound ? hiveFound.facts : evtxFacts;
 		const facts = forensic
 			? [forensic[0]!, ...(host.sample ? [{ level: "warn" as const, text: "A malware sample, shown as bytes only: nothing in it is run, drawn, or handed to another reader — and this inspection is in the audit trail" }] : []), ...(findings.sha256 ? [{ level: "info" as const, text: `SHA-256 ${findings.sha256}`, copy: findings.sha256 }] : []), ...forensic.slice(1)]
 			: binaryFacts(findings);
 		host.shown([...facts, ...warnings.map((w) => ({ level: "warn" as const, text: `Malformed: ${w}` }))]);
 	};
 
-	const view = new HexView(host, bytes, { pe, elf, macho, lnk, prefetch, evtx });
+	const view = new HexView(host, bytes, { pe, elf, macho, lnk, prefetch, evtx, hive: hive && hiveFound ? { hive, found: hiveFound } : null });
 	view.show();
 	send();
 
@@ -159,6 +166,7 @@ interface Parsed {
 	lnk: LnkInfo | null;
 	prefetch: PrefetchInfo | null;
 	evtx: boolean;
+	hive: { hive: Hive; found: HiveFindings } | null;
 }
 
 class HexView {
@@ -183,6 +191,8 @@ class HexView {
 	private readonly parsed: Parsed;
 	/** The Events tab, for an event log. */
 	readonly events: EventsPane | null;
+	/** The Registry tab, for a hive. */
+	readonly registry: RegistryPane | null;
 
 	constructor(host: Host, b: Uint8Array, parsed: Parsed) {
 		this.host = host;
@@ -190,13 +200,14 @@ class HexView {
 		this.parsed = parsed;
 		this.rows = Math.max(1, Math.ceil(b.length / ROW));
 		this.events = parsed.evtx ? new EventsPane((at, len) => this.goTo(at, len)) : null;
+		this.registry = parsed.hive ? new RegistryPane(parsed.hive.hive, parsed.hive.found, (at, len) => this.goTo(at, len)) : null;
 	}
 
 	show(): void {
 		const root = this.host.root;
 		if (this.host.sample) root.append(el("div", { class: "banner", "data-test": "hex-sample" }, "⚠ A malware sample — shown as bytes only. Nothing in it runs, is drawn, or leaves this frame; this inspection is in the audit trail."));
 		const program = this.parsed.pe || this.parsed.elf || this.parsed.macho;
-		const first = program ? "Program" : this.parsed.lnk ? "Shortcut" : this.parsed.prefetch ? "Prefetch" : this.events ? "Events" : null;
+		const first = program ? "Program" : this.parsed.lnk ? "Shortcut" : this.parsed.prefetch ? "Prefetch" : this.events ? "Events" : this.registry ? "Registry" : null;
 		const names = [...(first ? [first] : []), "Hex", "Strings"];
 		for (const n of names) {
 			const b = el("button", { "aria-pressed": "false", "data-test": `hex-tab-${n.toLowerCase()}` }, n);
@@ -227,7 +238,7 @@ class HexView {
 	private open(name: string): void {
 		let pane = this.built.get(name);
 		if (!pane) {
-			pane = name === "Events" && this.events ? this.events.pane : name === "Program" || name === "Shortcut" || name === "Prefetch" ? this.programPane() : name === "Hex" ? this.hexView() : this.stringsView();
+			pane = name === "Events" && this.events ? this.events.pane : name === "Registry" && this.registry ? this.registry.pane : name === "Program" || name === "Shortcut" || name === "Prefetch" ? this.programPane() : name === "Hex" ? this.hexView() : this.stringsView();
 			this.built.set(name, pane);
 			this.panes.append(pane);
 		}

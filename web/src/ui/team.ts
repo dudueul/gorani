@@ -341,7 +341,7 @@ export class GoraniTeam extends LitElement {
 								<input class=${input} placeholder="id (edr-drop)" .value=${d.id} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, id: (e.target as HTMLInputElement).value })} data-test="collector-id" />
 								<input class="${input} flex-1" placeholder="name" .value=${d.name} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, name: (e.target as HTMLInputElement).value })} data-test="collector-name" />
 							</div>
-							<input class=${input} placeholder="service token Client ID (…​.access)" .value=${d.commonName} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, commonName: (e.target as HTMLInputElement).value })} data-test="collector-cn" />
+							<input class=${input} placeholder="service token Client ID (…&#x200b;.access)" .value=${d.commonName} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, commonName: (e.target as HTMLInputElement).value })} data-test="collector-cn" />
 							<textarea class="${input} font-mono text-xs" rows="3" placeholder='{"publicKey": {"kty": "EC", …}}' .value=${d.key} @input=${(e: InputEvent) => (this.collectorDraft = { ...d, key: (e.target as HTMLTextAreaElement).value })} data-test="collector-key"></textarea>
 							<button class=${primary} ?disabled=${this.busy || !d.id.trim() || !d.commonName.trim() || !d.key.trim()} data-test="collector-request">Ask a second lead</button>
 						</form>

@@ -6,7 +6,7 @@
 > email, .eml and Outlook's .msg; 42d: every picture; 42e: archives; 42f:
 > Markdown, JSON, XML, web pages and code; 42g: programs and any file as
 > bytes — the one view a malware sample may have; 42h: Office macros'
-> source; 42i: shortcuts and Prefetch files). The
+> source; 42i: shortcuts and Prefetch files; 42j: event logs). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -767,6 +767,78 @@ Both parsers were checked against independent readers on the same bytes:
 LnkParse3 for shortcuts, dissect.target for Prefetch and dissect.util for
 Xpress Huffman (both used only as test oracles, never shipped).
 
+**Windows event logs (.evtx)** (42j): the record an intrusion leaves, and
+the first thing a responder asks for. Read from the format as libevtx
+documents it and Microsoft describes Binary XML (`forensic/evtx.ts`):
+
+- **What is read:** the file header and every 64 KiB chunk; each record's
+  Binary XML. Windows writes a *template* for an event's shape once per
+  chunk and then only the values for its holes, so a record is a template
+  instance: its definition (inline the first time), then its values.
+  `<EventData>` (or `<UserData>`) is itself a nested Binary XML value with
+  a template of its own. Every value type is decoded: strings and arrays of
+  them, integers, booleans, GUIDs, SIDs, binary (as hex, as Event Viewer
+  shows it), and FILETIME and SYSTEMTIME to Windows' 100 ns. A JavaScript
+  number would lose a FILETIME's last digits (2^53 is about 9×10^15; a
+  FILETIME is about 1.3×10^17), so that arithmetic is BigInt.
+- **What is checked:**
+  - each chunk's two CRC-32s: a record changed after Windows wrote it
+    breaks them;
+  - the record numbers: a gap is records taken out, which is what
+    log-editing tools do;
+  - the dirty and full flags.
+- **What is bounded:**
+  - every value lies inside the file and is as wide as its type;
+  - a template is parsed once per chunk, and one that names itself is
+    empty, not a loop;
+  - Binary XML nests at most 32 deep;
+  - one record may expand to at most 20,000 nodes. A template is copied
+    into every instance of it, so one 64 KiB record of a few thousand tiny
+    nested instances of a wide template would otherwise grow into millions
+    (fuzzing found it);
+  - at most 200,000 events are read, and the chunks are read a slice at a
+    time so the frame stays responsive.
+- **The Events tab** (`readers/hex-events.ts`):
+  - the table Event Viewer shows: time (UTC), record, event ID, level,
+    provider, and what the event is with the few values that matter (who,
+    from where, which command). It is virtualized: 200,000 rows scroll
+    like 20;
+  - filters: free text over every value; `4624` for an event ID;
+    `#1234` for a record; `IpAddress=10.0.0.5` for a field; a level, an
+    event ID, newest first, and **Notable only** (the records a finding
+    names);
+  - the details: every System field and every value as written, with
+    controls shown as their pictures (␃) and direction marks by name
+    ([RLO]); the record's bytes a click away in Hex.
+
+**The facts** (`facts/evtx.ts`), event IDs matched with their provider
+(IDs repeat across providers):
+
+| question | from |
+|---|---|
+| Was it tampered with? | the log cleared (1102, 104) and by whom; chunks whose checksums fail; record numbers that skip; the audit policy changed (4719) |
+| Who got in, and how? | failed logons by address and account (4625); one address trying 5 or more accounts (spraying); a success (4624) from an address that had failed 5 or more times; Remote Desktop (4624 type 10, 1149, 21/25), warned when from the internet; a type-9 logon through seclogo (the shape of pass-the-hash) |
+| What did they leave behind? | services (7045, 4697), the likeliest first: PsExec's, a shell, a known tool, a folder anyone can write to (repeats folded into one line); scheduled tasks with the command they run (4698, 4702, 106); permanent WMI subscriptions (5861); accounts made (4720) and added to admin groups (4728, 4732, 4756), their SIDs named from the log itself |
+| What did they run? | command lines (4688, Sysmon 1) and PowerShell (4104, 4103, 800) through the 42f script triage, with encoded commands decoded; tools by name (rclone, PsExec, procdump, wipers…); Office starting a shell; script blocks Windows itself logged as suspicious |
+| What did they take? | replication rights used by an account that is not a domain controller (4662: DCSync); RC4 service tickets for 3 or more services (4769: Kerberoasting); tickets without pre-authentication (4768: AS-REP roasting); LSASS opened (Sysmon 10); C$ and ADMIN$ reached (5140) |
+| What stopped them? | Defender's detections (1116, 1117, 1006), its real-time protection turned off (5001), exclusions added (5007) |
+
+The script triage reads at most 16 million characters of command lines
+and script blocks in all, and says how many it left unread. Every sentence
+passes through the same visible-characters rule as the details, since it
+quotes values the log's writer chose. An honest log (a
+service starting and stopping) says what it is and warns of nothing.
+
+The reader was checked against python-evtx (used only as a test oracle,
+never shipped) on two public logs from its own test suite: a Security log
+of 2,261 records and a System log of 1,601. Every record, provider, event
+ID, computer, channel and value matched, except in two places where
+python-evtx itself is wrong, and there ours was checked against the raw
+bytes instead: its string arrays drop and garble items, and its times,
+computed through floats, are off by up to 2 µs. The test-time writer
+(`tests/lib/evtx.mjs`) makes logs that python-evtx verifies, header,
+chunks and records.
+
 ### Programs (`readers/hex.ts`, `preview/binary/`, `facts/binary.ts`) (42g)
 
 Any file can be shown as bytes, and a program is taken apart; nothing is
@@ -962,7 +1034,11 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   form's text; an honest macro warning of nothing more than its presence;
   (42i) a lure shortcut and a Prefetch file built at test time, every fact;
   a share, a renamed Prefetch file, cut-short files; Xpress Huffman across
-  blocks and long matches.
+  blocks and long matches; (42j) an intrusion's event log built at test
+  time, its every step named, and an honest log warning of nothing; every
+  value type, times to the tick; a gap, a changed chunk, the flags, a log
+  that begins late, many chunks; a record built to expand, refused; cut
+  short and mutated logs said, never thrown.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -979,6 +1055,10 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   - the default Trusted Types policy attacked from inside;
   - forensic formats (42i): the lure shortcut's facts, its Shortcut tab
     and arguments; the Prefetch file's facts and its flagged files;
+  - event logs (42j): the intrusion's facts, a planted right-to-left
+    override shown as [RLO]; the Events tab filtered by event ID, by field
+    and to the notable records; a record's values and why it is marked;
+    its bytes in Hex;
   - macros (42h): a .docm's project named fact by fact, the Macros pane's
     flagged modules, a module opened in the text reader and back; the
     same project in an .xlsm, a .doc and a .ppt; OpenDocument Basic;

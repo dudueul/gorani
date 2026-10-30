@@ -14,6 +14,11 @@
  *             (where it is packed, where an overlay starts) — click it
  *   Strings   ASCII and UTF-16LE runs, by offset, filtered as you type
  *
+ * and, for the forensic formats (42i, 42j), what they record: a shortcut's
+ * target and where it was made (Shortcut), what a Prefetch file says ran
+ * (Prefetch), every event of an event log in a table (Events,
+ * readers/hex-events.ts).
+ *
  * Nothing here runs, draws or decodes the file as what it claims to be:
  * every byte reaches the page as a number, through textContent. The work
  * a big file takes (strings, hashes, the entropy strip) is done a slice
@@ -23,7 +28,7 @@
 
 import { md5, sha1 } from "@noble/hashes/legacy.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { boot, el, type Host } from "../host.ts";
+import { boot, el, type Fact, type Host } from "../host.ts";
 import { addCss } from "../kit.ts";
 import { binaryFacts, type BinaryFindings } from "../facts/binary.ts";
 import { capabilities } from "../binary/capabilities.ts";
@@ -37,6 +42,9 @@ import { StringScanner, stringFindings, type Found } from "../binary/strings.ts"
 import { lnkFacts, prefetchFacts } from "../facts/forensic.ts";
 import { parseLnk, type LnkInfo } from "../forensic/lnk.ts";
 import { parsePrefetch, type PrefetchInfo } from "../forensic/prefetch.ts";
+import { isEvtx, parseEvtx } from "../forensic/evtx.ts";
+import { evtxFindings } from "../facts/evtx.ts";
+import { EventsPane } from "./hex-events.ts";
 import hexCss from "./hex.css?inline";
 
 const ROW = 16;
@@ -64,18 +72,42 @@ export const start = boot(async (host) => {
 	// Forensic formats (42i): a shortcut, a Prefetch file.
 	const lnk = pe || elf || macho ? null : tryParse(() => parseLnk(bytes), "shortcut", warnings);
 	const prefetch = pe || elf || macho || lnk ? null : tryParse(() => parsePrefetch(bytes), "Prefetch data", warnings);
+	// An event log (42j): read after the frame is drawn, a chunk at a time.
+	const evtx = !pe && !elf && !macho && !lnk && !prefetch && isEvtx(bytes);
+	let evtxFacts: Fact[] | null = evtx ? [{ level: "info", text: "A Windows event log — reading its events…" }] : null;
 	const findings: BinaryFindings = { name: host.file.name, size: bytes.length, sha256: null, id: identify(bytes), pe, elf, macho, strings: null, entropy: 0, sample: host.sample };
 	const send = () => {
-		const forensic = lnk ? lnkFacts(lnk, host.file.name) : prefetch ? prefetchFacts(prefetch, host.file.name) : null;
+		const forensic = lnk ? lnkFacts(lnk, host.file.name) : prefetch ? prefetchFacts(prefetch, host.file.name) : evtxFacts;
 		const facts = forensic
 			? [forensic[0]!, ...(host.sample ? [{ level: "warn" as const, text: "A malware sample, shown as bytes only: nothing in it is run, drawn, or handed to another reader — and this inspection is in the audit trail" }] : []), ...(findings.sha256 ? [{ level: "info" as const, text: `SHA-256 ${findings.sha256}`, copy: findings.sha256 }] : []), ...forensic.slice(1)]
 			: binaryFacts(findings);
 		host.shown([...facts, ...warnings.map((w) => ({ level: "warn" as const, text: `Malformed: ${w}` }))]);
 	};
 
-	const view = new HexView(host, bytes, { pe, elf, macho, lnk, prefetch });
+	const view = new HexView(host, bytes, { pe, elf, macho, lnk, prefetch, evtx });
 	view.show();
 	send();
+
+	if (evtx && view.events) {
+		const chunks = Math.floor((bytes.length - 4096) / 65536);
+		try {
+			const log = await parseEvtx(bytes, async (c) => {
+				if (c % 8) return;
+				view.events!.progress(c, chunks);
+				await yieldNow();
+			});
+			if (log) {
+				const found = evtxFindings(log);
+				view.events.fill(log, found);
+				evtxFacts = found.facts;
+			}
+		} catch (e) {
+			const why = `its events could not be read (${e instanceof Error ? e.message : String(e)})`;
+			view.events.fail(`Its events could not be read.`);
+			warnings.push(why);
+		}
+		send();
+	}
 
 	// The slow part, a slice at a time: hashes, entropy, strings.
 	const h256 = sha256.create();
@@ -126,6 +158,7 @@ interface Parsed {
 	macho: MachoFile | null;
 	lnk: LnkInfo | null;
 	prefetch: PrefetchInfo | null;
+	evtx: boolean;
 }
 
 class HexView {
@@ -148,19 +181,22 @@ class HexView {
 	private readonly host: Host;
 	private readonly b: Uint8Array;
 	private readonly parsed: Parsed;
+	/** The Events tab, for an event log. */
+	readonly events: EventsPane | null;
 
 	constructor(host: Host, b: Uint8Array, parsed: Parsed) {
 		this.host = host;
 		this.b = b;
 		this.parsed = parsed;
 		this.rows = Math.max(1, Math.ceil(b.length / ROW));
+		this.events = parsed.evtx ? new EventsPane((at, len) => this.goTo(at, len)) : null;
 	}
 
 	show(): void {
 		const root = this.host.root;
 		if (this.host.sample) root.append(el("div", { class: "banner", "data-test": "hex-sample" }, "⚠ A malware sample — shown as bytes only. Nothing in it runs, is drawn, or leaves this frame; this inspection is in the audit trail."));
 		const program = this.parsed.pe || this.parsed.elf || this.parsed.macho;
-		const first = program ? "Program" : this.parsed.lnk ? "Shortcut" : this.parsed.prefetch ? "Prefetch" : null;
+		const first = program ? "Program" : this.parsed.lnk ? "Shortcut" : this.parsed.prefetch ? "Prefetch" : this.events ? "Events" : null;
 		const names = [...(first ? [first] : []), "Hex", "Strings"];
 		for (const n of names) {
 			const b = el("button", { "aria-pressed": "false", "data-test": `hex-tab-${n.toLowerCase()}` }, n);
@@ -191,13 +227,14 @@ class HexView {
 	private open(name: string): void {
 		let pane = this.built.get(name);
 		if (!pane) {
-			pane = name === "Program" || name === "Shortcut" || name === "Prefetch" ? this.programPane() : name === "Hex" ? this.hexView() : this.stringsView();
+			pane = name === "Events" && this.events ? this.events.pane : name === "Program" || name === "Shortcut" || name === "Prefetch" ? this.programPane() : name === "Hex" ? this.hexView() : this.stringsView();
 			this.built.set(name, pane);
 			this.panes.append(pane);
 		}
 		for (const [n, p] of this.built) p.hidden = n !== name;
 		for (const b of this.tabs.children) b.setAttribute("aria-pressed", String(b.textContent === name));
 		if (name === "Hex") requestAnimationFrame(() => this.draw(true));
+		if (name === "Events") requestAnimationFrame(() => this.events?.shownAgain());
 	}
 
 	// ── Hex ─────────────────────────────────────────────────────────────

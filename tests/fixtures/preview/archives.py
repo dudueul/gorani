@@ -214,7 +214,7 @@ keep("lure.zip", raw_zip([
     {"name": b"/etc/cron.d/gorani", "data": b"* * * * * root echo gorani\n"},
     {"name": b"passwd", "data": b"/etc/passwd", "method": 0, "mode": 0o120777},
     {"name": b"invoice.pdf.exe", "data": program},
-    {"name": "invoice‮fdp.exe".encode(), "data": program, "flags": UTF8},
+    {"name": "invoice\u202efdp.exe".encode(), "data": program, "flags": UTF8},
     {"name": b"report.txt", "data": b"the first report.txt\n"},
     {"name": b"report.txt", "data": b"the second report.txt: which one a tool shows is up to the tool\n"},
     {"name": b"nested.zip", "data": inner, "method": 0},

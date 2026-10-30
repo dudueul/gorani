@@ -23,6 +23,7 @@ import type { Fact } from "../host.ts";
 import { fieldFacts, linkFact, plural, shortUrl, some } from "../office.ts";
 import { codepageLabel, Ole, propertySet, summaryWords } from "../ole.ts";
 import { paragraphs, type Legacy } from "./types.ts";
+import { trimNul } from "../binary/read.ts";
 
 export function readDoc(ole: Ole): Legacy {
 	const kind = "a Word 97–2003 document";
@@ -161,7 +162,7 @@ function progId(b: Uint8Array | null): string {
 		const n = v.getUint32(o, true);
 		o += 4;
 		if (n === 0 || n > 0xffff) return "";
-		const s = new TextDecoder(codepageLabel(1252)).decode(b.subarray(o, Math.min(b.length, o + n))).replace(/\0+$/, "");
+		const s = trimNul(new TextDecoder(codepageLabel(1252)).decode(b.subarray(o, Math.min(b.length, o + n))));
 		o += n;
 		return s;
 	};

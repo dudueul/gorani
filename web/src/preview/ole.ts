@@ -20,6 +20,7 @@
  */
 
 import * as CFB from "cfb";
+import { trimNul } from "./binary/read.ts";
 
 const MAGIC = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 
@@ -124,10 +125,10 @@ export function propertySet(b: Uint8Array | null): Map<number, string | number |
 			else if (type === 3) out.set(id, v.getInt32(at + 4, true));
 			else if (type === 0x1e) {
 				const n = Math.min(v.getUint32(at + 4, true), 4096, b.length - at - 8);
-				out.set(id, text.decode(b.subarray(at + 8, at + 8 + n)).replace(/\0+$/, ""));
+				out.set(id, trimNul(text.decode(b.subarray(at + 8, at + 8 + n))));
 			} else if (type === 0x1f) {
 				const n = Math.min(v.getUint32(at + 4, true) * 2, 8192, b.length - at - 8);
-				out.set(id, utf16.decode(b.subarray(at + 8, at + 8 + n)).replace(/\0+$/, ""));
+				out.set(id, trimNul(utf16.decode(b.subarray(at + 8, at + 8 + n))));
 			} else if (type === 0x40 && at + 12 <= b.length) {
 				// FILETIME: 100 ns ticks since 1601. A zero means "not set".
 				const ticks = v.getUint32(at + 4, true) + v.getUint32(at + 8, true) * 2 ** 32;

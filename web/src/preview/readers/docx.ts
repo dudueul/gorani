@@ -35,6 +35,9 @@ import { renderAsync } from "docx-preview";
 import { boot, el, type Host } from "../host.ts";
 import { addCss, Finder, findCss, perFrame, Zoom } from "../kit.ts";
 import { docxFacts } from "../facts/word.ts";
+import { withMacros } from "../facts/vba.ts";
+import { macrosInZip, safely } from "../vba/macros.ts";
+import { macroButton } from "../vba/pane.ts";
 import { encryptedOoxml, plural, refusal } from "../office.ts";
 import { Ole } from "../ole.ts";
 import { Zip } from "../zip.ts";
@@ -60,7 +63,9 @@ export const start = boot(async (host) => {
 		host.shown([{ level: "warn", text: `Not opened: ${trap} — a "ZIP bomb"` }]);
 		return;
 	}
-	const facts = docxFacts(zip);
+	// Its macros (42h): read, never run; the Macros button shows them.
+	const macros = safely(() => macrosInZip(zip));
+	const facts = withMacros(docxFacts(zip), macros);
 
 	const content = el("div", { class: "docx-host" });
 	const styles = el("div", { hidden: "" });
@@ -87,15 +92,18 @@ export const start = boot(async (host) => {
 		});
 	} catch (e) {
 		refusal(host.root, "This document does not open.", String(e instanceof Error ? e.message : e));
+		// (Its macros are still shown: a lure's document is often only a shell for them.)
+		const mb = macroButton(host, macros);
+		if (mb) host.root.prepend(el("div", { class: "bar" }, mb));
 		host.shown([{ level: "warn", text: "The document did not open: it may be damaged" }, ...facts]);
 		return;
 	}
 	status.remove();
-	show(host, scroller, content);
+	show(host, scroller, content, macroButton(host, macros));
 	host.shown(facts);
 });
 
-function show(host: Host, scroller: HTMLElement, content: HTMLElement): void {
+function show(host: Host, scroller: HTMLElement, content: HTMLElement, macros: HTMLElement | null): void {
 	const wrapper = () => content.querySelector<HTMLElement>(".docx-wrapper");
 	const zoom = new Zoom({
 		// The widest page, at 100 % (docx-preview gives each its real width).
@@ -109,7 +117,7 @@ function show(host: Host, scroller: HTMLElement, content: HTMLElement): void {
 	}, 1.25);
 	const finder = new Finder(wrapper, scroller, "Find in the document");
 	const pages = content.querySelectorAll("section.docx").length;
-	const bar = el("div", { class: "bar" }, el("span", { class: "muted", "data-test": "docx-pages-count" }, plural(pages, "page")), el("span", { class: "sep" }), zoom.el, el("span", { class: "grow" }), finder.input, finder.found);
+	const bar = el("div", { class: "bar" }, el("span", { class: "muted", "data-test": "docx-pages-count" }, plural(pages, "page")), el("span", { class: "sep" }), zoom.el, el("span", { class: "grow" }), ...(macros ? [macros] : []), finder.input, finder.found);
 	host.root.append(bar, scroller);
 	zoom.update();
 	new ResizeObserver(perFrame(() => zoom.update())).observe(scroller);

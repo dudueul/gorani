@@ -24,6 +24,8 @@
 import * as XLSX from "xlsx";
 import type { Fact } from "../host.ts";
 import { linkFact, packageFacts, plural, propsWords, rels, shortUrl, some, unxml } from "../office.ts";
+import { withMacros } from "../facts/vba.ts";
+import { macrosInOle, macrosInZip, safely, type Macros } from "../vba/macros.ts";
 import { Ole, propertySet, summaryWords } from "../ole.ts";
 import { Zip } from "../zip.ts";
 
@@ -80,7 +82,7 @@ function decodeText(b: Uint8Array): { text: string; encoding: string } {
 	}
 }
 
-export type Analysis = { t: "book"; sheets: SheetInfo[]; facts: Fact[] } | { t: "refused"; title: string; why: string; facts: Fact[] };
+export type Analysis = { t: "book"; sheets: SheetInfo[]; facts: Fact[]; macros: Macros | null } | { t: "refused"; title: string; why: string; facts: Fact[] };
 
 /** Parse the workbook (kept here for the rows and searches that follow)
  * and say what it is. Pure apart from keeping it: unit:preview-facts. */
@@ -112,7 +114,9 @@ export function analyse(bytes: Uint8Array, name: string): Analysis {
 	facts.push(...bookFacts(book, infos, zip, ole, csv));
 	const said = [plural(infos.length, "sheet"), encoding && encoding !== "UTF-8" ? `text in ${encoding}` : "", ...(zip ? propsWords(zip) : propWords(book, ole))].filter(Boolean);
 	facts.unshift({ level: "info", text: said.join(" · ") });
-	return { t: "book", sheets: infos, facts };
+	// Its VBA (42h): xl/vbaProject.bin, or _VBA_PROJECT_CUR/ in an .xls — read, never run.
+	const macros = safely(() => (zip ? macrosInZip(zip) : ole ? macrosInOle(ole) : null));
+	return { t: "book", sheets: infos, facts: withMacros(facts, macros), macros };
 }
 
 function info(wb: XLSX.WorkBook, name: string, i: number): SheetInfo {

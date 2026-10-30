@@ -22,6 +22,8 @@ import { boot, el, type Host } from "../host.ts";
 import { addCss } from "../kit.ts";
 import { refusal } from "../office.ts";
 import type { CellOut, SheetInfo } from "./sheet.worker.ts";
+import type { Macros } from "../vba/macros.ts";
+import { macroButton } from "../vba/pane.ts";
 import sheetCss from "./sheet.css?inline";
 
 /** Rows asked of the worker at a time. */
@@ -44,10 +46,10 @@ export const start = boot(async (host) => {
 		});
 	worker.onerror = (e) => host.fail(`the workbook did not open: ${e.message || "the parser stopped"}`);
 	worker.onmessage = (e: MessageEvent) => {
-		const d = e.data as { t: string; id?: number; sheets?: SheetInfo[]; facts?: []; title?: string; why?: string; message?: string };
+		const d = e.data as { t: string; id?: number; sheets?: SheetInfo[]; facts?: []; title?: string; why?: string; message?: string; macros?: Macros | null };
 		if (d.t === "book") {
 			status.remove();
-			new Grid(host, d.sheets ?? [], ask).show();
+			new Grid(host, d.sheets ?? [], ask, macroButton(host, d.macros ?? null)).show();
 			host.shown(d.facts ?? []);
 		} else if (d.t === "refused") {
 			refusal(host.root, d.title ?? "This workbook is not opened.", d.why ?? "");
@@ -93,7 +95,7 @@ class Grid {
 	/** The cells of the rows drawn so far, for the formula bar. */
 	private cells = new Map<string, CellOut>();
 
-	constructor(private host: Host, private sheets: SheetInfo[], private ask: Ask) {
+	constructor(private host: Host, private sheets: SheetInfo[], private ask: Ask, private macros: HTMLElement | null = null) {
 		this.observer = new IntersectionObserver((entries) => {
 			if (entries.some((e) => e.isIntersecting)) void this.more();
 		}, { root: this.scroller, rootMargin: "600px 0px" });
@@ -102,7 +104,7 @@ class Grid {
 	}
 
 	show(): void {
-		const bar = el("div", { class: "bar" }, this.cellLabel, this.formula, el("span", { class: "grow" }), this.search, this.found);
+		const bar = el("div", { class: "bar" }, this.cellLabel, this.formula, el("span", { class: "grow" }), ...(this.macros ? [this.macros] : []), this.search, this.found);
 		this.sheets.forEach((s, i) => {
 			const label = s.kind === "macro" ? `⚠ ${s.name} (macro)` : s.hidden === 2 ? `${s.name} (very hidden)` : s.hidden ? `${s.name} (hidden)` : s.name;
 			const tab = el("button", { role: "tab", class: `tab${s.hidden || s.kind === "macro" ? " hid" : ""}`, "data-test": "sheet-tab", "aria-selected": String(i === this.sheet) }, label);

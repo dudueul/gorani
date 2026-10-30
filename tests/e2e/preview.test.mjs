@@ -64,6 +64,11 @@
  *     highlighted, wrapped on request; a dropper's every line named and
  *     its hidden command decoded; a leaked config's keys named, masked; a
  *     program named .js taken to the hex reader; plain text kept in the page;
+ *   - macros (42h): a .docm, .xlsm, .doc and .ppt carrying a project built
+ *     at test time — what runs by itself, Shell, the shellcode Declares,
+ *     VBA stomping, a hidden module, a locked project, a form's text —
+ *     named; the Macros pane lists the modules flagged; a module opened as
+ *     text in the text reader (its own facts) and back; OpenDocument Basic;
  *   - programs (42g): mingw's .exe and .dll, gcc's ELF, clang's universal
  *     Mach-O taken apart in the hex reader (headers, sections, imports,
  *     exports, the ad hoc signature); the hostile PE's every trick named;
@@ -81,6 +86,7 @@ import { startDev } from "../api/_dev.mjs";
 import { seedLead } from "../lib/seed-lead.mjs";
 import { dropperPs1, installSh, leakedEnv } from "../lib/hostile-text.mjs";
 import { hostilePe } from "../lib/programs.mjs";
+import { hostileProject, oleWithVba, odfWithBasic, pptWithVba, withVba } from "../lib/vba.mjs";
 
 let chromium = null;
 try {
@@ -271,6 +277,17 @@ try {
 		// (Built when the test runs — tests/lib/programs.mjs; a program named .pdf, a byte more so the duplicate check does not ask.)
 		{ name: "loader.exe", mimeType: "application/octet-stream", buffer: Buffer.from(hostilePe()) },
 		{ name: "receipt.pdf", mimeType: "application/pdf", buffer: Buffer.concat([fixture("hello.exe"), Buffer.from([1])]) },
+		// (Macros, built when the test runs — tests/lib/vba.mjs.)
+		...(() => {
+			const vba = hostileProject();
+			return [
+				["invoice.docm", withVba(fixture("report.docx"), vba)],
+				["budget.xlsm", withVba(fixture("report.xlsx"), vba)],
+				["memo.doc", oleWithVba(fixture("report.doc"), vba, "Macros/")],
+				["talk.ppt", pptWithVba(fixture("report.ppt"), vba)],
+				["notes.odt", odfWithBasic(fixture("report.odt"), "Module1", 'Sub Main\n  Shell("cmd /c calc.exe", 1)\nEnd Sub\n')],
+			].map(([name, b]) => ({ name, mimeType: "application/octet-stream", buffer: Buffer.from(b) }));
+		})(),
 		{ name: "blob.xyz", mimeType: "application/octet-stream", buffer: Buffer.from("bytes of no format \u0000\u0001\u0002 gorani", "latin1") },
 		...["bundle.zip", "bundle.7z", "bundle.rar", "bundle.tar.gz", "bundle.iso", "korean.zip", "lure.zip", "infected.zip", "locked.7z", "liar.zip", "report.alz", "report.egg", "azo.egg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		...["photo.jpg", "portrait.jpg", "redacted.jpg", "cropped.jpg", "polyglot.jpg", "generated.png", "bomb.png", "animated.gif", "photo.webp", "photo.avif", "scan.tiff", "photo.heic", "camera.dng", "camera.cr3", "camera.raf", "drawing.svg", "hostile.svg", "entities.svg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
@@ -918,6 +935,34 @@ try {
 	assert.equal(await page.locator("iframe[data-preview]").count(), 0, "a log is not handed to a reader");
 	await page.keyboard.press("Escape");
 
+	// ── macros (42h) ─────────────────────────────────────────────────────
+	d = await openDoc("invoice.docm", "docx");
+	tells = await factsSay(/Contains macros — a VBA project: 5 modules/);
+	for (const want of [/Runs by itself when the file is opened: Document_Open/, /it runs a program \(Shell\)/, /Calls Windows directly: VirtualAlloc \(kernel32\)/, /VBA stomping: Stomped's compiled code holds text its source never says/, /hidden from the VBA editor .*Helper/, /Locked for viewing in the VBA editor/, /controls hold text/]) assert.match(tells, want);
+	await d.locator('[data-test="macros-open"]').click();
+	await d.locator('[data-test="macros-pane"]').waitFor();
+	assert.deepEqual((await d.locator('[data-test="macros-module"]').allInnerTexts()).map((t) => t.replace(/\s+/g, " ").trim()), ["ThisDocument 3 lines · auto", "Module1 5 lines", "Helper 3 lines · hidden", "Stomped 2 lines · stomped", "UserForm1 2 lines"]);
+	await d.locator('[data-test="macros-module"]', { hasText: "Module1" }).click();
+	await d.locator('[data-test="macros-source"]', { hasText: "Shell s, vbHide" }).waitFor();
+	await d.locator('[data-test="macros-module"]', { hasText: "Helper" }).click();
+	await d.locator('[data-test="macros-module-open"]').click();
+	await page.locator('[data-test="viewer-name"]', { hasText: "invoice.docm › Helper.bas" }).waitFor({ timeout: 30_000 });
+	await page.frameLocator('iframe[data-preview="text"]').locator(".code", { hasText: "VirtualAlloc" }).waitFor({ timeout: 30_000 });
+	await factsSay(/Calls Windows directly: VirtualAlloc \(kernel32, line 2\)/);
+	await page.locator('[data-test="viewer-back"]').click();
+	await page.locator('iframe[data-preview="docx"]').waitFor({ timeout: 30_000 });
+	await closeDoc();
+	for (const [name, reader] of [["budget.xlsm", "sheet"], ["memo.doc", "legacy"], ["talk.ppt", "legacy"]]) {
+		d = await openDoc(name, reader);
+		await factsSay(/VBA stomping: Stomped's compiled code/);
+		await d.locator('[data-test="macros-open"]').waitFor({ timeout: 30_000 });
+		await closeDoc();
+	}
+	d = await openDoc("notes.odt", "legacy");
+	tells = await factsSay(/Contains macros — LibreOffice Basic: 1 module/);
+	assert.match(tells, /Standard\.Module1, line 2: it runs a program \(Shell\)/);
+	await closeDoc();
+
 	// ── programs (42g) ───────────────────────────────────────────────────
 	const hexStatus = (dd) => dd.locator('[data-test="hex-status"]');
 	d = await openDoc("hello.exe", "hex");
@@ -1076,7 +1121,7 @@ try {
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — programs (mingw, gcc and clang builds taken apart in the hex reader; the hostile PE's every trick named; Go to, Find, strings; a program named .pdf caught; a sample inspected as bytes only, each inspection in the audit trail first); text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — macros (a .docm, .xlsm, .doc, .ppt and OpenDocument Basic: what runs by itself, Shell, Declares, stomping, a hidden module named; the Macros pane; a module opened in the text reader); programs (mingw, gcc and clang builds taken apart in the hex reader; the hostile PE's every trick named; Go to, Find, strings; a program named .pdf caught; a sample inspected as bytes only, each inspection in the audit trail first); text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

@@ -536,6 +536,32 @@ Accepted:
   of the bytes) is the server-side backstop.
 - **No signature verification, no disassembly** (PREVIEWS.md › Limits).
 
+### Macros (commit 42h)
+
+The threat: macros are still how a document becomes a foothold, and the
+tricks are aimed at whoever looks: a source wiped while the compiled code
+runs (VBA stomping), modules hidden from the editor, a project locked so
+the editor will not show it, a payload kept in a form or the document's
+own text, an auto-start that is not called AutoOpen.
+
+The controls:
+
+- **Read, never run, in the frame.** Decompression and parsing are our
+  own code ([MS-OVBA]), bounds-checked and capped (a module's source at
+  16 MB, a .ppt's object at its declared size, 500 modules); a project
+  that does not parse leaves the generic fact and the document readable.
+- **The source is shown as text** (textContent), never as HTML, and opens
+  in the text reader only on request, as an inner preview.
+- **What the editor hides is named:** hidden modules, the lock, and the
+  compiled code's strings that the source does not contain.
+- **Test inputs are built at test time** (`tests/lib/vba.mjs`); no macro
+  sits in the repository.
+
+Accepted:
+
+- **No p-code disassembly** (PREVIEWS.md › Limits): stomping that leaves
+  no literal behind is not caught here.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

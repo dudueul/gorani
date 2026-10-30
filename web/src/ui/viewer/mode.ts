@@ -23,7 +23,7 @@ const TEXT_EXTS = [
 	"md", "markdown", "mdx", "json", "jsonl", "ndjson", "geojson", "har", "ipynb", "webmanifest",
 	"xml", "xsd", "xsl", "xslt", "plist", "rss", "atom", "csproj", "vbproj", "vcxproj", "resx", "config", "manifest", "wsf", "sct", "html", "htm", "xhtml", "hta",
 	"js", "mjs", "cjs", "jsx", "jse", "ts", "tsx", "mts", "cts", "py", "pyw", "sh", "bash", "zsh", "ksh", "command",
-	"ps1", "psm1", "psd1", "bat", "cmd", "vbs", "vbe", "vba", "bas", "css", "scss", "less", "yaml", "yml", "toml", "ini", "cfg", "conf", "inf", "reg", "properties", "env",
+	"ps1", "psm1", "psd1", "bat", "cmd", "vbs", "vbe", "vba", "bas", "cls", "frm", "css", "scss", "less", "yaml", "yml", "toml", "ini", "cfg", "conf", "inf", "reg", "properties", "env",
 	"sql", "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "cs", "java", "kt", "kts", "swift", "go", "rs", "php", "phtml", "rb", "pl", "pm", "lua", "r", "scala", "groovy", "gradle", "dart", "m", "mm",
 	"dockerfile", "makefile", "mk", "diff", "patch", "yar", "yara", "ahk", "au3", "nim", "asm", "s",
 ];

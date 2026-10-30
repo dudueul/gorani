@@ -92,7 +92,7 @@ export const LANGUAGES: Record<string, string> = {
 	xml: "xml", xsd: "xml", xsl: "xml", xslt: "xml", plist: "xml", rss: "xml", atom: "xml", csproj: "xml", vbproj: "xml", vcxproj: "xml", resx: "xml", config: "xml", manifest: "xml", wsf: "xml", sct: "xml", html: "xml", htm: "xml", xhtml: "xml", hta: "xml", svg: "xml",
 	js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript", jse: "javascript", ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript",
 	py: "python", pyw: "python", sh: "bash", bash: "bash", zsh: "bash", ksh: "bash", command: "bash",
-	ps1: "powershell", psm1: "powershell", psd1: "powershell", bat: "dos", cmd: "dos", vbs: "vbscript", vbe: "vbscript", vba: "vbscript", bas: "vbscript",
+	ps1: "powershell", psm1: "powershell", psd1: "powershell", bat: "dos", cmd: "dos", vbs: "vbscript", vbe: "vbscript", vba: "vbscript", bas: "vbscript", cls: "vbscript", frm: "vbscript",
 	css: "css", scss: "scss", less: "less", yaml: "yaml", yml: "yaml", toml: "ini", ini: "ini", cfg: "ini", conf: "ini", inf: "ini", reg: "ini", properties: "properties", env: "bash",
 	sql: "sql", c: "c", h: "c", cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp", hh: "cpp", cs: "csharp", java: "java", kt: "kotlin", kts: "kotlin", swift: "swift", go: "go", rs: "rust",
 	php: "php", phtml: "php", rb: "ruby", pl: "perl", pm: "perl", lua: "lua", r: "r", scala: "scala", groovy: "groovy", gradle: "groovy", dart: "dart", m: "objectivec", mm: "objectivec",

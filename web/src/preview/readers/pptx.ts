@@ -25,6 +25,9 @@ import { init } from "pptx-preview";
 import { boot, el, type Host } from "../host.ts";
 import { addCss, Finder, findCss, perFrame, Zoom } from "../kit.ts";
 import { deckFacts, slidesOf, type SlideMeta } from "../facts/slides.ts";
+import { withMacros } from "../facts/vba.ts";
+import { macrosInZip, safely } from "../vba/macros.ts";
+import { macroButton } from "../vba/pane.ts";
 import { encryptedOoxml, refusal, rels, unxml } from "../office.ts";
 import { Ole } from "../ole.ts";
 import { MAX_PART, Zip } from "../zip.ts";
@@ -54,7 +57,9 @@ export const start = boot(async (host) => {
 	}
 	const all = rels(zip);
 	const deck = slidesOf(zip, all);
-	const facts = deckFacts(zip, all, deck);
+	// Its macros (42h): read, never run; the Macros button shows them.
+	const macros = safely(() => macrosInZip(zip));
+	const facts = withMacros(deckFacts(zip, all, deck), macros);
 
 	const content = el("div", { class: "pptx-host" });
 	const scroller = el("div", { class: "scroll", "data-test": "pptx-slides" }, content);
@@ -73,10 +78,12 @@ export const start = boot(async (host) => {
 	// fact says so.
 	if (deck.length && !content.querySelector(".pptx-preview-slide-wrapper")) {
 		asText(host, zip, deck);
+		const mb = macroButton(host, macros);
+		if (mb) host.root.prepend(el("div", { class: "bar" }, mb));
 		host.shown([...facts, { level: "warn", text: `The slides could not be drawn${failed ? ` (${failed.slice(0, 80)})` : ""} — shown as their text; the file is damaged or built unusually` }]);
 		return;
 	}
-	show(host, scroller, content, deck);
+	show(host, scroller, content, deck, macroButton(host, macros));
 	host.shown(facts);
 });
 
@@ -121,7 +128,7 @@ function asText(host: Host, zip: Zip, deck: SlideMeta[]): void {
 	host.root.append(list);
 }
 
-function show(host: Host, scroller: HTMLElement, content: HTMLElement, deck: SlideMeta[]): void {
+function show(host: Host, scroller: HTMLElement, content: HTMLElement, deck: SlideMeta[], macros: HTMLElement | null): void {
 	const wrapper = () => content.querySelector<HTMLElement>(".pptx-preview-wrapper");
 	const slides = [...content.querySelectorAll<HTMLElement>(".pptx-preview-slide-wrapper")];
 	// Hidden slides marked; speaker notes under their slide (as text).
@@ -157,7 +164,7 @@ function show(host: Host, scroller: HTMLElement, content: HTMLElement, deck: Sli
 	next.addEventListener("click", () => goto(current() + 1));
 	const update = () => (label.textContent = `${current() + 1} / ${slides.length}`);
 	scroller.addEventListener("scroll", perFrame(update), { passive: true });
-	const bar = el("div", { class: "bar" }, prev, next, label, el("span", { class: "sep" }), zoom.el, el("span", { class: "grow" }), finder.input, finder.found);
+	const bar = el("div", { class: "bar" }, prev, next, label, el("span", { class: "sep" }), zoom.el, el("span", { class: "grow" }), ...(macros ? [macros] : []), finder.input, finder.found);
 	host.root.append(bar, scroller);
 	zoom.update();
 	update();

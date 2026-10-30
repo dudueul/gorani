@@ -14,6 +14,7 @@ import { linkFact, plural, shortUrl, some } from "../office.ts";
 import { findSecrets } from "../text/secrets.ts";
 import { scanScript } from "../text/script.ts";
 import type { TextKind, XmlDanger } from "../text/structured.ts";
+import { dangerousApi, triage } from "../vba/triage.ts";
 
 /** What a parsed Markdown or HTML page would do (the reader gathers it from an inert parse). */
 export interface PageFindings {
@@ -58,6 +59,17 @@ export function textFacts(f: TextFindings): Fact[] {
 	if (secrets.length) {
 		const kinds = [...new Set(secrets.map((s) => s.kind))];
 		facts.push({ level: "warn", text: `Holds what look like secrets — ${kinds.slice(0, 4).join(", ")}${kinds.length > 4 ? ", …" : ""}: ${some(secrets.map((s) => `${s.masked} (line ${s.line})`), 4)} — revoke them if this file got out` });
+	}
+
+	// VBA (a module opened from the Macros pane, a .bas or .cls — 42h):
+	// what runs by itself, and the Windows functions it declares.
+	if (f.language === "vbscript" && /\.(bas|cls|frm|vba)$/i.test(f.name)) {
+		const v = triage([{ name: f.name, stream: "", kind: "module", source: f.text, compiled: 0, unseen: [], hidden: false, stomped: false, formText: [] }]);
+		for (const a of v.autorun) facts.push({ level: "warn", text: `Line ${a.line}: ${a.what} runs by itself (${a.when === "control" ? "when its control draws" : `on ${a.when}`})` });
+		for (const f2 of v.findings.slice(0, 8)) facts.push({ level: "warn", text: `Line ${f2.line} ${f2.what}: ${q(f2.excerpt)}` });
+		const api = v.declares.filter((d) => dangerousApi(d.name));
+		if (api.length) facts.push({ level: "warn", text: `Calls Windows directly: ${some(api.map((d) => `${d.name} (${d.lib}, line ${d.line})`), 5)}` });
+		if (v.obfuscation.length) facts.push({ level: "warn", text: `Obfuscated: ${v.obfuscation.join("; ")}` });
 	}
 
 	// What a script would do.

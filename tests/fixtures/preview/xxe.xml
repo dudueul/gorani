@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!DOCTYPE report [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+  <!ENTITY lol "lol">
+]>
+<report><body>&xxe; &lol;</body></report>

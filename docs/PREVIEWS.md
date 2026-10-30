@@ -3,7 +3,8 @@
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > How the viewer shows formats that need a parser (commit 42a onward: PDF;
 > 42b: Word, Excel, PowerPoint, 한글 and the older Office formats; 42c:
-> email, .eml and Outlook's .msg; 42d: every picture; 42e: archives). The
+> email, .eml and Outlook's .msg; 42d: every picture; 42e: archives; 42f:
+> Markdown, JSON, XML, web pages and code). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -161,6 +162,7 @@ for readers that draw HTML.
 | `email` | .eml (and message/rfc822), .msg | postal-mime; msgreader for .msg; DOMPurify |
 | `image` | every picture: JPEG, PNG, GIF, WebP, AVIF, BMP, ICO, SVG; TIFF; HEIF (.heic); camera RAW (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF…) | the browser's decoders (in the frame); UTIF and libheif in a worker; exifr; our own structure and RAW readers (`preview/image/`) |
 | `archive` | ZIP (and JAR, APK, IPA…), ALZ, EGG; 7z, RAR, TAR and its compressions, gzip, bzip2, xz, zstd, CAB, ISO, UDF, WIM, DMG, VHD(X), ARJ, LZH, CPIO, RPM, DEB, XAR, MSI, CHM, squashfs… | our own ZIP, ALZ and EGG readers (`preview/archive/`); 7-Zip 24.09 as WebAssembly, in a worker |
+| `text` | Markdown; JSON, JSON Lines, notebooks; XML (plists, project files, .wsf, .sct); web pages (.html, .hta); code and scripts (PowerShell, batch, VBScript, JScript, shell, Python, JavaScript, PHP, C-family, Go, Rust, SQL, YAML, INI, .reg, .env, YARA, …) | marked (Markdown), highlight.js (core, about 40 languages), DOMPurify; our own trees, limits and triage (`preview/text/`) |
 
 ### PDF (pdf.js, `readers/pdf.ts`)
 
@@ -581,6 +583,83 @@ A reader can make a file more restricted this way, never less.
 - What the reader could not do: AZO and LEA entries, names that could not
   be decoded, a split archive's other parts.
 
+### Text (`readers/text.ts`, `preview/text/`, `facts/text.ts`) (42f)
+
+Plain text and logs are not here: they stay in the app's page, escaped
+(no parser reads them, so there is nothing to attack). What comes here is
+text a program would parse, render or run.
+
+| kind | shown as | the parser's limit |
+|---|---|---|
+| Markdown | rendered by marked, cleaned (below), in a shadow root; its source in a tab | — |
+| JSON | a tree built as it is opened, 500 items at a time; each value's path on a click (`$.sites[1].name`) | its nesting is counted first: past 512 levels it is not parsed (a stack exhausted is the attack) |
+| JSON Lines | a record a line, up to 100,000 | each line as JSON |
+| XML | a tree from an inert parse, its path on a click (`/settings/site[2]`) | not parsed at all when it declares entities or points outside (below) |
+| web pages | their source, never the page | an inert parse, for the facts |
+| code | highlighted, with line numbers; Wrap hides them (they would lie) | highlighted up to 1 MB, plain beyond |
+
+Every kind has its Source tab and Find. The first 8 MB are shown. A bigger
+JSON is shown as source, not parsed, and the facts say why.
+
+**Markdown is cleaned as an email is (42c).** marked turns it into HTML,
+raw HTML included. That HTML is first parsed inert, for the facts: its
+scripts, forms, frames and outside pictures are counted. Every picture
+that is not a picture inside the file itself becomes a placeholder; a
+relative one too, since the frame could not fetch it anyway. DOMPurify
+then removes every script, style, form, frame and media element. What
+remains goes into a shadow root, so its CSS cannot reach the bar. A link
+shows where it goes on hover, and a click goes nowhere (host.ts).
+
+**XML that reaches out is never parsed.** A DOCTYPE that declares
+entities is the "billion laughs" (entities that nest, a few kilobytes
+that expand to gigabytes). One that names an outside DTD or entity is
+XXE, the classic way an XML parser is made to read a file or call out.
+The browser's parser does neither of the dangerous things, but a tree
+built from such a file would show what the browser chose. So the file is
+shown as source, and the facts name the entity and the address.
+
+**A binary file with a text name** (a program named `invoice.js`, a
+binary plist) holds NUL bytes, which text never does. It is shown as
+characters, never parsed, and the facts say it is binary.
+
+**Encoding.** A BOM decides; otherwise UTF-8 if the bytes are UTF-8, then
+Korean (CP949, as Korean Windows writes it), then Western (Windows-1252).
+The facts name the encoding used.
+
+**The facts** (`facts/text.ts`, pure). These are what an analyst looks for
+first in a leaked file or a lure's script:
+
+- **Secrets** (`text/secrets.ts`): private keys; AWS, GitHub, GitLab,
+  Slack, Google, Stripe, OpenAI and Anthropic keys; JSON Web Tokens; Azure
+  storage keys; passwords in connection strings, settings and URLs. Each
+  is named by kind and line and **masked** (its first and last four
+  characters), so the facts never spread a key further. Placeholders
+  (`changeme`, `${VAR}`, `<your key>`) are skipped.
+- **What a script would do** (`text/script.ts`), one finding a line, in
+  line order:
+  - downloading and running code (PowerShell, `curl … | sh`, certutil,
+    bitsadmin, mshta, regsvr32, rundll32, WMIC);
+  - hidden code: PowerShell hidden and unrestricted, base64 decoded and
+    run, assemblies loaded from memory, Windows APIs from PowerShell;
+  - VBScript and JScript writing files, running commands, fetching;
+    JavaScript building code to eval; Node.js and Python running commands;
+  - staying: Run keys, scheduled tasks, services, crontab,
+    authorized_keys, new users;
+  - damage and cover: shadow copies deleted, recovery disabled, logs
+    cleared, Defender off, AMSI bypassed;
+  - shells: a reverse shell, a web shell.
+
+  A PowerShell `-EncodedCommand` is **decoded** (base64 of UTF-16LE) and
+  quoted, and the addresses it hid are listed with the rest. Windows
+  Script Encoder (`#@~^`), obfuscators' names and strings built a
+  character at a time are named. So are long base64 runs, every URL, and
+  every public IP address.
+- **Pages** (Markdown, HTML): the scripts, forms and frames they hold
+  (none drawn), and what they would load from outside (nothing loaded).
+- **XML**: entities, an outside DTD or entity, XInclude, code inside an
+  XSLT stylesheet (`msxsl:script`).
+- **JSON**: why it is not valid, or how many records and bad lines.
+
 ## Limits
 
 - **A reader that hangs can freeze the tab on some browsers.** Desktop
@@ -624,6 +703,15 @@ A reader can make a file more restricted this way, never less.
   with question marks and cannot be asked for by name; the facts say so.
 - **A split archive** (`.001`, `.z01`, a split EGG) is listed one part at
   a time: the vault holds each part as a file of its own.
+- **Script triage is pattern matching.** It names what is written
+  plainly; a script obfuscated past its patterns (built from pieces,
+  encrypted, run from a second stage) passes it. It is a reading aid, not
+  a verdict: a clean report proves nothing, and the 42g hex reader and a
+  sandbox are the next steps for anything suspected.
+- **Secret patterns are the providers' published formats**, plus
+  assignments that look like passwords. A key in another shape is missed;
+  a test key in the right shape is reported.
+- **Highlighting stops at 1 MB** and showing at 8 MB.
 
 ## Tests
 
@@ -644,7 +732,9 @@ A reader can make a file more restricted this way, never less.
     direction-changing character in any fact is shown, not obeyed (42e).
 - **`unit:viewer-modes`:** each format to its reader, by name or type,
   capped like any whole read, samples refused first; the first bytes
-  correcting a disguised name (a .msg is OLE, and stays email).
+  correcting a disguised name (a .msg is OLE, and stays email); (42f)
+  Markdown, JSON, XML, web pages and code to the text reader, plain text
+  and logs kept in the page, a sample script never parsed.
 - **`unit:preview-facts`** (Node, milliseconds): ZIP bombs refused (a part
   that lies, a directory that over-claims); every planted trick in the
   hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named, the
@@ -658,7 +748,12 @@ A reader can make a file more restricted this way, never less.
   the editing history, the AI mark, the bomb, and the facts each makes;
   (42e) every archive fixture through our ZIP, ALZ and EGG readers and
   7-Zip in Node: names (CP949), ZipCrypto and AES, wrong passwords, liars,
-  bombs, links, solid EGG, AZO, ESTsoft's own EGG sample, and the facts.
+  bombs, links, solid EGG, AZO, ESTsoft's own EGG sample, and the facts;
+  (42f) a leaked config's every key found and masked, placeholders not; a
+  dropper's every line named in order and its `-EncodedCommand` decoded;
+  a reverse shell, a web shell, Script Encoder, an obfuscator; JSON
+  nesting refused before parsing; XML entities and outside DTDs; Korean
+  and UTF-16 text decoded.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -673,6 +768,12 @@ A reader can make a file more restricted this way, never less.
     their markup shown as text; an RTF and a web archive named .doc named
     as disguises;
   - the default Trusted Types policy attacked from inside;
+  - text (42f): Markdown rendered with no script, form, frame or outside
+    picture, a link that hovers true and clicks nowhere, Find; JSON and
+    XML trees and their paths; the deep JSON and the XXE refused; a
+    phishing page shown as source; code highlighted and wrapped; the
+    dropper's, the installer's and the leaked config's facts; a program
+    named .js said to be binary; a log kept in the page;
   - archives (42e): ZIP, ALZ, EGG, 7z, RAR, TAR.GZ, ISO listed, folders
     walked, entries opened in previews of their own (a nested archive in
     turn); the lure's every trick named; a wrong password refused,
@@ -709,6 +810,10 @@ A reader can make a file more restricted this way, never less.
   - `archives.py` (each format's own tool — zip, 7z, rar, gcab, xorriso,
     arj, zstd; LHA, the hostile ZIPs, ALZ and EGG written by hand, ALZ
     checked with unalz, EGG from ESTsoft's specification): the archives.
+  - `texts.py` (no libraries): the Markdown, JSON, XML, page and code
+    files. The hostile scripts and the leaked config are built when the
+    tests run (`tests/lib/hostile-text.mjs`), from pieces, so the
+    repository holds no file a virus or secret scanner would flag.
 
   Everything except what LibreOffice writes is the same bytes on every run.
   Nothing in them is a working exploit: the scripts are text, the

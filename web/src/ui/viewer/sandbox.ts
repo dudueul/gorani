@@ -46,8 +46,12 @@ import { MAX_INLINE } from "./mode.ts";
  *           own JPEG preview; metadata (exifr)                        42d
  *   archive ZIP, ALZ, EGG (our own readers) and every other archive 7-Zip
  *           reads (WebAssembly, in a worker): listed, entries opened in
- *           previews of their own or saved                           42e */
-export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email" | "image" | "archive";
+ *           previews of their own or saved                           42e
+ *   text    Markdown (rendered, cleaned), JSON and XML (trees), web
+ *           pages (as source), code (highlight.js); secrets and what a
+ *           script would do, as facts. Plain text and logs stay in the
+ *           app's page, escaped: they need no parser                 42f */
+export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email" | "image" | "archive" | "text";
 
 /** The asset names each reader may ask for — and nothing else is fetched for it. */
 const ASSETS: Record<ReaderId, RegExp | null> = {
@@ -65,6 +69,7 @@ const ASSETS: Record<ReaderId, RegExp | null> = {
 	// 7-Zip (LGPL + unRAR restriction): its script and WebAssembly, asked
 	// for only when an archive is not one our own readers take.
 	archive: /^7zz\.(js|wasm)$/,
+	text: null,
 };
 
 /** Readers that run a worker of their own (its code is sent with theirs). */

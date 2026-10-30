@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- the survey's settings -->
+<settings version="3">
+  <site id="north" name="North ridge"><count>12</count></site>
+  <site id="river" name="강가"><count>7</count></site>
+  <owner>Gorani tests</owner>
+</settings>

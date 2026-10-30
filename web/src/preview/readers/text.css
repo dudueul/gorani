@@ -1,0 +1,189 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The text reader (commit 42f): highlighted source with a gutter, trees. */
+
+.bar .tabs {
+	display: inline-flex;
+	gap: 4px;
+}
+
+.panes {
+	font-size: 13px;
+}
+
+.source {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	min-width: 0;
+}
+
+.source pre {
+	margin: 0;
+	padding: 10px 12px;
+	font: 12.5px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, "D2Coding", monospace;
+	tab-size: 4;
+}
+
+.gutter {
+	color: #525252;
+	text-align: right;
+	user-select: none;
+	-webkit-user-select: none;
+	border-right: 1px solid var(--line);
+	background: #0f0f0f;
+}
+
+.code {
+	white-space: pre;
+	user-select: text;
+}
+
+.wrap .code {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.wrap .gutter {
+	display: none;
+}
+
+.wrap .source {
+	grid-template-columns: 1fr;
+}
+
+.status {
+	padding: 4px 10px;
+	border-top: 1px solid var(--line);
+	background: var(--panel);
+	font: 12px ui-monospace, Menlo, Consolas, monospace;
+	min-height: 1.9em;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+.tree {
+	/* (room on the left for the root's own arrow, drawn outside its row) */
+	padding: 8px 12px 8px 28px;
+	font: 12.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.tree details {
+	margin-left: 0;
+}
+
+.tree details > :not(summary) {
+	margin-left: 18px;
+}
+
+.tree summary {
+	cursor: pointer;
+	list-style-position: outside;
+}
+
+.tree .leaf {
+	margin-left: 18px;
+}
+
+.tree .line {
+	cursor: default;
+}
+
+.tree .k {
+	color: #93c5fd;
+}
+
+.tree .t {
+	color: #86efac;
+}
+
+.tree .a {
+	color: #fcd34d;
+}
+
+.tree .string {
+	color: #fca5a5;
+}
+
+.tree .number,
+.tree .boolean,
+.tree .null {
+	color: #c4b5fd;
+}
+
+.tree .text {
+	color: var(--text);
+	white-space: pre-wrap;
+}
+
+.tree .more {
+	margin: 4px 0 4px 18px;
+	min-height: 24px;
+	font-size: 12px;
+}
+
+.page {
+	display: block;
+}
+
+/* highlight.js, dark (our own few rules: the theme files are not bundled). */
+.hljs-comment,
+.hljs-quote {
+	color: #737373;
+	font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-doctag {
+	color: #c084fc;
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-template-string {
+	color: #86efac;
+}
+
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-bullet {
+	color: #fdba74;
+}
+
+.hljs-title,
+.hljs-section,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+	color: #93c5fd;
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-type,
+.hljs-params {
+	color: #fcd34d;
+}
+
+.hljs-meta,
+.hljs-tag {
+	color: #67e8f9;
+}
+
+.hljs-deletion {
+	color: #fca5a5;
+}
+
+.hljs-emphasis {
+	font-style: italic;
+}
+
+.hljs-strong {
+	font-weight: 600;
+}

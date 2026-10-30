@@ -4,7 +4,8 @@
 > How the viewer shows formats that need a parser (commit 42a onward: PDF;
 > 42b: Word, Excel, PowerPoint, 한글 and the older Office formats; 42c:
 > email, .eml and Outlook's .msg; 42d: every picture; 42e: archives; 42f:
-> Markdown, JSON, XML, web pages and code). The
+> Markdown, JSON, XML, web pages and code; 42g: programs and any file as
+> bytes — the one view a malware sample may have). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -162,6 +163,7 @@ for readers that draw HTML.
 | `email` | .eml (and message/rfc822), .msg | postal-mime; msgreader for .msg; DOMPurify |
 | `image` | every picture: JPEG, PNG, GIF, WebP, AVIF, BMP, ICO, SVG; TIFF; HEIF (.heic); camera RAW (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF…) | the browser's decoders (in the frame); UTIF and libheif in a worker; exifr; our own structure and RAW readers (`preview/image/`) |
 | `archive` | ZIP (and JAR, APK, IPA…), ALZ, EGG; 7z, RAR, TAR and its compressions, gzip, bzip2, xz, zstd, CAB, ISO, UDF, WIM, DMG, VHD(X), ARJ, LZH, CPIO, RPM, DEB, XAR, MSI, CHM, squashfs… | our own ZIP, ALZ and EGG readers (`preview/archive/`); 7-Zip 24.09 as WebAssembly, in a worker |
+| `hex` | any file as bytes; programs (PE: .exe .dll .sys…; ELF; Mach-O, universal too) taken apart; the only reader a malware sample reaches | our own parsers (`preview/binary/`); @noble/hashes for SHA-256, SHA-1, MD5 and the imphash |
 | `text` | Markdown; JSON, JSON Lines, notebooks; XML (plists, project files, .wsf, .sct); web pages (.html, .hta); code and scripts (PowerShell, batch, VBScript, JScript, shell, Python, JavaScript, PHP, C-family, Go, Rust, SQL, YAML, INI, .reg, .env, YARA, …) | marked (Markdown), highlight.js (core, about 40 languages), DOMPurify; our own trees, limits and triage (`preview/text/`) |
 
 ### PDF (pdf.js, `readers/pdf.ts`)
@@ -618,9 +620,10 @@ The browser's parser does neither of the dangerous things, but a tree
 built from such a file would show what the browser chose. So the file is
 shown as source, and the facts name the entity and the address.
 
-**A binary file with a text name** (a program named `invoice.js`, a
-binary plist) holds NUL bytes, which text never does. It is shown as
-characters, never parsed, and the facts say it is binary.
+**A binary file with a text name** (a binary plist, a database named
+.json) holds NUL bytes, which text never does. It is shown as characters,
+never parsed, and the facts say it is binary. A *program* with a text
+name (`invoice.js` that starts with MZ) goes to the hex reader (42g).
 
 **Encoding.** A BOM decides; otherwise UTF-8 if the bytes are UTF-8, then
 Korean (CP949, as Korean Windows writes it), then Western (Windows-1252).
@@ -659,6 +662,74 @@ first in a leaked file or a lure's script:
 - **XML**: entities, an outside DTD or entity, XInclude, code inside an
   XSLT stylesheet (`msxsl:script`).
 - **JSON**: why it is not valid, or how many records and bad lines.
+
+### Programs (`readers/hex.ts`, `preview/binary/`, `facts/binary.ts`) (42g)
+
+Any file can be shown as bytes, and a program is taken apart; nothing is
+run, mapped, disassembled or decoded as what it claims to be. Every byte
+reaches the page as a number, through `textContent`.
+
+| tab | what it shows |
+|---|---|
+| Program | PE, ELF or Mach-O: the header, the sections (offsets, sizes, rights, entropy; a click goes to them in Hex), the imports grouped by library with the dangerous ones marked, exports, libraries, the signature, the version strings, the hashes |
+| Hex | offset, hex and ASCII, sixteen bytes a row, drawn only where you look (a 256 MB file is 16 million rows); Go to an offset; Find text, UTF-16 text or hex bytes, forward and (Shift+Enter) back, wrapping; an entropy strip of the whole file — dark where it repeats, bright where it is compressed or encrypted — that goes where you click; the status line reads the byte as u8, u16 and u32 and names its section |
+| Strings | ASCII and UTF-16LE runs of 5 or more, by offset (what `strings` and `strings -el` print), filtered as you type; a click goes to the string in Hex |
+
+**Which files.** Programs by name (.exe .dll .sys .scr .cpl .ocx .efi
+.so .dylib .ko .elf .o .bin .node .pyd …), by type, and *by their first
+bytes under any name but an archive's*: an "invoice.pdf" that starts with
+MZ is the lure, and it is shown as the program it is (a self-extracting
+archive stays with the archive reader, which lists it). Other binaries
+(.wasm, .dex, .class, .lnk, .dmp, .pcap, .evtx, .db) come here too, and
+any file with no reader offers **Inspect as hex**.
+
+**The parsers** (pure, `unit:preview-facts`), written from the formats'
+own specifications — the PE/COFF specification, the System V ELF ABI,
+Apple's `<mach-o/loader.h>` and `<mach-o/fat.h>`:
+
+- every offset a file gives is bounds-checked before it is followed (a
+  read past the end ends the walk with "cut short", it never throws);
+- every loop a file controls is capped (96 sections — the Windows loader's
+  own limit —, 1000 import descriptors, 4096 load commands…);
+- an RVA is mapped through the section table, and one that points at
+  nothing is skipped;
+- checked against the tools analysts trust, on real compiler output:
+  pefile (imphash, sections, entropy, version strings, exports) for
+  mingw's .exe and .dll, readelf for gcc's ELF, llvm-otool and llvm-nm
+  for clang's universal Mach-O.
+
+**The facts** (`facts/binary.ts`), the first minute of triage:
+
+- **What** it is (and a name that says otherwise), SHA-256 (copyable),
+  the imphash — pefile's own method, Winsock's ordinals named as pefile
+  names them; for an oleaut32 ordinal no imphash at all rather than a
+  wrong one.
+- **Who:** the compile time (in the future, zeroed, or before 1995: forged
+  or a reproducible build's hash); the Authenticode signature's names, or
+  a Mach-O's identifier, Team ID and ad hoc flag — **never verified here**,
+  and said so; who the version resource says made it, and an unsigned file
+  that claims to be Microsoft's; its own name for itself; the PDB path,
+  and a user folder in it; a manifest asking for administrator.
+- **How:** packers by their section names (UPX, ASPack, MPRESS, Themida,
+  VMProtect…), sections of near-random bytes, sections both writable and
+  executable, an entry point in the last section or outside any, TLS
+  callbacks, an overlay after the last section, few imports that look the
+  rest up at run time, none at all; for ELF a stripped or missing section
+  table, UPX, an odd loader, a writable-and-executable segment, an RPATH
+  anyone can write, a kernel module; for Mach-O no signature on Apple
+  silicon, libraries loaded from /tmp.
+- **What for:** the imports grouped by capability — injection, keylogging,
+  downloading, credential theft, services, anti-debugging, privileges, the
+  reverse shell's socket + dup2 + exec — strong ones as warnings, common
+  ones as one line. In the strings: what a script would do (the 42f
+  triage, at the offset), URLs, public IPs, .onion and Bitcoin addresses,
+  registry Run keys, user folders, and the marks installers, packers and
+  known tools leave (NSIS, Inno Setup, PyInstaller, AutoIt, Go, Rust,
+  Mimikatz, Cobalt Strike, Meterpreter, a ransom note's words).
+
+**Malware samples** are inspected here and nowhere else — the hex reader
+has no Open, Save or hand-over. The inspection goes into the audit trail
+first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
 
 ## Limits
 
@@ -712,6 +783,15 @@ first in a leaked file or a lure's script:
   assignments that look like passwords. A key in another shape is missed;
   a test key in the right shape is reported.
 - **Highlighting stops at 1 MB** and showing at 8 MB.
+- **Signatures are not verified.** The hex reader names what an
+  Authenticode or Mach-O signature carries; checking it needs the
+  certificate chain and its revocation status, which a sandbox with no
+  network cannot have. "Signed" is never shown as "trusted".
+- **No disassembly, no .NET metadata beyond its runtime, no resources but
+  the version and manifest read.** Imports are what the file declares: a
+  packed program declares little, and the facts say so.
+- **A file is shown up to the viewer's whole-read cap** (256 MB); a bigger
+  sample is downloaded zipped into an analysis environment.
 
 ## Tests
 
@@ -730,11 +810,16 @@ first in a leaked file or a lure's script:
     fact's Copy is kept only when it is words the fact shows (42d);
   - the archive reader may ask for 7-Zip's two files and nothing else; a
     direction-changing character in any fact is shown, not obeyed (42e).
+- **`unit:preview-frame`** (42g): the text and hex readers ask for no
+  asset; `openPreview` refuses a sample for any reader but hex; the viewer
+  writes the audit line before it opens the bytes.
 - **`unit:viewer-modes`:** each format to its reader, by name or type,
   capped like any whole read, samples refused first; the first bytes
   correcting a disguised name (a .msg is OLE, and stays email); (42f)
   Markdown, JSON, XML, web pages and code to the text reader, plain text
-  and logs kept in the page, a sample script never parsed.
+  and logs kept in the page, a sample script never parsed; (42g) programs
+  to the hex reader by name, type, and their first bytes under any name
+  but an archive's.
 - **`unit:preview-facts`** (Node, milliseconds): ZIP bombs refused (a part
   that lies, a directory that over-claims); every planted trick in the
   hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named, the
@@ -753,7 +838,10 @@ first in a leaked file or a lure's script:
   dropper's every line named in order and its `-EncodedCommand` decoded;
   a reverse shell, a web shell, Script Encoder, an obfuscator; JSON
   nesting refused before parsing; XML entities and outside DTDs; Korean
-  and UTF-16 text decoded.
+  and UTF-16 text decoded; (42g) mingw's .exe and .dll, gcc's ELF and
+  clang's universal Mach-O read as pefile, readelf and llvm-otool read
+  them; the hostile PE's every trick named; files cut short anywhere said,
+  never thrown; strings, Find, capabilities.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -768,6 +856,11 @@ first in a leaked file or a lure's script:
     their markup shown as text; an RTF and a web archive named .doc named
     as disguises;
   - the default Trusted Types policy attacked from inside;
+  - programs (42g): the four real builds taken apart; the hostile PE's
+    facts, its sections, Go to, Find in text and hex, a string followed
+    into Hex; a program named .pdf; a file of no format inspected as hex;
+    a sample, out of the archive and saved, inspected as bytes only — the
+    hex reader and no other — and both inspections in the audit trail;
   - text (42f): Markdown rendered with no script, form, frame or outside
     picture, a link that hovers true and clicks nowhere, Find; JSON and
     XML trees and their paths; the deep JSON and the XXE refused; a
@@ -810,6 +903,10 @@ first in a leaked file or a lure's script:
   - `archives.py` (each format's own tool — zip, 7z, rar, gcab, xorriso,
     arj, zstd; LHA, the hostile ZIPs, ALZ and EGG written by hand, ALZ
     checked with unalz, EGG from ESTsoft's specification): the archives.
+  - `programs.sh` (mingw-w64, gcc, clang with ld64.lld and llvm-lipo): the
+    honest programs, each printing one line. The hostile PE is built when
+    the tests run (`tests/lib/programs.mjs`): structurally valid, a RET
+    for code, and nothing a scanner would take for malware on disk;
   - `texts.py` (no libraries): the Markdown, JSON, XML, page and code
     files. The hostile scripts and the leaked config are built when the
     tests run (`tests/lib/hostile-text.mjs`), from pieces, so the

@@ -98,6 +98,10 @@ portions are marked, their original notices are retained in place.
    WinZip AES are decrypted with @noble/ciphers and @noble/hashes (Paul
    Miller, MIT).
 
+   The hex reader (commit 42g) is our own code (web/src/preview/binary/),
+   written from the PE/COFF specification, the System V ELF ABI and
+   Apple's Mach-O headers; it hashes with @noble/hashes (Paul Miller, MIT).
+
    The text reader (commit 42f) bundles marked (Christopher Jeffrey and
    the marked contributors, MIT) for Markdown and highlight.js (Ivan
    Sagalaev and contributors, BSD-3-Clause) for highlighting: their

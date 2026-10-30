@@ -237,6 +237,14 @@ class ArchiveView {
 			row.addEventListener("dblclick", () => void this.take(e, "open"));
 			row.addEventListener("keydown", (ev) => ev.key === "Enter" && void this.take(e, "open"));
 		}
+		if (this.sample) {
+			// A sample is never opened — but it may be INSPECTED (42g): its
+			// bytes, strings and headers in the hex reader, after the app has
+			// put the inspection in the audit trail.
+			const i = el("button", { "data-test": "arc-inspect", title: "Its bytes, strings and program headers, in a hex view of its own — recorded in the audit trail" }, "Inspect");
+			i.addEventListener("click", (ev) => (ev.stopPropagation(), void this.take(e, "inspect")));
+			acts.append(i);
+		}
 		const s = el("button", { "data-test": "arc-save", title: this.sample ? "Save it into the vault as a malware sample" : "Save it into the vault (you are asked first)" }, this.sample ? "Save as sample" : "Save");
 		s.addEventListener("click", (ev) => (ev.stopPropagation(), void this.take(e, "save")));
 		acts.append(s);
@@ -244,7 +252,7 @@ class ArchiveView {
 		return row;
 	}
 
-	private async take(e: Entry, action: "open" | "save"): Promise<void> {
+	private async take(e: Entry, action: "open" | "save" | "inspect"): Promise<void> {
 		if (this.busy) return;
 		if (e.encrypted && this.password === null) {
 			this.say("It is encrypted: give the password above first.");
@@ -256,7 +264,7 @@ class ArchiveView {
 		const g = await this.ask({ t: "extract", index: e.index });
 		this.busy = false;
 		if (g.t !== "entry" || !g.bytes) {
-			this.say(`Not ${action === "open" ? "opened" : "saved"}: ${g.why ?? g.message ?? "it could not be unpacked"}.`, true);
+			this.say(`Not ${action === "open" ? "opened" : action === "inspect" ? "inspected" : "saved"}: ${g.why ?? g.message ?? "it could not be unpacked"}.`, true);
 			if (g.kind === "password") {
 				this.password = null;
 				this.drawLock();
@@ -264,9 +272,10 @@ class ArchiveView {
 			return;
 		}
 		const file = { name: e.path.split(/[\\/]/).pop() || "entry", mime: null, bytes: new Uint8Array(g.bytes) };
-		// What came out with "infected" is a sample: the app is told, and saves it only as one.
-		this.host.handOver(this.sample ? "save" : action, file, { sample: this.sample });
-		this.say(action === "open" && !this.sample ? `Opened ${visible(e.path)}.` : `Asked to save ${visible(e.path)}${this.sample ? " as a malware sample" : ""}.`);
+		// What came out with "infected" is a sample: the app is told, and
+		// saves it only as one — or shows its bytes, and nothing else.
+		this.host.handOver(action === "inspect" ? "inspect" : this.sample ? "save" : action, file, { sample: this.sample });
+		this.say(action === "inspect" ? `Asked to inspect ${visible(e.path)} (bytes only).` : action === "open" && !this.sample ? `Opened ${visible(e.path)}.` : `Asked to save ${visible(e.path)}${this.sample ? " as a malware sample" : ""}.`);
 	}
 
 	private say(text: string, warn = false): void {

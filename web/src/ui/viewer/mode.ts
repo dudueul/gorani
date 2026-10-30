@@ -28,6 +28,10 @@ const TEXT_EXTS = [
 	"dockerfile", "makefile", "mk", "diff", "patch", "yar", "yara", "ahk", "au3", "nim", "asm", "s",
 ];
 
+/** Programs and other binaries (42g): to the hex reader — their bytes,
+ * strings and (for PE, ELF and Mach-O) their structure; never run. */
+const HEX_EXTS = ["exe", "macho", "dll", "sys", "scr", "cpl", "ocx", "drv", "efi", "mui", "ax", "com", "so", "dylib", "o", "obj", "ko", "elf", "bin", "axf", "node", "pyd", "dex", "class", "wasm", "lnk", "dmp", "mdmp", "pcap", "pcapng", "evtx", "dat", "db", "sqlite", "pf"];
+
 /** The extensions each sandboxed reader takes (42a PDF; 42b Office, 한글; 42c email; 42d pictures; 42e archives; 42f text). */
 const BY_EXT: Record<string, ReaderId> = {
 	pdf: "pdf",
@@ -52,6 +56,7 @@ const BY_EXT: Record<string, ReaderId> = {
 	// web pages, code. Plain .txt and .log are not here: they stay in the
 	// app's page, escaped (a parser for them is attack surface for nothing).
 	...Object.fromEntries(TEXT_EXTS.map((e) => [e, "text" as const])),
+	...Object.fromEntries(HEX_EXTS.map((e) => [e, "hex" as const])),
 };
 
 /** …and the types, for a file whose name says nothing. */
@@ -116,6 +121,14 @@ const BY_MIME: Record<string, ReaderId> = {
 	"text/yaml": "text",
 	"application/yaml": "text",
 	"text/css": "text",
+	"application/x-msdownload": "hex",
+	"application/vnd.microsoft.portable-executable": "hex",
+	"application/x-dosexec": "hex",
+	"application/x-executable": "hex",
+	"application/x-elf": "hex",
+	"application/x-sharedlib": "hex",
+	"application/x-mach-binary": "hex",
+	"application/wasm": "hex",
 };
 
 /** Which sandboxed reader shows a file, if one does: by its name first
@@ -141,9 +154,15 @@ export function sniffReader(head: Uint8Array, guess: ReaderId, name: string): Re
 	const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
 	if (ascii.startsWith("%PDF-")) return "pdf";
 	if (ascii.startsWith("{\\rtf")) return "legacy";
+	// A program, whatever its name says (42g): shown as the program it is —
+	// an "invoice.pdf" that is a Windows executable is the lure itself.
+	// (Not for an archive: a self-extracting one is still an archive, and
+	// the archive reader lists it.)
+	const program = (head[0] === 0x4d && head[1] === 0x5a) || (head[0] === 0x7f && ascii.startsWith("\x7fELF")) || [0xfeedfacf, 0xfeedface, 0xcffaedfe, 0xcefaedfe].includes(((head[0]! << 24) | (head[1]! << 16) | (head[2]! << 8) | head[3]!) >>> 0);
+	if (program && guess !== "archive") return "hex";
 	const zip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
 	const ole = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
-	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image" || guess === "archive" || guess === "text") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)
+	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image" || guess === "archive" || guess === "text" || guess === "hex") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)
 	if (zip && guess === "legacy") {
 		// A ".doc" or ".ppt" that is really the 2007+ format, renamed.
 		if (/^(doc|dot)$/.test(ext)) return "docx";

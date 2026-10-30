@@ -78,6 +78,8 @@ export const places = {
 	/** Version n's original modified date (39y): when the uploader's copy was last changed. */
 	fileModified: (store: string, file: string, version: number) => place("file.modified", store, file, version),
 	fileIntake: (store: string, file: string) => place("file.intake", store, file),
+	/** What was inspected inside version n (commit 42g): an archive entry's name, sealed into the audit line. */
+	fileInspected: (store: string, file: string, version: number) => place("file.inspect", store, file, version),
 	custodyReason: (store: string, file: string, seq: number) => place("custody.reason", store, file, seq),
 	folderName: (store: string, folder: string) => place("folder.name", store, folder),
 	shareName: (store: string, share: string) => place("share.name", store, share),

@@ -106,8 +106,9 @@ assert.equal(sniffReader(head(ZIP), "archive", "a.zip"), "archive");
 assert.equal(sniffReader(head("Rar!\x1a\x07"), "archive", "a.zip"), "archive", "a RAR named .zip: the archive reader, which names it");
 
 // Text that needs a parser (42f): to the text reader in the frame — by
-// name, by type; its first bytes do not move it (a binary file named .js
-// is shown as characters, and the reader says it is binary).
+// name, by type; its first bytes do not move it — unless they are a
+// program's (42g, below): a binary that is not a program is shown as
+// characters, and the reader says it is binary.
 for (const name of ["README.md", "a.json", "a.jsonl", "a.geojson", "a.ipynb", "a.xml", "a.plist", "a.csproj", "a.html", "a.HTA", "a.js", "a.ts", "a.py", "a.sh", "a.ps1", "a.psm1", "a.bat", "a.cmd", "a.vbs", "a.vbe", "a.jse", "a.wsf", "a.sct", "a.css", "a.yaml", "a.toml", "a.ini", "a.reg", "a.env", "a.sql", "a.c", "a.rs", "a.go", "a.php", "a.rb", "a.yar", "a.ahk", "Dockerfile.dockerfile", "a.patch"]) {
 	assert.equal(readerFor("file", null, name), "text", name);
 }
@@ -116,8 +117,20 @@ for (const type of ["application/json", "text/html", "application/xml", "text/ja
 assert.equal(readerFor("image", "image/svg+xml", "a.svg"), "image", "an SVG is still a picture (its source is the picture reader's tab)");
 assert.equal(pickViewerMode("code", null, 10, "sample", "dropper.ps1"), "refused", "a sample script is never parsed, not even to be highlighted");
 assert.equal(pickViewerMode("code", null, MAX_INLINE + 1, "normal", "huge.json"), "too-large", "taken whole by the frame, so capped");
-assert.equal(sniffReader(head("MZ\x90\x00"), "text", "invoice.js"), "text", "a program named .js: the text reader, which says it is binary");
+assert.equal(sniffReader(head("MZ\x90\x00"), "text", "invoice.js"), "hex", "a program named .js: the hex reader (42g), which names the disguise");
 assert.equal(sniffReader(head("%PDF-1.7"), "text", "invoice.html"), "pdf", "a PDF named .html is shown as the PDF it is");
+
+// Programs and other binaries (42g): to the hex reader — by name, by
+// type; and a program under ANY name but an archive's goes there too (an
+// "invoice.pdf" that is an .exe is the lure; a self-extractor stays an archive).
+for (const name of ["a.exe", "a.DLL", "a.sys", "a.scr", "a.cpl", "a.so", "a.dylib", "a.macho", "a.ko", "a.elf", "a.bin", "a.o", "a.wasm", "a.dex", "a.class", "a.lnk", "a.dmp"]) assert.equal(readerFor("file", null, name), "hex", name);
+for (const type of ["application/x-msdownload", "application/vnd.microsoft.portable-executable", "application/x-executable", "application/x-mach-binary"]) assert.equal(readerFor("file", type, "noext"), "hex", type);
+for (const [bytes, label] of [["MZ\x90\x00", "a PE"], ["\x7fELF", "an ELF"], [[0xcf, 0xfa, 0xed, 0xfe], "a Mach-O"]] as const) {
+	for (const guess of ["pdf", "docx", "image", "text", "legacy", "email"] as const) assert.equal(sniffReader(head(bytes as string | number[]), guess, "invoice.pdf"), "hex", `${label} named as a ${guess}`);
+	assert.equal(sniffReader(head(bytes as string | number[]), "archive", "setup.zip"), "archive", `${label} named .zip: the archive reader (a self-extractor)`);
+}
+assert.equal(pickViewerMode("file", null, 10, "normal", "setup.exe"), "document", "a program is shown — as bytes and headers");
+assert.equal(pickViewerMode("file", null, 10, "sample", "setup.exe"), "refused", "a sample program is refused first: inspecting it is a choice the person makes, on the record");
 
 // Formats with no reader are honest about it — except a text/plain mime,
 // which still shows.
@@ -141,4 +154,4 @@ assert.equal(renderMime("video", "text/html", "v.mp4"), "video/mp4", "a stored d
 assert.equal(renderMime("video", null, "v.mkv"), "video/mp4");
 assert.equal(renderMime("text", "text/plain", "n"), "text/plain");
 
-console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused; Office, 한글, email, every picture, every archive and the text that needs a parser to their readers in the frame (plain text and logs kept in the page), and the first bytes correcting a disguised name");
+console.log("ok  viewer modes: the cap only where a file is read whole (media streams at any size), mimes, escape-by-construction, samples refused; Office, 한글, email, every picture, every archive, the text that needs a parser and every program to their readers in the frame (plain text and logs kept in the page), and the first bytes correcting a disguised name");

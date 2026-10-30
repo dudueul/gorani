@@ -65,6 +65,8 @@ const READERS = {
 	email: {},
 	// marked and highlight.js, bundled in (MIT, BSD-3: NOTICE).
 	text: {},
+	// Bytes, strings and program headers (42g): our own code and @noble/hashes.
+	hex: {},
 	archive: {
 		worker: "./readers/archive.worker.ts",
 		files: [["7z-wasm/7zz.umd.js", "7zz.js"], ["7z-wasm/7zz.wasm", "7zz.wasm"], ["7z-wasm/License.txt", "License.txt"], ["7z-wasm/unRarLicense.txt", "unRarLicense.txt"]],

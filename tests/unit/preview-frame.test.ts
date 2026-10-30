@@ -108,6 +108,14 @@ for (const bad of ["LICENSE", "libheif.js.map", "../hwp/rhwp_bg.wasm", "libheif-
 assert.equal(assetPath("archive", "7zz.js"), "/readers/archive/7zz.js");
 assert.equal(assetPath("archive", "7zz.wasm"), "/readers/archive/7zz.wasm");
 for (const bad of ["License.txt", "unRarLicense.txt", "7zz.umd.js", "../image/libheif.wasm", "7zz.wasm.map"]) assert.equal(assetPath("archive", bad), null, `archive refused: ${bad}`);
+// The text (42f) and hex (42g) readers ask for nothing at all.
+for (const reader of ["text", "hex"] as const) for (const any of ["a.js", "7zz.wasm", "libheif.js", "cmaps/x"]) assert.equal(assetPath(reader, any), null, `${reader} asks for nothing: ${any}`);
+// A malware sample reaches the hex reader and no other: openPreview refuses
+// the pair outright, and the open message carries the flag to the frame.
+const sandboxSrc = read("web/src/ui/viewer/sandbox.ts");
+assert.match(sandboxSrc, /if \(opts\.sample && reader !== "hex"\) throw/);
+assert.match(sandboxSrc, /sample: opts\.sample === true \}, "\*"/);
+assert.match(read("web/src/ui/viewer/viewer.ts"), /if \(sample\) await this\.model\.inspect\(id, this\.target\.version\);\s+const parts/, "the audit line before the bytes are opened");
 // A name with a right-to-left override cannot reorder the fact it is quoted in.
 assert.equal(visibleControls("invoice\u202efdp.exe"), "invoice[RLO]fdp.exe");
 assert.equal(cleanFact({ level: "warn", text: "Entry “invoice\u202efdp.exe” pretends" }).text, "Entry “invoice[RLO]fdp.exe” pretends", "every reader's facts, cleaned in one place");
@@ -129,4 +137,4 @@ assert.equal(cleanName("   "), "attachment");
 assert.equal(cleanName(null), "attachment");
 assert.equal(cleanName("x".repeat(500)).length, 200);
 
-console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more, handed-over names cleaned, a fact's Copy only words it shows, direction controls shown and not obeyed, 7-Zip the archive reader's only asset");
+console.log("ok  preview-frame: the bootstrap pinned by hash, a frame policy that replaces the app's and lets nothing leave, frame-src 'self' holding the frame, allow-scripts only, asset names that cannot climb out, three Trusted Types policies and no more, handed-over names cleaned, a fact's Copy only words it shows, direction controls shown and not obeyed, 7-Zip the archive reader's only asset, the text and hex readers asking for none, a sample reaching the hex reader only and only after its audit line");

@@ -19,7 +19,7 @@
  * that exploits a reader holds, at most, itself.
  *
  * The protocol, over one MessagePort handed over with the file:
- *   app → frame   {t:"open", code, worker?, file:{name, mime, size, bytes}, phone}
+ *   app → frame   {t:"open", code, worker?, file:{name, mime, size, bytes}, phone, compact?, sample?}
  *                 (window.postMessage, once, with the port and the bytes
  *                 transferred), then answers to asset requests
  *   frame → app   ready (window), asset, key, step, shown, error (port)
@@ -50,8 +50,12 @@ import { MAX_INLINE } from "./mode.ts";
  *   text    Markdown (rendered, cleaned), JSON and XML (trees), web
  *           pages (as source), code (highlight.js); secrets and what a
  *           script would do, as facts. Plain text and logs stay in the
- *           app's page, escaped: they need no parser                 42f */
-export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email" | "image" | "archive" | "text";
+ *           app's page, escaped: they need no parser                 42f
+ *   hex     any file as bytes: hex, strings, and a program's structure
+ *           (PE, ELF, Mach-O: headers, sections, imports, signature);
+ *           the ONLY reader a malware sample ever reaches, and only after
+ *           the inspection is in the audit trail (viewer.ts › inspect)  42g */
+export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email" | "image" | "archive" | "text" | "hex";
 
 /** The asset names each reader may ask for — and nothing else is fetched for it. */
 const ASSETS: Record<ReaderId, RegExp | null> = {
@@ -70,6 +74,7 @@ const ASSETS: Record<ReaderId, RegExp | null> = {
 	// for only when an archive is not one our own readers take.
 	archive: /^7zz\.(js|wasm)$/,
 	text: null,
+	hex: null,
 };
 
 /** Readers that run a worker of their own (its code is sent with theirs). */
@@ -111,7 +116,7 @@ export interface PreviewHandlers {
 	 * asks to have opened in a preview of its own, or saved into the vault.
 	 * Its name is cleaned and its size capped here; it is still the file's
 	 * own bytes, as untrusted as the file. */
-	onHandover?(action: "open" | "save", file: HandedFile): void;
+	onHandover?(action: "open" | "save" | "inspect", file: HandedFile): void;
 }
 
 export interface HandedFile {
@@ -122,6 +127,9 @@ export interface HandedFile {
 	 * sample — never opened, saved only as a sample. (A reader can only
 	 * make a file MORE restricted this way, never less.) */
 	sample?: boolean;
+	/** Shown in the hex reader (42g) — set by the viewer, never by a frame:
+	 * an "Inspect" the person asked for. */
+	hex?: boolean;
 }
 
 /**
@@ -186,7 +194,10 @@ export interface PreviewFrame {
  * Show `file` with `reader` in a new sandboxed frame inside `container`.
  * Resolves once the frame has the file (the reader then draws on its own).
  */
-export async function openPreview(container: HTMLElement, reader: ReaderId, file: { name: string; mime: string | null; bytes: Uint8Array }, on: PreviewHandlers, opts: { compact?: boolean } = {}): Promise<PreviewFrame> {
+export async function openPreview(container: HTMLElement, reader: ReaderId, file: { name: string; mime: string | null; bytes: Uint8Array }, on: PreviewHandlers, opts: { compact?: boolean; sample?: boolean } = {}): Promise<PreviewFrame> {
+	// A sample reaches the hex reader and no other (42g): checked here too,
+	// whatever the caller asked for.
+	if (opts.sample && reader !== "hex") throw new Error("a malware sample is shown as bytes only");
 	const frame = document.createElement("iframe");
 	frame.src = "/preview.html";
 	// allow-scripts and NOTHING else — above all not allow-same-origin, which
@@ -277,7 +288,7 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 				// A request, checked: a known action, real bytes under the cap,
 				// and not more than one every half second (a reader gone wrong
 				// cannot flood the app with "open this").
-				if ((d.action !== "open" && d.action !== "save") || !(d.bytes instanceof ArrayBuffer) || d.bytes.byteLength > MAX_INLINE || !on.onHandover) return;
+				if ((d.action !== "open" && d.action !== "save" && d.action !== "inspect") || !(d.bytes instanceof ArrayBuffer) || d.bytes.byteLength > MAX_INLINE || !on.onHandover) return;
 				const now = Date.now();
 				if (now - lastHandover < 500) return;
 				lastHandover = now;
@@ -295,6 +306,6 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 	// just said ready, still running only our hash-pinned bootstrap (no
 	// reader code has been sent yet), unable to navigate off this site
 	// (frame-src 'self') and closed if it navigates at all (the load count).
-	frame.contentWindow?.postMessage({ t: "open", code: readerJs, worker: workerJs, file: { name: file.name, mime: file.mime, size: bytes.byteLength, bytes }, phone: isPhone(), compact: opts.compact === true }, "*", [channel.port2, bytes]);
+	frame.contentWindow?.postMessage({ t: "open", code: readerJs, worker: workerJs, file: { name: file.name, mime: file.mime, size: bytes.byteLength, bytes }, phone: isPhone(), compact: opts.compact === true, sample: opts.sample === true }, "*", [channel.port2, bytes]);
 	return { close };
 }

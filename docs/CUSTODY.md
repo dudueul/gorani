@@ -288,6 +288,37 @@ any reader:          sample = the flag OR the sealed type says so
 - Not yet: ZIP64 (samples over 4 GiB are refused, not zipped); the desktop
   shells (docs/DESKTOP.md) must route their downloads through the same zip.
 
+### Inspection (commit 42g)
+
+A sample is still never run, played, rendered or handed to a reader that
+draws. Since 42g it can be **inspected**: its bytes, its strings and, for
+a program, its structure (PE, ELF, Mach-O: headers, sections, imports, the
+signature's names), in the hex reader of the sandboxed preview frame
+(docs/PREVIEWS.md › Programs). The triage questions — what is it, what
+would it do, what is its hash — are answered without a second machine,
+and on the record:
+
+- **The line first.** "Inspect as bytes" (the refusal panel) and "Inspect"
+  (an entry of an archive opened with "infected") call
+  `POST …/files/<id>/inspect` before anything is decrypted. The Worker
+  (`files_store.rs › file_inspect`) checks the version and writes
+  `file.inspect` into the area's chained trail — so into the SIEM feed —
+  with who, which version, and whether it was a sample. Only when it has
+  answered does the viewer open the bytes; a refusal opens nothing.
+- **An entry's name is sealed** (`places.fileInspected`, the store key):
+  the line says "an entry inside version N (its name sealed)", the team
+  reads the name, the server does not. A plain-text name is refused.
+- **The hex reader and no other.** `sandbox.ts › openPreview` throws if a
+  sample is sent to any other reader; the frame is told it holds a sample
+  (`OpenMessage.sample`) and says so; the hex reader has no Open, no Save
+  and no hand-over at all.
+- **A read is a read:** a case's read-only grantee may inspect
+  (`case_need`: Read), and the line carries their name.
+- The server cannot see what the app then shows. What it guarantees is
+  that every inspection the app asks for is on the record, and the app
+  asks before it decrypts (`unit:preview-frame` checks the order;
+  `api:samples` › 6 the route; `e2e:preview` the trail after both kinds).
+
 ## Stage 6 — intake, custody transfers, the two-person rule (D5.6 / D5.7), the design
 
 Two commits: **29f** the two-person rule and the legal hold it releases;

@@ -86,3 +86,26 @@ portions are marked, their original notices are retained in place.
    LGPL requires. The RAW, TIFF-directory and structure readers
    (web/src/preview/image/) are ours, written from the TIFF 6.0, DNG,
    JPEG, PNG, GIF, RIFF and ISO base media file format specifications.
+
+   The archive reader (commit 42e) uses 7-Zip 24.09 (Igor Pavlov; GNU LGPL
+   2.1 or later, with the unRAR restriction), compiled to WebAssembly by
+   the 7z-wasm package (use-strict). Its script and WebAssembly are not
+   bundled with our code: they are copied unchanged, with 7-Zip's
+   License.txt and unRarLicense.txt, into web/public/readers/archive/, and
+   loaded at run time only when an archive needs them. Under the unRAR
+   restriction, the RAR decoder may not be used to recreate the RAR
+   compression algorithm; nothing here compresses anything. ZipCrypto and
+   WinZip AES are decrypted with @noble/ciphers and @noble/hashes (Paul
+   Miller, MIT).
+
+   Our ZIP, ALZ and EGG readers (web/src/preview/archive/) are our own
+   code:
+   - ALZ has no published specification. Its reader follows the layout
+     unalz (kippler, as Debian ships it) and EggDotNet (akolman, MIT)
+     read, and its fixtures are checked with unalz.
+   - EGG follows ESTsoft's "EGG Format Specification, Version 1.0". That
+     document's licence says the EGG file format and decompression module
+     are ESTsoft's, free for non-commercial use, and need ESTsoft's
+     approval for commercial use. Anyone deploying this commercially
+     should seek that approval, or remove the EGG reader (archive/egg.ts).
+   - AZO, EGG's own compression method, is not implemented.

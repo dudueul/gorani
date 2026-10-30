@@ -31,6 +31,13 @@ const BY_EXT: Record<string, ReaderId> = {
 	heic: "image", heif: "image", hif: "image", tif: "image", tiff: "image", svg: "image", svgz: "image", jxl: "image", psd: "image", jp2: "image",
 	dng: "image", cr2: "image", cr3: "image", nef: "image", nrw: "image", arw: "image", srf: "image", sr2: "image", orf: "image", rw2: "image", raw: "image", rwl: "image",
 	pef: "image", srw: "image", raf: "image", "3fr": "image", erf: "image", kdc: "image", dcr: "image", mos: "image", iiq: "image", mef: "image", x3f: "image",
+	// Archives (42e): our own ZIP, ALZ and EGG readers; 7-Zip for the rest.
+	zip: "archive", zipx: "archive", jar: "archive", war: "archive", ear: "archive", apk: "archive", aab: "archive", ipa: "archive", xpi: "archive", crx: "archive", nupkg: "archive", whl: "archive", vsix: "archive", epub: "archive",
+	"7z": "archive", rar: "archive", tar: "archive", tgz: "archive", taz: "archive", tbz: "archive", tbz2: "archive", tb2: "archive", txz: "archive", tlz: "archive", tzst: "archive",
+	gz: "archive", bz2: "archive", xz: "archive", lz: "archive", lzma: "archive", zst: "archive", lz4: "archive", z: "archive",
+	cab: "archive", iso: "archive", udf: "archive", wim: "archive", swm: "archive", esd: "archive", dmg: "archive", vhd: "archive", vhdx: "archive", vmdk: "archive", vdi: "archive", qcow2: "archive",
+	arj: "archive", lzh: "archive", lha: "archive", cpio: "archive", rpm: "archive", deb: "archive", xar: "archive", pkg: "archive", chm: "archive", squashfs: "archive", sfs: "archive", cramfs: "archive", msi: "archive",
+	alz: "archive", egg: "archive",
 };
 
 /** …and the types, for a file whose name says nothing. */
@@ -60,6 +67,24 @@ const BY_MIME: Record<string, ReaderId> = {
 	"application/vnd.oasis.opendocument.presentation": "legacy",
 	"message/rfc822": "email",
 	"application/vnd.ms-outlook": "email",
+	"application/zip": "archive",
+	"application/x-zip-compressed": "archive",
+	"application/x-7z-compressed": "archive",
+	"application/vnd.rar": "archive",
+	"application/x-rar-compressed": "archive",
+	"application/x-tar": "archive",
+	"application/gzip": "archive",
+	"application/x-gzip": "archive",
+	"application/x-bzip2": "archive",
+	"application/x-xz": "archive",
+	"application/zstd": "archive",
+	"application/vnd.ms-cab-compressed": "archive",
+	"application/x-iso9660-image": "archive",
+	"application/x-lzh-compressed": "archive",
+	"application/x-arj": "archive",
+	"application/x-apple-diskimage": "archive",
+	"application/java-archive": "archive",
+	"application/vnd.android.package-archive": "archive",
 };
 
 /** Which sandboxed reader shows a file, if one does: by its name first
@@ -87,7 +112,7 @@ export function sniffReader(head: Uint8Array, guess: ReaderId, name: string): Re
 	if (ascii.startsWith("{\\rtf")) return "legacy";
 	const zip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
 	const ole = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
-	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)
+	if (guess === "sheet" || guess === "hwp" || guess === "email" || guess === "image" || guess === "archive") return guess; // each reads every form of its family (a .msg is an OLE file; the picture reader names a disguise itself)
 	if (zip && guess === "legacy") {
 		// A ".doc" or ".ppt" that is really the 2007+ format, renamed.
 		if (/^(doc|dot)$/.test(ext)) return "docx";
@@ -133,8 +158,7 @@ function modeOf(kind: string, mime: string | null): ViewerMode {
 		case "sheet":
 		case "slides":
 		case "archive":
-			// The formats with a reader in the frame never get here
-			// (readerFor, above); archives get theirs next (42e).
+			// The formats with a reader in the frame never get here (readerFor, above).
 			return mime === "text/plain" ? "text" : "unsupported";
 		default: {
 			if (mime?.startsWith("video/")) return "video";

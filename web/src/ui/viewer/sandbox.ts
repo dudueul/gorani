@@ -43,8 +43,11 @@ import { MAX_INLINE } from "./mode.ts";
  *   email   .eml (postal-mime) and Outlook .msg (msgreader)          42c
  *   image   every picture: the browser's own decoders, in the frame;
  *           TIFF (UTIF) and HEIF (libheif) in a worker; a RAW file's
- *           own JPEG preview; metadata (exifr)                        42d */
-export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email" | "image";
+ *           own JPEG preview; metadata (exifr)                        42d
+ *   archive ZIP, ALZ, EGG (our own readers) and every other archive 7-Zip
+ *           reads (WebAssembly, in a worker): listed, entries opened in
+ *           previews of their own or saved                           42e */
+export type ReaderId = "pdf" | "docx" | "sheet" | "pptx" | "hwp" | "legacy" | "email" | "image" | "archive";
 
 /** The asset names each reader may ask for — and nothing else is fetched for it. */
 const ASSETS: Record<ReaderId, RegExp | null> = {
@@ -59,10 +62,13 @@ const ASSETS: Record<ReaderId, RegExp | null> = {
 	// libheif (LGPL-3.0): its script and its WebAssembly, asked for only
 	// when a HEIF is opened.
 	image: /^libheif\.(js|wasm)$/,
+	// 7-Zip (LGPL + unRAR restriction): its script and WebAssembly, asked
+	// for only when an archive is not one our own readers take.
+	archive: /^7zz\.(js|wasm)$/,
 };
 
 /** Readers that run a worker of their own (its code is sent with theirs). */
-const WORKERS: Partial<Record<ReaderId, true>> = { pdf: true, sheet: true, image: true };
+const WORKERS: Partial<Record<ReaderId, true>> = { pdf: true, sheet: true, image: true, archive: true };
 
 /** Is this a name the reader may be sent? (Exported for unit:preview-frame.) */
 export function assetPath(reader: ReaderId, path: unknown): string | null {
@@ -84,7 +90,7 @@ export interface Fact {
 export function cleanFact(f: unknown): Fact {
 	const o = (f ?? {}) as { level?: unknown; text?: unknown; copy?: unknown };
 	const text = String(o.text ?? "").slice(0, 300);
-	const out: Fact = { level: o.level === "warn" ? "warn" : "info", text };
+	const out: Fact = { level: o.level === "warn" ? "warn" : "info", text: visibleControls(text) };
 	if (typeof o.copy === "string" && o.copy.trim() && o.copy.length <= 100 && text.includes(o.copy)) out.copy = o.copy;
 	return out;
 }
@@ -107,6 +113,10 @@ export interface HandedFile {
 	name: string;
 	mime: string | null;
 	bytes: Uint8Array;
+	/** It came out of an archive opened with "infected" (42e): a malware
+	 * sample — never opened, saved only as a sample. (A reader can only
+	 * make a file MORE restricted this way, never less.) */
+	sample?: boolean;
 }
 
 /**
@@ -125,6 +135,14 @@ export function cleanName(name: unknown): string {
 		.slice(0, 200)
 		.trim();
 	return s || "attachment";
+}
+
+/** Text that cannot reorder the line it is shown in: direction-changing
+ * characters (a file named "invoice\u202Efdp.exe" — RLO) are shown as
+ * [RLO], not obeyed. Pure: unit:preview-frame. */
+export function visibleControls(s: string): string {
+	const tag: Record<string, string> = { "\u202a": "[LRE]", "\u202b": "[RLE]", "\u202c": "[PDF]", "\u202d": "[LRO]", "\u202e": "[RLO]", "\u2066": "[LRI]", "\u2067": "[RLI]", "\u2068": "[FSI]", "\u2069": "[PDI]", "\u200e": "[LRM]", "\u200f": "[RLM]" };
+	return s.replace(/[\u202a-\u202e\u2066-\u2069\u200e\u200f]/g, (c) => tag[c] ?? "");
 }
 
 /** A reader's code, fetched once per page load (it is the app's own code, not secret). */
@@ -259,7 +277,7 @@ export async function openPreview(container: HTMLElement, reader: ReaderId, file
 				if (now - lastHandover < 500) return;
 				lastHandover = now;
 				const mime = typeof d.mime === "string" && /^[\w.+-]+\/[\w.+-]+$/.test(d.mime) ? d.mime.toLowerCase().slice(0, 127) : null;
-				on.onHandover(d.action, { name: cleanName(d.name), mime, bytes: new Uint8Array(d.bytes) });
+				on.onHandover(d.action, { name: cleanName(d.name), mime, bytes: new Uint8Array(d.bytes), sample: (d as { sample?: unknown }).sample === true });
 				return;
 			}
 		}

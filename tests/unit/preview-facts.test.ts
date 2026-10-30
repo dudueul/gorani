@@ -45,6 +45,14 @@ import { readMeta, readThumbnail } from "../../web/src/preview/image/meta.ts";
 import { gpsOf, orientationOf } from "../../web/src/preview/image/tags.ts";
 import { readTiff } from "../../web/src/preview/image/tiff.ts";
 import { imageFacts, metaGroups, type ImageFindings } from "../../web/src/preview/facts/image.ts";
+import { listZip, extractZip, decodeName, Refusal } from "../../web/src/preview/archive/zip.ts";
+import { listAlz, extractAlz } from "../../web/src/preview/archive/alz.ts";
+import { listEgg, extractEgg } from "../../web/src/preview/archive/egg.ts";
+import { SevenZip } from "../../web/src/preview/archive/run7z.ts";
+import { parseListing, streamName, troubleOf } from "../../web/src/preview/archive/sevenzip.ts";
+import { crc32, zipDecrypt } from "../../web/src/preview/archive/crypto.ts";
+import { archiveFacts, pathRisk, treeOf } from "../../web/src/preview/facts/archive.ts";
+import type { Listing } from "../../web/src/preview/archive/types.ts";
 
 const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url)));
 const said = (facts: { text: string }[]) => facts.map((f) => f.text).join("\n");
@@ -356,4 +364,135 @@ assert.match(pf.text, /Declares XML entities .* not drawn/);
 assert.match((await pictureFacts("animated.gif")).text, /Animated: 3 frames/);
 assert.doesNotMatch((await pictureFacts("drawing.svg", { svg: { scripts: 0, handlers: 0, foreign: 0, password: false, remote: [], links: [], jsLinks: 0, entities: false, embedded: 0 } })).facts.filter((x) => x.level === "warn").map((x) => x.text).join(), /./, "an honest drawing warns of nothing");
 
-console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named");
+// ── 9. Archives (42e) ────────────────────────────────────────────────
+// Our own ZIP, ALZ and EGG readers on archives their own tools wrote (ALZ
+// checked with unalz, EGG with ESTsoft's own sample), and 7-Zip — the same
+// WebAssembly the frame runs — for the rest.
+
+const { default: sevenFactory } = await import(new URL("../../web/node_modules/7z-wasm/7zz.es6.js", import.meta.url).href);
+let seven: SevenZip | null = null;
+const sink = SevenZip.sink(() => seven);
+seven = new SevenZip(await sevenFactory({ wasmBinary: readFileSync(new URL("../../web/node_modules/7z-wasm/7zz.wasm", import.meta.url)), stdin: () => null, stdout: sink.out, stderr: sink.err, print: () => {}, printErr: () => {} }));
+const sz = seven!;
+const unpack = { bzip2: async (d: Uint8Array, cap: number) => sz.stream("bz2", d, cap), lzma: async (p: Uint8Array, d: Uint8Array, size: number, cap: number) => sz.lzma(p, d, size, cap) };
+const text = (b: Uint8Array) => new TextDecoder().decode(b);
+const refused = async (f: () => Promise<unknown>) => {
+	try {
+		await f();
+		return null;
+	} catch (e) {
+		return e instanceof Refusal ? e.kind : `threw ${e}`;
+	}
+};
+const noFallback = async () => {
+	throw new Error("no fallback expected");
+};
+const LIM = 256 * 1024 * 1024;
+
+// ZIP: names, two kinds of crypto, links, liars and bombs.
+let z = listZip(fixture("bundle.zip"))!;
+assert.deepEqual(z.items.map((i) => i.path).sort(), ["data/ledger.csv", "docs/notes.md", "docs/고라니.txt", "photos/photo.jpg", "report.txt"]);
+assert.equal(z.comment, "Gorani test bundle");
+assert.equal(text(await extractZip(fixture("bundle.zip"), z.items.find((i) => i.path === "docs/고라니.txt")!, null, LIM, noFallback)), "고라니 메모 — a Korean file name\n");
+z = listZip(fixture("korean.zip"))!;
+assert.deepEqual(z.items.map((i) => [i.path, i.encoding]), [["보고서.txt", "cp949"], ["사진/고라니.jpg", "cp949"]], "Korean Windows names, unflagged CP949, read as Korean (7-Zip's build shows question marks)");
+assert.equal(decodeName(new TextEncoder().encode("naïve.txt"), false).encoding, "utf-8", "unflagged UTF-8 stays UTF-8");
+z = listZip(fixture("lure.zip"))!;
+assert.equal(z.items.find((i) => i.path === "passwd")?.link, "", "a Unix symbolic link");
+assert.equal(text(await extractZip(fixture("lure.zip"), z.items.find((i) => i.path === "passwd")!, null, LIM, noFallback)), "/etc/passwd", "its body is its target");
+z = listZip(fixture("infected.zip"))!;
+assert.equal(z.encryption, "ZipCrypto");
+assert.equal(text(await extractZip(fixture("infected.zip"), z.items[0]!, "infected", LIM, noFallback)), "MZ gorani fixture: not a program (a sample, swapped zipped)\n");
+assert.equal(await refused(() => extractZip(fixture("infected.zip"), z.items[0]!, "wrong", LIM, noFallback)), "password");
+assert.equal(await refused(() => extractZip(fixture("infected.zip"), z.items[0]!, null, LIM, noFallback)), "password");
+z = listZip(fixture("aes.zip"))!;
+assert.equal(z.encryption, "AES-256");
+const aesItem = z.items.find((i) => !i.dir)!;
+assert.equal(text(await extractZip(fixture("aes.zip"), aesItem, "gorani", LIM, noFallback)), "Gorani archive report\nThe photo is in photos/.\n", "WinZip AES-256, as 7-Zip writes it");
+assert.equal(await refused(() => extractZip(fixture("aes.zip"), aesItem, "nope", LIM, noFallback)), "password");
+z = listZip(fixture("liar.zip"))!;
+assert.equal(await refused(() => extractZip(fixture("liar.zip"), z.items[0]!, null, LIM, noFallback)), "liar", "an entry that inflates past its claim is stopped, never held");
+z = listZip(fixture("bomb.zip"))!;
+assert.equal(await refused(() => extractZip(fixture("bomb.zip"), z.items[0]!, null, 1024 * 1024, noFallback)), "too-big", "past the viewer's limit, refused before anything inflates");
+assert.equal(zipDecrypt("x", new Uint8Array(12), new Uint8Array(0), 0x42), null, "a header whose check byte disagrees: a wrong password, without decrypting the data");
+assert.equal(crc32(new TextEncoder().encode("hello")), 0x3610a686);
+
+// ALZ (written here, checked with unalz) and EGG (ESTsoft's specification).
+const alz = listAlz(fixture("report.alz"))!;
+assert.deepEqual(alz.items.map((i) => [i.path, i.method]), [["report.txt", "Store"], ["docs/notes.md", "Deflate"], ["docs/고라니.txt", "BZip2"], ["photos/photo.jpg", "Deflate"]]);
+assert.equal(alz.items[0]!.modified, "2026-01-02 03:04:04", "a DOS date and time");
+assert.equal(text(await extractAlz(fixture("report.alz"), alz.items[2]!, null, LIM, unpack.bzip2)), "고라니 메모 — a Korean file name\n", "bzip2, through 7-Zip");
+const ialz = listAlz(fixture("infected.alz"))!;
+assert.equal(text(await extractAlz(fixture("infected.alz"), ialz.items[1]!, "infected", LIM, unpack.bzip2)), "MZ gorani fixture: not a program\n", "ZipCrypto: its 12-byte header outside the packed size");
+assert.equal(await refused(() => extractAlz(fixture("infected.alz"), ialz.items[1]!, "wrong", LIM, unpack.bzip2)), "password");
+const egg = listEgg(fixture("report.egg"))!;
+assert.deepEqual(egg.items.map((i) => i.path), ["docs", "report.txt", "docs/notes.md", "docs/고라니.txt", "photos/photo.jpg", "run.sh"], "a path given by its parent's id; a CP949 name by its code page");
+assert.equal(egg.comment, "Gorani EGG fixture");
+assert.equal(egg.items[5]!.attributes, "-rwxr-xr-x", "POSIX information");
+for (const i of egg.items.filter((x) => !x.dir)) assert.ok((await extractEgg(fixture("report.egg"), egg, i, null, LIM, unpack)).length === i.size, `${i.path} (${i.method}) unpacks`);
+const legg = listEgg(fixture("locked.egg"))!;
+assert.equal(text(await extractEgg(fixture("locked.egg"), legg, legg.items[0]!, "infected", LIM, unpack)), "the sample is inside\n", "ZipCrypto");
+assert.equal(text(await extractEgg(fixture("locked.egg"), legg, legg.items[1]!, "gorani", LIM, unpack)), "Gorani archive report\nThe photo is in photos/.\n", "AES-256, WinZip's scheme, its MAC checked");
+assert.equal(await refused(() => extractEgg(fixture("locked.egg"), legg, legg.items[1]!, "nope", LIM, unpack)), "password");
+const segg = listEgg(fixture("solid.egg"))!;
+assert.equal(text(await extractEgg(fixture("solid.egg"), segg, segg.items[1]!, null, LIM, unpack)), "beta, in the same stream\n", "solid: one stream, cut at each file's place");
+const aegg = listEgg(fixture("azo.egg"))!;
+assert.equal(await refused(() => extractEgg(fixture("azo.egg"), aegg, aegg.items[0]!, null, LIM, unpack)), "unsupported", "AZO: listed, not opened");
+// ESTsoft's own sample (Section 4), its CRC as the earlier example prints it.
+const hex = (s: string) => new Uint8Array(s.match(/../g)!.map((x) => parseInt(x, 16)));
+const ascii = (s: string) => [...new TextEncoder().encode(s)].map((x) => x.toString(16).padStart(2, "0")).join("");
+const sample = hex(`45474741000101000000000000002282E208E390850A000000000500000000000000AC91850A000900${ascii("hello.txt")}0B95862C00090080957F1543DDC901002282E208130CB5020000050000000500000086A610362282E208${ascii("hello")}2282E208`);
+const sl = listEgg(sample)!;
+assert.deepEqual([sl.items[0]!.path, sl.items[0]!.size, sl.warnings], ["hello.txt", 5, []]);
+assert.equal(text(await extractEgg(sample, sl, sl.items[0]!, null, LIM, unpack)), "hello");
+
+// 7-Zip: every other format, a .tar.gz opened to its TAR, names hidden by AES.
+const seven7 = (name: string): Listing => {
+	sz.load(fixture(name), name);
+	let l = sz.list(null, fixture(name).length);
+	const inner = sz.innerTar(l, LIM);
+	if (inner) {
+		sz.load(inner.bytes, inner.name);
+		l = { ...sz.list(null, inner.bytes.length), inner: inner.name };
+	}
+	return l;
+};
+for (const [name, format] of [["bundle.7z", "7z"], ["bundle.rar", "RAR 5"], ["bundle.cab", "CAB (Windows cabinet)"], ["bundle.iso", "ISO 9660 disk image"], ["bundle.arj", "ARJ"], ["bundle.lzh", "LHA (LZH)"], ["bundle.tar.gz", "TAR"], ["bundle.tar.xz", "TAR"], ["bundle.tar.bz2", "TAR"]] as const) {
+	const l = seven7(name);
+	assert.equal(l.format, format, name);
+	const report = l.entries.find((e) => /report\.txt$/.test(e.path))!;
+	assert.equal(text(sz.extract(report.path, null, LIM)), "Gorani archive report\nThe photo is in photos/.\n", `${name}: an entry, out`);
+}
+assert.ok(seven7("bundle.iso").entries.some((e) => e.path === "docs/고라니.txt"), "a Korean name through Joliet");
+let one = seven7("notes.txt.zst");
+assert.deepEqual(one.entries.map((e) => e.path), ["notes.txt"], "a single stream, named after its archive");
+assert.equal(text(sz.extract("notes.txt", null, LIM)), "# Notes\n\n- 고라니 (water deer)\n- *field* notes\n");
+one = seven7("locked.7z");
+assert.equal(one.headersEncrypted, true, "AES with encrypted names: nothing listed without the password");
+sz.load(fixture("locked.7z"), "locked.7z");
+assert.ok(sz.list("gorani", 1).entries.some((e) => e.path === "bundle/report.txt"), "…and everything with it");
+assert.equal(streamName("/in/x.tgz"), "x.tar");
+assert.equal(troubleOf("ERROR: Wrong password : a"), "password");
+assert.equal(parseListing("--\nPath = /in/a\nType = zip\n\n----------\nPath = a\u0000b\nSize = 1\n", "/in/a", 1).entries[0]!.path, "a\u0000b");
+
+// The facts.
+const af = (name: string, password: string | null = null) => {
+	const l = listZip(fixture(name)) ?? listAlz(fixture(name)) ?? listEgg(fixture(name))!;
+	const two = "items" in l ? (l as unknown as { items: { path: string; localName?: string | null }[] }).items.filter((i) => i.localName).map((i) => ({ central: i.path, local: i.localName! })) : [];
+	return said(archiveFacts({ name, listing: l, password, links: new Map([[2, "/etc/passwd"]]), twoNames: two }));
+};
+let at = af("lure.zip");
+for (const want of [/climbs out of the folder .* “\.\.\/\.\.\/evil\.txt”/, /absolute path, written wherever it names: “\/etc\/cron\.d\/gorani”/, /symbolic link: “passwd” → “\/etc\/passwd”/, /invoice\.pdf\.exe” \(it pretends to be \.pdf/, /right-to-left mark/, /Open me\.lnk” \(a Windows shortcut\)/, /Holds 1 archive of its own: “nested\.zip”/, /The same path more than once: “report\.txt”/, /Comment: “Your invoice is attached”/]) assert.match(at, want);
+assert.match(af("infected.zip"), /Every entry is encrypted \(ZipCrypto\) — no scanner looked inside/);
+assert.match(af("infected.zip", "infected"), /Opened with the password “infected” — .* treated as samples/);
+assert.match(af("bomb.zip"), /unpacks to 20\.0 MB from 19\.9 kB \(1029×\) — a ZIP bomb's ratio/);
+assert.match(af("azo.egg"), /compressed with AZO/);
+assert.doesNotMatch(af("bundle.zip"), /climbs|absolute|symbolic|pretend|encrypted|bomb/, "an honest bundle warns of nothing");
+assert.match(said(archiveFacts({ name: "bundle.iso", listing: seven7("bundle.iso"), password: null, links: new Map() })), /A disk image: files taken out of it do not carry Windows' downloaded-from-the-internet mark/);
+assert.match(said(archiveFacts({ name: "bundle.zip", listing: seven7("bundle.rar"), password: null, links: new Map() })), /Named \.zip, but it is a RAR 5 archive/);
+assert.equal(pathRisk("a/../../b"), "traversal");
+assert.equal(pathRisk("C:\\Windows\\x.dll"), "absolute");
+assert.equal(pathRisk("..file/ok"), null, "a name that starts with dots is not a climb");
+assert.deepEqual([...treeOf(listZip(fixture("lure.zip"))!.entries).children.keys()].filter((k) => k.startsWith("report")).length, 2, "the same path twice: both shown");
+
+console.log("ok  preview-facts: ZIP bombs refused (a lying part, an over-claiming directory); every planted trick in the hostile Word, Excel, PowerPoint, 한글, .doc and RTF fixtures named — and the honest reports warn of nothing; the phishing .eml's and .msg's every trick named, the forged Authentication-Results not believed, the hop the sender could not write found, a forwarded message parsed in turn, attachments judged by name and bytes; pictures sniffed by their bytes, a bomb's size read before decoding, what follows a picture's end named, a RAW file's own previews found, GPS, the camera and the editing read, a thumbnail that no longer matches named; archives read by our ZIP, ALZ and EGG readers and by 7-Zip (7z, RAR 5, TAR in three compressions, CAB, ISO, ARJ, LZH, zstd), CP949 names, ZipCrypto and AES opened and wrong passwords refused, liars and bombs stopped, AZO listed and not opened, and every lure's trick named");

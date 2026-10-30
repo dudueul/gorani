@@ -17,6 +17,11 @@
  *                           main thread (preview/readers/sheet.worker.ts)
  *   readers/hwp/            rhwp's WebAssembly (and its licence)
  *   readers/image.worker.js the image reader's worker: exifr, UTIF, RAW previews
+ *   readers/archive.worker.js the archive reader's worker: our ZIP, ALZ and
+ *                           EGG readers, and the 7-Zip driver
+ *   readers/archive/        7-Zip 24.09 (LGPL + unRAR restriction): its
+ *                           script and WebAssembly, files of their own,
+ *                           with its licences
  *   readers/image/          libheif (LGPL-3.0): its script and WebAssembly,
  *                           kept as files of their own — replaceable, as the
  *                           licence asks — with its LICENSE
@@ -58,6 +63,10 @@ const READERS = {
 	hwp: { files: [["@rhwp/core/rhwp_bg.wasm", "rhwp_bg.wasm"], ["@rhwp/core/LICENSE", "LICENSE"]] },
 	legacy: {},
 	email: {},
+	archive: {
+		worker: "./readers/archive.worker.ts",
+		files: [["7z-wasm/7zz.umd.js", "7zz.js"], ["7z-wasm/7zz.wasm", "7zz.wasm"], ["7z-wasm/License.txt", "License.txt"], ["7z-wasm/unRarLicense.txt", "unRarLicense.txt"]],
+	},
 	image: {
 		worker: "./readers/image.worker.ts",
 		files: [["libheif-js/libheif-wasm/libheif.js", "libheif.js"], ["libheif-js/libheif-wasm/libheif.wasm", "libheif.wasm"], ["libheif-js/libheif-wasm/LICENSE", "LICENSE"]],

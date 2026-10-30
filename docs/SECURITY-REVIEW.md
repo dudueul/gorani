@@ -426,6 +426,42 @@ Accepted:
   pass it.
 - **Each small picture costs a frame of its own.**
 
+### Archives (commit 42e)
+
+The threat: an archive is how a lure carries its payload past a mail
+scanner (encrypted, the password in the message), how a malware sample is
+exchanged ("infected"), and how an unpacking tool is turned against its
+user: a path that climbs out of its folder, a symbolic link, a bomb, two
+names for one entry. The parsers themselves are attack surface: 7-Zip has
+had memory-safety bugs, for instance in its RAR5 decoder. The build used
+here, 24.09, predates the fixes in 25.00.
+
+The controls, on top of the frame:
+
+- **Nothing is unpacked to a disk or run.** Entries exist only as bytes
+  in the frame's worker, until the person opens one in a preview of its
+  own or saves it to the vault.
+- **Parsers in a sandbox inside a sandbox.** 7-Zip runs as WebAssembly in
+  a worker in the opaque-origin frame. A memory bug corrupts only the
+  module's own linear memory; WebAssembly cannot reach the frame's memory
+  or the app's. Its files come from the frame's fixed asset list.
+- **Sizes:** each entry is counted as it is unpacked and stopped at its
+  claim (and at the viewer's limit); CRCs are checked.
+- **Samples:** what an archive opened with "infected" yields is never
+  opened, only saved as a sample. The frame can only add this
+  restriction; the app enforces it on its own side.
+- **Names:** direction-changing characters are shown, never obeyed, in
+  the listing and in every reader's facts. A path is shown as written.
+- **Evidence:** the facts name every trick above before anything is
+  opened (`unit:preview-facts`, `e2e:preview`).
+
+Accepted:
+
+- **7-Zip 24.09** is what the 7z-wasm package ships. A newer build would
+  have to be compiled here, which is later work. The frame and WebAssembly
+  bound what a bug could do.
+- **AZO and LEA are not supported.**
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

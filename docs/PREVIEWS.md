@@ -3,7 +3,7 @@
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > How the viewer shows formats that need a parser (commit 42a onward: PDF;
 > 42b: Word, Excel, PowerPoint, 한글 and the older Office formats; 42c:
-> email, .eml and Outlook's .msg; 42d: every picture). The
+> email, .eml and Outlook's .msg; 42d: every picture; 42e: archives). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -160,6 +160,7 @@ for readers that draw HTML.
 | `legacy` | .doc .ppt .rtf .odt .odp, and web pages or MHT archives named .doc | our own parsers (`preview/legacy/`) |
 | `email` | .eml (and message/rfc822), .msg | postal-mime; msgreader for .msg; DOMPurify |
 | `image` | every picture: JPEG, PNG, GIF, WebP, AVIF, BMP, ICO, SVG; TIFF; HEIF (.heic); camera RAW (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF…) | the browser's decoders (in the frame); UTIF and libheif in a worker; exifr; our own structure and RAW readers (`preview/image/`) |
+| `archive` | ZIP (and JAR, APK, IPA…), ALZ, EGG; 7z, RAR, TAR and its compressions, gzip, bzip2, xz, zstd, CAB, ISO, UDF, WIM, DMG, VHD(X), ARJ, LZH, CPIO, RPM, DEB, XAR, MSI, CHM, squashfs… | our own ZIP, ALZ and EGG readers (`preview/archive/`); 7-Zip 24.09 as WebAssembly, in a worker |
 
 ### PDF (pdf.js, `readers/pdf.ts`)
 
@@ -506,6 +507,80 @@ The picture is sized rather than scaled, so an SVG stays sharp. Past 300 %
 pixels are drawn as squares. Zoomed in, a swipe pans the picture instead of
 opening the next file (`host.setSwipeGuard`).
 
+### Archives (`readers/archive.ts`, `preview/archive/`, `facts/archive.ts`) (42e)
+
+An archive is listed in the frame; nothing in it is unpacked to a disk or
+run. Its worker (`readers/archive.worker.ts`) reads it with one of:
+
+| engine | formats | why |
+|---|---|---|
+| our ZIP reader (`archive/zip.ts`) | ZIP and its kin (JAR, APK, IPA, XPI…) | the details decide what a tool shows, and 7-Zip's WebAssembly build turns a Korean (CP949) name into question marks |
+| our ALZ reader (`archive/alz.ts`) | ALZ, ALZip's own (common in Korea) | no library reads it |
+| our EGG reader (`archive/egg.ts`) | EGG, ALZip's newer format | no library reads it; written from ESTsoft's published specification |
+| 7-Zip 24.09 (`archive/run7z.ts`) | 7z, RAR 4/5, TAR, gzip, bzip2, xz, zstd, LZMA, LZ4, CAB, ISO, UDF, WIM, DMG, VHD/VHDX/VMDK, ARJ, LZH, CPIO, RPM, ar/DEB, XAR, MSI, CHM, NSIS, squashfs, cramfs, … | the widest reader there is. Its two files (1.7 MB) are asked of the app only when an archive needs them, and kept as files of their own (NOTICE) |
+
+7-Zip is driven as its command line is: `l -slt` for a technical listing
+(`archive/sevenzip.ts` reads it), and `x -so -spd` for one entry. The
+entry is written to stdout and counted as it comes; at its cap the run is
+stopped. A password is always given, so 7-Zip never waits for one. A
+compressed stream holding one TAR (`.tar.gz`, `.tgz`, `.tar.xz`…) is
+listed as that TAR.
+
+**What the reader shows:** the folders and files, a breadcrumb, and a
+filter over every path. Each name is shown as written: `..` stays `..`, a
+leading `/` is a folder of its own, and a right-to-left mark is shown as
+`[RLO]` rather than obeyed (in the app's facts too, for every reader:
+`sandbox.ts › cleanFact`).
+
+**An entry** opens the way an email's attachment does (42c). **Open**
+hands it to the app, which shows it in a new frame with its own reader,
+stacked: "lure.zip › nested.zip › inner.txt", with Back. **Save** hands it
+to the app, which asks before it writes.
+
+**Sizes.** Every entry is capped at the viewer's whole-read limit and at
+what it claims, plus a little:
+
+- deflate is inflated as a stream and stopped past the cap;
+- 7-Zip is stopped mid-run past the cap;
+- every CRC is checked.
+
+An entry that inflates past its claim (a liar) is refused, never held.
+
+**Passwords.** ZipCrypto and WinZip AES (`archive/crypto.ts`, with
+@noble's AES and SHA-1) for ZIP, ALZ and EGG; 7-Zip's own for the rest
+(7z AES with encrypted names included). The reader asks for a password
+when entries, or their names, are encrypted, and refuses a wrong one.
+**"infected"**, the password malware samples are swapped with, is one
+click away. Everything it opens is a **malware sample**:
+
+- the frame offers only Save as sample;
+- the hand-over says so, and the app refuses to open it and saves it only
+  as a sample, the box ticked and locked (`viewer.ts › openInner,
+  confirmSave`).
+
+A reader can make a file more restricted this way, never less.
+
+**The facts** (`facts/archive.ts`, pure):
+
+- **Can anyone see in?** Entries encrypted, so no scanner looked inside;
+  names encrypted; the password "infected".
+- **Where would it write?** A path that climbs out of the folder it is
+  unpacked into (`../../`, "Zip Slip"); an absolute path; a symbolic link
+  and where it points (its body is its target, read for this).
+- **What is inside?** Programs, scripts, shortcuts, and names that
+  pretend (`invoice.pdf.exe`, a right-to-left mark), judged by the email
+  reader's own rules; archives inside the archive; a disk image, whose
+  files lose Windows' internet mark (a way past SmartScreen).
+- **Is it honest?**
+  - the same path twice, or twice but for case;
+  - a ZIP entry whose local header names it differently from the
+    directory (two tools would show two different files);
+  - data after the end, or bytes in front of it;
+  - a ZIP bomb's ratio, or a total past 4 GB;
+  - a name that is not the format (a RAR named .zip).
+- What the reader could not do: AZO and LEA entries, names that could not
+  be decoded, a split archive's other parts.
+
 ## Limits
 
 - **A reader that hangs can freeze the tab on some browsers.** Desktop
@@ -537,6 +612,18 @@ opening the next file (`host.setSwipeGuard`).
   speaks it is evidence; when it is silent it proves nothing.
 - **Every small picture is a frame of its own** (Quick Look, the details
   pane, each poster on screen): safe, and heavier than an `<img>`.
+- **EGG's AZO method is not decoded.** It is ESTsoft's own; the one open
+  decoder known (in EggDotNet) carries no licence of its own, so it is not
+  taken. Nor are LEA-encrypted entries opened (no library here has the
+  cipher). AZO and LEA entries are listed.
+- **The EGG format is ESTsoft's.** Its specification's licence permits
+  non-commercial use and asks for ESTsoft's approval for commercial use
+  (NOTICE).
+- **7-Zip's WebAssembly build has only UTF-8.** In formats other than ZIP,
+  ALZ and EGG, a name in another encoding (a Korean LZH, say) is listed
+  with question marks and cannot be asked for by name; the facts say so.
+- **A split archive** (`.001`, `.z01`, a split EGG) is listed one part at
+  a time: the vault holds each part as a file of its own.
 
 ## Tests
 
@@ -552,7 +639,9 @@ opening the next file (`host.setSwipeGuard`).
   - an attachment's name cleaned before the app uses it (42c): no path, no
     control or right-to-left characters, a length cap;
   - the image reader may ask for libheif's two files and nothing else; a
-    fact's Copy is kept only when it is words the fact shows (42d).
+    fact's Copy is kept only when it is words the fact shows (42d);
+  - the archive reader may ask for 7-Zip's two files and nothing else; a
+    direction-changing character in any fact is shown, not obeyed (42e).
 - **`unit:viewer-modes`:** each format to its reader, by name or type,
   capped like any whole read, samples refused first; the first bytes
   correcting a disguised name (a .msg is OLE, and stays email).
@@ -566,7 +655,10 @@ opening the next file (`host.setSwipeGuard`).
   the .msg read like the .eml, and the honest message warning of nothing;
   (42d) every picture fixture sniffed by its bytes, its declared size, its
   end and what follows it, a RAW file's own previews, GPS and the camera,
-  the editing history, the AI mark, the bomb, and the facts each makes.
+  the editing history, the AI mark, the bomb, and the facts each makes;
+  (42e) every archive fixture through our ZIP, ALZ and EGG readers and
+  7-Zip in Node: names (CP949), ZipCrypto and AES, wrong passwords, liars,
+  bombs, links, solid EGG, AZO, ESTsoft's own EGG sample, and the facts.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -581,6 +673,11 @@ opening the next file (`host.setSwipeGuard`).
     their markup shown as text; an RTF and a web archive named .doc named
     as disguises;
   - the default Trusted Types policy attacked from inside;
+  - archives (42e): ZIP, ALZ, EGG, 7z, RAR, TAR.GZ, ISO listed, folders
+    walked, entries opened in previews of their own (a nested archive in
+    turn); the lure's every trick named; a wrong password refused,
+    "infected" a sample saved only as one; names hidden by AES unlocked; a
+    liar stopped; AZO named;
   - pictures (42d): every format drawn in the frame and none in the page;
     zoom by wheel, keys and double click, a drag that pans; GPS copied;
     the redacted photo's thumbnail and the cropped one's shape caught; the
@@ -608,7 +705,10 @@ opening the next file (`host.setSwipeGuard`).
     exactly what a test expects): the .eml messages;
   - `images.py` (Pillow draws; EXIF, XMP, TIFF directories, the DNG, CR3
     and RAF layouts and the HEIF boxes written by hand; ffmpeg's x265
-    encodes the HEIF's picture): the pictures.
+    encodes the HEIF's picture): the pictures;
+  - `archives.py` (each format's own tool — zip, 7z, rar, gcab, xorriso,
+    arj, zstd; LHA, the hostile ZIPs, ALZ and EGG written by hand, ALZ
+    checked with unalz, EGG from ESTsoft's specification): the archives.
 
   Everything except what LibreOffice writes is the same bytes on every run.
   Nothing in them is a working exploit: the scripts are text, the

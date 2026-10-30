@@ -44,7 +44,7 @@ export function parseJson(text: string): { value: unknown } | { error: string } 
 	const depth = jsonDepth(text);
 	if (depth > MAX_DEPTH) return { error: `it nests deeper than ${MAX_DEPTH} levels — not parsed` };
 	try {
-		return { value: JSON.parse(text.replace(/^﻿/, "")) };
+		return { value: JSON.parse(text.replace(/^\ufeff/, "")) };
 	} catch (e) {
 		return { error: e instanceof Error ? e.message.slice(0, 200) : "it is not valid JSON" };
 	}
@@ -111,7 +111,7 @@ export function textKind(name: string, text: string): { kind: TextKind; language
 	if (/^(html?|xhtml|hta)$/.test(ext)) return { kind: "html", language: "xml" };
 	if (language === "xml") return { kind: "xml", language };
 	if (language) return { kind: "code", language };
-	const start = text.replace(/^﻿/, "").trimStart().slice(0, 200);
+	const start = text.replace(/^\ufeff/, "").trimStart().slice(0, 200);
 	if (/^[[{]/.test(start)) return { kind: "json", language: "json" };
 	if (/^<\?xml|^<[a-zA-Z][\w:-]*[\s>]/.test(start)) return /^<!doctype html|^<html/i.test(start) ? { kind: "html", language: "xml" } : { kind: "xml", language: "xml" };
 	if (/^#!.*\b(?:ba|z|k|da)?sh\b/.test(start)) return { kind: "code", language: "bash" };

@@ -76,7 +76,7 @@ export function otherKind(b: Uint8Array): string | null {
 	if (a.startsWith("\x7fELF")) return "a Linux program";
 	if (b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0) return "an Office 97–2003 document";
 	if (b.length > 8 && ascii(b, 4, 4) === "ftyp" && /^(isom|mp4|M4V|qt|avc1|iso)/.test(ascii(b, 8, 4))) return "a video";
-	const head = new TextDecoder("utf-8", { fatal: false }).decode(b.subarray(0, 1024)).replace(/^﻿/, "").trimStart().toLowerCase();
+	const head = new TextDecoder("utf-8", { fatal: false }).decode(b.subarray(0, 1024)).replace(/^\ufeff/, "").trimStart().toLowerCase();
 	if (/^<\?php/.test(head)) return "a PHP script";
 	if (/^(<!doctype html|<html|<head|<body|<script|<iframe)/.test(head)) return "a web page";
 	return null;
@@ -119,7 +119,7 @@ export function sniffImage(b: Uint8Array, name = ""): Sniffed {
 	if (a.startsWith("BM") && b.length > 26 && u32le(b, 14) >= 12 && u32le(b, 14) <= 124) return is("bmp");
 	if (b[0] === 0 && b[1] === 0 && (b[2] === 1 || b[2] === 2) && b[3] === 0 && u16le(b, 4) > 0 && u16le(b, 4) < 256 && (ext === "ico" || ext === "cur")) return is("ico");
 	if (b[0] === 0x1f && b[1] === 0x8b && ext === "svgz") return is("svgz");
-	const head = new TextDecoder("utf-8", { fatal: false }).decode(b.subarray(0, 4096)).replace(/^﻿/, "").trimStart();
+	const head = new TextDecoder("utf-8", { fatal: false }).decode(b.subarray(0, 4096)).replace(/^\ufeff/, "").trimStart();
 	if (/^(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE svg[\s\S]*?>\s*)?<svg[\s>]/i.test(head)) return is("svg");
 	const other = otherKind(b);
 	return { format: null, label: other ?? "not a picture this viewer knows", native: false, mime: null, other: other ?? undefined };

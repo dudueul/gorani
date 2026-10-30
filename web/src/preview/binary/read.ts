@@ -17,6 +17,16 @@ export class Short extends Error {
 	}
 }
 
+/** A string without the NULs that pad its end. Not `.replace(/\0+$/, "")`:
+ * that regex tries every NUL as the start of the run, and a string of
+ * thousands of NULs followed by anything else costs it millions of steps
+ * (fuzzing the event-log reader found a second spent on one file). */
+export function trimNul(s: string): string {
+	let n = s.length;
+	while (n > 0 && s.charCodeAt(n - 1) === 0) n--;
+	return n === s.length ? s : s.slice(0, n);
+}
+
 /** Little- or big-endian reads over a byte array, each one bounds-checked. */
 export class Reader {
 	readonly b: Uint8Array;

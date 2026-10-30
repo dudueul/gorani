@@ -588,6 +588,62 @@ Accepted:
   (AGPL) checked our output while this was written; neither is a
   dependency, and no code was taken from either.
 
+### Event logs (commit 42j)
+
+The threat: an event log is evidence, but whoever broke in may have
+written it, or edited it afterwards. Its Binary XML is a small virtual
+machine of tokens, templates and offsets that point anywhere in a chunk,
+which is room for loops, recursion and expansion. Its values are strings
+the attacker chose: account names, command lines, service paths.
+
+The controls:
+
+- **Our own parser, bounds-checked** (the 42g `Reader`):
+  - every value lies inside the file and is as wide as its type (fuzzing
+    found a value whose size lied: a raw `RangeError`, now refused before
+    any read);
+  - templates are parsed once per chunk, and one that names itself is
+    empty;
+  - nesting stops at 32;
+  - each parse is capped at 100,000 tokens;
+  - a record that would expand past 20,000 nodes is refused. A template
+    is copied into every instance of it, so one record can be built to
+    grow without limit; `tests/lib/evtx.mjs › amplifier` builds one;
+  - at most 200,000 events are read;
+  - the script triage reads at most 16 million characters of command
+    lines and script blocks in all, and says how many it left unread (a
+    log of 32 KiB script blocks could hold gigabytes).
+- **A quadratic regex removed.** Trimming NULs with `/\0+$/` backtracks
+  from every NUL in a run, so a 64 KiB value of NULs followed by anything
+  else cost seconds. Fuzzing the event-log reader found it.
+  `binary/read.ts › trimNul` replaces it there and in the two older readers
+  that had it (the OLE property sets, the .doc container). Fuzzing 1,200
+  mutated logs now takes about as long as a clean parse, and the unit test
+  keeps 60 of them.
+- **Tampering is reported, not hidden:** chunks that fail their CRC-32s,
+  gaps in the record numbers, the log cleared, the audit policy changed.
+- **Values are text,** shown through textContent. Controls appear as their
+  pictures and direction marks by name ([RLO]), in the details and in
+  every fact sentence, so a value cannot reorder what an analyst reads.
+- **Test inputs are built at test time** (`tests/lib/evtx.mjs`): an
+  intrusion's worth of events is what a detection rule flags on disk.
+
+And one in the sources themselves:
+
+- **No invisible characters in the code** (`unit:source-hygiene`). A
+  right-to-left override or a zero-width character inside a source file is
+  invisible in review but changes what the code says ("Trojan Source",
+  CVE-2021-42574). The readers that look for these characters in hostile
+  files had them written literally in eight places. They are now escapes
+  (`\u202e`), and every tracked text file is checked.
+
+Accepted:
+
+- **python-evtx (Apache-2.0) as an oracle only:** it checked our output on
+  two public logs and on what the test writer makes. It is not a
+  dependency. Where it disagreed (string arrays, times through floats),
+  the raw bytes decided.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

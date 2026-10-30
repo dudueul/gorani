@@ -82,9 +82,12 @@ const TOOLS: [RegExp, string][] = [
 	[/^ADFIND\.EXE$|^SHARPHOUND\.EXE$|^BLOODHOUND\.EXE$/, "maps Active Directory — the reconnaissance before ransomware"],
 	[/^(?:WEVTUTIL)\.EXE$/, "clears event logs"],
 	[/^VSSADMIN\.EXE$/, "manages (and deletes) shadow copies"],
+	[/^(?:SDELETE(?:64)?|BCWIPE\w*|ERASER\w*|WIPEFILE)\.EXE$/, "wipes files beyond recovery (destroys evidence)"],
 	[/^NTDSUTIL\.EXE$/, "copies the Active Directory database"],
 	[/^(?:CERTUTIL|BITSADMIN|MSHTA|REGSVR32|WMIC|CMSTP|INSTALLUTIL|MSBUILD)\.EXE$/, "a Windows tool attackers misuse to fetch or run code"],
 ];
+/** What running a program says, for the programs whose running is a finding (shared with the event-log facts, 42j). */
+export const toolNote = (exe: string): string | undefined => TOOLS.find(([re]) => re.test(exe.toUpperCase()))?.[1];
 const WRITABLE = /\\(?:USERS\\[^\\]+\\(?:APPDATA|DOWNLOADS|DESKTOP|DOCUMENTS)|USERS\\PUBLIC|PROGRAMDATA|WINDOWS\\TEMP|\$RECYCLE\.BIN|PERFLOGS|TEMP)\\/i;
 
 export function prefetchFacts(p: PrefetchInfo, name: string): Fact[] {
@@ -93,8 +96,8 @@ export function prefetchFacts(p: PrefetchInfo, name: string): Fact[] {
 	if (p.runs.length) facts.push({ level: "info", text: `Last ran ${iso(p.runs[0]!)} UTC${p.runs.length > 1 ? `; before that ${p.runs.slice(1).map(iso).join(", ")}` : ""}` });
 	const m = /^(.+)-([0-9A-F]{8})\.pf$/i.exec(name);
 	if (m && (m[1]!.toUpperCase() !== p.exe.toUpperCase() || m[2]!.toUpperCase() !== p.hash)) facts.push({ level: "warn", text: `Named for ${m[1]} (${m[2]!.toUpperCase()}), but its header says ${p.exe} (${p.hash}) — renamed, or moved from another machine` });
-	const tool = TOOLS.find(([re]) => re.test(p.exe.toUpperCase()));
-	if (tool) facts.push({ level: "warn", text: `${p.exe} ${tool[1]}` });
+	const tool = toolNote(p.exe);
+	if (tool) facts.push({ level: "warn", text: `${p.exe} ${tool}` });
 	const self = p.files.find((f) => f.toUpperCase().endsWith(`\\${p.exe.toUpperCase()}`));
 	if (self) facts.push({ level: WRITABLE.test(self) ? "warn" : "info", text: `It ran from ${q(self, 160)}${WRITABLE.test(self) ? " — a folder any user can write to" : ""}` });
 	const odd = p.files.filter((f) => f !== self && WRITABLE.test(f));

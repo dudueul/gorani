@@ -124,7 +124,7 @@ function sniff(b: Uint8Array): { kind: string; family: RegExp } | null {
  * before it offers to save an attachment: a reader in the frame is only
  * believed about what the app can see too. */
 export function partRisk(name: string, bytes: Uint8Array): string | null {
-	if (/[‪-‮⁦-⁩]/.test(name)) return "its name hides its real extension behind a right-to-left mark";
+	if (/[\u202a-\u202e\u2066-\u2069]/.test(name)) return "its name hides its real extension behind a right-to-left mark";
 	const clean = name.toLowerCase().trim().replace(/[.\s]+$/, "");
 	const ext = clean.includes(".") ? clean.split(".").pop()! : "";
 	const danger = DANGER.find(([re]) => re.test(ext))?.[1] ?? null;

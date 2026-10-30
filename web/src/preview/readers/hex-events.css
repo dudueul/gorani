@@ -1,0 +1,122 @@
+/* Copyright 2026- Seongwoo Hong. All rights reserved. */
+
+/* The hex reader's Events tab (commit 42j): a virtualized table, a details pane. */
+
+.evtools input[type="search"] {
+	flex: 1 1 16rem;
+	min-width: 10rem;
+}
+
+.evtools label {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	white-space: nowrap;
+	font-size: 13px;
+}
+
+/* One grid for the header and every row, so the columns line up. */
+.evrow {
+	display: grid;
+	grid-template-columns: 1.5em 13.5em 5.5em 4.5em 7.5em 11em minmax(0, 1fr);
+	gap: 0 10px;
+	align-items: center;
+	height: 22px;
+	padding: 0 12px;
+	font-size: 12.5px;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.evrow > span {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.evhead {
+	color: var(--muted);
+	font-weight: 500;
+	border-bottom: 1px solid var(--line);
+	cursor: default;
+}
+
+.evscroll {
+	position: relative;
+	flex: 1;
+	min-height: 8rem;
+	overflow: auto;
+	overscroll-behavior: contain;
+	outline: none;
+	font-variant-numeric: tabular-nums;
+}
+
+.evwin {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+}
+
+.evrow:not(.evhead):hover {
+	background: #171717;
+}
+
+.evrow.notable {
+	background: rgb(146 64 14 / 0.16);
+}
+
+.evrow.sel {
+	background: oklch(0.72 0.17 145 / 0.3);
+}
+
+.evscroll:focus-visible .evrow.sel {
+	outline: 1px solid oklch(0.72 0.17 145);
+	outline-offset: -1px;
+}
+
+.caution {
+	color: #fcd34d;
+}
+
+/* The details: under the table, scrolling on its own. */
+.evdetail {
+	flex: 0 0 auto;
+	max-height: 42%;
+	overflow: auto;
+	border-top: 1px solid var(--line);
+	padding: 8px 12px 12px;
+}
+
+.evdetail h3 {
+	font-size: 14px;
+	margin: 2px 0 6px;
+}
+
+.evdetail h4 {
+	font-size: 13px;
+	margin: 12px 0 4px;
+	color: var(--muted);
+	font-weight: 500;
+}
+
+.evdetail button {
+	margin-top: 10px;
+}
+
+.evval {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.phone .evrow {
+	grid-template-columns: 1.2em 9.5em 4em 6em minmax(0, 1fr);
+}
+
+.phone .evrow > span:nth-child(3),
+.phone .evrow > span:nth-child(6) {
+	display: none;
+}
+
+.phone .evdetail {
+	max-height: 50%;
+}

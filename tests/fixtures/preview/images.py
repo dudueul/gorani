@@ -237,7 +237,7 @@ def app1_exif(tiff: bytes) -> bytes:
 
 def xmp_packet(body: str) -> str:
     return (
-        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
         '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
         f"{body}</rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
     )

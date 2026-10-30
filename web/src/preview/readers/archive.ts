@@ -28,7 +28,7 @@ import archiveCss from "./archive.css?inline";
 
 const fmtSize = (n: number | null) => (n === null ? "" : n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} kB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`);
 /** A name as text that cannot reorder the line it is in. */
-export const visible = (s: string) => s.replace(/[‪-‮⁦-⁩‎‏]/g, (c) => ({ "‪": "[LRE]", "‫": "[RLE]", "‬": "[PDF]", "‭": "[LRO]", "‮": "[RLO]", "⁦": "[LRI]", "⁧": "[RLI]", "⁨": "[FSI]", "⁩": "[PDI]", "‎": "[LRM]", "‏": "[RLM]" })[c] ?? "").replace(/[\u0000-\u001f\u007f]/g, "�");
+export const visible = (s: string) => s.replace(/[\u202a-\u202e\u2066-\u2069\u200e\u200f]/g, (c) => ({ "\u202a": "[LRE]", "\u202b": "[RLE]", "\u202c": "[PDF]", "\u202d": "[LRO]", "\u202e": "[RLO]", "\u2066": "[LRI]", "\u2067": "[RLI]", "\u2068": "[FSI]", "\u2069": "[PDI]", "\u200e": "[LRM]", "\u200f": "[RLM]" })[c] ?? "").replace(/[\u0000-\u001f\u007f]/g, "�");
 
 interface Got {
 	t: string;
@@ -213,7 +213,7 @@ class ArchiveView {
 	private row(label: string, node: Node | null, e: Entry | null): HTMLElement {
 		const isFolder = !!node && (node.children.size > 0 || !!e?.dir);
 		const risk = e ? pathRisk(e.path) : null;
-		const flags = [e?.encrypted ? "🔒" : "", e?.link !== null && e?.link !== undefined ? `↪ ${visible(this.links.get(e.index) ?? "link")}` : "", risk === "traversal" ? "⚠ climbs out" : risk === "absolute" ? "⚠ absolute" : "", /[‪-‮⁦-⁩]/.test(label) ? "⚠ [RLO]" : ""].filter(Boolean).join(" ");
+		const flags = [e?.encrypted ? "🔒" : "", e?.link !== null && e?.link !== undefined ? `↪ ${visible(this.links.get(e.index) ?? "link")}` : "", risk === "traversal" ? "⚠ climbs out" : risk === "absolute" ? "⚠ absolute" : "", /[\u202a-\u202e\u2066-\u2069]/.test(label) ? "⚠ [RLO]" : ""].filter(Boolean).join(" ");
 		const name = el("span", { class: "name" }, el("span", { class: "icon" }, isFolder ? "📁" : "📄"), el("span", { class: "label" }, visible(label)));
 		const cells = [name, el("span", { class: "num" }, isFolder ? "" : fmtSize(e?.size ?? null)), el("span", { class: "num muted" }, isFolder ? "" : fmtSize(e?.packed ?? null)), el("span", { class: "muted" }, e?.modified ?? ""), el("span", { class: "muted" }, e?.method ?? ""), el("span", { class: "flags" }, flags)];
 		const row = el("div", { class: `row${isFolder ? " folder" : ""}`, role: "row", "data-test": "arc-row", "data-path": e?.path ?? node?.path ?? label, tabindex: "0" }, ...cells);

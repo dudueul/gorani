@@ -3,7 +3,7 @@
 > Copyright 2026- Seongwoo Hong. All rights reserved.
 > How the viewer shows formats that need a parser (commit 42a onward: PDF;
 > 42b: Word, Excel, PowerPoint, 한글 and the older Office formats; 42c:
-> email, .eml and Outlook's .msg). The
+> email, .eml and Outlook's .msg; 42d: every picture). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -14,7 +14,9 @@ A security team's files are the ones attackers make: a PDF that exploits
 its reader, an Office document with a macro, a phishing email that reports
 back when it is opened. Showing them needs parsers (pdf.js, Office
 readers, MIME parsers), and a parser is exactly what a crafted file
-attacks.
+attacks. So is a picture: the browser's own image decoders are parsers
+too, and CVE-2023-4863 (a heap overflow in libwebp) was exploited in the
+wild through ordinary `<img>` tags.
 
 In this app a successful attack in the page would be the worst kind. The
 page holds the unlocked vault: its keys, the session, the API, and every
@@ -157,6 +159,7 @@ for readers that draw HTML.
 | `hwp` | .hwp (HWP 5 and 3) .hwpx | rhwp, as WebAssembly (12 MB, asked of the app) |
 | `legacy` | .doc .ppt .rtf .odt .odp, and web pages or MHT archives named .doc | our own parsers (`preview/legacy/`) |
 | `email` | .eml (and message/rfc822), .msg | postal-mime; msgreader for .msg; DOMPurify |
+| `image` | every picture: JPEG, PNG, GIF, WebP, AVIF, BMP, ICO, SVG; TIFF; HEIF (.heic); camera RAW (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF…) | the browser's decoders (in the frame); UTIF and libheif in a worker; exifr; our own structure and RAW readers (`preview/image/`) |
 
 ### PDF (pdf.js, `readers/pdf.ts`)
 
@@ -415,6 +418,94 @@ bidirectional characters, at most 200 characters.
   flagged, never previewed, downloaded only inside an "infected" zip
   (CUSTODY.md, stage 5). It is signed and recorded like any upload.
 
+### Pictures (`readers/image.ts`, `preview/image/`, `facts/image.ts`) (42d)
+
+Every picture the vault shows is drawn in the frame, never in the app's
+page: the viewer, the explorer's Quick Look and details pane, and the Movie
+tab's posters (a poster is a picture whoever can write the area made). The
+small ones use the frame's **compact** mode (`ui/viewer/picture.ts`): the
+picture alone, fitted, in a frame that takes no clicks and no keyboard.
+
+| format | drawn by |
+|---|---|
+| JPEG, PNG (APNG), GIF, WebP, AVIF, BMP, ICO | the browser, as an `<img>` of a `blob:` URL, inside the frame |
+| SVG (and .svgz, inflated as a stream to at most 32 MB) | the browser, as an `<img>` too: an SVG drawn as a picture runs no script and loads nothing. Its source in a tab, as text |
+| TIFF | UTIF, in the reader's worker: every page (up to 20), turned by its Orientation |
+| HEIF (.heic, .heif) | libheif as WebAssembly, in the worker. Its two files (1.5 MB) are asked of the app only when a HEIF is opened, and kept as files of their own (LGPL-3.0, NOTICE) |
+| camera RAW | the camera's own JPEG preview, found by our own reader (`image/raw.ts`): JPEGs in a TIFF's directories and SubIFDs (DNG, CR2, NEF, ARW, ORF, RW2, PEF), CR3's PRVW and THMB boxes, the JPEG RAF's header points at; else a scan for JPEGs. The largest is shown. The sensor data is not decoded |
+| JPEG XL, Photoshop, JPEG 2000 | nothing (no decoder here); the metadata is still read |
+
+**Before anything decodes a picture**, `image/structure.ts` walks its
+structure: JPEG segments, PNG chunks, GIF blocks, WebP's RIFF, the ISO
+boxes of HEIF/AVIF/CR3, TIFF directories (`image/tiff.ts`: every offset
+checked, a directory read once, at most 64). From these it learns:
+
+- the size the file **declares**. Above 220 megapixels nothing is drawn;
+  above 100 for what our decoders draw (4 bytes a pixel). A 69-byte PNG
+  that declares 60000×60000 is named as a decompression bomb;
+- where the picture **ends**, so what comes after it can be named;
+- its comments, text chunks, and the blocks that carry metadata.
+
+**The metadata** is read by exifr in the worker: EXIF, GPS, XMP, IPTC, ICC,
+PNG's header and text. It is shown in an **Info panel** in the frame
+(beside the picture; a sheet over it on a phone): the picture, when it was
+taken (as written, with its time zone), the camera and lens, the location,
+the editing history, people and rights, what is hidden in the file, and
+every tag under "All metadata".
+
+**The facts** (`facts/image.ts`, pure):
+
+- **Where and when.** GPS to the metre ("Carries where it was taken:
+  37.56630° N, 126.97790° E · 38 m up · facing 128° · ±5 m"). The viewer
+  offers to **copy** the coordinates. The frame has no clipboard, so the
+  app does it, and only for words the fact shows (`sandbox.ts ›
+  cleanFact`). Nothing is sent anywhere: no map is drawn, no service asked.
+  Also the time taken, the camera's serial number, its owner, the artist
+  and copyright.
+- **What was done to it.** The editor and its XMP history; modified long
+  after it was taken. Also an embedded **thumbnail that no longer
+  matches**. A camera writes a 160×120 copy of the photo into its EXIF,
+  and many editors leave it as it was. The worker draws both at 32×32 in
+  grey, in all eight orientations (a phone stores both on their side),
+  trims the black bars a camera pads a thumbnail with, and compares:
+  - another shape means the picture was **cropped**, and the thumbnail may
+    show what was cut away;
+  - another picture means something was **painted over or removed**, and
+    the thumbnail may still show it.
+
+  The thumbnail is in the Info panel, to look at.
+- **Where it came from.** An AI model's mark (IPTC DigitalSourceType:
+  trainedAlgorithmicMedia); an image generator's settings in a PNG
+  (Stable Diffusion's "parameters", ComfyUI's "prompt"); Content
+  Credentials (C2PA), present but not verified.
+- **What it hides.** Data after the picture's end: a ZIP (a polyglot), a
+  program, text that is code, or a JPEG nothing declares. Things expected
+  there are named as harmless: a motion photo's video, the extra pictures
+  Multi-Picture Format declares, Samsung's trailer. Code in a comment or a
+  text chunk (a web shell: `<?php system(…)`). A name that is not what the
+  bytes are: a JPEG named .png is information; an SVG named .png is a
+  warning (SVG can carry script); a web page named .png is not drawn at
+  all.
+- **What an SVG would do,** from an inert parse: scripts and event
+  handlers, HTML inside (foreignObject, a password form), what it would
+  load from outside, its links, `javascript:` links. None of it is run or
+  loaded. An SVG that declares XML entities (the "billion laughs" shape)
+  is not parsed or drawn; its source is shown.
+- **Animation** (GIF, APNG, WebP frames), TIFF pages, HEIF pictures.
+
+**Zoom, pan and pinch** (`image/stage.ts`, Pointer Events, so mouse, pen
+and fingers alike):
+
+- the wheel zooms around the pointer (a trackpad's pinch arrives as a
+  wheel with Ctrl);
+- a drag pans; two fingers pinch;
+- a double click or tap fits, or goes to 100 %;
+- keys: `+` `−` `0` (fit) `1` (actual pixels) `R` (turn) `I` (Info).
+
+The picture is sized rather than scaled, so an SVG stays sharp. Past 300 %
+pixels are drawn as squares. Zoomed in, a swipe pans the picture instead of
+opening the next file (`host.setSwipeGuard`).
+
 ## Limits
 
 - **A reader that hangs can freeze the tab on some browsers.** Desktop
@@ -437,6 +528,15 @@ bidirectional characters, at most 200 characters.
   outside pictures are gone, by design; the Source tab has the original.
 - **A .msg has no source**: Outlook keeps properties, not the message.
   Its headers are there only when it came from outside the organisation.
+- **RAW files show the camera's preview**, not the sensor data: an edit
+  made to the RAW in a darkroom program is not seen. JPEG XL, Photoshop
+  and JPEG 2000 files show their metadata only. A HEIF's thumbnails and
+  depth maps are not shown; a TIFF shows its first 20 pages.
+- **The thumbnail check is a likeness at 32×32**, for JPEG's EXIF
+  thumbnail only: a small change (a word retouched) can pass it. When it
+  speaks it is evidence; when it is silent it proves nothing.
+- **Every small picture is a frame of its own** (Quick Look, the details
+  pane, each poster on screen): safe, and heavier than an `<img>`.
 
 ## Tests
 
@@ -450,7 +550,9 @@ bidirectional characters, at most 200 characters.
   - asset names cannot climb out of a reader's folder; 한글's reader may
     ask for its WebAssembly and nothing else; the others for nothing;
   - an attachment's name cleaned before the app uses it (42c): no path, no
-    control or right-to-left characters, a length cap.
+    control or right-to-left characters, a length cap;
+  - the image reader may ask for libheif's two files and nothing else; a
+    fact's Copy is kept only when it is words the fact shows (42d).
 - **`unit:viewer-modes`:** each format to its reader, by name or type,
   capped like any whole read, samples refused first; the first bytes
   correcting a disguised name (a .msg is OLE, and stays email).
@@ -461,7 +563,10 @@ bidirectional characters, at most 200 characters.
   .doc, .ppt and RTF text read right (Korean included); (42c) the email
   fixtures' facts: the forged Authentication-Results not believed, the
   entry hop, the sender's disguises, every planted link and attachment,
-  the .msg read like the .eml, and the honest message warning of nothing.
+  the .msg read like the .eml, and the honest message warning of nothing;
+  (42d) every picture fixture sniffed by its bytes, its declared size, its
+  end and what follows it, a RAW file's own previews, GPS and the camera,
+  the editing history, the AI mark, the bomb, and the facts each makes.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -476,6 +581,13 @@ bidirectional characters, at most 200 characters.
     their markup shown as text; an RTF and a web archive named .doc named
     as disguises;
   - the default Trusted Types policy attacked from inside;
+  - pictures (42d): every format drawn in the frame and none in the page;
+    zoom by wheel, keys and double click, a drag that pans; GPS copied;
+    the redacted photo's thumbnail and the cropped one's shape caught; the
+    polyglot, the AI mark, the bomb, the disguises; TIFF pages, HEIF
+    through libheif, the RAW previews; the hostile SVG's script never run
+    and its beacons never asked for; the details pane's compact frame; on
+    a phone, a pinch, a pan instead of the next file, a double tap;
   - email (42c): an .eml drawn with its own picture, Find, the headers,
     text and source tabs, its PDF opened in its own preview and back; a
     phishing message's facts, its link shown on hover and dead on click,
@@ -493,7 +605,10 @@ bidirectional characters, at most 200 characters.
   - `ole.mjs` (rhwp, cfb): the 한글 files, the OLE surgery Python
     cannot do, and Outlook's .msg;
   - `mail.py` (no libraries: MIME written out by hand, so every header is
-    exactly what a test expects): the .eml messages.
+    exactly what a test expects): the .eml messages;
+  - `images.py` (Pillow draws; EXIF, XMP, TIFF directories, the DNG, CR3
+    and RAF layouts and the HEIF boxes written by hand; ffmpeg's x265
+    encodes the HEIF's picture): the pictures.
 
   Everything except what LibreOffice writes is the same bytes on every run.
   Nothing in them is a working exploit: the scripts are text, the

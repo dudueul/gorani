@@ -379,6 +379,53 @@ organisation, often no transport headers. The facts then say less. The
 reader shows the HTML as cleaned; someone who needs it exactly as sent
 has the Source tab, as text.
 
+### Pictures (commit 42d)
+
+The threat: a picture is a parser's input like any document. The
+browser's own decoders have been exploited through ordinary `<img>`
+tags (CVE-2023-4863, libwebp). Before 42d every picture was decoded in
+the app's page, beside the unlocked vault: in the viewer, in Quick Look,
+in the details pane, and in the Movie tab's posters. A poster is a
+picture anyone who can write the area made. A picture also carries what
+its owner may not know it does: where it was taken, the camera's serial
+number, an edit that a stale thumbnail betrays, a ZIP after its end.
+
+The controls:
+
+- **No picture is decoded in the app's page.** Every one is drawn in the
+  preview frame: the viewer's reader, or the frame's compact mode for the
+  small ones (a frame that takes no clicks and no keyboard). A decoder
+  that falls holds one picture, in an opaque origin with no network.
+- **The heavy parsers run in a worker:** exifr, UTIF (TIFF) and libheif
+  (HEIF, WebAssembly). libheif is fetched only for a HEIF, through the
+  frame's fixed asset list. The worker inherits the frame's CSP and
+  Trusted Types; the one script it loads goes through a policy that
+  accepts only `blob:` URLs.
+- **Size first:** the size a picture declares is read from its structure
+  before any decoder runs. Past 220 megapixels nothing is drawn; past 100
+  for our own decoders. A gzip SVG inflates as a stream to at most 32 MB.
+  An SVG that declares XML entities is neither parsed nor drawn.
+- **SVG is drawn as a picture,** which runs no script and loads nothing.
+  What it would run or load is named from an inert parse.
+- **RAW sensor data is not decoded;** the camera's own JPEG preview is
+  shown.
+- **The clipboard stays with the app:** the frame has none. A fact may
+  offer words to copy only if they are words it shows, and the app copies
+  them on a click.
+- **Evidence:** GPS, the camera and its serial number, the editing
+  history, a thumbnail that no longer matches, an AI model's mark, data
+  after the end, code in a comment, and a name that lies are all reported
+  outside the frame (`unit:preview-facts`, `e2e:preview`).
+
+Accepted:
+
+- **Video and audio are still decoded in the app's page,** by the
+  browser's media stack: the in-page player (39p) and the media worker's
+  streams. Moving playback into the frame is later work.
+- **The thumbnail check is a likeness test at 32×32:** a small edit can
+  pass it.
+- **Each small picture costs a frame of its own.**
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

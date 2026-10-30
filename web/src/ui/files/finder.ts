@@ -173,10 +173,13 @@ export class GoraniFinder extends LitElement {
 		try {
 			const p = await this.model.preview(id, 512 * 1024);
 			if (p && this.quickLook?.id === id) {
+				// A new object (Lit redraws on an assignment, not on a field set).
 				// A picture is drawn in the preview frame (42d, viewer/picture.ts), not in this page.
-				if (row.kind === "image") this.quickLook.picture = { name: row.name, mime: p.mime, bytes: p.bytes };
-				else if (row.kind === "text" || row.kind === "code" || row.kind === "pdf") this.quickLook.text = new TextDecoder().decode(p.bytes.subarray(0, 16384));
-				this.quickLook.meta = { size: row.size, version: row.version, updatedAt: shownModified(row) };
+				this.quickLook = {
+					...this.quickLook,
+					...(row.kind === "image" ? { picture: { name: row.name, mime: p.mime, bytes: p.bytes } } : row.kind === "text" || row.kind === "code" || row.kind === "pdf" ? { text: new TextDecoder().decode(p.bytes.subarray(0, 16384)) } : {}),
+					meta: { size: row.size, version: row.version, updatedAt: shownModified(row) },
+				};
 			}
 		} catch {
 			// best-effort

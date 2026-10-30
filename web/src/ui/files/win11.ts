@@ -187,9 +187,10 @@ export class GoraniWin11 extends LitElement {
 			try {
 				const p = await this.model.preview(id);
 				if (p && this.previewFile?.id === id) {
+					// A new object, not a field set on the old one: Lit redraws
+					// on an assignment, and a mutation would leave the icon up.
 					// A picture is drawn in the preview frame (42d, viewer/picture.ts), not in this page.
-					if (row.kind === "image") this.previewFile.picture = { name: row.name, mime: p.mime, bytes: p.bytes };
-					else this.previewFile.text = new TextDecoder().decode(p.bytes.subarray(0, 8192));
+					this.previewFile = row.kind === "image" ? { ...this.previewFile, picture: { name: row.name, mime: p.mime, bytes: p.bytes } } : { ...this.previewFile, text: new TextDecoder().decode(p.bytes.subarray(0, 8192)) };
 				}
 			} catch {
 				// previews are best-effort; the icon stays

@@ -11,13 +11,16 @@
 # It builds; it never deploys. No secrets, the job token read-only,
 # first-party actions only (actions/checkout, actions/setup-node,
 # actions/cache). Windows minutes count twice against the plan, so only
-# changes to the build's own scripts and configuration run it.
+# changes to the build's own scripts and configuration run it, and a branch
+# runs it once, through its pull request: a push trigger on the branch too
+# would run it twice for every commit (the two runs have different refs, so
+# the concurrency group below cancels neither).
 
 name: deploy-build
 
 on:
   push:
-    branches: [main, "claude/**"]
+    branches: [main]
     paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]
   pull_request:
     paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]

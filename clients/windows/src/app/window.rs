@@ -45,6 +45,12 @@ const TITLE: &str = "Gorani Settings";
 /// The client area, in 96-dpi units.
 const WIDTH: i32 = 580;
 const HEIGHT: i32 = 500;
+/// A static control's "no prefix" style (WinUser.h SS_NOPREFIX; the crate
+/// keeps it behind a feature this program has no other use for).
+const SS_NOPREFIX: u32 = 0x80;
+/// The row of tabs: x, y and width in 96-dpi units; its height is the
+/// tabs' own (ui::fit_tab_strip). The pages are laid out below it.
+const TAB_STRIP: [i32; 3] = [8, 8, 564];
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Tab {
@@ -249,6 +255,13 @@ pub(crate) fn self_test() -> Result<String, String> {
 		return Err(format!("{missing} control(s) could not be made"));
 	}
 	let controls = with_win(|w| w.placed.len()).unwrap_or(0);
+	let strip = with_win(|w| ui::rect(w.c.tab)).unwrap_or_default();
+	if strip.bottom - strip.top <= 0 || strip.bottom - strip.top > ui::scale(60, unsafe { GetDpiForSystem() }) {
+		return Err(format!("the row of tabs is {} pixels high", strip.bottom - strip.top));
+	}
+	if let Some(n @ 1..) = with_win(|w| covered(w)) {
+		return Err(format!("{n} control(s) lie under the row of tabs, where they are neither drawn nor clicked"));
+	}
 	refresh();
 	for tab in [Tab::Account, Tab::Sync, Tab::Devices, Tab::Advanced] {
 		select(tab);
@@ -269,6 +282,9 @@ pub(crate) fn self_test() -> Result<String, String> {
 	if with_win(|w| w.font.is_invalid()) != Some(false) {
 		return Err("no message font at 144 dpi".into());
 	}
+	if let Some(n @ 1..) = with_win(|w| covered(w)) {
+		return Err(format!("at 144 dpi, {n} control(s) lie under the row of tabs"));
+	}
 	// SAFETY: our own window; WM_DESTROY clears the state.
 	unsafe {
 		DestroyWindow(hwnd).map_err(|e| e.message().to_string())?;
@@ -276,7 +292,7 @@ pub(crate) fn self_test() -> Result<String, String> {
 	if with_win(|_| ()).is_some() {
 		return Err("the window's state outlived it".into());
 	}
-	Ok(format!("self-test ok: {controls} controls, 4 tabs, re-laid out at 144 dpi"))
+	Ok(format!("self-test ok: {controls} controls, 4 tabs, none under the row of tabs, re-laid out at 144 dpi"))
 }
 
 pub(crate) fn close() {
@@ -297,13 +313,18 @@ fn build(hwnd: HWND, dpi: u32) -> Win {
 	};
 	let none = WINDOW_EX_STYLE(0);
 	let edge = WS_EX_CLIENTEDGE;
-	let label = WINDOW_STYLE(0);
+	// Labels show their text as given: an "&" (in a server's address, a
+	// device's name) is not taken as a keyboard-shortcut marker.
+	let label = WINDOW_STYLE(SS_NOPREFIX);
 	let edit = WS_TABSTOP | ui::ws(ES_AUTOHSCROLL);
 	let button = WS_TABSTOP | ui::ws(BS_PUSHBUTTON);
 	let check = WS_TABSTOP | ui::ws(BS_AUTOCHECKBOX);
 	let combo = WS_TABSTOP | WS_VSCROLL | ui::ws(CBS_DROPDOWNLIST);
-	let mut c = C { tab: add(None, Show::Always, WC_TABCONTROLW, "", WS_TABSTOP, none, ID_TAB, [8, 8, 564, 432]), ..Default::default() };
-	for (i, title) in ["Account", "Sync", "This computer & devices", "Advanced"].iter().enumerate() {
+	let [tx, ty, tw] = TAB_STRIP;
+	let mut c = C { tab: add(None, Show::Always, WC_TABCONTROLW, "", WS_TABSTOP, none, ID_TAB, [tx, ty, tw, 28]), ..Default::default() };
+	// ("&&": a tab's title takes "&" as a shortcut marker — "& devices"
+	// showed as "_devices".)
+	for (i, title) in ["Account", "Sync", "This computer && devices", "Advanced"].iter().enumerate() {
 		ui::tab_add(c.tab, i, title);
 	}
 	let (a, s, d, v) = (Some(0), Some(1), Some(2), Some(3));
@@ -382,6 +403,24 @@ fn relayout(win: &Win) {
 		ui::place(p.h, p.r[0], p.r[1], p.r[2], p.r[3], win.dpi);
 		ui::set_font(p.h, win.font);
 	}
+	// The tabs' height follows the font, so it is measured after it is set.
+	let [x, y, w] = TAB_STRIP;
+	ui::fit_tab_strip(win.c.tab, x, y, w, win.dpi);
+}
+
+/// Controls of a page that lie under the row of tabs. The tab control is
+/// made first, so it is above every page's controls: one it overlaps is
+/// neither drawn nor clicked (40b's first MSIX showed every page blank).
+fn covered(win: &Win) -> usize {
+	let strip = ui::rect(win.c.tab);
+	win.placed
+		.iter()
+		.filter(|p| p.page.is_some())
+		.filter(|p| {
+			let r = ui::rect(p.h);
+			r.left < strip.right && strip.left < r.right && r.top < strip.bottom && strip.top < r.bottom
+		})
+		.count()
 }
 
 /// Show what belongs to the chosen tab and the enrolment state.

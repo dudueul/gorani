@@ -13,7 +13,11 @@
 //   5. changes since an anchor: additions, edits, deletions, and an
 //      anchor too old to answer;
 //   6. the enumerators answer the system's observers;
-//   7. Finder's badges: a sample, a read-only area's items (39e).
+//   7. Finder's badges: a sample, a read-only area's items (39e);
+//   8. Finder's "Always keep on this Mac" and "Free up space": the marks,
+//      the content policy they give, a change Finder learns of, a sample
+//      never kept, a folder freed with what is in it, one file freed out of
+//      a kept folder (the rest still kept), the marks kept across restarts.
 
 import FileProvider
 import UniformTypeIdentifiers
@@ -196,6 +200,75 @@ final class ProviderCoreTests: XCTestCase {
 		_ = try core.model.refresh(force: true)
 		XCTAssertEqual(try decorations(a), [GoraniFileProviderItem.decoration("readOnly")])
 		XCTAssertTrue(GoraniFileProviderItem.decoration("sample").rawValue.hasPrefix(GoraniFileProviderItem.decorationPrefix + "."), "named under the extension's id")
+	}
+
+	// ── 8. "Always keep on this Mac" and "Free up space" ──
+
+	func policy(_ id: String, of other: ProviderCore? = nil) throws -> NSFileProviderContentPolicy? {
+		let c: ProviderCore = other ?? core
+		return (try c.providerItem(id) as? GoraniFileProviderItem)?.contentPolicy
+	}
+
+	func testAlwaysKeepMarksTheItemAndFinderLearnsOfIt() throws {
+		let start = core.anchor
+		let before = try XCTUnwrap(core.providerItem(a) as? GoraniFileProviderItem)
+		XCTAssertEqual(try policy(a), .inherited, "as its folder is, until asked")
+		XCTAssertEqual(core.keep([a]), [a], "a file: asked for at once")
+		XCTAssertEqual(try policy(a), .downloadEagerlyAndKeepDownloaded, "downloaded and kept downloaded — the system's to do")
+		XCTAssertEqual(try policy(docs), .inherited, "its folder is not kept")
+		let changed = try XCTUnwrap(core.changes(since: start))
+		XCTAssertEqual(changed.updated.map { $0.itemIdentifier.rawValue }, [a], "a change since the anchor: the system reads the new policy")
+		let after = try XCTUnwrap(core.providerItem(a) as? GoraniFileProviderItem)
+		XCTAssertNotEqual(after.itemVersion.metadataVersion, before.itemVersion.metadataVersion, "the metadata version moves with the mark")
+		XCTAssertEqual(after.itemVersion.contentVersion, before.itemVersion.contentVersion, "…the content's does not: nothing to fetch again")
+		let again = core.anchor
+		core.keep([a])
+		XCTAssertEqual(core.anchor, again, "kept already: no change")
+	}
+
+	func testASampleIsNeverKept() throws {
+		XCTAssertEqual(core.keep([sample]), [])
+		XCTAssertFalse(core.model.isKept(sample))
+		XCTAssertEqual(try policy(sample), .downloadLazily, "never downloaded at once, whatever a folder above says")
+		core.keep([""])
+		XCTAssertEqual(core.model.kept, [docs], "the top: what is in it — the sample not")
+	}
+
+	func testFreeingAFolderFreesWhatIsInIt() throws {
+		core.keep([docs, a])
+		XCTAssertEqual(core.free([docs]), [docs], "the folder evicted, what is in it with it")
+		XCTAssertTrue(core.model.kept.isEmpty)
+		XCTAssertEqual(try policy(a), .inherited)
+	}
+
+	func testFreeingOneFileOutOfAKeptFolderKeepsTheRest() throws {
+		let b = try put(docs, "b.txt", "bee")
+		let sub = (try bridge.call(["op": "mem.dir", "parent": docs, "name": "sub"])["item"] as? [String: Any])?["id"] as? String ?? ""
+		let c = try put(sub, "c.txt", "sea")
+		let d = try put(sub, "d.txt", "dee")
+		XCTAssertTrue(try core.refresh())
+		core.keep([docs])
+		XCTAssertEqual(core.free([c]), [c])
+		XCTAssertFalse(core.model.isKept(docs), "the folder kept as a whole no more — or c would stay downloaded through it")
+		XCTAssertEqual(core.model.kept, [a, b, d], "what else was kept through it is kept in its own right")
+		XCTAssertEqual(try policy(c), .inherited)
+	}
+
+	func testTheMarksAreKeptAcrossARestart() throws {
+		let file = FileManager.default.temporaryDirectory.appendingPathComponent("gorani-kept-\(UUID().uuidString).json")
+		defer { try? FileManager.default.removeItem(at: file) }
+		try ProviderCore(bridge: bridge, keptFile: file).keep([a])
+		let again = try ProviderCore(bridge: bridge, keptFile: file)
+		XCTAssertTrue(again.model.isKept(a), "saved on this Mac, read back at the next start")
+		XCTAssertEqual(try policy(a, of: again), .downloadEagerlyAndKeepDownloaded)
+		again.free([a])
+		XCTAssertFalse(try ProviderCore(bridge: bridge, keptFile: file).model.isKept(a))
+	}
+
+	func testFinderActionsAreNamedUnderTheExtension() {
+		XCTAssertEqual(ProviderCore.Action(identifier: GoraniFileProviderItem.decorationPrefix + ".keep"), .keep)
+		XCTAssertEqual(ProviderCore.Action(identifier: GoraniFileProviderItem.decorationPrefix + ".free"), .free)
+		XCTAssertNil(ProviderCore.Action(identifier: "com.example.keep"), "another extension's action is not ours")
 	}
 
 	func testTheCoresRefusalsBecomeFileProviderErrors() {

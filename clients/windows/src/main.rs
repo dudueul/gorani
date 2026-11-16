@@ -5,7 +5,10 @@
 //! ```text
 //! gorani-cloud <folder> [--case C] [--profile P] [--accept-unverified] [--keep-local] [--verbose]
 //!                                    the area as a Cloud Files folder, until Ctrl-C
-//! gorani-cloud free <file>           drop one file's local bytes (it stays listed)
+//! gorani-cloud free <file|folder>    drop the local bytes (it stays listed) —
+//!                                    Explorer's "Free up space"
+//! gorani-cloud keep <file|folder>    keep it on this device — Explorer's "Always
+//!                                    keep on this device"; the running shell fetches it
 //! gorani-cloud unregister <folder>   the folder stops being a sync root
 //! ```
 //!
@@ -59,10 +62,28 @@ fn run() -> Result<(), String> {
 	}
 	let flag = |k: &str| flags.get(k).cloned();
 	match pos.first().map(String::as_str) {
+		// The two choices Explorer's context menu offers, from a prompt (a
+		// script, a Server without Explorer): the same pin state Explorer
+		// sets (cf.rs › Pin), which the running shell acts on.
 		Some("free") => {
-			let file = pos.get(1).ok_or("gorani-cloud free <file>")?;
-			cf::dehydrate(std::path::Path::new(file)).map_err(|e| e.to_string())?;
-			println!("{file}: its local bytes are gone; it stays listed");
+			let target = pos.get(1).ok_or("gorani-cloud free <file|folder>")?;
+			let path = std::path::Path::new(target);
+			if path.is_dir() {
+				cf::set_pin(path, cf::Pin::Unpinned).map_err(|e| e.to_string())?;
+				println!("{target}: the running Gorani drops the local bytes of everything in it (each once it is sent)");
+			} else {
+				// A file: now, shell running or not — kept no more first (a
+				// pinned file's bytes cannot be dropped).
+				cf::set_pin(path, cf::Pin::Unspecified).map_err(|e| e.to_string())?;
+				cf::dehydrate(path).map_err(|e| e.to_string())?;
+				println!("{target}: its local bytes are gone; it stays listed");
+			}
+			Ok(())
+		}
+		Some("keep") => {
+			let target = pos.get(1).ok_or("gorani-cloud keep <file|folder>")?;
+			cf::set_pin(std::path::Path::new(target), cf::Pin::Pinned).map_err(|e| e.to_string())?;
+			println!("{target}: kept on this device — the running Gorani fetches it now, or when it next starts (and drops it again when it stops, unless it keeps local files)");
 			Ok(())
 		}
 		Some("unregister") => {
@@ -87,7 +108,7 @@ fn run() -> Result<(), String> {
 			running.stop();
 			Ok(())
 		}
-		None => Err("usage: gorani-cloud <folder> [--case C] [--profile P] [--accept-unverified] [--keep-local] [--verbose] | free <file> | unregister <folder>".into()),
+		None => Err("usage: gorani-cloud <folder> [--case C] [--profile P] [--accept-unverified] [--keep-local] [--verbose] | free <file|folder> | keep <file|folder> | unregister <folder>".into()),
 	}
 }
 

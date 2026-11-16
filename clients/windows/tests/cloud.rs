@@ -192,6 +192,157 @@ fn a_cloud_files_folder_over_the_replica() {
 	}
 }
 
+/// Explorer's two context-menu choices, as another program makes them:
+/// "Always keep on this device" and "Free up space" are only the pin
+/// attribute (attrib's +P and +U set the same one Explorer does), and the
+/// shell must do the rest (provider.rs › pins). Files of 200 KB and more:
+/// a tiny one can live inside its MFT record, where "on disk" means little.
+#[test]
+fn explorer_always_keep_and_free_up_space() {
+	use cf::Pin;
+	let mem = Arc::new(Mutex::new(MemRemote::new("pins")));
+	let (keep_dir, k1, top, free_dir, f1, f2, bad) = {
+		let mut m = mem.lock().unwrap();
+		let keep_dir = m.put_dir("", "keep");
+		let k1 = m.put(&keep_dir.id, "k1.bin", &pattern(6 * 1024 * 1024 + 5));
+		let top = m.put("", "top.bin", &pattern(200_000));
+		let free_dir = m.put_dir("", "free");
+		let f1 = m.put(&free_dir.id, "f1.bin", &pattern(300_000));
+		let f2 = m.put(&free_dir.id, "f2.bin", &pattern(250_000));
+		let bad = m.put("", "bad.exe", &pattern(200_000));
+		m.mark_sample(&bad.id);
+		(keep_dir, k1, top, free_dir, f1, f2, bad)
+	};
+	let remote: Arc<Mutex<dyn Remote + Send>> = mem.clone();
+	let run = provider::start(&fresh_root("pins"), remote, provider::Options { poll: None, keep_local: false, verbose: true }).expect("start");
+	let root = run.root().to_path_buf();
+	let at = |rel: &str| root.join(rel);
+	let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+	let on_disk = |p: &Path| cf::info(p).map(|i| i.on_disk).unwrap_or(u64::MAX);
+	let pin = |p: &Path| cf::info(p).map(|i| i.pin);
+	let whole = |p: &Path| size(p) > 0 && on_disk(p) >= size(p);
+	// (attrib.exe: another program, as Explorer is — and the same attribute.
+	// Found in CI: it says "File not found" for a folder given as a `\\?\`
+	// path or without /D — and exits 0 all the same; so it gets a plain path,
+	// /D for a folder, and what it set is checked. Nothing acts on it before
+	// that check: with no poller, the provider looks only in `wait`.)
+	let attrib = |flags: &[&str], p: &Path| {
+		use std::os::windows::fs::MetadataExt;
+		let plain = PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"));
+		let mut cmd = std::process::Command::new("attrib");
+		cmd.args(flags);
+		if p.is_dir() {
+			cmd.arg("/D");
+		}
+		let out = cmd.arg(&plain).output().expect("attrib.exe");
+		let said = String::from_utf8_lossy(&out.stdout).to_string();
+		let attrs = std::fs::metadata(p).map(|m| m.file_attributes()).unwrap_or(0);
+		for f in flags {
+			let bit = match &f[1..] {
+				"P" => 0x0008_0000,
+				"U" => 0x0010_0000,
+				_ => continue,
+			};
+			assert_eq!(attrs & bit != 0, f.starts_with('+'), "attrib {f} {} did not take (it said: {said:?}; attributes now {attrs:#x})", plain.display());
+		}
+	};
+	let reads = || mem.lock().unwrap().reads;
+	let _ = (&keep_dir, &k1, &free_dir, &f2);
+
+	// 1. "Always keep on this device" on a file: fetched whole, at once,
+	// without anything reading it — and read from the disk after.
+	assert_eq!(on_disk(&at("top.bin")), 0, "nothing fetched before it is asked for");
+	attrib(&["+P"], &at("top.bin"));
+	wait("top.bin kept on this device", &run, || whole(&at("top.bin")));
+	let before = reads();
+	assert_eq!(std::fs::read(at("top.bin")).unwrap(), pattern(200_000));
+	assert_eq!(reads(), before, "a kept file is read from this disk, not fetched");
+
+	// 2. On a folder (the folder alone): what is in it is kept too, and so
+	// is what arrives in it later.
+	attrib(&["+P"], &at("keep"));
+	wait("keep\\k1.bin kept", &run, || whole(&at("keep\\k1.bin")));
+	assert_eq!(pin(&at("keep\\k1.bin")), Some(Pin::Pinned), "marked kept, as Explorer then shows it");
+	let later = mem.lock().unwrap().put(&keep_dir.id, "later.bin", &pattern(220_000));
+	run.sync_remote().unwrap();
+	wait("keep\\later.bin, arrived later, kept", &run, || whole(&at("keep\\later.bin")));
+	let _ = later;
+	// Freeing one of them: that one freed, the folder kept as a whole no
+	// more (or its next look would keep the file again), the rest still
+	// kept — and what arrives now is not.
+	attrib(&["-P", "+U"], &at("keep\\later.bin"));
+	wait("keep\\later.bin freed", &run, || on_disk(&at("keep\\later.bin")) == 0 && pin(&at("keep")) == Some(Pin::Unspecified));
+	assert!(whole(&at("keep\\k1.bin")) && pin(&at("keep\\k1.bin")) == Some(Pin::Pinned), "the other file stays kept");
+	mem.lock().unwrap().put(&keep_dir.id, "after.bin", &pattern(210_000));
+	run.sync_remote().unwrap();
+	run.sync_local();
+	std::thread::sleep(Duration::from_secs(2));
+	run.sync_local();
+	assert_eq!(on_disk(&at("keep\\after.bin")), 0, "arrived after the folder was freed: not kept");
+	assert!(on_disk(&at("keep\\later.bin")) == 0, "and the freed file was not kept again");
+
+	// 3. A new version of a kept file: its old bytes dropped (the platform
+	// refuses that while it is pinned — the shell lifts the pin for it),
+	// the new ones fetched at once, still kept.
+	mem.lock().unwrap().edit(&top.id, &pattern(260_000));
+	run.sync_remote().unwrap();
+	wait("top.bin's new version kept", &run, || size(&at("top.bin")) == 260_000 && whole(&at("top.bin")) && pin(&at("top.bin")) == Some(Pin::Pinned));
+	let before = reads();
+	assert_eq!(std::fs::read(at("top.bin")).unwrap(), pattern(260_000), "the new version's bytes");
+	assert_eq!(reads(), before, "…from this disk");
+
+	// 4. "Free up space" on a file: its bytes dropped, still listed, and the
+	// request done (back to neither) — so a later read fetches it as any
+	// read does, and it is not dropped again under the reader.
+	assert_eq!(std::fs::read(at("free\\f1.bin")).unwrap(), pattern(300_000));
+	assert!(on_disk(&at("free\\f1.bin")) > 0, "read, so on disk");
+	attrib(&["+U"], &at("free\\f1.bin"));
+	wait("free\\f1.bin freed", &run, || on_disk(&at("free\\f1.bin")) == 0 && pin(&at("free\\f1.bin")) == Some(Pin::Unspecified));
+	assert!(at("free\\f1.bin").exists(), "still listed");
+	let before = reads();
+	assert_eq!(std::fs::read(at("free\\f1.bin")).unwrap(), pattern(300_000), "read again…");
+	assert!(reads() > before, "…fetched again: its bytes had left the disk");
+	std::thread::sleep(Duration::from_secs(2));
+	run.sync_local();
+	assert!(on_disk(&at("free\\f1.bin")) > 0, "…and left there: the request was done once");
+
+	// 5. A change not sent yet is sent first, freed after — never lost.
+	let edited: Vec<u8> = pattern(230_000).iter().map(|b| b ^ 0x5a).collect();
+	std::fs::write(at("free\\f1.bin"), &edited).unwrap();
+	attrib(&["+U"], &at("free\\f1.bin"));
+	wait("the change sent, then freed", &run, || mem.lock().unwrap().content(&f1.id).as_deref() == Some(&edited[..]) && on_disk(&at("free\\f1.bin")) == 0 && pin(&at("free\\f1.bin")) == Some(Pin::Unspecified));
+	let before = reads();
+	assert_eq!(std::fs::read(at("free\\f1.bin")).unwrap(), edited, "the change, from the server");
+	assert!(reads() > before);
+
+	// 6. On a folder: everything in it.
+	assert_eq!(std::fs::read(at("free\\f2.bin")).unwrap(), pattern(250_000));
+	attrib(&["+U"], &at("free"));
+	wait("free\\ freed", &run, || on_disk(&at("free\\f2.bin")) == 0 && pin(&at("free")) == Some(Pin::Unspecified));
+
+	// 7. "Free up space" on a kept file: kept no more.
+	attrib(&["-P", "+U"], &at("top.bin"));
+	wait("top.bin freed", &run, || on_disk(&at("top.bin")) == 0 && pin(&at("top.bin")) == Some(Pin::Unspecified));
+
+	// 8. A malware sample is never kept: its bytes never on this disk raw,
+	// and the mark undone so Explorer does not claim it.
+	attrib(&["+P"], &at("bad.exe"));
+	wait("the sample's mark undone", &run, || pin(&at("bad.exe")) == Some(Pin::Unspecified));
+	assert_eq!(on_disk(&at("bad.exe")), 0);
+	let _ = &bad;
+
+	// 9. Stop: the kept files' plaintext leaves with the shell too — still
+	// marked kept, and fetched again when it next starts.
+	run.stop();
+	assert_eq!(on_disk(&at("keep\\k1.bin")), 0, "no plaintext left while no shell runs");
+	assert_eq!(pin(&at("keep\\k1.bin")), Some(Pin::Pinned), "the choice kept");
+	let remote: Arc<Mutex<dyn Remote + Send>> = mem.clone();
+	let run = provider::start(&root, remote, provider::Options { poll: None, keep_local: false, verbose: true }).expect("start again");
+	wait("keep\\k1.bin fetched again at start", &run, || whole(&at("keep\\k1.bin")));
+	run.stop();
+	cleanup(&root);
+}
+
 #[test]
 fn a_read_only_area_refuses_deletes_and_keeps_new_files_local() {
 	let mem = Arc::new(Mutex::new(MemRemote::new("case:ir-1")));

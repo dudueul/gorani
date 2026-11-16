@@ -77,6 +77,17 @@ targets:
           NSExtensionFileProviderSupportsEnumeration: true
           # Finder's badges (39e): named under the extension's bundle id,
           # matched by GoraniFileProviderItem.decorations.
+          # Finder's context menu (FileProviderExtension.swift ›
+          # performAction): the extension's own actions, no UI of their
+          # own. Shown for any selection; what does not apply (a sample
+          # kept) is refused item by item (ProviderCore › keep).
+          NSExtensionFileProviderActions:
+            - NSExtensionFileProviderActionIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER).keep
+              NSExtensionFileProviderActionName: Always keep on this Mac
+              NSExtensionFileProviderActionActivationRule: TRUEPREDICATE
+            - NSExtensionFileProviderActionIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER).free
+              NSExtensionFileProviderActionName: Free up space
+              NSExtensionFileProviderActionActivationRule: TRUEPREDICATE
           NSFileProviderDecorations:
             - Identifier: $(PRODUCT_BUNDLE_IDENTIFIER).sample
               Category: Badge

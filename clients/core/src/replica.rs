@@ -386,6 +386,9 @@ fn check_name(name: &str) -> Result<(), FsError> {
 pub struct MemRemote {
 	pub area: String,
 	pub read_only: Option<String>,
+	/// How many reads it has served: a shell's test asks whether a read
+	/// came from the disk (none) or from here.
+	pub reads: u64,
 	items: BTreeMap<String, Item>,
 	bytes: HashMap<(String, i64), Vec<u8>>,
 	changed: bool,
@@ -528,7 +531,9 @@ impl Remote for MemRemote {
 		}
 		let b = self.bytes.get(&(id.to_string(), version)).ok_or(FsError::NotFound)?;
 		let from = (offset as usize).min(b.len());
-		Ok(b[from..(from + len as usize).min(b.len())].to_vec())
+		let out = b[from..(from + len as usize).min(b.len())].to_vec();
+		self.reads += 1;
+		Ok(out)
 	}
 
 	fn create_file(&mut self, parent: &str, name: &str, path: &Path) -> Result<Item, FsError> {

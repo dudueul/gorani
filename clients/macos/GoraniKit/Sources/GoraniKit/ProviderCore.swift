@@ -15,6 +15,11 @@
 //             the server, and the item answered is theirs — nothing is lost
 //   delete    to the area's Trash
 //   changes   since an anchor (ReplicaModel)
+//   keep      Finder's "Always keep on this Mac": items marked kept (their
+//             content policy says so — the system downloads and holds them)
+//   free      Finder's "Free up space": kept no more — the items, what is in
+//             them, and the kept folders above them as a whole — then evicted
+//             (the extension asks the system, which does the evicting)
 
 import FileProvider
 import Foundation
@@ -24,13 +29,38 @@ public final class ProviderCore {
 	public let bridge: GoraniBridge
 	public let model: ReplicaModel
 	private let temp: URL
+	/// Where the kept marks are saved (nil: kept in memory only — tests).
+	private let keptFile: URL?
 
-	public init(bridge: GoraniBridge, temporaryDirectory: URL = FileManager.default.temporaryDirectory) throws {
+	/// Finder's two choices, as the extension's Info.plist declares them
+	/// (project.yml › NSExtensionFileProviderActions): named under the
+	/// extension's bundle id, as the badges are.
+	public enum Action: Equatable {
+		case keep, free
+
+		public init?(identifier: String) {
+			switch identifier {
+			case GoraniFileProviderItem.decorationPrefix + ".keep": self = .keep
+			case GoraniFileProviderItem.decorationPrefix + ".free": self = .free
+			default: return nil
+			}
+		}
+	}
+
+	/// `keptFile`: the kept marks, saved there (the extension: in the app
+	/// group's container — this Mac's, never the server's).
+	public init(bridge: GoraniBridge, temporaryDirectory: URL = FileManager.default.temporaryDirectory, keptFile: URL? = nil) throws {
 		self.bridge = bridge
-		model = ReplicaModel(bridge: bridge)
+		self.keptFile = keptFile
+		model = ReplicaModel(bridge: bridge, kept: Self.loadKept(keptFile))
 		temp = temporaryDirectory.appendingPathComponent("gorani-fetch-\(UUID().uuidString)", isDirectory: true)
 		try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
 		try model.refresh(force: true)
+	}
+
+	/// An item as File Provider sees it, its kept mark with it.
+	private func fp(_ i: GoraniItem) -> GoraniFileProviderItem {
+		GoraniFileProviderItem(i, readOnly: readOnly, kept: model.isKept(i.id))
 	}
 
 	public var readOnly: Bool { model.readOnly != nil }
@@ -50,7 +80,7 @@ public final class ProviderCore {
 
 	public func providerItem(_ id: String) throws -> NSFileProviderItem {
 		if id.isEmpty { return GoraniRootItem(readOnly: readOnly) }
-		return GoraniFileProviderItem(try known(id), readOnly: readOnly)
+		return fp(try known(id))
 	}
 
 	public func fetch(_ id: String) throws -> (URL, NSFileProviderItem) {
@@ -64,9 +94,9 @@ public final class ProviderCore {
 			try model.refresh(force: true)
 			let now = try known(id)
 			try bridge.download(id: id, version: now.version, to: url)
-			return (url, GoraniFileProviderItem(now, readOnly: readOnly))
+			return (url, fp(now))
 		}
-		return (url, GoraniFileProviderItem(i, readOnly: readOnly))
+		return (url, fp(i))
 	}
 
 	private func writable() throws {
@@ -91,7 +121,7 @@ public final class ProviderCore {
 			made = try bridge.create(parent: parent, name: template.filename, from: source!)
 		}
 		try model.refresh(force: true)
-		return GoraniFileProviderItem(model.item(made.id) ?? made, readOnly: readOnly)
+		return fp(model.item(made.id) ?? made)
 	}
 
 	/// `base`: the content version the system's change follows (nil: the current one).
@@ -129,7 +159,7 @@ public final class ProviderCore {
 		} else {
 			list = model.children(of: GoraniFileProviderItem.id(container))
 		}
-		return list.map { GoraniFileProviderItem($0, readOnly: readOnly) }
+		return list.map { fp($0) }
 	}
 
 	public var anchor: Data { ReplicaModel.anchorData(model.generation) }
@@ -137,7 +167,92 @@ public final class ProviderCore {
 	/// Changes since `anchor` (nil: expired).
 	public func changes(since anchor: Data) -> (updated: [NSFileProviderItem], deleted: [NSFileProviderItemIdentifier])? {
 		guard let g = ReplicaModel.anchorValue(anchor), let c = model.changes(since: g) else { return nil }
-		return (c.updated.map { GoraniFileProviderItem($0, readOnly: readOnly) }, c.deleted.map { GoraniFileProviderItem.identifier($0) })
+		return (c.updated.map { fp($0) }, c.deleted.map { GoraniFileProviderItem.identifier($0) })
+	}
+
+	// ── Finder's "Always keep on this Mac" and "Free up space" ─────────
+
+	/// What "Always keep on this Mac" asks: these items marked kept — a
+	/// sample never (its bytes are never on this Mac raw). The top (the
+	/// root container) is everything in it. Returns the files to ask the
+	/// system to download now (it would anyway: their policy says so).
+	@discardableResult
+	public func keep(_ ids: [String]) -> [String] {
+		var marks = model.kept
+		var files: [String] = []
+		for id in ids.flatMap({ $0.isEmpty ? model.children(of: "").map(\.id) : [$0] }) {
+			guard let i = model.item(id), !i.sample else { continue }
+			marks.insert(id)
+			if !i.isFolder { files.append(id) }
+		}
+		save(marks)
+		return files
+	}
+
+	/// What "Free up space" asks: these items kept no more — nor what is in
+	/// them, nor, as a whole, the kept folders above them (or the system
+	/// would keep them downloaded through the folder: a kept folder's
+	/// items inherit its policy). What else is in those folders stays kept,
+	/// each marked in its own right now. Returns what to evict: the items
+	/// asked about (the system evicts a folder with what is in it).
+	@discardableResult
+	public func free(_ ids: [String]) -> [String] {
+		var marks = model.kept
+		for id in ids {
+			if id.isEmpty {
+				marks.removeAll()
+				continue
+			}
+			for gone in [id] + descendants(of: id) { marks.remove(gone) }
+			// The folders above, top first: from the highest kept one down,
+			// each unmarked and its other items marked instead.
+			let above = ancestors(of: id)
+			guard let top = above.firstIndex(where: { marks.contains($0) }) else { continue }
+			for (n, folder) in above.enumerated() where n >= top {
+				marks.remove(folder)
+				let onTheWay = n + 1 < above.count ? above[n + 1] : id
+				for c in model.children(of: folder) where c.id != onTheWay && !c.sample {
+					marks.insert(c.id)
+				}
+			}
+		}
+		save(marks)
+		return ids
+	}
+
+	/// The folders above an item, the top's own first (not the root).
+	private func ancestors(of id: String) -> [String] {
+		var out: [String] = []
+		var at = model.item(id)?.parent ?? ""
+		while !at.isEmpty, !out.contains(at), let i = model.item(at) {
+			out.insert(at, at: 0)
+			at = i.parent
+		}
+		return out
+	}
+
+	/// Everything in a folder, however deep.
+	private func descendants(of id: String) -> [String] {
+		model.children(of: id).flatMap { [$0.id] + ($0.isFolder ? descendants(of: $0.id) : []) }
+	}
+
+	/// New marks: into the model (a new generation, when they changed) and
+	/// onto this Mac's disk — only those of items still there.
+	private func save(_ marks: Set<String>) {
+		let marks = marks.filter { model.item($0) != nil }
+		guard model.setKept(marks) else { return }
+		guard let keptFile else { return }
+		do {
+			let data = try JSONSerialization.data(withJSONObject: marks.sorted())
+			try data.write(to: keptFile, options: .atomic)
+		} catch {
+			NSLog("Gorani: the kept marks were not saved: %@", String(describing: error))
+		}
+	}
+
+	private static func loadKept(_ url: URL?) -> Set<String> {
+		guard let url, let data = try? Data(contentsOf: url), let ids = try? JSONSerialization.jsonObject(with: data) as? [String] else { return [] }
+		return Set(ids)
 	}
 
 	/// The core's refusal as the error File Provider understands.

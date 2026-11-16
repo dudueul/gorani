@@ -18,19 +18,25 @@
 //!                           watcher, sent once the writer let go, then made placeholders
 //!                           in sync. A save the server refuses as stale becomes a
 //!                           conflict copy beside the other version
+//! pins                      Explorer's "Always keep on this device" and "Free up space"
+//!                           are only an attribute (cf.rs › Pin), seen by the watcher:
+//!                           a kept file is fetched whole, at once, and again after each
+//!                           new version; a freed one has its bytes dropped once it is
+//!                           sent (`pins`)
 //! stop                      what was hydrated is dehydrated — plaintext leaves the
-//!                           disk with the shell (unless --keep-local)
+//!                           disk with the shell (unless --keep-local); a kept file's
+//!                           too, still marked kept, and fetched again at the next start
 //! ```
 //!
 //! Locks: the remote and the state are each held only for a call, never
 //! across a file-system operation — our own deletes and renames come back
 //! as callbacks on the platform's threads, and must not wait for us.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -39,7 +45,7 @@ use gorani_client_core::replica::{Item, Remote, Saved};
 use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Storage::CloudFilters::{CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS, CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE, CF_CALLBACK_DELETE_FLAG_IS_UNDELETE};
 
-use crate::cf;
+use crate::cf::{self, Pin};
 use crate::names::{self, identity, key, layout, local_name, parse_identity};
 
 /// How much a FETCH_DATA answers at once (a multiple of 4 KiB, as the
@@ -47,6 +53,12 @@ use crate::names::{self, identity, key, layout, local_name, parse_identity};
 const CHUNK: u64 = 4 * 1024 * 1024;
 /// A local change is looked at once nothing has touched it for this long.
 const SETTLE: Duration = Duration::from_millis(1500);
+/// A kept file is fetched this much at a time (a multiple of CHUNK): stop
+/// waits for at most one such range, not for a 255 GiB image.
+const KEEP_RANGE: u64 = 16 * CHUNK;
+/// A kept file whose fetch failed (the server out of reach, a refusal) is
+/// tried again after this long.
+const KEEP_RETRY: Duration = Duration::from_secs(30);
 
 pub struct Options {
 	/// Ask the server for changes this often; None: only when told (tests).
@@ -78,6 +90,14 @@ type Stamp = (u64, SystemTime);
 fn stamp(p: &Path) -> Option<Stamp> {
 	let m = std::fs::metadata(p).ok()?;
 	Some((m.len(), m.modified().ok()?))
+}
+
+/// The files "Always keep on this device" wants fetched (the keeper
+/// thread's queue), and the failed ones' next try.
+#[derive(Default)]
+struct Keeps {
+	queue: BTreeSet<PathBuf>,
+	retry: BTreeMap<PathBuf, Instant>,
 }
 
 #[derive(Default)]
@@ -152,6 +172,8 @@ pub struct Provider {
 	warned: Mutex<HashSet<String>>,
 	/// The shell registered the folder (shell.rs): custom states are shown.
 	explorer: bool,
+	keeps: Mutex<Keeps>,
+	keeps_wake: Condvar,
 }
 
 /// A path as callbacks name it: without `\\?\` and the drive.
@@ -303,6 +325,11 @@ impl Provider {
 					self.show_sample(&full);
 				}
 				self.state.lock().expect("lock").insert(Known { id: i.id.clone(), rel: rel.to_path_buf(), kind: i.kind, version: i.version, size: i.size, modified: Some(i.modified), sample: i.sample, stamp: stamp(&full) });
+				// Into a folder kept on this device: kept too, as Explorer
+				// shows the folder's new files (and fetched, if a file).
+				if !i.sample && self.pinned(full.parent().unwrap_or(&self.root)) && cf::set_pin(&full, Pin::Pinned).is_ok() && i.kind == Kind::File {
+					self.keep_later(rel.to_path_buf());
+				}
 			}
 			Some(Err(e)) => self.warn_once(&format!("place:{}", i.id), &format!("could not place {}: {e}", rel.display())),
 			None => {}
@@ -367,10 +394,16 @@ impl Provider {
 	fn refresh_local(&self, k: &Known, i: &Item) {
 		let full = self.root.join(&k.rel);
 		match cf::info(&full) {
-			Some(info) if info.in_sync => match cf::update(&full, &identity(&i.id, i.version), Some((false, i.size, i.modified, self.read_only_item(i))), true) {
+			// (A kept file's pin is lifted for the drop — the platform refuses
+			// to dehydrate a pinned placeholder, and the old bytes must go —
+			// then it is fetched again, as the new version.)
+			Some(info) if info.in_sync => match cf::pin_lifted(&full, || cf::update(&full, &identity(&i.id, i.version), Some((false, i.size, i.modified, self.read_only_item(i))), true)) {
 				Ok(()) => {
 					self.log(&format!("{} is version {} now", k.rel.display(), i.version));
 					self.state.lock().expect("lock").insert(Known { version: i.version, size: i.size, modified: Some(i.modified), sample: i.sample, stamp: stamp(&full), ..k.clone() });
+					if info.pin == Pin::Pinned && !i.sample {
+						self.keep_later(k.rel.clone());
+					}
 				}
 				// In use: the next round tries again.
 				Err(e) => self.log(&format!("{} is busy ({e}); later", k.rel.display())),
@@ -397,6 +430,11 @@ impl Provider {
 		let full = self.root.join(&k.rel);
 		if i.sample && !k.sample {
 			self.show_sample(&full);
+			// (Kept no more: a sample's bytes never stay on this disk raw, and
+			// the drop below would be refused while it is pinned.)
+			if cf::info(&full).is_some_and(|f| f.pin == Pin::Pinned) {
+				let _ = cf::set_pin(&full, Pin::Unspecified);
+			}
 		}
 		if cf::update(&full, &identity(&i.id, k.version), Some((k.kind == Kind::Dir, k.size, i.modified, self.read_only_item(i))), i.sample && !k.sample).is_ok() {
 			self.state.lock().expect("lock").insert(Known { modified: Some(i.modified), sample: i.sample, stamp: stamp(&full), ..k.clone() });
@@ -422,7 +460,9 @@ impl Provider {
 				self.scan(&self.root.clone(), true);
 				continue;
 			}
-			match self.local(&rel) {
+			// (What the member did first — a change is sent before a "Free
+			// up space" may drop its bytes — then what the pin state asks.)
+			match self.local(&rel).and_then(|done| if done { self.pins(&rel) } else { Ok(false) }) {
 				Ok(true) => {}
 				Ok(false) => self.note(rel),
 				Err(e) => {
@@ -541,12 +581,16 @@ impl Provider {
 			let full = e.path();
 			let rel = full.strip_prefix(&self.root).map(Path::to_path_buf).unwrap_or_default();
 			let Ok(meta) = e.metadata() else { continue };
-			match cf::info(&full).and_then(|i| parse_identity(&i.identity).map(|(id, v)| (i.in_sync, id, v))) {
+			let info = cf::info(&full);
+			match info.as_ref().and_then(|i| parse_identity(&i.identity).map(|(id, v)| (i.in_sync, id, v))) {
 				Some((in_sync, id, version)) => {
 					let kind = if meta.is_dir() { Kind::Dir } else { Kind::File };
 					let st = if in_sync && !meta.is_dir() { stamp(&full) } else { None };
 					self.state.lock().expect("lock").insert(Known { id, rel: rel.clone(), kind, version, size: if meta.is_dir() { 0 } else { meta.len() }, modified: None, sample: false, stamp: st });
-					if !in_sync || queue_all {
+					// (A kept file the last stop dropped is fetched again now;
+					// a "Free up space" asked while no shell ran is done now.)
+					let pinned = matches!(info.as_ref().map(|i| i.pin), Some(Pin::Pinned | Pin::Unpinned));
+					if !in_sync || queue_all || pinned {
 						self.note(rel.clone());
 					}
 				}
@@ -558,17 +602,217 @@ impl Provider {
 		}
 	}
 
-	/// Drop the local bytes of everything sent (the shell is stopping).
+	/// Drop the local bytes of everything sent (the shell is stopping) —
+	/// a kept file's too: no plaintext stays on this disk while no shell
+	/// runs (unless --keep-local). Its pin stays, and the next start
+	/// fetches it again (`scan`).
 	fn dehydrate_all(&self) {
 		let files: Vec<PathBuf> = self.state.lock().expect("lock").known.values().filter(|k| k.kind == Kind::File).map(|k| self.root.join(&k.rel)).collect();
 		for f in files {
 			if cf::info(&f).is_some_and(|i| i.in_sync) {
-				if let Err(e) = cf::dehydrate(&f) {
+				if let Err(e) = cf::pin_lifted(&f, || cf::dehydrate(&f)) {
 					self.log(&format!("{} kept on disk ({e})", f.display()));
 				}
 			}
 		}
 	}
+
+	// ── Explorer's "Always keep on this device" and "Free up space" ────
+
+	/// What a placeholder's pin state asks, done: Ok(false) not yet (a
+	/// change still to send, a file held open). Explorer only sets the
+	/// attribute (cf.rs › Pin); the fetching and the dropping are ours.
+	///
+	///   kept (PINNED)       fetched whole, at once (the keeper thread), and
+	///                       again after each new version; a folder: every
+	///                       placeholder in it kept too, and what arrives later
+	///   freed (UNPINNED)    its bytes dropped once it is in sync — then the
+	///                       request is done: back to neither, so a later read
+	///                       fetches it as any read does, and is not dropped
+	///                       again under the reader; a folder: everything in it
+	fn pins(&self, rel: &Path) -> Result<bool, String> {
+		let full = self.root.join(rel);
+		let Some(info) = cf::info(&full) else { return Ok(true) };
+		let dir = full.is_dir();
+		match info.pin {
+			Pin::Pinned if dir => {
+				for (sub, sub_info) in placeholders_under(&full) {
+					if matches!(sub_info.pin, Pin::Unspecified | Pin::Other) && !self.is_sample(&sub) {
+						let _ = cf::set_pin(&sub, Pin::Pinned);
+					}
+					// (A sample in the folder is left alone — unless it was
+					// itself marked kept, which `keep` undoes, and says.)
+					if !sub.is_dir() && (sub_info.pin == Pin::Pinned || !self.is_sample(&sub)) {
+						self.keep(&sub, &sub_info);
+					}
+				}
+				Ok(true)
+			}
+			Pin::Pinned => {
+				self.keep(&full, &info);
+				Ok(true)
+			}
+			Pin::Unpinned if dir => {
+				let mut done = true;
+				for (sub, sub_info) in placeholders_under(&full) {
+					done &= if sub.is_dir() { cf::set_pin(&sub, Pin::Unspecified).is_ok() } else { self.free(&sub, &sub_info)? };
+				}
+				if done {
+					cf::set_pin(&full, Pin::Unspecified).map_err(|e| e.to_string())?;
+					self.unkeep_above(&full);
+					self.log(&format!("freed {}", rel.display()));
+				}
+				Ok(done)
+			}
+			Pin::Unpinned => self.free(&full, &info),
+			Pin::Unspecified | Pin::Other => Ok(true),
+		}
+	}
+
+	/// A kept file: fetched, if any of it is not on disk yet.
+	fn keep(&self, full: &Path, info: &cf::Info) {
+		let rel = full.strip_prefix(&self.root).map(Path::to_path_buf).unwrap_or_default();
+		if self.is_sample(full) {
+			// Never kept: a sample's bytes are never on this disk raw (and
+			// the read would be refused anyway). Said, and undone, so
+			// Explorer does not show it as kept.
+			let _ = cf::set_pin(full, Pin::Unspecified);
+			self.warn_once(&format!("keep-sample:{}", key(&rel)), &format!("{} is a malware sample — never kept on this device", rel.display()));
+			return;
+		}
+		let size = std::fs::metadata(full).map(|m| m.len()).unwrap_or(0);
+		if info.on_disk < size {
+			self.keep_later(rel);
+		}
+	}
+
+	/// A freed file: its bytes dropped (Ok(false) while it holds a change
+	/// not sent yet, or something holds it open), then back to neither.
+	fn free(&self, full: &Path, info: &cf::Info) -> Result<bool, String> {
+		if !info.in_sync {
+			// (The member's unsent change: sent first, freed after.)
+			return Ok(false);
+		}
+		// (Whatever the count of bytes on disk says: a small file's bytes can
+		// live in its MFT record, where that count may say none. Dropping
+		// what is gone already costs a call; the request is cleared below,
+		// so it is not asked again.)
+		let dropped = if info.pin == Pin::Pinned { cf::pin_lifted(full, || cf::dehydrate(full)) } else { cf::dehydrate(full) };
+		if let Err(e) = dropped {
+			self.log(&format!("{} is busy ({e}); freed later", full.display()));
+			return Ok(false);
+		}
+		cf::set_pin(full, Pin::Unspecified).map_err(|e| e.to_string())?;
+		self.unkeep_above(full);
+		self.log(&format!("freed {}", full.strip_prefix(&self.root).unwrap_or(full).display()));
+		Ok(true)
+	}
+
+	/// Freed inside a folder kept as a whole: that folder (and any kept one
+	/// above it) is kept as a whole no more — or the next look at it would
+	/// keep the freed file again. What else is in them stays kept: a kept
+	/// folder's placeholders carry their own mark (`pins`).
+	fn unkeep_above(&self, full: &Path) {
+		let mut at = full.parent();
+		while let Some(dir) = at {
+			if !dir.starts_with(&self.root) {
+				break;
+			}
+			if self.pinned(dir) {
+				let _ = cf::set_pin(dir, Pin::Unspecified);
+			}
+			if dir == self.root {
+				break;
+			}
+			at = dir.parent();
+		}
+	}
+
+	/// Whether a folder (the root included) is kept on this device.
+	fn pinned(&self, dir: &Path) -> bool {
+		cf::info(dir).is_some_and(|i| i.pin == Pin::Pinned)
+	}
+
+	fn is_sample(&self, full: &Path) -> bool {
+		let rel = full.strip_prefix(&self.root).unwrap_or(full);
+		let st = self.state.lock().expect("lock");
+		st.id_at(rel).and_then(|id| st.known.get(&id)).is_some_and(|k| k.sample)
+	}
+
+	/// Queue a kept file's fetch (the keeper thread's).
+	fn keep_later(&self, rel: PathBuf) {
+		self.keeps.lock().expect("lock").queue.insert(rel);
+		self.keeps_wake.notify_one();
+	}
+
+	/// The keeper thread: kept files fetched one at a time, a range at a
+	/// time, off the poller's thread (a large file takes as long as it takes,
+	/// and the folder's other work goes on). Ends with the shell.
+	fn keeper(&self) {
+		loop {
+			let next = {
+				let mut k = self.keeps.lock().expect("lock");
+				loop {
+					if self.stop.load(Ordering::SeqCst) {
+						return;
+					}
+					let now = Instant::now();
+					let due: Vec<PathBuf> = k.retry.iter().filter(|(_, at)| **at <= now).map(|(r, _)| r.clone()).collect();
+					for r in due {
+						k.retry.remove(&r);
+						k.queue.insert(r);
+					}
+					if let Some(r) = k.queue.pop_first() {
+						break r;
+					}
+					k = self.keeps_wake.wait_timeout(k, Duration::from_millis(500)).expect("lock").0;
+				}
+			};
+			if let Err(e) = self.fetch_kept(&next) {
+				self.warn_once(&format!("keep:{}", key(&next)), &format!("{}: not on this device yet ({e}) — tried again every {} s", next.display(), KEEP_RETRY.as_secs()));
+				self.keeps.lock().expect("lock").retry.insert(next, Instant::now() + KEEP_RETRY);
+			}
+		}
+	}
+
+	/// A kept file's bytes, all of them, fetched now — unless it is kept
+	/// no more, or the shell is stopping.
+	fn fetch_kept(&self, rel: &Path) -> Result<(), String> {
+		let full = self.root.join(rel);
+		let Some(info) = cf::info(&full) else { return Ok(()) };
+		if info.pin != Pin::Pinned || self.is_sample(&full) {
+			return Ok(());
+		}
+		let size = std::fs::metadata(&full).map_err(|e| e.to_string())?.len();
+		let mut at = 0;
+		while at < size {
+			if self.stop.load(Ordering::SeqCst) {
+				return Ok(());
+			}
+			let len = KEEP_RANGE.min(size - at);
+			cf::hydrate(&full, at, len).map_err(|e| e.to_string())?;
+			at += len;
+		}
+		self.log(&format!("kept {} on this device", rel.display()));
+		Ok(())
+	}
+}
+
+/// Every placeholder under `dir` (deepest last), with its state.
+fn placeholders_under(dir: &Path) -> Vec<(PathBuf, cf::Info)> {
+	let mut out = Vec::new();
+	let Ok(entries) = std::fs::read_dir(dir) else { return out };
+	for e in entries.flatten() {
+		let p = e.path();
+		if let Some(i) = cf::info(&p) {
+			let is_dir = p.is_dir();
+			out.push((p.clone(), i));
+			if is_dir {
+				out.extend(placeholders_under(&p));
+			}
+		}
+	}
+	out
 }
 
 /// Is a writer still holding it? (Opened with no sharing: fails while any
@@ -723,6 +967,7 @@ pub struct Running {
 	connection: Option<cf::Connection>,
 	watcher: Option<crate::watch::Watcher>,
 	poller: Option<JoinHandle<()>>,
+	keeper: Option<JoinHandle<()>>,
 	keep_local: bool,
 }
 
@@ -763,12 +1008,16 @@ pub fn start(root: &Path, remote: Arc<Mutex<dyn Remote + Send>>, opts: Options) 
 		verbose: opts.verbose,
 		warned: Mutex::new(HashSet::new()),
 		explorer,
+		keeps: Mutex::new(Keeps::default()),
+		keeps_wake: Condvar::new(),
 	});
 	provider.scan(&root, false);
 	let connection = cf::connect(&root, cf::Callbacks { fetch_data: on_fetch_data, notify_delete: on_delete, notify_rename: on_rename }, Arc::as_ptr(&provider) as *const c_void).map_err(|e| format!("could not connect the sync root: {e}"))?;
 	provider.sync_remote(true)?;
 	let p = provider.clone();
 	let watcher = crate::watch::Watcher::start(&root, move |rel| p.note(rel)).map_err(|e| format!("could not watch {}: {e}", root.display()))?;
+	let p = provider.clone();
+	let keeper = std::thread::spawn(move || p.keeper());
 	let poller = opts.poll.map(|every| {
 		let p = provider.clone();
 		std::thread::spawn(move || {
@@ -785,7 +1034,7 @@ pub fn start(root: &Path, remote: Arc<Mutex<dyn Remote + Send>>, opts: Options) 
 			}
 		})
 	});
-	Ok(Running { provider, connection: Some(connection), watcher: Some(watcher), poller, keep_local: opts.keep_local })
+	Ok(Running { provider, connection: Some(connection), watcher: Some(watcher), poller, keeper: Some(keeper), keep_local: opts.keep_local })
 }
 
 impl Running {
@@ -812,6 +1061,12 @@ impl Running {
 		if let Some(w) = self.watcher.take() {
 			w.stop();
 		}
+		// (The keeper ends after the range it is fetching: what it fetched
+		// is dropped below with the rest.)
+		self.provider.keeps_wake.notify_all();
+		if let Some(t) = self.keeper.take() {
+			let _ = t.join();
+		}
 		self.provider.sync_local(true);
 		if !self.keep_local {
 			self.provider.dehydrate_all();
@@ -824,6 +1079,9 @@ impl Running {
 
 impl Drop for Running {
 	fn drop(&mut self) {
+		// (Not stopped: the keeper ends too, not left holding the provider.)
+		self.provider.stop.store(true, Ordering::SeqCst);
+		self.provider.keeps_wake.notify_all();
 		if let Some(c) = self.connection.take() {
 			let _ = cf::disconnect(c);
 		}

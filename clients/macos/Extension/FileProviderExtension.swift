@@ -8,6 +8,11 @@
 // It opens the vault from the profile in the app group's container
 // (`gorani-sync setup --profile "<container>/gorani-sync.json"`, or the
 // host app), unlocked with this Mac's enrolled copy.
+//
+// Finder's context menu has two actions of ours (NSFileProviderCustomAction,
+// declared in Info.plist — project.yml): "Always keep on this Mac" and "Free
+// up space". The marks are ProviderCore's (saved beside the profile); the
+// downloading and the evicting are the system's, asked here.
 
 import FileProvider
 import Foundation
@@ -31,7 +36,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 				let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
 			else { throw NSFileProviderError(.notAuthenticated) }
 			let bridge = try GoraniBridge(profile: dir.appendingPathComponent("gorani-sync.json").path)
-			core = try ProviderCore(bridge: bridge)
+			// (The kept marks are this Mac's: one file per domain, beside the
+			// profile — the domain's id as a plain file name.)
+			let name = String(domain.identifier.rawValue.map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "_" })
+			core = try ProviderCore(bridge: bridge, keptFile: dir.appendingPathComponent("gorani-kept-\(name).json"))
 			startPolling()
 		} catch {
 			NSLog("Gorani: the vault did not open: %@", String(describing: error))
@@ -99,5 +107,63 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 	func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
 		guard let core else { throw unavailable }
 		return GoraniEnumerator(core: core, container: containerItemIdentifier, queue: queue)
+	}
+}
+
+// ── Finder's "Always keep on this Mac" and "Free up space" ─────────────
+
+extension FileProviderExtension: NSFileProviderCustomAction {
+	func performAction(identifier actionIdentifier: NSFileProviderExtensionActionIdentifier, onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier], completionHandler: @escaping (Error?) -> Void) -> Progress {
+		let progress = Progress(totalUnitCount: 1)
+		queue.async {
+			guard let core = self.core else { return completionHandler(self.unavailable) }
+			guard let action = ProviderCore.Action(identifier: actionIdentifier.rawValue) else {
+				return completionHandler(NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+			}
+			guard let manager = NSFileProviderManager(for: self.domain) else { return completionHandler(NSFileProviderError(.providerNotFound)) }
+			let ids = itemIdentifiers.map { GoraniFileProviderItem.id($0) }
+			switch action {
+			case .keep:
+				// The marks first; the signal makes the system read the kept
+				// items' new policy — and download them, as it then says to.
+				let files = core.keep(ids)
+				manager.signalEnumerator(for: .workingSet) { _ in
+					for id in files {
+						manager.requestDownloadForItem(withIdentifier: GoraniFileProviderItem.identifier(id), requestedRange: nil) { _ in }
+					}
+					progress.completedUnitCount = 1
+					completionHandler(nil)
+				}
+			case .free:
+				// Kept no more first (the system refuses to evict a kept
+				// item), then evicted — retried while the system has yet to
+				// read the new policy, or an edit is still on its way up.
+				let toEvict = core.free(ids)
+				manager.signalEnumerator(for: .workingSet) { _ in
+					self.evict(toEvict, with: manager, triesLeft: 5) { error in
+						progress.completedUnitCount = 1
+						completionHandler(error)
+					}
+				}
+			}
+		}
+		return progress
+	}
+
+	/// Evict each item in turn; the first that will not go is the answer.
+	private func evict(_ ids: [String], with manager: NSFileProviderManager, triesLeft: Int, done: @escaping (Error?) -> Void) {
+		guard let id = ids.first else { return done(nil) }
+		manager.evictItem(identifier: GoraniFileProviderItem.identifier(id)) { error in
+			let code = (error as? NSFileProviderError)?.code
+			if error != nil, triesLeft > 1, code == .nonEvictable || code == .unsyncedEdits {
+				self.queue.asyncAfter(deadline: .now() + 2) { self.evict(ids, with: manager, triesLeft: triesLeft - 1, done: done) }
+				return
+			}
+			if let error {
+				NSLog("Gorani: %@ was not freed: %@", id, String(describing: error))
+				return done(error)
+			}
+			self.queue.async { self.evict(Array(ids.dropFirst()), with: manager, triesLeft: 5, done: done) }
+		}
 	}
 }

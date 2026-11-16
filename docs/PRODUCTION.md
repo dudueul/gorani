@@ -41,8 +41,10 @@ settings are in § 3 › The desktop installers.)
    (`scripts/build-*.mjs`), not shell lines, so nothing needs bash, and
    CI's `deploy-build` runs them on Windows whenever they change.
 
-   (The first build also downloads `worker-build`'s own tools — esbuild,
-   wasm-bindgen, wasm-opt — into `~/.cache/worker-build`.) Then:
+   (The first build also installs `worker-build` 0.8 into `~/.cargo/bin`,
+   replacing one of another version, which cannot build this Worker, and
+   downloads its own tools — esbuild, wasm-bindgen, wasm-opt — into
+   `~/.cache/worker-build`.) Then:
 
    ```sh
    npm install && npm --prefix web install

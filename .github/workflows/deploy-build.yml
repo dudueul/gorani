@@ -53,6 +53,9 @@ jobs:
           rustup show active-toolchain || rustup default stable
           rustup target add wasm32-unknown-unknown
           rustc --version && cargo --version && node --version
+      # worker-build is cached with cargo's record of installing it
+      # (.crates.toml, .crates2.json): cargo will not overwrite a binary it
+      # has no record of. (build-worker.mjs uses a 0.8 it finds either way.)
       - uses: actions/cache@v4
         with:
           path: |
@@ -60,6 +63,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ~/.cargo/bin/worker-build.exe
+            ~/.cargo/bin/worker-codegen.exe
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             target
           key: deploy-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: deploy-build-${{ runner.os }}-

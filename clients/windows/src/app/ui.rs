@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
@@ -266,6 +266,33 @@ pub fn tab_add(h: HWND, i: usize, title: &str) {
 	unsafe {
 		SendMessageW(h, TCM_INSERTITEMW, Some(WPARAM(i)), Some(LPARAM(&item as *const _ as isize)));
 	}
+}
+
+/// Make a tab control just as tall as its row of tabs, at (x, y) and `w`
+/// wide in 96-dpi units; the pages are drawn below it, on the window's own
+/// background. (A tab control is a sibling of the pages' controls, made
+/// before them, so it sits ABOVE them: a full-height one covered every
+/// page — blank, and taking the clicks — in 40b's first MSIX.)
+pub fn fit_tab_strip(h: HWND, x: i32, y: i32, w: i32, dpi: u32) {
+	let mut item = RECT::default();
+	// SAFETY: TCM_GETITEMRECT fills the RECT we pass, for item 0.
+	let ok = unsafe { SendMessageW(h, TCM_GETITEMRECT, Some(WPARAM(0)), Some(LPARAM(&mut item as *mut RECT as isize))).0 } != 0;
+	// The row, and two pixels of the pane's edge the chosen tab opens onto.
+	let height = if ok && item.bottom > 0 { item.bottom + scale(2, dpi) } else { scale(28, dpi) };
+	// SAFETY: moving a child window of ours.
+	unsafe {
+		let _ = MoveWindow(h, scale(x, dpi), scale(y, dpi), scale(w, dpi), height, true);
+	}
+}
+
+/// A window's rectangle, in screen coordinates.
+pub fn rect(h: HWND) -> RECT {
+	let mut r = RECT::default();
+	// SAFETY: GetWindowRect fills the RECT we pass.
+	unsafe {
+		let _ = GetWindowRect(h, &mut r);
+	}
+	r
 }
 
 pub fn tab_selected(h: HWND) -> usize {

@@ -852,11 +852,21 @@ the per-user Run key (`"…\gorani.exe" --background`).
   system.
 - **In CI, `gorani --self-test`** makes the real Settings window without
   showing it: every control must exist, every tab arrange, the protection
-  menu fill, the layout survive 144 dpi, and the window go cleanly.
+  menu fill, no page's control lie under the row of tabs, the layout
+  survive 144 dpi, and the window go cleanly.
 - **The package check** runs `gorani --version` through its alias.
 
 What CI cannot do is look at the window, or enrol against a real Access
-deployment. The first run on a real PC is that check.
+deployment. The first run on a real PC is that check, and it found what
+the self-test then learned to look for. The MSIX's first Settings window
+showed every tab empty. The tab control was made first, so it sat above
+the pages' controls, its body covering them: they were neither drawn nor
+clicked. The fix makes the tab control only as tall as its row of tabs,
+with the pages laid out below it, and the self-test now fails if any page
+control lies under that row. The same run showed "This computer & devices"
+as "This computer _devices": a tab's title takes "&" as a shortcut marker,
+so the title is now written "&&". Labels are made with SS_NOPREFIX, so
+text from a server or a profile is shown as given.
 
 ### 40c as built: signing in through the browser
 

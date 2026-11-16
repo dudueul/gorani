@@ -1048,6 +1048,7 @@ try {
 		await software.click();
 		await software.press("ArrowRight");
 		await d.locator('.rrow[data-path="Software\\\\Microsoft"]').waitFor();
+		assert.equal(await page.locator("iframe[data-preview]").getAttribute("title"), "Preview of NTUSER.DAT", "→ opened the key; the viewer did not move to the next file");
 		assert.equal(await d.locator('[data-test="hex-reg-deleted"]').isDisabled(), true, "no deleted keys in this one");
 		await closeDoc();
 	} else console.log(`skip  e2e:preview registry hives — ${hivesUnavailable}`);

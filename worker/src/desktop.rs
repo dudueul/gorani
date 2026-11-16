@@ -31,8 +31,18 @@
 //!   history, or a synced history.
 //! - **Loopback only.** The form posts to `http://127.0.0.1`, which
 //!   browsers treat as a secure context, and only to the port given.
-//! - **The page.** `no-store`, `no-referrer`, no frames, no script.
-//!   `form-action` names that one loopback address.
+//! - **The Origin.** The app takes the hand-off only from a form whose
+//!   Origin is this server, so even a state that leaked (a synced history,
+//!   a shared screen) cannot be used by another site's page. That needs the
+//!   browser to SAY the origin, and on this POST it does only under the
+//!   right referrer policy: from an https page to http://127.0.0.1, the
+//!   default (`strict-origin-when-cross-origin`, a "downgrade") and
+//!   `no-referrer` both make it send `Origin: null` (Fetch, "append a
+//!   request Origin header"). The page used `no-referrer` until the first
+//!   real sign-in showed every hand-off refused. It sends `origin` now: the
+//!   scheme and host only, never the path or its state.
+//! - **The page.** `no-store`, no frames, no script. `form-action` names that
+//!   one loopback address.
 //!
 //! The token handed over is the person's own Access session for this
 //! application. The app holds it in its profile, as cloudflared holds its
@@ -109,7 +119,11 @@ pub async fn sign_in(req: &Request, email: &str, dev_mode: bool) -> Result<Respo
 	headers.set("Content-Type", "text/html; charset=utf-8")?;
 	headers.set("Content-Security-Policy", &csp)?;
 	headers.set("Cache-Control", "no-store")?;
-	headers.set("Referrer-Policy", "no-referrer")?;
+	// "origin": the browser names this server as the form's Origin (and its
+	// Referer is the origin alone: the state in this page's address stays
+	// here). Not no-referrer, nor the default: both send Origin: null to
+	// http://127.0.0.1, and the app refuses a hand-off it cannot place.
+	headers.set("Referrer-Policy", "origin")?;
 	headers.set("X-Content-Type-Options", "nosniff")?;
 	headers.set("X-Frame-Options", "DENY")?;
 	Ok(Response::ok(html)?.with_headers(headers))

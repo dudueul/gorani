@@ -134,6 +134,7 @@ try {
 		assert.match(csp, new RegExp(`form-action http://127\\.0\\.0\\.1:${port}/gorani-sign-in`), csp);
 		assert.match(csp, /frame-ancestors 'none'/);
 		assert.equal(page.headers.get("cache-control"), "no-store");
+		assert.equal(page.headers.get("referrer-policy"), "origin", "so the browser names the server as the form's Origin (no-referrer made it send null: e2e:signin)");
 		const html = await page.text();
 		assert.match(html, /Sign Gorani in on this computer\?/);
 		assert.match(html, /jinu@family\.test/);

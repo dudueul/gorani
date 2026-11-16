@@ -736,7 +736,12 @@ new version: the platform refuses to dehydrate a pinned placeholder
   once the file is in sync, then the state goes back to neither. A later
   read then fetches the file as any read does, and the shell does not drop
   it again under the reader. It dehydrates whatever the on-disk count says
-  (a small file's bytes can live in its MFT record).
+  (a small file's bytes can live in its MFT record). A folder passes its
+  request down: each file in it gets its own, and the folder's is done at
+  once. A file held open keeps its request until it is let go, and the
+  others are not dropped again meanwhile. (Before, the request stayed on
+  the folder until every file had gone, and each retry for the held file
+  dropped the others again, under whoever had reopened one.)
 - **"Always keep" is a standing state.** A keeper thread fetches kept
   files a range (64 MiB) at a time, so stop waits for one range, not for
   a 255 GiB image. A failure is tried again every 30 s. A new version is

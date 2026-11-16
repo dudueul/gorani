@@ -315,10 +315,25 @@ fn explorer_always_keep_and_free_up_space() {
 	assert_eq!(std::fs::read(at("free\\f1.bin")).unwrap(), edited, "the change, from the server");
 	assert!(reads() > before);
 
-	// 6. On a folder: everything in it.
+	// 6. On a folder: everything in it, each file once. One held open is
+	// freed when it is let go; the others are done at once — and one read
+	// again meanwhile is not freed again under its reader (found on review:
+	// each retry for the held file dropped the others again).
 	assert_eq!(std::fs::read(at("free\\f2.bin")).unwrap(), pattern(250_000));
+	assert!(on_disk(&at("free\\f1.bin")) > 0, "read in step 5, so on disk");
+	let held = std::fs::File::open(at("free\\f2.bin")).unwrap();
 	attrib(&["+U"], &at("free"));
-	wait("free\\ freed", &run, || on_disk(&at("free\\f2.bin")) == 0 && pin(&at("free")) == Some(Pin::Unspecified));
+	wait("free\\ freed but for the file held open", &run, || pin(&at("free")) == Some(Pin::Unspecified) && on_disk(&at("free\\f1.bin")) == 0 && pin(&at("free\\f2.bin")) == Some(Pin::Unpinned));
+	assert!(on_disk(&at("free\\f2.bin")) > 0, "held open: not yet");
+	assert_eq!(std::fs::read(at("free\\f1.bin")).unwrap(), edited, "f1 read again meanwhile");
+	for _ in 0..3 {
+		std::thread::sleep(Duration::from_millis(700));
+		run.sync_local();
+	}
+	assert!(on_disk(&at("free\\f1.bin")) > 0, "…and left there while f2 waits: freed once");
+	drop(held);
+	wait("free\\f2.bin freed once let go", &run, || on_disk(&at("free\\f2.bin")) == 0 && pin(&at("free\\f2.bin")) == Some(Pin::Unspecified));
+	assert!(on_disk(&at("free\\f1.bin")) > 0, "f1 still not freed again");
 
 	// 7. "Free up space" on a kept file: kept no more.
 	attrib(&["-P", "+U"], &at("top.bin"));

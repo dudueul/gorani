@@ -652,17 +652,35 @@ impl Provider {
 				self.keep(&full, &info);
 				Ok(true)
 			}
+			// A folder passes the request down: each file in it carries a
+			// "Free up space" of its own, done once (`free`), and the folder's
+			// is done now. (It was kept on the folder until every file had
+			// gone — and while one was held open, each retry dropped the
+			// others again, under whoever had opened one meanwhile.) A file
+			// held open, or with a change still to send, keeps its own until
+			// it can be freed: the next looks at it are its own.
 			Pin::Unpinned if dir => {
-				let mut done = true;
-				for (sub, sub_info) in placeholders_under(&full) {
-					done &= if sub.is_dir() { cf::set_pin(&sub, Pin::Unspecified).is_ok() } else { self.free(&sub, &sub_info)? };
+				for (sub, _) in placeholders_under(&full) {
+					let sub_rel = sub.strip_prefix(&self.root).map(Path::to_path_buf).unwrap_or_default();
+					let wanted = if sub.is_dir() { Pin::Unspecified } else { Pin::Unpinned };
+					if let Err(e) = cf::set_pin(&sub, wanted) {
+						self.warn_once(&format!("free:{}", key(&sub_rel)), &format!("{}: not freed with its folder ({e})", sub_rel.display()));
+						continue;
+					}
+					if wanted == Pin::Unpinned {
+						let done = match cf::info(&sub) {
+							Some(now) => self.free(&sub, &now)?,
+							None => true,
+						};
+						if !done {
+							self.note(sub_rel);
+						}
+					}
 				}
-				if done {
-					cf::set_pin(&full, Pin::Unspecified).map_err(|e| e.to_string())?;
-					self.unkeep_above(&full);
-					self.log(&format!("freed {}", rel.display()));
-				}
-				Ok(done)
+				cf::set_pin(&full, Pin::Unspecified).map_err(|e| e.to_string())?;
+				self.unkeep_above(&full);
+				self.log(&format!("freed {}", rel.display()));
+				Ok(true)
 			}
 			Pin::Unpinned => self.free(&full, &info),
 			Pin::Unspecified | Pin::Other => Ok(true),

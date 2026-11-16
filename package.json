@@ -1,9 +1,11 @@
 {
 	"_copyright": "Copyright 2026- Seongwoo Hong. All rights reserved.",
 	"_note": "The root package only orchestrates: the web app has its own package in web/, the Rust side is a Cargo workspace (see Cargo.toml).",
+	"_postinstall": "Installing the root installs web/ too, from web/'s own lockfile (npm ci: exactly what it records, or an error when web/package.json has moved on without it). Done here, not left to a second command, because a second command gets skipped: bun install, or npm install alone, left web/ empty, and the web build then failed deep inside esbuild (scripts/build-preflight.mjs now says so first).",
 	"name": "gorani",
 	"private": true,
 	"scripts": {
+		"postinstall": "npm --prefix web ci",
 		"build:web": "npm --prefix web run build",
 		"build": "npm run build:web",
 		"dev": "npm run build:web && wrangler dev",

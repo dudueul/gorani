@@ -155,8 +155,14 @@ pub fn judge(r: &Request, state: &str, origin: &str) -> Result<Zeroizing<String>
 	}
 	// The page is the server's: a browser names the page's origin on a
 	// cross-origin form POST. Another site cannot hand this app a token.
-	if r.origin.as_deref().map(|o| o.trim_end_matches('/')) != Some(origin) {
-		return Err("this sign-in did not come from your team's server");
+	// A browser says "null" (or nothing) when the page's referrer policy
+	// tells it to: the server's page before 40c's fix did, and every
+	// hand-off was refused as if it came from somewhere else. An Origin the
+	// app cannot place is still not taken; the message says what to update.
+	match r.origin.as_deref().map(|o| o.trim_end_matches('/')) {
+		Some(o) if o == origin => {}
+		None | Some("null") => return Err("the browser did not say which site this sign-in came from: your team's Gorani server is older than this app and needs its update (its sign-in page withholds it)"),
+		Some(_) => return Err("this sign-in did not come from your team's server"),
 	}
 	if !r.content_type.as_deref().is_some_and(|t| t.starts_with("application/x-www-form-urlencoded")) {
 		return Err("not a sign-in form");
@@ -275,7 +281,8 @@ mod tests {
 		let ok = post(Some("https://gorani.at.day"), &format!("state={state}&token=ey.tok.sig"));
 		assert_eq!(judge(&ok, &state, "https://gorani.at.day").unwrap().as_str(), "ey.tok.sig");
 		assert!(judge(&post(Some("https://evil.example"), &format!("state={state}&token=t")), &state, "https://gorani.at.day").unwrap_err().contains("did not come from"));
-		assert!(judge(&post(None, &format!("state={state}&token=t")), &state, "https://gorani.at.day").is_err(), "no Origin: refused");
+		assert!(judge(&post(None, &format!("state={state}&token=t")), &state, "https://gorani.at.day").unwrap_err().contains("did not say which site"), "no Origin: refused, and why");
+		assert!(judge(&post(Some("null"), &format!("state={state}&token=t")), &state, "https://gorani.at.day").unwrap_err().contains("needs its update"), "Origin: null (a no-referrer page): refused, with what to update");
 		assert!(judge(&post(Some("https://gorani.at.day"), "state=wrong&token=t"), &state, "https://gorani.at.day").unwrap_err().contains("not the one"));
 		assert!(judge(&post(Some("https://gorani.at.day"), &format!("state={state}")), &state, "https://gorani.at.day").is_err());
 		let mut get = ok;

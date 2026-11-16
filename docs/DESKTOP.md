@@ -902,9 +902,29 @@ The browser is usually signed in already, so signing in is one button.
 |---|---|
 | A website opens the page in the person's browser, hoping something listens on the port it names | Nothing is sent without the person's click on the server's own page. |
 | Someone plants their own token in the app (login CSRF) | The app takes only its own state (compared in constant time), only from the server's Origin, only as a POST. |
-| The token in a URL: the history, a synced history, a Referer | It travels in a form body, to loopback. The page is `no-store` and `no-referrer`, with no frames. |
+| The token in a URL: the history, a synced history, a Referer | It travels in a form body, to loopback. The page is `no-store`, with no frames, and its referrer policy is `origin`: a Referer carries the server's origin alone, never the page's address with its state. |
 | The page as a script target | No script. Its CSP is `default-src 'none'`, its style by hash, and `form-action` exactly the one loopback address. Port and state are checked to their shapes. |
 | A listener left open | Loopback only. It takes one sign-in, refuses everything else without stopping, and ends at five minutes or on Cancel. |
+
+**The Origin, in a real browser.** The first real sign-ins all ended in
+the app's "this sign-in did not come from your team's server". The page
+had `Referrer-Policy: no-referrer`. On a form POST, that policy makes
+the browser send `Origin: null` (Fetch, "append a request Origin
+header"). So does the browser's default (`strict-origin-when-cross-origin`)
+here, since an https page posting to `http://127.0.0.1` counts as a
+downgrade. The app, rightly, takes no hand-off it cannot place. The tests
+had played the browser with `fetch`, setting the Origin themselves, so
+they passed. The page now sends `Referrer-Policy: origin`, under which the
+browser names the server and nothing more. The app says plainly when an
+older server withholds it. `e2e:signin` checks all three policies in
+Chromium against the Worker's own page served at an https origin.
+
+The state alone would stop a web page from planting a token: it is 256
+bits, made per click, and never leaves the app and the person's tab. The
+Origin check is kept on top of it. If a state ever leaked (a synced
+history, a shared screen), another site's page still could not hand the
+app a token, because no browser will name the server as that page's
+origin.
 
 **Running out.** The token lasts as long as the Access session (a day,
 by default). A shell running for days reads the profile again when its

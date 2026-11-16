@@ -644,6 +644,45 @@ Accepted:
   dependency. Where it disagreed (string arrays, times through floats),
   the raw bytes decided.
 
+### Registry hives (commit 42k)
+
+The threat: a hive is a database of cells that point at one another by
+offset, and the person who wrote it may want a reader to loop, to read
+past the end, or to show something other than what Windows runs. Its
+names and values are strings the writer chose.
+
+The controls:
+
+- **Our own parser, bounds-checked** (the 42g `Reader`):
+  - every offset must land on a cell in use inside the bins: a free cell,
+    a cell past the bins' end or one shorter than its record is refused,
+    and the key or value that pointed there is skipped and said;
+  - lists are capped (100,000 subkeys, 20,000 values a key); an index of
+    lists (`ri`) is followed 8 deep, and a list it has already followed
+    is not followed again;
+  - a value keeps at most 1 MB of its data, big data included;
+  - nothing is read until it is asked for, so a hive costs what is looked
+    at, not what it claims to hold.
+- **Fuzzed:** 1,150 mutated copies of the real hives (and 60 in the unit
+  test, every run) read without an exception, the slowest no slower than a
+  clean read.
+- **Text is text:** names and data reach the page through textContent,
+  with controls and direction marks made visible (the 42j rule), in the
+  tree, the values and the facts.
+- **A string is read as Windows reads it, and what follows is said:** a
+  REG_SZ ends at its first NUL, as Windows ends it; the tree shows how many
+  characters follow, since data hidden after a NUL is a known trick.
+
+Accepted:
+
+- **python-registry and regipy (MIT) as oracles only:** they checked our
+  output on three real hives (150,056 keys, every byte of their values;
+  the ShimCache and UserAssist). Neither is a dependency, and no code was
+  taken from either.
+- **The sample hives are fetched, not kept:** regipy's test data, from one
+  pinned commit, checked by SHA-256 twice (download and hive). A changed
+  file fails the test. A missing one skips it, and the test says so.
+
 ## Still open
 
 None of the review's findings. What remains is the product roadmap in

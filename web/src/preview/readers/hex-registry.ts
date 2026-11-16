@@ -6,8 +6,8 @@
  * frame, with the keys that matter marked.
  *
  *   the tree      keys, opened as you go (a hive of 200,000 keys is read
- *                 only where you look); a key a finding names is marked ⚠,
- *                 and each key on the way to one •
+ *                 only where you look); a key a warning names is marked ⚠,
+ *                 one only noted ○, and each key on the way to either •
  *   the values    name, type and data of the chosen key, its last write;
  *                 a value's whole data (text and hex), its bytes in Hex
  *   Go to key     a path, with or without HKLM\SOFTWARE in front of it
@@ -22,7 +22,7 @@
 import { el } from "../host.ts";
 import { addCss } from "../kit.ts";
 import { BIN, type Hive, type RegKey, type RegValue } from "../forensic/regf.ts";
-import { MOUNT, type HiveFindings } from "../facts/regf.ts";
+import { MOUNT, type HiveFindings, type Place } from "../facts/regf.ts";
 import { shown } from "../facts/evtx.ts";
 import registryCss from "./hex-registry.css?inline";
 
@@ -35,7 +35,7 @@ export class RegistryPane {
 	private readonly found: HiveFindings;
 	private readonly toHex: (offset: number, len: number) => void;
 	/** Lower-cased paths: of a place, and of every key on the way to one. */
-	private readonly marked = new Map<string, string>();
+	private readonly marked = new Map<string, Place[]>();
 	private readonly onWay = new Set<string>();
 	private readonly tree = el("div", { class: "rtree", role: "tree", "aria-label": "Keys", "data-test": "hex-reg-tree" });
 	private readonly right = el("div", { class: "rright" });
@@ -51,7 +51,10 @@ export class RegistryPane {
 		this.toHex = toHex;
 		for (const p of found.places) {
 			const lc = p.path.toLowerCase();
-			if (!this.marked.has(lc)) this.marked.set(lc, p.why);
+			// (Every finding a key has: one Run key can hold a disguise among honest entries.)
+			const all = this.marked.get(lc);
+			if (all) all.push(p);
+			else this.marked.set(lc, [p]);
 			const parts = lc.split("\\");
 			for (let i = 1; i < parts.length; i++) this.onWay.add(parts.slice(0, i).join("\\"));
 		}
@@ -99,12 +102,13 @@ export class RegistryPane {
 			const p = path ? `${path}\\${k.name}` : k.name;
 			const lc = p.toLowerCase();
 			const why = this.marked.get(lc);
+			const warned = why?.some((w) => w.level === "warn") ?? false;
 			const toggle = el("span", { class: "rtoggle", "aria-hidden": "true" }, k.subkeyCount ? "▸" : "");
 			const row = el(
 				"div",
-				{ class: `rrow${why ? " warn" : ""}`, role: "treeitem", tabindex: "-1", ...(k.subkeyCount ? { "aria-expanded": "false" } : {}), "data-path": p, ...(why ? { title: shown(why) } : {}) },
+				{ class: `rrow${warned ? " warn" : ""}`, role: "treeitem", tabindex: "-1", ...(k.subkeyCount ? { "aria-expanded": "false" } : {}), "data-path": p, ...(why ? { title: shown(why.map((w) => w.why).join("\n")) } : {}) },
 				toggle,
-				el("span", { class: "rmark" }, why ? "⚠" : this.onWay.has(lc) ? "•" : ""),
+				el("span", { class: "rmark" }, warned ? "⚠" : why ? "○" : this.onWay.has(lc) ? "•" : ""),
 				el("span", { class: "rname" }, shown(k.name) || "(no name)"),
 				...(k.subkeyCount ? [el("span", { class: "muted rcount" }, k.subkeyCount.toLocaleString("en"))] : []),
 			);
@@ -187,7 +191,7 @@ export class RegistryPane {
 		this.right.replaceChildren(
 			el("div", { class: "rpath mono", "data-test": "hex-reg-path" }, shown(`${MOUNT[this.found.kind] ? `${MOUNT[this.found.kind]}\\` : ""}${path}`)),
 			el("p", { class: "muted" }, `Last written ${k.written ? `${k.written.replace("T", " ").replace("Z", "")} UTC` : "—"} · ${k.subkeyCount.toLocaleString("en")} subkeys · ${values.length.toLocaleString("en")} values${k.className ? ` · class “${shown(k.className)}”` : ""}`),
-			...(why ? [el("p", { class: "warn", "data-test": "hex-reg-why" }, `⚠ ${shown(why)}`)] : []),
+			...(why ? [el("ul", { class: "rwhy", "data-test": "hex-reg-why" }, ...[...why].sort((a, b) => (a.level === b.level ? 0 : a.level === "warn" ? -1 : 1)).map((w) => el("li", { class: w.level === "warn" ? "warn" : "muted" }, `${w.level === "warn" ? "⚠" : "○"} ${shown(w.why)}`)))] : []),
 			values.length ? table : el("p", { class: "muted" }, "No values."),
 			detail,
 		);

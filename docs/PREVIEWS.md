@@ -6,7 +6,8 @@
 > email, .eml and Outlook's .msg; 42d: every picture; 42e: archives; 42f:
 > Markdown, JSON, XML, web pages and code; 42g: programs and any file as
 > bytes — the one view a malware sample may have; 42h: Office macros'
-> source; 42i: shortcuts and Prefetch files; 42j: event logs). The
+> source; 42i: shortcuts and Prefetch files; 42j: event logs; 42k:
+> registry hives). The
 > viewer's own modes (raster images, text, video, music) are in
 > web/src/ui/viewer/mode.ts. Why malware samples are never shown at all is
 > in CUSTODY.md, stage 5.
@@ -839,6 +840,78 @@ computed through floats, are off by up to 2 µs. The test-time writer
 (`tests/lib/evtx.mjs`) makes logs that python-evtx verifies, header,
 chunks and records.
 
+**Windows registry hives** (42k): SYSTEM, SOFTWARE, SAM, SECURITY,
+NTUSER.DAT, UsrClass.dat, Amcache.hve. The registry is where Windows
+keeps what should run, so it is where an intruder makes things run again;
+and it remembers what people did. Read from the format as libregf
+documents it (`forensic/regf.ts`):
+
+- **What is read:**
+  - the base block: its XOR checksum, the last write, the name the hive
+    had, and the two sequence numbers (unequal: changes still in the
+    .LOG1 and .LOG2 files beside it);
+  - the bins and their cells: keys (`nk`), values (`vk`), subkey lists in
+    all four forms (`lf`, `lh`, `li`, and `ri`, an index of lists), and
+    big data (`db`, segments of 16,344 bytes);
+  - names in Latin-1 or UTF-16 as each key and value says; every time to
+    the tick (the FILETIME formatter shared with the event logs).
+- **Read lazily:** a key's subkeys and values only when asked for, so a
+  40 MB SOFTWARE hive of 117,000 keys opens at once.
+- **Deleted keys:** a free cell still holds what was there until it is
+  reused; keys found there are listed by name and last write.
+- **What is bounded:** every offset must land on a cell in use inside the
+  bins; 100,000 subkeys and 20,000 values per key at most; an index of
+  lists is followed 8 deep, and a list that points back into itself is
+  followed once; a value keeps at most 1 MB of its data.
+- **The ShimCache** (`forensic/shimcache.ts`): SYSTEM's AppCompatCache,
+  in its Windows 7, 8/8.1 and 10/11 layouts. It names programs Windows'
+  compatibility layer looked at (deleted ones too) with their files'
+  modification times, and on 7 and 8 whether they ran.
+- **The Registry tab** (`readers/hex-registry.ts`):
+  - a tree of keys, opened as you go. A key a warning names is marked ⚠,
+    one only noted ○, and each key on the way to either •;
+  - a key's values (name, type, data as regedit shows it); a value's whole
+    data, as text and hex; its cell in the Hex tab;
+  - Go to key, with or without HKLM\SOFTWARE (or HKCU) in front;
+  - Places: the findings above the preview, each a click from its key;
+  - the deleted keys, each a click from its bytes.
+
+**The facts** (`facts/regf.ts`). Which hive it is comes from the keys at
+its top. Then each answers its own questions:
+
+| hive | what it says |
+|---|---|
+| NTUSER.DAT, UsrClass.dat | what starts when this person signs in (Run, RunOnce, the old Load and Run values, a logon script, a user-level shell); COM objects registered for this user only from a folder anyone can write to (hijacking); the keys UAC-bypass tricks write; what they ran (UserAssist, its names in ROT13, known folders spelled out), typed in Run and in Explorer's address bar, searched for; the computers they reached by Remote Desktop; the Sysinternals tools whose licence they accepted; the documents whose macros they enabled |
+| SOFTWARE | the Windows version, install date and owner; what starts for everyone (Run, RunOnce, RunServices, both 32- and 64-bit); Winlogon's Shell and Userinit; Image File Execution Options (a debugger for sethc.exe: the sticky-keys backdoor) and SilentProcessExit; AppInit_DLLs; scheduled tasks' commands; Defender turned off or told to look away; PowerShell logging turned off; remote-access software installed; the user profiles; the networks it joined |
+| SYSTEM | the computer's name, time zone and last shutdown; the services (PsExec's, a shell, a known tool, a folder anyone can write to, a name of Windows' own in the wrong place); the DLLs LSA loads; WDigest keeping passwords in clear; Remote Desktop, its port and NLA; the firewall off; BootExecute and AppCertDlls; USB disks; the ShimCache and BAM (programs that ran, deleted ones too) |
+| SAM | the local accounts (never their hashes): a name ending in $ hidden from "net user", when each last signed in |
+| SECURITY | the names of the LSA secrets: services that keep a password |
+| Amcache.hve | programs that ran, with their SHA-1 |
+
+A command that starts by itself is judged the same way everywhere: the
+42f script triage (an encoded command decoded); a known tool by name; a
+program that runs other code; Windows' own loaders when what they load is
+somewhere odd; a name of Windows' own (svchost.exe, lsass.exe…) outside
+the folder Windows keeps it in; a folder anyone can write to (but not the
+per-user installs and Defender, which live there by design). Lists of
+what ran leave out Windows' own dual-use tools in their own folder, since
+every computer has run regsvr32.
+
+The reader was checked against python-registry and regipy (test oracles
+only, never shipped) on three real hives from regipy's own test data: a
+Windows 7 user's NTUSER.DAT and the SYSTEM and SOFTWARE of the same
+investigation, 150,056 keys in all.
+- Every key, every value and every byte of their data matched
+  python-registry, big data included.
+- The two differences were python-registry's notation, not the data. It
+  calls the default value "(default)", and it hands back a resident
+  value's four bytes where the value's size says fewer.
+- The ShimCache (660 entries) and UserAssist (29) matched regipy.
+- On those hives the facts name what the investigation found: PsExec's
+  service, WDigest set to keep passwords in clear, a.exe replaced in
+  TEMP 47 times, an svchost.exe in a folder of its own started from Run,
+  and Defender turned off.
+
 ### Programs (`readers/hex.ts`, `preview/binary/`, `facts/binary.ts`) (42g)
 
 Any file can be shown as bytes, and a program is taken apart; nothing is
@@ -1038,7 +1111,13 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
   time, its every step named, and an honest log warning of nothing; every
   value type, times to the tick; a gap, a changed chunk, the flags, a log
   that begins late, many chunks; a record built to expand, refused; cut
-  short and mutated logs said, never thrown.
+  short and mutated logs said, never thrown. **`unit:registry-hives`**
+  (42k): three real hives, fetched once and pinned (tests/lib/hives.mjs),
+  read key for key as python-registry reads them (each walk pinned as one
+  digest); the ShimCache and UserAssist as regipy reads them, and the
+  ShimCache's Windows 7 x64, 8.1 and 10 layouts; each hive's findings and
+  the keys they mark; a broken checksum, a dirty hive, one cut short, 60
+  mutations, never thrown.
 - **`e2e:preview`** (Chromium):
   - the frame's headers;
   - a PDF's pages, text, Korean through a CMap, Find, and facts; a
@@ -1059,6 +1138,10 @@ first (docs/CUSTODY.md › Inspection), and the frame shows a banner.
     override shown as [RLO]; the Events tab filtered by event ID, by field
     and to the notable records; a record's values and why it is marked;
     its bytes in Hex;
+  - registry hives (42k): a SYSTEM with no extension taken to the
+    Registry tab, its findings; a place opening the tree down to its key;
+    Go to key with HKLM\SYSTEM in front; a value's data and its cell in
+    Hex; a user's hive's tree opened from the keyboard;
   - macros (42h): a .docm's project named fact by fact, the Macros pane's
     flagged modules, a module opened in the text reader and back; the
     same project in an .xlsm, a .doc and a .ppt; OpenDocument Basic;

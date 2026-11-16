@@ -1024,7 +1024,8 @@ try {
 		// A place: the tree opens down to its key, its finding beside the values.
 		const wdigest = await d.locator('[data-test="hex-reg-places"] option', { hasText: "WDigest" }).first().getAttribute("value");
 		await d.locator('[data-test="hex-reg-places"]').selectOption(wdigest);
-		await d.locator('[data-test="hex-reg-path"]', { hasText: "HKLM\\SYSTEM\\ControlSet001\\Control\\SecurityProviders\\WDigest" }).waitFor();
+		// (A regular expression: a string would match whatever the case, and the path must be the hive's own.)
+		await d.locator('[data-test="hex-reg-path"]', { hasText: /^HKLM\\SYSTEM\\ControlSet001\\Control\\SecurityProviders\\WDigest$/ }).waitFor();
 		await d.locator('[data-test="hex-reg-why"] li.warn', { hasText: "WDigest keeps passwords in memory in clear" }).waitFor();
 		await d.locator('[data-test="hex-reg-values"] td', { hasText: "UseLogonCredential" }).waitFor();
 		await d.locator('.rrow.sel[data-path="ControlSet001\\\\Control\\\\SecurityProviders\\\\WDigest"]').waitFor();

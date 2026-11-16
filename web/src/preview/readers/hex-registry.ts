@@ -156,19 +156,27 @@ export class RegistryPane {
 		const parts = lcPath.split("\\");
 		for (let i = 1; i <= parts.length; i++) {
 			const p = parts.slice(0, i).join("\\");
-			let entry = this.rows.get(p);
+			const entry = this.rows.get(p);
 			if (!entry) {
 				// Past what the tree shows (a key beyond MAX_CHILDREN): straight to it.
-				const k = this.hive.path(lcPath);
-				if (!k) return false;
-				this.select(k, lcPath);
+				// (Spelled as the hive spells it, key by key.)
+				let k: RegKey | null = this.hive.root;
+				const names: string[] = [];
+				for (const part of parts) {
+					k = k && this.hive.child(k, part);
+					if (!k) return false;
+					names.push(k.name);
+				}
+				this.select(k!, names.join("\\"));
 				return true;
 			}
-			if (i < parts.length) this.toggle(entry, p, i - 1, true);
+			// (The row's own path, as the hive spells it: `p` is lower-cased for the lookup.)
+			const real = entry.row.getAttribute("data-path") ?? p;
+			if (i < parts.length) this.toggle(entry, real, i - 1, true);
 			else {
 				entry.row.scrollIntoView({ block: "center" });
 				entry.row.focus();
-				this.select(entry.key, entry.row.getAttribute("data-path") ?? p);
+				this.select(entry.key, real);
 			}
 		}
 		return true;

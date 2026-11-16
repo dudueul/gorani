@@ -221,10 +221,30 @@ fn explorer_always_keep_and_free_up_space() {
 	let on_disk = |p: &Path| cf::info(p).map(|i| i.on_disk).unwrap_or(u64::MAX);
 	let pin = |p: &Path| cf::info(p).map(|i| i.pin);
 	let whole = |p: &Path| size(p) > 0 && on_disk(p) >= size(p);
-	// (attrib.exe: another program, as Explorer is — and the same attribute.)
+	// (attrib.exe: another program, as Explorer is — and the same attribute.
+	// Found in CI: it says "File not found" for a folder given as a `\\?\`
+	// path or without /D — and exits 0 all the same; so it gets a plain path,
+	// /D for a folder, and what it set is checked. Nothing acts on it before
+	// that check: with no poller, the provider looks only in `wait`.)
 	let attrib = |flags: &[&str], p: &Path| {
-		let ok = std::process::Command::new("attrib").args(flags).arg(p).status().map(|s| s.success()).unwrap_or(false);
-		assert!(ok, "attrib {flags:?} {}", p.display());
+		use std::os::windows::fs::MetadataExt;
+		let plain = PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\"));
+		let mut cmd = std::process::Command::new("attrib");
+		cmd.args(flags);
+		if p.is_dir() {
+			cmd.arg("/D");
+		}
+		let out = cmd.arg(&plain).output().expect("attrib.exe");
+		let said = String::from_utf8_lossy(&out.stdout).to_string();
+		let attrs = std::fs::metadata(p).map(|m| m.file_attributes()).unwrap_or(0);
+		for f in flags {
+			let bit = match &f[1..] {
+				"P" => 0x0008_0000,
+				"U" => 0x0010_0000,
+				_ => continue,
+			};
+			assert_eq!(attrs & bit != 0, f.starts_with('+'), "attrib {f} {} did not take (it said: {said:?}; attributes now {attrs:#x})", plain.display());
+		}
 	};
 	let reads = || mem.lock().unwrap().reads;
 	let _ = (&keep_dir, &k1, &free_dir, &f2);

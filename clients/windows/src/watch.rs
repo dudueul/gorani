@@ -6,6 +6,10 @@
 //! on the whole tree. Each event is only a path to look at again: the
 //! provider decides what it is (provider.rs › local), so a lost or
 //! repeated event costs a look, never a wrong upload.
+//!
+//! Attribute changes too: Explorer's "Always keep on this device" and "Free
+//! up space" are nothing but a pin attribute set on the file (cf.rs › Pin),
+//! and this is how the provider learns of them (provider.rs › pins).
 
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -54,7 +58,7 @@ impl Watcher {
 						buf.as_mut_ptr() as *mut _,
 						(buf.len() * 4) as u32,
 						true,
-						FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+						FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES,
 						Some(&mut got),
 						None,
 						None,

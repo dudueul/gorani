@@ -424,7 +424,8 @@ gorani-sync replica [--case C]     one JSON request per line on stdin, one answe
 
 ```text
 gorani-cloud <folder> [--case C] [--keep-local]    serve the area as a Cloud Files sync root
-gorani-cloud free <file>                           drop one file's local bytes now
+gorani-cloud free <file|folder>                    Explorer's "Free up space" (39j)
+gorani-cloud keep <file|folder>                    Explorer's "Always keep on this device" (39j)
 gorani-cloud unregister <folder>                   the folder stops being a sync root
 ```
 
@@ -553,7 +554,8 @@ What Explorer and Finder show of a Gorani folder:
   `Gorani!<the user's SID>!<area>` — its own entry in the navigation pane
   ("Gorani — <area>", "(read-only)" for an evidence case), the Status
   column's cloud and tick, "Always keep on this device" and "Free up
-  space"; a malware sample carries a custom state ("Malware sample — never
+  space" (acted on since 39j — until then they set an attribute nothing
+  read); a malware sample carries a custom state ("Malware sample — never
   opened raw", a warning sign) and is marked in sync again after, so the
   shell's write is not taken for an edit. The policies are cldapi's own
   (cf.rs). Where the shell will not register it (a Server SKU, a
@@ -704,6 +706,79 @@ repositories (GitHub Pro, Team, Enterprise), move the secret into an
 environment `release` limited to main and `v*` tags, and add
 `environment: release` to the sign job: then no other branch's workflow
 can reach the key. Rotate with `new-key.sh` when the key may have leaked.
+
+### 39j as built: "Free up space" and "Always keep", from the context menu
+
+The two choices every cloud folder offers, on the right-click of a file
+or a folder, in Explorer and in Finder:
+
+| | Windows (Explorer's own entries) | macOS (the extension's actions) |
+|---|---|---|
+| **Always keep on this device / Mac** | fetched whole at once, again after each new version; a folder: what is in it, and what arrives later | marked kept: the item's content policy says "download eagerly, keep downloaded", and the system does both; a folder's items inherit it |
+| **Free up space** | the bytes dropped once the file is sent — a change is never lost; a folder: everything in it | kept no more, then evicted by the system (retried while an edit is still on its way up) |
+| a malware sample | never kept: the mark undone, and said | never kept; never downloaded eagerly through a kept folder either |
+| freeing one item out of a kept folder | that item freed; the folder kept as a whole no more, what else is in it still kept (each carries its own mark) | the same: the marks above it pushed down to what else is in those folders |
+| when Gorani stops | a kept file's plaintext leaves too (the stop guarantee, 39b), its mark stays, and it is fetched again at the next start — `--keep-local` for real offline use | the system's cache, as for every File Provider: kept files stay downloaded |
+
+**Windows: the platform only sets an attribute.** Explorer's two entries
+set the placeholder's pin state (FILE_ATTRIBUTE_PINNED, _UNPINNED) and
+nothing else: Microsoft documents that the sync engine does the
+dehydrating after its directory-change notification for those
+attributes. Before 39j the watcher did not ask for attribute changes,
+so the entries did nothing. Worse, a pinned file then could not take a
+new version: the platform refuses to dehydrate a pinned placeholder
+(ERROR_CLOUD_FILE_PINNED), the shell's own refreshes too.
+
+- **The watcher asks for attribute changes** (watch.rs). Each one is a
+  path to look at again, as every event is; `pins` (provider.rs) does
+  what the pin state asks.
+- **"Free up space" is a request, done once.** The bytes are dropped
+  once the file is in sync, then the state goes back to neither. A later
+  read then fetches the file as any read does, and the shell does not drop
+  it again under the reader. It dehydrates whatever the on-disk count says
+  (a small file's bytes can live in its MFT record).
+- **"Always keep" is a standing state.** A keeper thread fetches kept
+  files a range (64 MiB) at a time, so stop waits for one range, not for
+  a 255 GiB image. A failure is tried again every 30 s. A new version is
+  dropped with the pin lifted for the moment (cf.rs › `pin_lifted`),
+  then fetched again. So is stop's drop, which keeps the mark: the next
+  start's scan fetches what is kept.
+- **A folder kept is marked all the way down.** Each placeholder in it
+  gets its own mark, and so does what the server places there later.
+  That is why freeing one file inside only has to unmark the folders
+  above it.
+- **From a prompt:** `gorani-cloud keep|free <file|folder>` sets the same
+  attribute (attrib's `+P` and `+U` do too). `free` on a file also drops
+  its bytes there and then, whether a shell is running or not.
+
+**macOS: the system does it, our extension marks it.** Finder has no
+pin attribute for a provider to watch. The two entries are the
+extension's custom actions (NSFileProviderCustomAction, macOS 11+;
+declared in Info.plist through project.yml ›
+NSExtensionFileProviderActions, shown for any selection).
+
+- "Always keep on this Mac" marks the items (ProviderCore › `keep`). The
+  marks are in each generation of the ReplicaModel, so keeping is a
+  change since an anchor, like an edit on the server. The item's
+  `contentPolicy` (macOS 13+) becomes `downloadEagerlyAndKeepDownloaded`,
+  and its metadata version moves with the mark, or the system would take
+  the item for unchanged. Files are also asked for at once
+  (`requestDownloadForItem`).
+- "Free up space" unmarks (`free`) and signals, then evicts
+  (`evictItem`, which takes a folder with what is in it). The system
+  refuses to evict a kept item, and an edit not uploaded yet: both are
+  retried for a few seconds, while the system reads the new policy and
+  sends the edit.
+- The marks are this Mac's: a JSON list beside the profile in the app
+  group's container, one per domain, read back at the next start.
+  `allowsEvicting` was no help: Apple lists it for macOS 11–13 only.
+
+Tests: `ci:windows-cloud` sets the attributes from another process
+(attrib.exe, as Explorer does), and checks with the replica's read count
+that a kept file is read from the disk and a freed one from the server.
+`swift test` covers every decision about the marks. The two Finder
+calls, `requestDownloadForItem` and `evictItem`, need a registered
+domain, which an unsigned CI build has not.
 
 ## Commit 40: settings in a window
 

@@ -6,6 +6,11 @@
 // generation number; a generation the model no longer remembers (the
 // extension restarted, or fell far behind) is EXPIRED, and the system then
 // enumerates everything again (NSFileProviderError.syncAnchorExpired).
+//
+// The items "Always keep on this Mac" marks are part of each generation
+// too: keeping or freeing one is a change since an anchor as much as an
+// edit on the server — Finder learns of it the same way, and reads the
+// item's new content policy (FileProviderItem.swift).
 
 import Foundation
 
@@ -14,13 +19,18 @@ public final class ReplicaModel {
 	private let lock = NSLock()
 	public private(set) var generation: UInt64 = 0
 	private var snapshots: [UInt64: [String: GoraniItem]] = [:]
+	/// The kept items' ids, per generation, and now.
+	private var keptAt: [UInt64: Set<String>] = [:]
+	private var keptNow: Set<String>
 	public private(set) var readOnly: String?
 	public private(set) var area: String = ""
 	/// How many generations are remembered for `changes(since:)`.
 	private let keep: UInt64 = 16
 
-	public init(bridge: GoraniBridge) {
+	/// `kept`: the items marked "Always keep on this Mac" (what was saved).
+	public init(bridge: GoraniBridge, kept: Set<String> = []) {
 		self.bridge = bridge
+		keptNow = kept
 	}
 
 	/// Ask the core; a new generation when the listing changed. `force`:
@@ -38,9 +48,42 @@ public final class ReplicaModel {
 		self.readOnly = readOnly
 		self.area = area
 		if let last = snapshots[generation], last == now { return false }
+		advance(now)
+		return true
+	}
+
+	/// A new generation of `items` and the kept marks as they are now.
+	/// (Called with the lock held.)
+	private func advance(_ items: [String: GoraniItem]) {
 		generation += 1
-		snapshots[generation] = now
-		if generation > keep { snapshots[generation - keep] = nil }
+		snapshots[generation] = items
+		keptAt[generation] = keptNow
+		if generation > keep {
+			snapshots[generation - keep] = nil
+			keptAt[generation - keep] = nil
+		}
+	}
+
+	/// The kept marks now.
+	public var kept: Set<String> {
+		lock.lock()
+		defer { lock.unlock() }
+		return keptNow
+	}
+
+	public func isKept(_ id: String) -> Bool {
+		kept.contains(id)
+	}
+
+	/// New kept marks: a new generation when they differ (the items whose
+	/// mark changed are then what changed). Returns whether they did.
+	@discardableResult
+	public func setKept(_ marks: Set<String>) -> Bool {
+		lock.lock()
+		defer { lock.unlock() }
+		if marks == keptNow { return false }
+		keptNow = marks
+		advance(snapshots[generation] ?? [:])
 		return true
 	}
 
@@ -75,7 +118,8 @@ public final class ReplicaModel {
 		lock.lock()
 		defer { lock.unlock() }
 		guard let then = snapshots[anchor], let now = snapshots[generation] else { return nil }
-		let updated = now.values.filter { then[$0.id] != $0 }.sorted { $0.id < $1.id }
+		let (markedThen, markedNow) = (keptAt[anchor] ?? [], keptAt[generation] ?? [])
+		let updated = now.values.filter { then[$0.id] != $0 || markedThen.contains($0.id) != markedNow.contains($0.id) }.sorted { $0.id < $1.id }
 		let deleted = then.keys.filter { now[$0] == nil }.sorted()
 		return (updated, deleted)
 	}

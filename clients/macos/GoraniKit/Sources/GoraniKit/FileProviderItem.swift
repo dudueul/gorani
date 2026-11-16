@@ -11,6 +11,13 @@
 // Finder's badges (commit 39e): a sample, an item of a read-only area, and
 // a name that did not open in its place each carry a decoration — declared
 // in the extension's Info.plist (project.yml), named under its bundle id.
+//
+// "Always keep on this Mac" (Finder's context menu, the extension's custom
+// action): a kept item says so in its content policy — downloaded at once
+// and kept downloaded, new versions too; what is in a kept folder inherits
+// it. The system does the downloading and refuses to evict it; the mark is
+// ours (ProviderCore › keep), and moves the metadata version, or the system
+// would take the item for unchanged.
 
 import FileProvider
 import Foundation
@@ -19,6 +26,8 @@ import UniformTypeIdentifiers
 public final class GoraniFileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDecorating {
 	public let item: GoraniItem
 	private let readOnly: Bool
+	/// Marked "Always keep on this Mac".
+	public let kept: Bool
 
 	/// The extension's bundle id: decorations are named under it (the
 	/// extension sets it at start; tests use the default).
@@ -28,9 +37,10 @@ public final class GoraniFileProviderItem: NSObject, NSFileProviderItem, NSFileP
 		NSFileProviderItemDecorationIdentifier(rawValue: "\(decorationPrefix).\(name)")
 	}
 
-	public init(_ item: GoraniItem, readOnly: Bool) {
+	public init(_ item: GoraniItem, readOnly: Bool, kept: Bool = false) {
 		self.item = item
 		self.readOnly = readOnly
+		self.kept = kept && !item.sample
 	}
 
 	public static func identifier(_ id: String) -> NSFileProviderItemIdentifier {
@@ -67,7 +77,15 @@ public final class GoraniFileProviderItem: NSObject, NSFileProviderItem, NSFileP
 	}
 
 	public var itemVersion: NSFileProviderItemVersion {
-		NSFileProviderItemVersion(contentVersion: Data("\(item.version)".utf8), metadataVersion: Data("\(item.version):\(item.modified):\(item.sample)".utf8))
+		NSFileProviderItemVersion(contentVersion: Data("\(item.version)".utf8), metadataVersion: Data("\(item.version):\(item.modified):\(item.sample):\(kept ? "kept" : "-")".utf8))
+	}
+
+	/// Kept: downloaded at once, never evicted. A sample: never downloaded
+	/// eagerly, whatever the folder above says (it cannot be read anyway).
+	/// Anything else: as its folder is.
+	public var contentPolicy: NSFileProviderContentPolicy {
+		if item.sample { return .downloadLazily }
+		return kept ? .downloadEagerlyAndKeepDownloaded : .inherited
 	}
 
 	/// What Finder badges: a sample (warning), a read-only area's item

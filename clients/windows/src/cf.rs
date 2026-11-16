@@ -14,16 +14,20 @@
 //! placeholder created MARK_IN_SYNC with an identity blob (names.rs › identity);
 //!             updated, converted, dehydrated through a handle opened with an
 //!             oplock — an application holding the file open makes those wait
+//! pin         what Explorer's "Always keep on this device" (PINNED) and "Free up
+//!             space" (UNPINNED) set — read, set, and lifted for the shell's own
+//!             drops; hydrate fetches a range of a pinned file now
 //! ```
 
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use windows::core::{GUID, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, NTSTATUS};
 use windows::Win32::Storage::CloudFilters::*;
-use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO};
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES};
 
 pub use windows::Win32::Foundation::{STATUS_ACCESS_DENIED, STATUS_CLOUD_FILE_ACCESS_DENIED, STATUS_CLOUD_FILE_IN_USE, STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_READ_ONLY_VOLUME, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS};
 
@@ -181,24 +185,124 @@ impl Drop for Handle {
 	}
 }
 
-/// A placeholder's state: in sync or not, and its identity blob.
+/// A placeholder's pin state: what Explorer's "Always keep on this device"
+/// (PINNED) and "Free up space" (UNPINNED) set on it. The platform does
+/// neither itself — it sets the attribute, and it is the provider that,
+/// seeing the change (watch.rs), fetches or drops the bytes (provider.rs ›
+/// pins). It does refuse one thing on its own: dehydrating a PINNED
+/// placeholder fails (ERROR_CLOUD_FILE_PINNED), the shell's own drops too
+/// — hence `pin_lifted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pin {
+	/// Neither: fetched when read, left as it is.
+	Unspecified,
+	/// "Always keep on this device".
+	Pinned,
+	/// "Free up space".
+	Unpinned,
+	/// EXCLUDED or INHERIT: states Explorer does not set; treated as neither.
+	Other,
+}
+
+impl Pin {
+	fn of(s: CF_PIN_STATE) -> Self {
+		if s == CF_PIN_STATE_PINNED {
+			Pin::Pinned
+		} else if s == CF_PIN_STATE_UNPINNED {
+			Pin::Unpinned
+		} else if s == CF_PIN_STATE_UNSPECIFIED {
+			Pin::Unspecified
+		} else {
+			Pin::Other
+		}
+	}
+
+	fn raw(self) -> CF_PIN_STATE {
+		match self {
+			Pin::Pinned => CF_PIN_STATE_PINNED,
+			Pin::Unpinned => CF_PIN_STATE_UNPINNED,
+			Pin::Unspecified | Pin::Other => CF_PIN_STATE_UNSPECIFIED,
+		}
+	}
+}
+
+/// A placeholder's state: in sync or not, its identity blob, its pin
+/// state, and how many of its bytes are on this disk (0: dehydrated; the
+/// file's size or more: all of them).
 pub struct Info {
 	pub in_sync: bool,
 	pub identity: Vec<u8>,
+	pub pin: Pin,
+	pub on_disk: u64,
 }
 
 /// None when the file is not a placeholder (a file the member just made).
 pub fn info(path: &Path) -> Option<Info> {
 	let h = Handle::open(path, false).ok()?;
-	let mut buf = vec![0u8; size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 4096];
+	// (u64s: the struct holds 64-bit fields and must be aligned for them —
+	// a byte buffer is only as aligned as the allocator happens to make it.)
+	let bytes = size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 4096;
+	let mut buf = vec![0u64; bytes.div_ceil(8)];
 	let mut got = 0u32;
 	// SAFETY: the buffer is large enough for the struct and the largest identity.
-	unsafe { CfGetPlaceholderInfo(h.win32(), CF_PLACEHOLDER_INFO_BASIC, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, Some(&mut got)) }.ok()?;
-	// SAFETY: the platform wrote a CF_PLACEHOLDER_BASIC_INFO at the start.
-	let basic = unsafe { &*(buf.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
-	let at = offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
-	let len = (basic.FileIdentityLength as usize).min(buf.len() - at);
-	Some(Info { in_sync: basic.InSyncState == CF_IN_SYNC_STATE_IN_SYNC, identity: buf[at..at + len].to_vec() })
+	unsafe { CfGetPlaceholderInfo(h.win32(), CF_PLACEHOLDER_INFO_STANDARD, buf.as_mut_ptr() as *mut c_void, (buf.len() * 8) as u32, Some(&mut got)) }.ok()?;
+	// SAFETY: the platform wrote a CF_PLACEHOLDER_STANDARD_INFO at the start.
+	let st = unsafe { &*(buf.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO) };
+	// SAFETY: the same buffer, as the bytes it is.
+	let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+	let at = offset_of!(CF_PLACEHOLDER_STANDARD_INFO, FileIdentity);
+	let len = (st.FileIdentityLength as usize).min(raw.len() - at);
+	Some(Info { in_sync: st.InSyncState == CF_IN_SYNC_STATE_IN_SYNC, identity: raw[at..at + len].to_vec(), pin: Pin::of(st.PinState), on_disk: st.OnDiskDataSize.max(0) as u64 })
+}
+
+/// A plain handle for the calls that need no more than one (an
+/// "attribute or no-access handle", as the platform's documentation puts
+/// it): setting a pin state, hydrating. Not CfOpenFileWithOplock's — an
+/// application opening the file mid-fetch would break that oplock and
+/// invalidate the handle under a long hydration.
+fn attribute_handle(path: &Path, write: bool) -> Result<std::fs::File> {
+	use std::os::windows::fs::OpenOptionsExt;
+	let access = FILE_READ_ATTRIBUTES.0 | if write { FILE_WRITE_ATTRIBUTES.0 } else { 0 };
+	std::fs::OpenOptions::new()
+		.access_mode(access)
+		.share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+		// (A folder opens only with backup semantics.)
+		.custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+		.open(path)
+		.map_err(|e| windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32)))
+}
+
+/// Set a placeholder's pin state (Explorer's own two choices, or neither).
+pub fn set_pin(path: &Path, pin: Pin) -> Result<()> {
+	let f = attribute_handle(path, true)?;
+	// SAFETY: a handle we own, open for the call.
+	unsafe { CfSetPinState(HANDLE(f.as_raw_handle()), pin.raw(), CF_SET_PIN_FLAG_NONE, None) }
+}
+
+/// Fetch `length` bytes from `offset` of a placeholder now — through the
+/// provider's own FETCH_DATA, as a read would. Blocks until they are on
+/// disk, so it is never called on one of the platform's callback threads.
+pub fn hydrate(path: &Path, offset: u64, length: u64) -> Result<()> {
+	let f = attribute_handle(path, false)?;
+	// SAFETY: a handle we own, open for the call.
+	unsafe { CfHydratePlaceholder(HANDLE(f.as_raw_handle()), offset as i64, length as i64, CF_HYDRATE_FLAG_NONE, None) }
+}
+
+/// Run `f` with a PINNED placeholder's pin lifted for the moment, then
+/// pinned again — the shell's own drops (a new version's bytes replace the
+/// old, the plaintext leaving at stop) are refused while it is pinned.
+/// The person's choice stays: the bytes come back once the shell fetches
+/// them again.
+pub fn pin_lifted<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+	let pinned = info(path).is_some_and(|i| i.pin == Pin::Pinned);
+	if pinned {
+		set_pin(path, Pin::Unspecified)?;
+	}
+	let r = f();
+	if pinned {
+		let _ = set_pin(path, Pin::Pinned);
+	}
+	r
 }
 
 /// Run `f` with the read-only attribute lifted for the moment, if the shell

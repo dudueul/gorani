@@ -72,9 +72,14 @@ jobs:
         run: npm run build:web
       - name: The Worker (as wrangler.jsonc's build command runs it)
         run: node scripts/build-worker.mjs
+      # wrangler.jsonc's main is the shim, but the shim only re-exports
+      # ../index.js: the Worker itself is index.js and the WebAssembly beside
+      # it, so those are what is checked (-s: there, and not empty).
       - name: What wrangler would upload
         shell: bash
         run: |
-          test -f worker/build/worker/shim.mjs && ls -la worker/build/worker
-          test -f web/dist/index.html && ls web/dist | head
-          ls web/public/readers | head
+          for f in worker/build/worker/shim.mjs worker/build/index.js worker/build/index_bg.wasm web/dist/index.html web/dist/gorani-media.wasm web/public/readers/hex.js; do
+            test -s "$f" || { echo "missing or empty: $f"; exit 1; }
+          done
+          ls -la worker/build worker/build/worker
+          ls web/dist | head

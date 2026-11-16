@@ -212,8 +212,11 @@ export function boot(run: (host: Host) => Promise<void>): (msg: OpenMessage, por
 
 		// Keys the viewer owns — Escape closes, ← → move to the next file —
 		// go out to it: a focused frame keeps every key to itself otherwise.
-		// (Not from a field: there they edit the field.)
+		// (Not from a field: there they edit the field. Not a key a reader
+		// already used — the registry tree's → opens a key (42k); passed on
+		// as well, it also moved the viewer to the next file.)
 		window.addEventListener("keydown", (e) => {
+			if (e.defaultPrevented) return;
 			const t = e.target as HTMLElement | null;
 			if (t?.closest?.("input, textarea, select, [contenteditable]")) {
 				if (e.key === "Escape") (t as HTMLElement).blur();

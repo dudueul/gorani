@@ -98,6 +98,8 @@ export async function startDev({ port = 8790 + Math.floor(Math.random() * 40), c
 			"",
 		].join("\n"),
 	);
+	// (tests/output/ is git-ignored: a fresh clone has none until this makes it.)
+	fs.mkdirSync(path.join(ROOT, "tests/output"), { recursive: true });
 	const out = fs.openSync(path.join(ROOT, "tests/output/wrangler-dev.log"), "w");
 	// Fresh SQLite state per run: a private persist directory (created before
 	// the server starts — workerd wants it present), cleared each run so the

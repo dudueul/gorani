@@ -129,6 +129,15 @@ for (const [bytes, label] of [["MZ\x90\x00", "a PE"], ["\x7fELF", "an ELF"], [[0
 	for (const guess of ["pdf", "docx", "image", "text", "legacy", "email"] as const) assert.equal(sniffReader(head(bytes as string | number[]), guess, "invoice.pdf"), "hex", `${label} named as a ${guess}`);
 	assert.equal(sniffReader(head(bytes as string | number[]), "archive", "setup.zip"), "archive", `${label} named .zip: the archive reader (a self-extractor)`);
 }
+// Forensic artefacts (42i–42k): registry hives by Windows' own names
+// (System32\config keeps them with no extension) and .hve; and a hive,
+// an event log or a Prefetch file under any name, by its first bytes.
+for (const name of ["SYSTEM", "SOFTWARE", "SAM", "SECURITY", "DEFAULT", "system", "Amcache.hve", "NTUSER.DAT", "UsrClass.dat", "Security.evtx"]) assert.equal(readerFor("file", null, name), "hex", name);
+assert.equal(readerFor("file", null, "notes"), null, "a name with no extension is not a hive's for being one");
+for (const [bytes, label] of [["regf", "a registry hive"], ["ElfFile\x00", "an event log"], ["\x1e\x00\x00\x00SCCA", "a Prefetch file"], ["MAM\x04", "a compressed Prefetch file"]] as const) {
+	assert.equal(sniffReader(head(bytes), "text", "notes.txt"), "hex", `${label} named .txt`);
+	assert.equal(sniffReader(head(bytes), "archive", "logs.zip"), "archive", `${label} named .zip stays with the archive reader`);
+}
 assert.equal(pickViewerMode("file", null, 10, "normal", "setup.exe"), "document", "a program is shown — as bytes and headers");
 assert.equal(pickViewerMode("file", null, 10, "sample", "setup.exe"), "refused", "a sample program is refused first: inspecting it is a choice the person makes, on the record");
 

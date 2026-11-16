@@ -20,6 +20,8 @@ wrangler.r2.jsonc
 *.local
 # Test outputs (generated per run)
 tests/output/
+# Test inputs fetched once and kept (the sample registry hives, tests/lib/hives.mjs)
+tests/.cache/
 # The video engine, built for the browser (scripts/build-media-wasm.mjs)
 web/public/gorani-media.wasm
 # The preview frame's readers, bundled for the frame (scripts/build-readers.mjs)

@@ -25,7 +25,7 @@
  * Pure: unit:preview-facts.
  */
 
-import { Reader, Short, trimNul } from "../binary/read.ts";
+import { filetimeIso, Reader, Short, trimNul } from "../binary/read.ts";
 
 export interface EvtxEvent {
 	record: number;
@@ -293,7 +293,7 @@ class Chunk {
 			case 0x10:
 				return text(size === 8 ? hex(v.getBigUint64(0, true), 16) : hex(v.getUint32(0, true), 8));
 			case 0x11:
-				return text(filetimeText(r, at));
+				return text(filetimeIso(r, at));
 			case 0x12: {
 				const p2 = (n: number, w = 2) => String(v.getUint16(n, true)).padStart(w, "0");
 				return text(`${p2(0, 4)}-${p2(2)}-${p2(6)}T${p2(8)}:${p2(10)}:${p2(12)}.${p2(14, 3)}Z`);
@@ -367,17 +367,6 @@ function sid(r: Reader, at: number, size: number): string {
 
 /** The widths of the fixed-width value types, for their arrays (type | 0x80). */
 const WIDTH: Record<number, number> = { 0x03: 1, 0x04: 1, 0x05: 2, 0x06: 2, 0x07: 4, 0x08: 4, 0x09: 8, 0x0a: 8, 0x0b: 4, 0x0c: 8, 0x0d: 4, 0x0f: 16, 0x11: 8, 0x12: 16, 0x14: 4, 0x15: 8 };
-
-/** A FILETIME (100 ns ticks since 1601) as ISO 8601 to the tick — a
- * number would lose the last digits (2^53 holds 9e15; FILETIMEs are
- * 1.3e17), so the arithmetic is BigInt. "" for zero or past 9999. */
-function filetimeText(r: Reader, at: number): string {
-	const t = (BigInt(r.u32(at + 4)) << 32n) | BigInt(r.u32(at));
-	if (!t) return "";
-	const secs = Number(t / 10_000_000n) - 11_644_473_600;
-	if (secs < -11_644_473_600 || secs > 253_402_300_799) return "";
-	return `${new Date(secs * 1000).toISOString().slice(0, 19)}.${String(t % 10_000_000n).padStart(7, "0")}Z`;
-}
 
 const textOf = (vs: Node[]): string => vs.map((v) => (v.kind === "text" ? v.text : v.kind === "tree" ? textOf(v.nodes) : v.kind === "element" ? textOf(v.children) : "")).join("");
 const attr = (e: Element | undefined, name: string) => textOf(e?.attrs.find(([k]) => k === name)?.[1] ?? []);
@@ -466,7 +455,7 @@ export async function parseEvtx(b: Uint8Array, onChunk?: (i: number) => Promise<
 				try {
 					chunk.budget = MAX_NODES;
 					const parsed = chunk.parse(at + 24, at + size - 4, 0);
-					const ev = eventOf(chunk.render(parsed), record, at, filetimeText(r, at + 16));
+					const ev = eventOf(chunk.render(parsed), record, at, filetimeIso(r, at + 16));
 					if (last >= 0 && record > last + 1) log.gaps.push({ after: last, missing: record - last - 1 });
 					last = record;
 					log.events.push(ev);

@@ -14,6 +14,7 @@
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,7 +32,7 @@ if (fs.existsSync(OUT) && fs.statSync(OUT).mtimeMs >= sourcesAt) {
 }
 
 const target = process.env.CARGO_TARGET_DIR ?? path.join(ROOT, "target");
-const r = spawnSync("cargo", ["build", "-p", "gorani-media-wasm", "--target", "wasm32-unknown-unknown", "--release"], { cwd: ROOT, stdio: "inherit", env: { ...process.env, PATH: `${process.env.HOME}/.cargo/bin:${process.env.PATH ?? ""}` } });
+const r = spawnSync("cargo", ["build", "-p", "gorani-media-wasm", "--target", "wasm32-unknown-unknown", "--release"], { cwd: ROOT, stdio: "inherit", env: { ...process.env, PATH: [path.join(os.homedir(), ".cargo", "bin"), process.env.PATH ?? ""].join(path.delimiter) } });
 if (r.status !== 0) {
 	console.error("build-media-wasm: cargo failed — is the target installed? rustup target add wasm32-unknown-unknown");
 	process.exit(r.status ?? 1);

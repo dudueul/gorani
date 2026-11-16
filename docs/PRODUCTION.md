@@ -35,6 +35,12 @@ settings are in § 3 › The desktop installers.)
    rustup target add wasm32-unknown-unknown
    ```
 
+   On **Windows**, install Rust with rustup (it asks for the Visual Studio
+   C++ build tools, which build scripts need), then add the same target.
+   Run every command below in PowerShell. The build steps are Node scripts
+   (`scripts/build-*.mjs`), not shell lines, so nothing needs bash, and
+   CI's `deploy-build` runs them on Windows whenever they change.
+
    (The first build also downloads `worker-build`'s own tools — esbuild,
    wasm-bindgen, wasm-opt — into `~/.cache/worker-build`.) Then:
 

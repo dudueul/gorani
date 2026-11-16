@@ -56,7 +56,7 @@ with a signed SHA256SUMS). Check before running anything:
 ## Development
 
 ```sh
-npm install && npm --prefix web install   # root + web deps
+npm install                               # root, then web/ (its postinstall: npm --prefix web ci)
 npm run build                             # web → web/dist
 cargo check --workspace --target wasm32-unknown-unknown   # Rust worker
 npm run dev                               # wrangler dev (serves assets + worker)

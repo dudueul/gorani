@@ -2,6 +2,11 @@
 
 # Node / web build
 node_modules/
+# bun's lockfile, written by `bun install`: npm's lockfiles (package-lock.json,
+# web/package-lock.json) are the record of what is installed, and a second
+# lockfile would be a second record nobody reviews
+bun.lock
+bun.lockb
 dist/
 *.tsbuildinfo
 

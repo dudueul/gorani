@@ -21,9 +21,9 @@ name: deploy-build
 on:
   push:
     branches: [main]
-    paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]
+    paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "package-lock.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]
   pull_request:
-    paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]
+    paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "package-lock.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]
   workflow_dispatch:
 
 permissions:
@@ -69,8 +69,11 @@ jobs:
             target
           key: deploy-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: deploy-build-${{ runner.os }}-
-      - name: The web app's packages
-        run: npm ci --prefix web
+      # One install at the root, as a person runs it: its postinstall installs
+      # web/ (npm --prefix web ci), which the build then checks first
+      # (scripts/build-preflight.mjs).
+      - name: The packages (the root's, and web/'s through its postinstall)
+        run: npm ci
       # The steps of `npm run deploy`, but the upload, from PowerShell (the
       # runner's shell on Windows) as a person runs them; npm runs the web
       # app's build script through cmd.exe, as it does on their machine.

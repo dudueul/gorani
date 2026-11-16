@@ -1,0 +1,91 @@
+# Copyright 2026- Seongwoo Hong. All rights reserved.
+#
+# The deploy's build, on Windows: what `npm run deploy` builds before it
+# uploads — the web app (its WebAssembly, the preview readers, Vite) and the
+# Rust Worker (scripts/build-worker.mjs, as wrangler.jsonc runs it). Linux
+# runs the same scripts in every test run (tests/api/_dev.mjs); Windows ran
+# them only on a person's machine, where the first deploy from it found two
+# that could not run there: a bare path given to import(), and a bash line
+# given to cmd.exe.
+#
+# It builds; it never deploys. No secrets, the job token read-only,
+# first-party actions only (actions/checkout, actions/setup-node,
+# actions/cache). Windows minutes count twice against the plan, so only
+# changes to the build's own scripts and configuration run it, and a branch
+# runs it once, through its pull request: a push trigger on the branch too
+# would run it twice for every commit (the two runs have different refs, so
+# the concurrency group below cancels neither).
+
+name: deploy-build
+
+on:
+  push:
+    branches: [main]
+    paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]
+  pull_request:
+    paths: ["scripts/build-*.mjs", "wrangler.jsonc", "package.json", "web/package.json", "web/package-lock.json", "web/vite.config.ts", "worker/Cargo.toml", ".github/workflows/deploy-build.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: the deploy's build (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup default stable
+          rustup target add wasm32-unknown-unknown
+          rustc --version && cargo --version && node --version
+      # worker-build is cached with cargo's record of installing it
+      # (.crates.toml, .crates2.json): cargo will not overwrite a binary it
+      # has no record of. (build-worker.mjs uses a 0.8 it finds either way.)
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/worker-build.exe
+            ~/.cargo/bin/worker-codegen.exe
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            target
+          key: deploy-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: deploy-build-${{ runner.os }}-
+      - name: The web app's packages
+        run: npm ci --prefix web
+      # The steps of `npm run deploy`, but the upload, from PowerShell (the
+      # runner's shell on Windows) as a person runs them; npm runs the web
+      # app's build script through cmd.exe, as it does on their machine.
+      - name: The web app (WebAssembly, preview readers, Vite)
+        run: npm run build:web
+      - name: The Worker (as wrangler.jsonc's build command runs it)
+        run: node scripts/build-worker.mjs
+      # wrangler.jsonc's main is the shim, but the shim only re-exports
+      # ../index.js: the Worker itself is index.js and the WebAssembly beside
+      # it, so those are what is checked (-s: there, and not empty).
+      - name: What wrangler would upload
+        shell: bash
+        run: |
+          for f in worker/build/worker/shim.mjs worker/build/index.js worker/build/index_bg.wasm web/dist/index.html web/dist/gorani-media.wasm web/public/readers/hex.js; do
+            test -s "$f" || { echo "missing or empty: $f"; exit 1; }
+          done
+          ls -la worker/build worker/build/worker
+          ls web/dist | head

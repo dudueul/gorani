@@ -34,7 +34,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB = path.join(ROOT, "web");
@@ -99,7 +99,9 @@ const sourcesAt = Math.max(newest(SRC), newest(path.join(WEB, "package-lock.json
 const outputs = Object.keys(READERS).map((n) => path.join(OUT, `${n}.js`));
 if (outputs.every((o) => fs.existsSync(o)) && oldest(OUT) >= sourcesAt) process.exit(0);
 
-const { build } = await import(require.resolve("esbuild"));
+// (A file:// URL: import() takes no bare path on Windows — "C:\\…" reads
+// as a URL whose scheme is "c:".)
+const { build } = await import(pathToFileURL(require.resolve("esbuild")).href);
 
 /** msgreader decodes Outlook's 8-bit strings with iconv-lite, which is built
  * on Node's Buffer; in the frame the browser's TextDecoder does the same

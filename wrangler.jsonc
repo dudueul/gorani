@@ -37,16 +37,12 @@
 	"main": "worker/build/worker/shim.mjs",
 	"compatibility_date": "2026-09-01",
 
-	// Build the Rust worker. `worker-build` compiles src/lib.rs to
-	// wasm32-unknown-unknown, runs wasm-bindgen and emits build/worker/.
-	// PATH: rustup installs cargo into ~/.cargo/bin, which a login shell has
-	// but wrangler's build shell may not — make it explicit.
-	// worker-build is pinned to the `worker` crate's minor version (0.8, as in
-	// worker/Cargo.toml): each worker-build refuses a crate of another minor,
-	// so an unpinned install broke the first fresh build after 0.9 came out.
-	// Raise both together.
+	// Build the Rust worker: scripts/build-worker.mjs runs worker-build
+	// (pinned to the `worker` crate's 0.8) with ~/.cargo/bin on the PATH. A
+	// script, not a shell line, so it runs on Windows too: wrangler runs this
+	// command through cmd.exe there, where `export PATH=…` does not exist.
 	"build": {
-		"command": "cd worker && export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo install -q worker-build@^0.8 && worker-build --release"
+		"command": "node scripts/build-worker.mjs"
 	},
 
 	// The web app is a static Lit SPA built into web/dist and served by the
